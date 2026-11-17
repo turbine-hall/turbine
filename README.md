@@ -21,10 +21,10 @@ pnpm install
 pnpm build
 ```
 
-Optional alias (run from any project directory):
+Optional alias (run from any project directory; point `--dir` at your local clone):
 
 ```bash
-alias turbine='pnpm --dir /Users/ahsanaasim/Documents/CodeLab/6senseHQ/factory turbine'
+alias turbine='pnpm --dir /path/to/turbine turbine'
 ```
 
 ## Use in an existing project
