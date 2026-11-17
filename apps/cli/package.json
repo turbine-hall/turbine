@@ -1,0 +1,34 @@
+{
+  "name": "@turbine-hall/turbine-cli",
+  "version": "0.5.0",
+  "type": "module",
+  "bin": {
+    "turbine": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@turbine-hall/turbine-adapter-git": "workspace:*",
+    "@turbine-hall/turbine-adapter-jira": "workspace:*",
+    "@turbine-hall/turbine-adapter-tests": "workspace:*",
+    "@turbine-hall/turbine-contracts": "workspace:*",
+    "@turbine-hall/turbine-core": "workspace:*",
+    "@turbine-hall/turbine-evidence-contract": "workspace:*",
+    "@turbine-hall/turbine-executor": "workspace:*",
+    "@turbine-hall/turbine-lineage-impact": "workspace:*",
+    "@turbine-hall/turbine-models": "workspace:*",
+    "@turbine-hall/turbine-skills": "workspace:*",
+    "@turbine-hall/turbine-storage-sqlite": "workspace:*",
+    "@turbine-hall/turbine-tools": "workspace:*",
+    "commander": "^14.0.1",
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

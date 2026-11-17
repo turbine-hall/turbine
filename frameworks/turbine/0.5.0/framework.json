@@ -1,0 +1,12 @@
+{
+  "id": "turbine",
+  "version": "0.5.0",
+  "name": "Turbine",
+  "stages": [
+    "IMPORTED", "ASSESSING", "REQUIREMENTS_REVIEW", "REQUIREMENTS_APPROVED",
+    "PLANNING", "PLAN_REVIEW", "PLAN_APPROVED", "IMPLEMENTING", "AI_REVIEW",
+    "HUMAN_CODE_REVIEW", "VERIFYING", "HUMAN_ACCEPTANCE", "ACCEPTED"
+  ],
+  "humanGates": ["requirements", "plan", "code-review", "sqa-acceptance"],
+  "checksum": "sha256:turbine-0.5.0-baseline"
+}

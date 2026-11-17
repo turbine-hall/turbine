@@ -1,0 +1,11 @@
+{
+  "id": "core/plan-change",
+  "version": "0.1.0",
+  "source": "turbine-original",
+  "license": "UNLICENSED-internal",
+  "runnerCompatibility": ["turbine-models"],
+  "inputs": ["work-package", "context"],
+  "outputs": ["plan"],
+  "requiredCapabilities": ["repo.inspect"],
+  "resourceLimits": { "maxModelCalls": 2 }
+}

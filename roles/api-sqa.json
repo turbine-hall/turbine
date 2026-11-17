@@ -1,0 +1,12 @@
+{
+  "id": "api-sqa",
+  "version": "0.1.0",
+  "responsibility": "Verify API contracts/auth/negative cases",
+  "inputs": ["work-package", "approved-specification", "approved-plan", "repository-context"],
+  "skills": { "required": ["core/verify-acceptance"], "optional": [] },
+  "capabilities": { "required": ["tests.run","repo.read"], "prohibited": ["requirements.approve", "plan.approve", "git.merge", "production.deploy"] },
+  "outputs": ["test-report"],
+  "model_policy": "analysis-capable",
+  "max_attempts": 2,
+  "escalates_on": ["ambiguous-requirement", "scope-expansion", "destructive-change"]
+}

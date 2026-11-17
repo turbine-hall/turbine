@@ -1,0 +1,11 @@
+{
+  "id": "core/verify-acceptance",
+  "version": "0.1.0",
+  "source": "turbine-original",
+  "license": "UNLICENSED-internal",
+  "runnerCompatibility": ["turbine-models"],
+  "inputs": ["work-package", "context"],
+  "outputs": ["verify"],
+  "requiredCapabilities": ["tests.run"],
+  "resourceLimits": { "maxModelCalls": 2 }
+}

@@ -1,0 +1,12 @@
+{
+  "id": "spec-writer",
+  "version": "0.1.0",
+  "responsibility": "Produce verifiable specification and acceptance scenarios",
+  "inputs": ["work-package", "approved-specification", "approved-plan", "repository-context"],
+  "skills": { "required": ["core/write-specification"], "optional": [] },
+  "capabilities": { "required": ["repo.read"], "prohibited": ["requirements.approve", "plan.approve", "git.merge", "production.deploy"] },
+  "outputs": ["specification"],
+  "model_policy": "analysis-capable",
+  "max_attempts": 2,
+  "escalates_on": ["ambiguous-requirement", "scope-expansion", "destructive-change"]
+}

@@ -1,0 +1,11 @@
+{
+  "id": "core/review-change",
+  "version": "0.1.0",
+  "source": "turbine-original",
+  "license": "UNLICENSED-internal",
+  "runnerCompatibility": ["turbine-models"],
+  "inputs": ["work-package", "context"],
+  "outputs": ["review"],
+  "requiredCapabilities": ["repo.read","git.diff"],
+  "resourceLimits": { "maxModelCalls": 2 }
+}

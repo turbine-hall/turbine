@@ -1,0 +1,12 @@
+{
+  "id": "code-quality-checker",
+  "version": "0.1.0",
+  "responsibility": "Run deterministic lint/type/static checks",
+  "inputs": ["work-package", "approved-specification", "approved-plan", "repository-context"],
+  "skills": { "required": [], "optional": [] },
+  "capabilities": { "required": ["tests.run","repo.read"], "prohibited": ["requirements.approve", "plan.approve", "git.merge", "production.deploy"] },
+  "outputs": ["test-report"],
+  "model_policy": "analysis-capable",
+  "max_attempts": 2,
+  "escalates_on": ["ambiguous-requirement", "scope-expansion", "destructive-change"]
+}

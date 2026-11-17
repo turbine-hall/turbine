@@ -1,0 +1,12 @@
+{
+  "id": "architect",
+  "version": "0.1.0",
+  "responsibility": "Analyze boundaries, interfaces and architecture decisions",
+  "inputs": ["work-package", "approved-specification", "approved-plan", "repository-context"],
+  "skills": { "required": ["core/plan-change"], "optional": [] },
+  "capabilities": { "required": ["repo.inspect","repo.read"], "prohibited": ["requirements.approve", "plan.approve", "git.merge", "production.deploy"] },
+  "outputs": ["architecture"],
+  "model_policy": "analysis-capable",
+  "max_attempts": 2,
+  "escalates_on": ["ambiguous-requirement", "scope-expansion", "destructive-change"]
+}

@@ -1,0 +1,17 @@
+{
+  "key": "OPS-123",
+  "id": "10001",
+  "summary": "Add leave approval endpoint",
+  "description": "Managers can approve leave requests. Auth permissions must be enforced.",
+  "issueType": "Story",
+  "priority": "Medium",
+  "status": "To Do",
+  "labels": ["backend", "api"],
+  "assignee": "Dev Example",
+  "updatedAt": "2026-11-11T10:00:00.000Z",
+  "url": "https://example.atlassian.net/browse/OPS-123",
+  "acceptanceCriteria": [
+    "Authorized manager can approve a pending leave request",
+    "Unauthorized caller receives 403"
+  ]
+}

@@ -1,0 +1,17 @@
+---
+description: Drive Turbine Hall (turbine) with human gates — always use task next
+alwaysApply: true
+---
+
+# Turbine Agent Driver
+
+When helping with Turbine Hall tasks or `.turbine/` packets:
+
+1. Run `turbine task next <work-id>` and follow its `Do now` / `Commands` / `Agent playbook`. Do not invent workflow steps.
+2. After every sync, run `turbine task next` again.
+3. Code changes for a task go only in `.turbine/worktrees/<id>/` on `turbine/<id>` — never commit task work on staging/main unless merging a PR.
+4. Human gates (requirements, plan, review, acceptance) are decided ONLY by the human running `turbine task approve <id>` / `turbine task reject <id>` in their own terminal. Never run approve, reject, waive, cancel or changes-requested yourself, never edit Decision sections, never touch `.turbine/state/`. Summarise what needs approving and stop.
+5. ACCEPTED means the packet is closed, not that the main checkout has the change. Next: PR → merge → `git pull` in the main folder.
+6. Edit packet content (requirements text, acceptance observations) and run `sync`; that never approves anything.
+
+Full playbook: `docs/AGENT_DRIVER.md`.

@@ -1,0 +1,157 @@
+import type { ModelAdapter } from './types.js';
+
+export function createMockModelAdapter(id = 'mock-default'): ModelAdapter {
+  return {
+    id,
+    provider: 'mock',
+    capabilities: {
+      text: true,
+      structuredOutput: true,
+      toolCalling: false,
+      maxContextTokens: 128000,
+    },
+    async run(request) {
+      if (request.schemaId === 'healthcheck') {
+        return {
+          content: { ok: true, message: 'pong' },
+          usage: { inputTokens: 1, outputTokens: 1 },
+          providerRequestId: `mock_${Date.now()}`,
+        };
+      }
+      if (request.schemaId === 'assessment' || request.skillIds.includes('core/assess-requirements')) {
+        // Decide only from the request itself, not the skill text around it.
+        const requestOnly = (request.prompt.split('## REQUEST')[1] ?? request.prompt).split('\n## ')[0]!.toLowerCase();
+        return {
+          content: {
+            readiness: 'needs_clarification_or_ready',
+            facts: [{ text: 'Request received and normalized', source: 'request' }],
+            assumptions: ['Existing authentication middleware remains unchanged unless specified'],
+            unknowns: requestOnly.includes('auth')
+              ? []
+              : ['Who is authorized to perform this action?'],
+            proposedAcceptanceCriteria: [
+              {
+                id: 'ac_1',
+                statement: 'The described behavior is observable via API or UI as specified',
+                kind: 'behavioral',
+              },
+              {
+                id: 'ac_2',
+                statement: 'Unauthorized callers receive an appropriate error response',
+                kind: 'behavioral',
+              },
+            ],
+            nonGoals: ['Unrelated refactors'],
+            riskHints: requestOnly.includes('auth') || requestOnly.includes('permission')
+              ? ['auth-permissions']
+              : [],
+          },
+          usage: { inputTokens: 100, outputTokens: 200 },
+          providerRequestId: `mock_${Date.now()}`,
+        };
+      }
+
+      if (request.schemaId === 'specification' || request.skillIds.includes('core/write-specification')) {
+        return {
+          content: {
+            summary: 'Users get the requested behaviour; invalid input is refused.',
+            requirements: [
+              {
+                id: 'FR-001',
+                priority: 'P0',
+                kind: 'behavioral',
+                statement: 'WHEN a user performs the requested action THE SYSTEM SHALL complete it and show the result',
+                status: 'proposed',
+              },
+              {
+                id: 'FR-002',
+                priority: 'P1',
+                kind: 'behavioral',
+                statement: 'IF the input is invalid THEN THE SYSTEM SHALL refuse it with an error message',
+                status: 'proposed',
+              },
+            ],
+            nonGoals: ['Drive-by refactors'],
+            userFlow: {
+              steps: [
+                { from: 'User', to: 'App', message: 'requests the action' },
+                { from: 'App', to: 'API', message: 'checks permission and performs it' },
+                { from: 'App', to: 'User', message: 'shows the result' },
+              ],
+            },
+            testIntent: ['Unit tests for core logic', 'Negative test for unauthorised access'],
+            requestCoverage: [...request.prompt.matchAll(/^- (R\d+): /gm)].map((m) => ({ itemId: m[1], requirementIds: ['FR-001'] })),
+          },
+          usage: { inputTokens: 120, outputTokens: 260 },
+          providerRequestId: `mock_${Date.now()}`,
+        };
+      }
+
+      if (request.schemaId === 'plan' || request.skillIds.includes('core/plan-change')) {
+        const ids = [...request.prompt.matchAll(/^- ([A-Za-z]+[-_]\w+) \(P[012]\):/gm)].map((m) => m[1]!);
+        const reqIds = ids.length ? ids : ['FR-001'];
+        return {
+          content: {
+            summary: 'Bounded implementation plan',
+            steps: [
+              { id: 'S1', description: 'Implement the main behaviour', requirementIds: [reqIds[0]], files: ['src/'] },
+              ...(reqIds.length > 1
+                ? [{ id: 'S2', description: 'Handle the remaining requirements', requirementIds: reqIds.slice(1), files: ['src/'] }]
+                : []),
+              { id: `S${reqIds.length > 1 ? 3 : 2}`, description: 'Add tests', requirementIds: reqIds, files: ['test/'] },
+            ],
+            testPlan: reqIds.map((id) => ({ requirementId: id, test: `Test for ${id}`, kind: 'unit' })),
+            risks: [{ risk: 'Mock plan — no real repository analysis', mitigation: 'Review the diff carefully' }],
+            estimatedComplexity: 'low',
+          },
+          usage: { inputTokens: 140, outputTokens: 220 },
+          providerRequestId: `mock_${Date.now()}`,
+        };
+      }
+
+      if (request.schemaId === 'review' || request.skillIds.includes('core/review-change')) {
+        // Mock reviewer: one low-severity note on the first changed file (no quote), no claims.
+        const files = request.prompt.match(/CHANGED FILES:\n((?: {2}\S+ .+\n?)+)/);
+        const first = files?.[1]?.split('\n')[0]?.trim().split(/\s+/).slice(1).join(' ');
+        return {
+          content: {
+            findings: first
+              ? [{ severity: 'low', claim: 'Mock review: confirm this file matches the plan', file: first }]
+              : [],
+            claims: { dependenciesAdded: [], testFilesChanged: [] },
+            coverage: (() => {
+              const tests = request.prompt.match(/TEST FILES CHANGED: (.+)/)?.[1];
+              if (!tests || tests === 'none') return [];
+              const first = tests.split(',')[0]!.trim();
+              return [...request.prompt.matchAll(/^- ([A-Za-z]+[-_]\w+) \(P[012]\):/gm)].map((m) => ({ requirementId: m[1], testFile: first }));
+            })(),
+            summary: 'Mock review of the diff.',
+          },
+          usage: { inputTokens: 150, outputTokens: 120 },
+          providerRequestId: `mock_${Date.now()}`,
+        };
+      }
+
+      if (request.schemaId === 'implement' || request.skillIds.includes('core/execute-code-change')) {
+        return {
+          content: {
+            summary: 'Mock implementation guidance',
+            filesTouched: ['README.md'],
+            testCommands: ['pnpm test'],
+            notes: [
+              'Mock provider does not modify the repository; supervised/manual mode expected.',
+            ],
+          },
+          usage: { inputTokens: 160, outputTokens: 180 },
+          providerRequestId: `mock_${Date.now()}`,
+        };
+      }
+
+      return {
+        content: { ok: true, echo: request.prompt.slice(0, 200) },
+        usage: { inputTokens: 10, outputTokens: 10 },
+        providerRequestId: `mock_${Date.now()}`,
+      };
+    },
+  };
+}

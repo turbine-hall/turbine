@@ -1,0 +1,12 @@
+{
+  "id": "requirements-analyst",
+  "version": "0.1.0",
+  "responsibility": "Identify missing or conflicting user intent",
+  "inputs": ["work-package", "approved-specification", "approved-plan", "repository-context"],
+  "skills": { "required": ["core/assess-requirements"], "optional": [] },
+  "capabilities": { "required": ["issue.read","repo.read"], "prohibited": ["requirements.approve", "plan.approve", "git.merge", "production.deploy"] },
+  "outputs": ["assessment"],
+  "model_policy": "analysis-capable",
+  "max_attempts": 2,
+  "escalates_on": ["ambiguous-requirement", "scope-expansion", "destructive-change"]
+}

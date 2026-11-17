@@ -1,0 +1,12 @@
+{
+  "id": "ux-designer",
+  "version": "0.1.0",
+  "responsibility": "Specify relevant interactions and states",
+  "inputs": ["work-package", "approved-specification", "approved-plan", "repository-context"],
+  "skills": { "required": ["core/write-specification"], "optional": [] },
+  "capabilities": { "required": ["repo.read"], "prohibited": ["requirements.approve", "plan.approve", "git.merge", "production.deploy"] },
+  "outputs": ["other"],
+  "model_policy": "analysis-capable",
+  "max_attempts": 2,
+  "escalates_on": ["ambiguous-requirement", "scope-expansion", "destructive-change"]
+}

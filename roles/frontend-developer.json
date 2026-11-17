@@ -1,0 +1,12 @@
+{
+  "id": "frontend-developer",
+  "version": "0.1.0",
+  "responsibility": "Implement UI behavior",
+  "inputs": ["work-package", "approved-specification", "approved-plan", "repository-context"],
+  "skills": { "required": ["core/execute-code-change","core/surgical-changes"], "optional": [] },
+  "capabilities": { "required": ["repo.read","workspace.write","tests.run","git.diff"], "prohibited": ["requirements.approve", "plan.approve", "git.merge", "production.deploy"] },
+  "outputs": ["change-report","diff","test-report"],
+  "model_policy": "analysis-capable",
+  "max_attempts": 2,
+  "escalates_on": ["ambiguous-requirement", "scope-expansion", "destructive-change"]
+}

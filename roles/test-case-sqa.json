@@ -1,0 +1,12 @@
+{
+  "id": "test-case-sqa",
+  "version": "0.1.0",
+  "responsibility": "Derive positive/negative/boundary test scenarios",
+  "inputs": ["work-package", "approved-specification", "approved-plan", "repository-context"],
+  "skills": { "required": ["core/verify-acceptance"], "optional": [] },
+  "capabilities": { "required": ["repo.read"], "prohibited": ["requirements.approve", "plan.approve", "git.merge", "production.deploy"] },
+  "outputs": ["test-plan"],
+  "model_policy": "analysis-capable",
+  "max_attempts": 2,
+  "escalates_on": ["ambiguous-requirement", "scope-expansion", "destructive-change"]
+}

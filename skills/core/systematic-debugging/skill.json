@@ -1,0 +1,11 @@
+{
+  "id": "core/systematic-debugging",
+  "version": "0.1.0",
+  "source": "turbine-original",
+  "license": "UNLICENSED-internal",
+  "runnerCompatibility": ["turbine-models"],
+  "inputs": ["work-package", "context"],
+  "outputs": ["other"],
+  "requiredCapabilities": ["none"],
+  "resourceLimits": { "maxModelCalls": 2 }
+}

@@ -1,0 +1,12 @@
+{
+  "id": "core/execute-code-change",
+  "version": "0.2.0",
+  "source": "turbine-original",
+  "license": "UNLICENSED-internal",
+  "runnerCompatibility": ["turbine-models"],
+  "inputs": ["work-package", "context"],
+  "outputs": ["implement"],
+  "requiredCapabilities": ["repo.read"],
+  "resourceLimits": { "maxModelCalls": 2 },
+  "notes": "In manual-supervised mode this skill only produces guidance; a human or supervised agent writes the code in the worktree, so it needs no write capability."
+}
