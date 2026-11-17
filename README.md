@@ -1,4 +1,17 @@
-# Turbine Hall (`turbine`)
+<p align="center">
+  <a href="https://github.com/turbine-hall/turbine" target="_blank">
+    <img src="docs/assets/turbine-logo.jpg" width="120" alt="Turbine Logo" />
+  </a>
+</p>
+
+<p align="center">
+  <strong>Turbine Hall</strong> (<code>turbine</code>)<br />
+  A governed workflow engine for human + AI software work.
+</p>
+
+<p align="center">
+  <a href="https://github.com/turbine-hall/turbine/actions/workflows/ci.yml"><img src="https://github.com/turbine-hall/turbine/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+</p>
 
 **Turbine** is the framework (rules, gates, roles). **Turbine Hall** is the app — the CLI that runs it.
 
