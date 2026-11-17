@@ -17,11 +17,6 @@
 
 A turbine turns raw input into steady output; the turbine hall is where you watch it run.
 
-## Attribution
-
-- **Framework proposed by** [Ahsan Aasim](https://github.com/ahsanaasim)
-- **Open-source project maintained by** [6sense HQ Ltd.](https://6sensehq.com)
-
 ## Requirements
 
 - Node.js 22+
@@ -140,3 +135,8 @@ Binary name is provisional (`turbine`). Package scope is `@turbine-hall/*`.
 - [Turbine Hall (app requirements)](docs/TURBINE_HALL_REQUIREMENTS_v0.5.md)
 - [Implementation status](docs/IMPLEMENTATION_STATUS.md)
 - [Agent driver](docs/AGENT_DRIVER.md)
+
+## Attribution
+
+- **Framework proposed by** [Ahsan Aasim](https://github.com/ahsanaasim)
+- **Open-source project maintained by** [6sense HQ Ltd.](https://6sensehq.com)
