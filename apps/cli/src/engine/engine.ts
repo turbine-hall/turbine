@@ -47,6 +47,8 @@ import type { ModelAdapter } from '@turbine-hall/turbine-models';
 import { ToolBroker } from '@turbine-hall/turbine-tools';
 import { createJiraAdapter, issueToMarkdown, type JiraIssue } from '@turbine-hall/turbine-adapter-jira';
 import { inspectRepo } from '@turbine-hall/turbine-adapter-git';
+import { hasUncommittedChanges, observeBranch } from './context/git-read.js';
+import { repoHead } from './context/understand.js';
 import { analyze, type AnalysisFinding } from './docs/analyze.js';
 import { lintPacket, type LintIssue } from './docs/lint.js';
 import {
@@ -819,11 +821,13 @@ export class Engine {
     return work;
   }
 
-  async plan(idOrAlias: string): Promise<{
+  async plan(idOrAlias: string, opts: { onlyIfPending?: boolean } = {}): Promise<{
     work: WorkPackage;
     plan: unknown;
     planHash: string;
     packetDir: string;
+    /** True when `onlyIfPending` was set and the task had already left the pending state: nothing was planned. */
+    skipped?: boolean;
   }> {
     const first = this.ctx.store.getWork(idOrAlias);
     if (!['PLAN_REVIEW', 'CHANGES_REQUESTED', 'REQUIREMENTS_APPROVED', 'PLANNING'].includes(first.currentState)) {
@@ -834,19 +838,31 @@ export class Engine {
     // refused, and a failed attempt releases its claim so the next `sync` can resume it.
     const claim = this.ctx.store.claimWork(first.id, 'planning');
     try {
-      return await this.planClaimed(first.id, claim);
+      return await this.planClaimed(first.id, claim, opts);
     } finally {
       this.ctx.store.releaseClaim(first.id, claim);
     }
   }
 
-  private async planClaimed(idOrAlias: string, claim: string): Promise<{
+  private async planClaimed(idOrAlias: string, claim: string, opts: { onlyIfPending?: boolean } = {}): Promise<{
     work: WorkPackage;
     plan: unknown;
     planHash: string;
     packetDir: string;
+    skipped?: boolean;
   }> {
     let work = this.ctx.store.getWork(idOrAlias);
+    if (opts.onlyIfPending && work.currentState !== 'REQUIREMENTS_APPROVED' && work.currentState !== 'PLANNING') {
+      // Another sync published the plan while this one waited for the claim. Planning again would replace a
+      // plan that is awaiting approval, so this attempt stops here.
+      return {
+        work,
+        plan: undefined,
+        planHash: this.ctx.store.getLatestArtifact(work.id, 'plan')?.contentHash ?? '',
+        packetDir: packetPaths(this.ctx.projectRoot, work.id).dir,
+        skipped: true,
+      };
+    }
     if (work.currentState === 'PLAN_REVIEW' || work.currentState === 'CHANGES_REQUESTED') {
       work = { ...work, currentState: 'PLANNING', updatedAt: now() };
       this.ctx.store.saveWork(work);
@@ -866,12 +882,13 @@ export class Engine {
     // on a mismatch both are read once more; if they still disagree, the checkout cannot be pinned and the task stops.
     const gather = () => {
       const evidence = collectProjectEvidence(this.ctx.projectRoot, evidenceText, { store: this.ctx.store });
-      let info: ReturnType<typeof inspectRepo> | undefined;
-      try {
-        info = inspectRepo(this.ctx.projectRoot);
-      } catch {
-        info = undefined; // not a git checkout: the facts alone are what the planner is given
-      }
+      // Read with the same isolated Git reader as the facts (no inherited GIT_* variables). Not a git checkout:
+      // the facts alone are what the planner is given.
+      const h = repoHead(this.ctx.projectRoot);
+      const info =
+        'error' in h
+          ? undefined
+          : { root: h.repoRoot, head: h.head, branch: observeBranch(h.repoRoot)?.branch, dirty: hasUncommittedChanges(h.repoRoot) };
       return { evidence, info };
     };
     const pinned = (g: ReturnType<typeof gather>) => !g.info || !g.evidence.snapshot || g.info.head === g.evidence.snapshot.commit;
@@ -883,9 +900,7 @@ export class Engine {
     const projectEvidence = gathered.evidence;
     let repoContext = JSON.stringify(projectEvidence, null, 2);
     if (gathered.info && projectEvidence.snapshot) {
-      // The branch is the one pinned with the facts (from the same observation), never a separate read.
-      const { root, head, dirty, remotes } = gathered.info;
-      repoContext = JSON.stringify({ git: { root, head, dirty, remotes, branch: projectEvidence.git?.branch }, projectEvidence }, null, 2);
+      repoContext = JSON.stringify({ git: gathered.info, projectEvidence }, null, 2);
     }
 
     this.checkBudget(work.id);
@@ -932,12 +947,16 @@ export class Engine {
       schemaId: 'plan',
       maxOutputTokens: 4000,
     });
-    // Publication is one transaction. BEGIN IMMEDIATE takes the write lock first, so the checks and every write
-    // below see one consistent state. The model call is charged in every outcome: a plan that is discarded still
-    // cost the call, so the charge and a "plan.discarded" event are kept. Checks return their reason as a value
-    // (a throw would roll the charge back).
-    const outcome = this.ctx.store.transaction(() => {
+    // The completed model call is charged on its own, committed before publication. Publication can roll back
+    // (a failed write, a lost claim); the call still happened, so it still counts.
+    this.ctx.store.transaction(() => {
       this.ctx.store.incrementBudget(work.id, 1);
+      this.ctx.store.appendEvent({ workId: work.id, type: 'plan.model-call', payload: { roleId: 'project-manager', outcome: 'received' } });
+    });
+    // Publication is one transaction. BEGIN IMMEDIATE takes the write lock first, so the checks and every write
+    // below see one consistent state. A discarded plan returns its reason as a value (a throw would roll back
+    // its "plan.discarded" event).
+    const outcome = this.ctx.store.transaction(() => {
       const current = this.ctx.store.getWork(work.id);
       const discard = (code: 'E_CONCURRENT' | 'E_INVALID_TRANSITION', message: string) => {
         this.ctx.store.appendEvent({ workId: work.id, type: 'plan.discarded', payload: { reason: message } });
@@ -2489,8 +2508,8 @@ export class Engine {
     // PLANNING is where a task stays when the project facts could not be refreshed; re-running
     // `sync` after the repository is repaired resumes planning (requirements are already approved).
     if (work.currentState === 'REQUIREMENTS_APPROVED' || work.currentState === 'PLANNING') {
-      const planned = await this.plan(work.id);
-      return { action: 'plan', work: planned.work, detail: { planHash: planned.planHash, packetDir: planned.packetDir } };
+      const planned = await this.plan(work.id, { onlyIfPending: true });
+      return { action: 'plan', work: planned.work, detail: { planHash: planned.planHash, packetDir: planned.packetDir, ...(planned.skipped ? { skipped: true } : {}) } };
     }
 
     if (work.currentState === 'IMPLEMENTING') {

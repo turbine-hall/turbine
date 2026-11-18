@@ -314,7 +314,8 @@ function createLock(lock: string): void {
 function readLockOwner(lock: string): { pid: number; ino: number } | undefined {
   let fd: number;
   try {
-    fd = openSync(lock, constants.O_RDONLY | constants.O_NOFOLLOW);
+    // O_NONBLOCK: opening a FIFO without a writer would otherwise block forever; a non-regular entry is refused below.
+    fd = openSync(lock, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined; // released meanwhile
     throw new Error(`the publish lock ${lock} cannot be opened safely (${(e as Error).message}); remove it if no turbine process is running`);
@@ -386,8 +387,11 @@ export function writeContextFiles(
     // Build and stage both files completely before anything is renamed into place, so the HEAD check below
     // happens after both are ready. Staging touches only temp files.
     const project = renderProjectMd(s, readRegular(p.project));
-    const staged = [stage(p.snapshot, `${JSON.stringify(s, null, 2)}\n`), stage(p.project, project)];
+    // Every staged temp file is removed if anything after it fails, including staging the second output.
+    const staged: Array<{ file: string; tmp: string }> = [];
     try {
+      staged.push(stage(p.snapshot, `${JSON.stringify(s, null, 2)}\n`));
+      staged.push(stage(p.project, project));
       if (!stillCurrent()) throw new HeadMovedError('HEAD changed while the project context was being written; nothing was published. Run again.');
     } catch (e) {
       for (const t of staged) rmSync(t.tmp, { force: true });
@@ -407,14 +411,24 @@ export function writeContextFiles(
 export function ensureContextIgnored(projectRoot: string): boolean {
   const file = join(projectRoot, '.turbine', '.gitignore');
   const text = readRegular(file);
-  if (text !== undefined && contextIgnored(text)) return false;
-  // Every generated output already ignored by git (through any rule): leave the file alone. undefined means
-  // this is not a repository, where the textual rule is the only evidence and is used as is.
+  // Git's own verdict decides, because only Git applies every rule form (wildcards, negations in order).
+  // Outside a repository there is no verdict, and the textual rule is the only evidence.
   const verdicts = GENERATED_PROBES.map((probe) => isGitIgnored(projectRoot, probe));
-  if (verdicts.every((v) => v !== false)) return false;
+  const inRepository = verdicts.some((v) => v !== undefined);
+  const ignored = inRepository ? verdicts.every((v) => v === true) : text !== undefined && contextIgnored(text);
+  if (ignored) return false;
+  // Our rule is already the last line, so a rule elsewhere overrides it. Appending again would only grow the
+  // file on every run; lint reports that case.
+  if (text !== undefined && lastRuleLine(text) === `${CONTEXT_DIR}/`) return false;
   mkdirSync(dirname(file), { recursive: true });
   writeAtomic(file, `${(text ?? '').replace(/\n*$/, text ? '\n' : '')}${CONTEXT_DIR}/\n`);
   return true;
+}
+
+/** The last rule line of a .gitignore (blank lines and comments skipped), trimmed. */
+function lastRuleLine(gitignore: string): string | undefined {
+  const rules = gitignore.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+  return rules[rules.length - 1];
 }
 
 /** Paths inside the generated directory, used to ask git whether each generated output is ignored. */
@@ -452,7 +466,7 @@ export function lintProjectContext(projectRoot: string): LintIssue[] {
   if (!hasSnapshot && !hasProject) return issues;
   const unignored = GENERATED_PROBES.filter((probe) => isGitIgnored(projectRoot, probe) === false).map((probe) => probe.split('/').pop());
   if (unignored.length) {
-    issues.push({ level: 'error', file: '.turbine/.gitignore', message: `git does not ignore ${unignored.join(', ')} (a later rule un-ignores .turbine/context/), so generated files would be committed; remove that rule or add \`.turbine/context/\` after it` });
+    issues.push({ level: 'error', file: '.turbine/.gitignore', message: `git does not ignore ${unignored.join(', ')} (a rule un-ignores them), so generated files would be committed; remove that rule, or append \`context/\` as the last line of .turbine/.gitignore` });
   }
 
   let snapshot: RepoSnapshot | undefined;

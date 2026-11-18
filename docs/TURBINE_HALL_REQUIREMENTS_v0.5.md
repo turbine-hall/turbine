@@ -629,7 +629,7 @@ Detect Git root, branch, clean/dirty state, base commit, remote metadata, primar
 | ID | Scenario | Pass condition (test in `tests/integration/context-snapshot.test.ts`) |
 |---|---|---|
 | AT-CTX-01 | Fresh repo | `understand` builds a snapshot; every fact, dependency, convention and unconfirmed item carries a source whose blob id and lines match git |
-| AT-CTX-02 | Idempotent | Second run at the same commit prints `Project understood (snapshot <sha8>)`, leaves the bytes of `snapshot.json` and `PROJECT.md` unchanged (`.turbine/.gitignore` is written only if git does not already ignore the generated files) and yields the same hash (also in a clone) |
+| AT-CTX-02 | Idempotent | Second run at the same commit, with both generated files intact, prints `Project understood (snapshot <sha8>)` and leaves the bytes of `snapshot.json` and `PROJECT.md` unchanged (`.turbine/.gitignore` is written only if git does not already ignore the generated files). A missing or edited generated file is regenerated (AT-CTX-02 does not apply). The same hash results in a clone |
 | AT-CTX-03 | New commit | Snapshot is rebuilt and the printed diff lists exactly the added, removed and changed facts |
 | AT-CTX-04 | Dirty tree | Dirty, staged and untracked files that contradict the commit change no fact and no hash; only the "not included" notice appears |
 | AT-CTX-05 | Partial convention | Under 100% and no enforcing config: listed `unconfirmed` with counts, never as a fact; the schema refuses an unproven `confirmed` |

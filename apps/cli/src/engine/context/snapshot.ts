@@ -1025,7 +1025,8 @@ function prettierConventions(b: Builder, regular: TreeEntry[], root: Pkg | null)
     else if (isObj(y.value) && y.value.prettier) yaml = { value: y.value.prettier as Json, lines: (o) => y.lines(['prettier', o]) };
   }
   const candidates: string[] = [];
-  if (root && root.data.prettier !== undefined) candidates.push(root.path);
+  // A falsy setting ("prettier": null) is not a configuration, the same rule as for package.yaml.
+  if (root && root.data.prettier) candidates.push(root.path);
   if (yaml && yaml !== 'unknown') candidates.push('package.yaml');
   const rcTracked = RC.filter((f) => b.byPath.has(f));
   if (yaml === 'unknown') {

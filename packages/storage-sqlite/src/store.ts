@@ -499,7 +499,12 @@ export class WorkStore {
  * which case a claim cannot be told apart from a reused pid and is treated as held while its pid lives.
  */
 function processStart(pid: number): string | undefined {
-  const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8' });
+  // Render the start time in UTC with the C locale: the same process must read the same string whatever the
+  // time zone or language of the process that asks (lstart is formatted in local time otherwise).
+  const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+    encoding: 'utf8',
+    env: { ...process.env, TZ: 'UTC', LC_ALL: 'C', LANG: 'C' },
+  });
   if (r.status !== 0) return undefined;
   const text = r.stdout.trim();
   return text === '' ? undefined : text;

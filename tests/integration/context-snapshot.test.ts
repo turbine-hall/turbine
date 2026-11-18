@@ -82,7 +82,8 @@ function commitFiles(dir: string, files: Record<string, string | null>, msg = 'c
 
 function newRepo(files: Record<string, string>): string {
   const dir = tmp('turbine-ctx-');
-  git(dir, 'init', '-q');
+  // The files ref backend: tests write loose ref files, which the reftable backend does not have.
+  git(dir, '-c', 'init.defaultRefFormat=files', 'init', '-q');
   git(dir, 'config', 'user.email', 'test@example.com');
   git(dir, 'config', 'user.name', 'Test');
   commitFiles(dir, files, 'init');
@@ -1613,6 +1614,16 @@ describe('review round 4 (PR #9): the third review batch stays closed', () => {
     expect(byKey(s.conventions, 'convention:prettier:.prettierrc:semi')).toMatchObject({ status: 'confirmed' });
   });
 
+  it('a wildcard rule that un-ignores the generated directory is repaired by appending the rule last', () => {
+    const dir = newRepo(appFiles());
+    mkdirSync(join(dir, '.turbine'), { recursive: true });
+    writeFileSync(join(dir, '.turbine', '.gitignore'), 'context/\n!cont*/\n');
+    understandProject(openStore(), dir);
+    const rules = readFileSync(join(dir, '.turbine', '.gitignore'), 'utf8').trimEnd().split('\n');
+    expect(rules[rules.length - 1]).toBe('context/');
+    expect(lintProjectContext(dir).filter((i) => i.level === 'error')).toEqual([]);
+  });
+
   it('lint reports an output that git does not ignore, even when the snapshot itself is ignored', () => {
     const dir = newRepo(appFiles());
     understandProject(openStore(), dir);
@@ -1634,7 +1645,11 @@ describe('review round 4 (PR #9): the third review batch stays closed', () => {
     expect(readFileSync(target, 'utf8')).toBe('0');
   });
 
-  it('a lock whose owner was reused by another process (start time differs) is taken over', () => {
+  // The process-start probe needs `ps`; without it a claim cannot be told from a reused pid, and these tests
+  // would assert behaviour that the platform cannot provide.
+  const psAvailable = spawnSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], { encoding: 'utf8' }).stdout.trim() !== '';
+
+  it.skipIf(!psAvailable)('a lock whose owner was reused by another process (start time differs) is taken over', () => {
     const file = join(tmp('turbine-claim-'), 'engine.db');
     const store = new WorkStore(file);
     stores.push(store);
@@ -1644,7 +1659,7 @@ describe('review round 4 (PR #9): the third review batch stays closed', () => {
     expect(() => store.claimWork('w2', 'planning')).not.toThrow();
   });
 
-  it('a live claim whose process still has the same start time is never taken over', () => {
+  it.skipIf(!psAvailable)('a live claim whose process still has the same start time is never taken over', () => {
     const file = join(tmp('turbine-claim-'), 'engine.db');
     const store = new WorkStore(file);
     stores.push(store);

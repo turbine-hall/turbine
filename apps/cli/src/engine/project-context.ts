@@ -93,9 +93,11 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
     return ev;
   }
 
-  // HEAD can move between the read and the publication. That one case gets a single rebuild at the new HEAD;
-  // any other failure, or a second move, stops the task (the old facts are never served).
-  const load = (head: RepoHead, retriesLeft = 1): RepoSnapshot => {
+  // HEAD can move during this collection, and each move costs one rebuild. ONE budget covers the whole
+  // collection (publication and pinning alike): a single move recovers, and a second move stops the task (the
+  // old facts are never served).
+  let retriesLeft = 1;
+  const load = (head: RepoHead): RepoSnapshot => {
     if (opts.store) {
       const fresh = ensureFreshSnapshot(opts.store, projectRoot, head);
       try {
@@ -103,7 +105,10 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
       } catch (e) {
         const headMoved = (e as { details?: { reason?: unknown } }).details?.reason === 'head-moved';
         const now = headMoved && retriesLeft > 0 ? repoHead(projectRoot) : undefined;
-        if (now && !('error' in now)) return load(now, retriesLeft - 1);
+        if (now && !('error' in now)) {
+          retriesLeft -= 1;
+          return load(now);
+        }
         throw e;
       }
       return fresh.snapshot;
@@ -126,6 +131,10 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
     // HEAD moved while the snapshot was read (or cannot be read now): rebuild at the commit it is at now.
     // If that cannot be done, or HEAD keeps moving, the task stops; the old facts are never served.
     if (!observed) throw err('E_CONTEXT_UNAVAILABLE', 'HEAD could not be read after project facts were read; retry when the repository is quiet', { snapshot: snapshot.commit });
+    if (retriesLeft <= 0) {
+      throw err('E_CONTEXT_UNAVAILABLE', `HEAD keeps moving (snapshot at ${snapshot.commit.slice(0, 8)}, HEAD is ${observed.commit.slice(0, 8)}); project facts cannot be pinned to one commit. Retry when the checkout is quiet.`, { snapshot: snapshot.commit, head: observed.commit });
+    }
+    retriesLeft -= 1;
     const moved: RepoHead = { repoRoot: at.repoRoot, head: observed.commit };
     try {
       snapshot = load(moved);

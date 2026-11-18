@@ -113,7 +113,8 @@ export function publishFresh(store: WorkStore, projectRoot: string, fresh: Fresh
     const h = repoHead(projectRoot);
     return !('error' in h) && h.head === commit;
   };
-  const record = fresh.status === 'current' ? undefined : () => store.saveSnapshot(fresh.snapshot, projectRoot);
+  // Recorded whenever files are written, under the same lock: a re-written snapshot becomes the latest row again.
+  const record = () => store.saveSnapshot(fresh.snapshot, projectRoot);
   try {
     if (fresh.status === 'current' && contextFilesCurrent(projectRoot, fresh.snapshot)) {
       // Nothing to regenerate, but an earlier run may have stopped before the ignore rule was added.
