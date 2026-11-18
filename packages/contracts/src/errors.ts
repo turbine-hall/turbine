@@ -35,6 +35,7 @@ export const ErrorCodes = {
   E_ADAPTER: { code: 'E_ADAPTER', exit: 4 },
   E_RUN_FAILURE: { code: 'E_RUN_FAILURE', exit: 5 },
   E_CONCURRENT: { code: 'E_CONCURRENT', exit: 6 },
+  E_CONTEXT_UNAVAILABLE: { code: 'E_CONTEXT_UNAVAILABLE', exit: 3 },
 } as const;
 
 export function err(

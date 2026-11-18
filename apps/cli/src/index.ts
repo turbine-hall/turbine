@@ -5,10 +5,14 @@ import { createJiraAdapter } from '@turbine-hall/turbine-adapter-jira';
 import { assertTransition, listFrameworks, loadRoles } from '@turbine-hall/turbine-core';
 import { listModels } from '@turbine-hall/turbine-models';
 import { loadSkills } from '@turbine-hall/turbine-skills';
+import { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
+import { err } from '@turbine-hall/turbine-contracts';
+import { formatOutcome, understandOnInit, understandProject } from './engine/context/understand.js';
+import { lintProjectContext } from './engine/context/render.js';
 import { Engine } from './engine/engine.js';
 import { initProject, openContext } from './engine/project.js';
 import { handleError, printResult } from './output.js';
-import { factoryRoot } from './paths.js';
+import { callerCwd, factoryRoot, findProjectRoot } from './paths.js';
 import { HUMAN_PRESENCE, ask, askReviewer, assertHumanTerminal } from './human-gate.js';
 
 const program = new Command();
@@ -28,15 +32,70 @@ program
         projectPath: opts.project,
         nonInteractive: !!opts.nonInteractive,
       });
+      // A repository that already has commits gets its project facts right away.
+      let context: string | undefined;
+      const store = new WorkStore(result.paths.dbPath);
+      try {
+        context = understandOnInit(store, result.paths.root);
+      } catch (e) {
+        process.stderr.write(`Warning: project facts were not built: ${(e as Error).message}\nRun: turbine understand\n`);
+      } finally {
+        store.close();
+      }
       printResult(
         {
           message: 'Initialized Turbine Hall project',
           createdOrEnsured: result.created,
           config: result.paths.configPath,
           note: 'Re-running init is idempotent and does not overwrite edited project.yaml',
+          ...(context ? { context } : {}),
         },
         false,
       );
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+program
+  .command('understand')
+  .option('--json', 'JSON output')
+  .description('Build or refresh the project facts (a snapshot of the repository at HEAD) and render .turbine/context/')
+  .action((opts) => {
+    try {
+      const ctx = openContext();
+      try {
+        const o = understandProject(ctx.store, ctx.projectRoot);
+        if (opts.json) {
+          printResult(
+            { status: o.status, snapshot: o.snapshot.hash, commit: o.snapshot.commit, dirty: o.dirty, written: o.written, repaired: o.repaired, diff: o.diff },
+            true,
+          );
+        } else process.stdout.write(`${formatOutcome(o).join('\n')}\n`);
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+program
+  .command('lint')
+  .option('--json', 'JSON output')
+  .description('Check the generated project context (.turbine/context/) has not been edited by hand')
+  .action((opts) => {
+    try {
+      // Lint only reads files: it finds the project from the caller's directory and does not open the store
+      // (openContext would create or migrate the database, which a read-only check must not do).
+      const cwd = callerCwd();
+      const root = findProjectRoot(cwd);
+      if (!root) throw err('E_INVALID_CONFIG', `No .turbine project found from ${cwd}. Run: turbine init --project .`);
+      const issues = lintProjectContext(root);
+      if (opts.json) printResult(issues, true);
+      else if (!issues.length) process.stdout.write('Project context OK.\n');
+      else for (const i of issues) process.stdout.write(`${i.level.toUpperCase().padEnd(7)} ${i.file}: ${i.message}\n`);
+      if (issues.some((i) => i.level === 'error')) process.exitCode = 3;
     } catch (e) {
       handleError(e);
     }

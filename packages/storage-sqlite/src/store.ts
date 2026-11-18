@@ -7,6 +7,7 @@ import type {
   EngineEvent,
   Evidence,
   RecoveryPlan,
+  RepoSnapshot,
   RoleRun,
   WorkPackage,
 } from '@turbine-hall/turbine-contracts';
@@ -19,11 +20,15 @@ import {
   EngineEventSchema,
   EvidenceSchema,
   RecoveryPlanSchema,
+  RepoSnapshotSchema,
   RoleRunSchema,
+  assertNoUnsafeKeys,
   WorkPackageSchema,
   createId,
   err,
 } from '@turbine-hall/turbine-contracts';
+import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import type { SqliteDb } from './db.js';
 import { openDatabase } from './db.js';
 
@@ -42,8 +47,12 @@ export class WorkStore {
     this.db.close();
   }
 
+  /**
+   * BEGIN IMMEDIATE takes SQLite's write lock up front: reads inside `fn` (for example a claim check) and
+   * the writes that follow cannot be interleaved with another process's writes.
+   */
   transaction<T>(fn: () => T): T {
-    this.db.exec('BEGIN');
+    this.db.exec('BEGIN IMMEDIATE');
     try {
       const result = fn();
       this.db.exec('COMMIT');
@@ -385,6 +394,84 @@ export class WorkStore {
     return plans.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] ?? null;
   }
 
+  /**
+   * Store a repository snapshot. The schema re-checks the hash, so only a snapshot whose
+   * content matches its hash can be stored. Saving a hash again moves it to "latest" for the repo.
+   */
+  saveSnapshot(snapshot: RepoSnapshot, repoPath: string): void {
+    const parsed = RepoSnapshotSchema.parse(snapshot);
+    // REPLACE deletes the old (repo_path, hash) row and inserts a new one in a single statement, so a
+    // re-saved snapshot gets a fresh rowid and becomes the latest for THIS repository only; another
+    // repository that holds the same hash keeps its own row.
+    this.db
+      .prepare(`INSERT OR REPLACE INTO repo_snapshots(hash, repo_path, "commit", data, created_at) VALUES (?, ?, ?, ?, ?)`)
+      .run(parsed.hash, repoPath, parsed.commit, JSON.stringify(parsed), now());
+  }
+
+  getSnapshot(hash: string): RepoSnapshot | null {
+    const row = this.db
+      .prepare(`SELECT hash, data FROM repo_snapshots WHERE hash = ? ORDER BY rowid DESC LIMIT 1`)
+      .get(hash) as { hash: string; data: string } | undefined;
+    return row ? this.parseSnapshotRow(row) : null;
+  }
+
+  /** The snapshot most recently saved for this repository path. */
+  getLatestSnapshotFor(repoPath: string): RepoSnapshot | null {
+    const row = this.db
+      .prepare(`SELECT hash, data FROM repo_snapshots WHERE repo_path = ? ORDER BY rowid DESC LIMIT 1`)
+      .get(repoPath) as { hash: string; data: string } | undefined;
+    return row ? this.parseSnapshotRow(row) : null;
+  }
+
+  /** The schema proves the JSON is a valid snapshot; this proves it is the one the row is filed under. */
+  private parseSnapshotRow(row: { hash: string; data: string }): RepoSnapshot {
+    const raw: unknown = JSON.parse(row.data);
+    assertNoUnsafeKeys(raw);
+    const parsed = RepoSnapshotSchema.parse(raw);
+    if (parsed.hash !== row.hash) {
+      throw new Error(`snapshot stored under ${row.hash} actually has hash ${parsed.hash} (the row was replaced or corrupted)`);
+    }
+    return parsed;
+  }
+
+  /**
+   * Claim a work item for a long-running stage. Exactly one caller holds a claim at a time. A claim is
+   * taken over ONLY when its owning process no longer exists: elapsed time alone never frees a claim,
+   * because a slow live planner must not be displaced. Returns the token to release with.
+   */
+  claimWork(workId: string, purpose: string): string {
+    // Owner = pid | process start time | unique id. The start time tells a live owner from a reused pid.
+    const token = `${process.pid}|${processStart(process.pid) ?? ''}|${randomUUID()}`;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const inserted = this.db
+        .prepare(`INSERT OR IGNORE INTO work_claims(work_id, owner, purpose, claimed_at) VALUES (?, ?, ?, ?)`)
+        .run(workId, token, purpose, now());
+      if (Number(inserted.changes) === 1) return token;
+      const row = this.db.prepare(`SELECT owner, purpose, claimed_at FROM work_claims WHERE work_id = ?`).get(workId) as
+        | { owner: string; purpose: string; claimed_at: string }
+        | undefined;
+      if (!row) continue; // released between the two statements: try again
+      if (claimOwnerIsDead(row.owner)) {
+        const taken = this.db
+          .prepare(`UPDATE work_claims SET owner = ?, purpose = ?, claimed_at = ? WHERE work_id = ? AND owner = ?`)
+          .run(token, purpose, now(), workId, row.owner);
+        if (Number(taken.changes) === 1) return token;
+        continue;
+      }
+      throw err('E_CONCURRENT', `${row.purpose} is already in progress for ${workId} (started ${row.claimed_at}). Wait for it to finish, then retry.`);
+    }
+    throw err('E_CONCURRENT', `Could not claim ${workId} for ${purpose}; another process is changing it. Retry.`);
+  }
+
+  holdsClaim(workId: string, token: string): boolean {
+    const row = this.db.prepare(`SELECT owner FROM work_claims WHERE work_id = ?`).get(workId) as { owner: string } | undefined;
+    return row?.owner === token;
+  }
+
+  releaseClaim(workId: string, token: string): void {
+    this.db.prepare(`DELETE FROM work_claims WHERE work_id = ? AND owner = ?`).run(workId, token);
+  }
+
   getBudget(workId: string): { modelCalls: number; estimatedCost: number } {
     const row = this.db
       .prepare(`SELECT model_calls, estimated_cost FROM budget_counters WHERE work_id = ?`)
@@ -405,4 +492,42 @@ export class WorkStore {
       )
       .run(workId, modelCalls, estimatedCost);
   }
+}
+
+/**
+ * When a process started, as the OS reports it (`ps -o lstart=`). Undefined where that cannot be read, in
+ * which case a claim cannot be told apart from a reused pid and is treated as held while its pid lives.
+ */
+function processStart(pid: number): string | undefined {
+  // Render the start time in UTC with the C locale: the same process must read the same string whatever the
+  // time zone or language of the process that asks (lstart is formatted in local time otherwise).
+  const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+    encoding: 'utf8',
+    env: { ...process.env, TZ: 'UTC', LC_ALL: 'C', LANG: 'C' },
+  });
+  if (r.status !== 0) return undefined;
+  const text = r.stdout.trim();
+  return text === '' ? undefined : text;
+}
+
+/**
+ * True only when the claim's owner is confirmed gone: its pid no longer exists, or the pid now belongs to a
+ * different process (its start time differs). Age alone never qualifies.
+ */
+function claimOwnerIsDead(owner: string): boolean {
+  const parts = owner.split('|');
+  // Owners written before the start time was recorded look like "pid:uuid".
+  const pid = parts.length > 1 ? Number(parts[0]) : Number(owner.split(':')[0]);
+  if (!Number.isInteger(pid) || pid <= 0) return true; // not a token we issued: nobody can be defending it
+  try {
+    process.kill(pid, 0); // signal 0 only checks that the process exists
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ESRCH';
+  }
+  const recorded = parts.length > 2 ? parts[1] : undefined;
+  if (recorded) {
+    const now = processStart(pid);
+    if (now !== undefined && now !== recorded) return true; // the pid was reused by another process
+  }
+  return false;
 }

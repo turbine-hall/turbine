@@ -109,7 +109,7 @@ export function initProject(input: {
   if (!existsSync(paths.gitignorePath)) {
     writeFileSync(
       paths.gitignorePath,
-      ['state/', '*.db', '*.db-*', 'worktrees/', '.env', 'secrets/'].join('\n') + '\n',
+      ['state/', '*.db', '*.db-*', 'worktrees/', 'context/', '.env', 'secrets/'].join('\n') + '\n',
       'utf8',
     );
     created.push(paths.gitignorePath);
