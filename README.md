@@ -1,55 +1,180 @@
 <p align="center">
   <a href="https://github.com/turbine-hall/turbine" target="_blank">
-    <img src="docs/assets/turbine-logo.jpg" width="120" alt="Turbine Logo" />
+    <img src="docs/assets/turbine-logo.jpg" width="120" alt="Turbine — open-source governance framework for AI-assisted software development" />
   </a>
 </p>
 
+<h1 align="center">Turbine — Governed Workflow Engine for Human + AI Software Development</h1>
+
 <p align="center">
-  <strong>Turbine Hall</strong> (<code>turbine</code>)<br />
-  A governed workflow engine for human + AI software work.
+  <strong>Ship AI-written code your team can actually trust.</strong><br />
+  An open-source CLI that adds requirements, approvals, independent review, real test evidence and audit trails<br />
+  to the work your developers already do with AI coding agents like Cursor, Claude Code and Copilot.
 </p>
 
 <p align="center">
-  <a href="https://github.com/turbine-hall/turbine/actions/workflows/ci.yml"><img src="https://github.com/turbine-hall/turbine/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/turbine-hall/turbine/actions/workflows/ci.yml"><img src="https://github.com/turbine-hall/turbine/actions/workflows/ci.yml/badge.svg" alt="CI status" /></a>
+  <img src="https://img.shields.io/badge/version-0.5.0-blue" alt="Version 0.5.0" />
+  <img src="https://img.shields.io/badge/node-%E2%89%A522-brightgreen" alt="Node.js 22 or later" />
+  <img src="https://img.shields.io/badge/TypeScript-strict-3178c6" alt="TypeScript" />
+  <a href="https://github.com/turbine-hall/turbine/stargazers"><img src="https://img.shields.io/github/stars/turbine-hall/turbine?style=social" alt="GitHub stars" /></a>
 </p>
 
-**Turbine** is the framework (rules, gates, roles). **Turbine Hall** is the app — the CLI that runs it.
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#who-is-turbine-for">Who it's for</a> ·
+  <a href="#faq">FAQ</a> ·
+  <a href="docs/TURBINE_FRAMEWORK_v0.5.md">Framework spec</a>
+</p>
 
-A turbine turns raw input into steady output; the turbine hall is where you watch it run.
+---
 
-## Requirements
+## What is Turbine?
 
-- Node.js 22+
+**Turbine** is an open-source **AI software development governance framework**, and **Turbine Hall** (`turbine`) is the command-line app that runs it. Together they give engineering teams a repeatable, auditable way to turn a feature request or Jira ticket into reviewed, tested, accepted code when humans and **AI coding agents** work on it together.
+
+AI coding tools are great at writing code, but they don't give you *process*: unclear requirements turn into confident wrong code, nobody can say which requirement a change satisfies, and "the tests pass" often means "the agent said they pass." Turbine fixes that by putting a **deterministic, fail-closed workflow** around the agent:
+
+- **Requirements before code.** Every task gets a spec with numbered requirements (FR-001, P0/P1/P2), open questions, and a plan that a human approves.
+- **Humans approve, AI doesn't.** Requirements, plan, code review and final acceptance are human-only decisions. An AI agent cannot approve its own work.
+- **Approvals are bound to content.** Approvals are tied to the exact hash of the spec, plan or commit. Change the code and the old approval goes stale on its own.
+- **Real evidence, not self-reporting.** Turbine runs your lint, typecheck, test and build commands in an isolated git worktree and records the output. No configured checks means the task is blocked, not passed.
+- **Traceability from requirement to commit.** Each requirement is traced through the plan, tests and checks to the diff: FULL, PARTIAL or NONE.
+- **Right-sized AI roles.** 16 specialist roles (architect, security reviewer, API SQA, and so on) are picked per task based on risk, so a typo fix doesn't pay for a security audit and a file-upload feature doesn't skip one.
+
+> Turbine is not a replacement for Scrum or Kanban. Those decide *what* to build next. Turbine governs *how* a single work item gets built, reviewed and verified by humans and AI.
+
+---
+
+## Who is Turbine for?
+
+| You are… | What Turbine gives you |
+|---|---|
+| **CTO / VP of Engineering** | Predictable AI-assisted delivery, an audit trail for every change, and a clear point of human accountability per task |
+| **Software development agency / IT services firm** | One consistent delivery standard across clients, projects and developers, whatever AI tools each engineer prefers |
+| **Tech startup founder or tech lead** | The speed of AI coding agents without piling up unreviewed, untested code |
+| **Software engineer** | A CLI that tells you (and your agent) exactly what to do next, and specs/reviews in plain Markdown inside your repo |
+| **QA / SQA engineer** | Commit-bound test evidence, per-requirement acceptance checklists, and checks that re-run whenever code changes |
+| **Engineering manager / PM** | Requirements in a format you can edit, open questions surfaced before coding starts, and status you can read at a glance |
+
+---
+
+## Key features
+
+### 🧭 Governed software delivery lifecycle
+A state machine that enforces the path from intake to acceptance:
+
+```text
+IMPORTED → ASSESSING → REQUIREMENTS_REVIEW → REQUIREMENTS_APPROVED
+ → PLANNING → PLAN_REVIEW → PLAN_APPROVED
+ → IMPLEMENTING → AI_REVIEW → HUMAN_CODE_REVIEW
+ → VERIFYING → HUMAN_ACCEPTANCE → ACCEPTED
+```
+
+Transitions are checked in code. Gates fail closed and report `PASS`, `CONCERNS` or `FAIL`. Waivers need a named human, a reason and an expiry date.
+
+### 📄 Markdown-first task packets
+Every work item lives in your repo under `.turbine/tasks/<work-id>/`:
+
+| File | Purpose |
+|---|---|
+| `STATUS.md` | Start here: current state, who acts next, gate progress diagram, blockers |
+| `SPEC.md` | Requirements (FR-001, P0/P1/P2, EARS wording), open questions, verified context vs. assumptions, plan and test plan |
+| `REVIEW.md` | What changed (from git), traceability per requirement, AI review, check results, acceptance checklist |
+| `evidence/` | Raw JSON and logs behind the documents |
+
+Docs are rendered from the engine's state, including Mermaid diagrams for gate progress, change maps and user flows. Packet size scales with the task: **trivial**, **standard** or **full** track.
+
+### 🔍 Diff-grounded AI code review
+AI review runs through lenses (spec, tests, security) and is triaged deterministically. A finding has to cite a changed file, quoted code has to exist in the diff, and claims about dependencies or tests are checked against git.
+
+### 🧪 Real verification in isolated worktrees
+Each task gets its own git worktree and branch (`turbine/<work-id>`). Your configured setup and check commands run there, one evidence record per check. New commits make earlier review and test results stale automatically.
+
+### 🛡️ Risk-based role selection (ARSP)
+The **Adaptive Role Selection Policy** picks the smallest set of roles that covers the task's risk. The profile is the maximum of rule triggers, model recommendation, the human-set minimum and observed evidence, and it is never lowered. Triggers such as `file-upload`, `untrusted-input`, `data-deletion` and `new-dependency` bring in the right reviewers. A new dependency in the diff triggers a dependency audit.
+
+### 🔗 Lineage and change-impact tracking
+Requirements, plans, commits, reviews and tests are linked by typed edges. When something upstream changes, everything that depended on it is invalidated. When a link is missing, Turbine invalidates conservatively instead of guessing.
+
+### 🔌 Tool- and model-independent
+Jira, Git, GitHub, IDEs and CI are **adapters**, not foundations. Use the built-in offline mock model or any **OpenAI-compatible API** (OpenAI, Azure-compatible gateways, proxies). It works alongside **Cursor** (with a built-in hook that blocks agents from running approval commands), **Claude Code**, **GitHub Copilot** or any agent that can run shell commands.
+
+### 🗂️ Multi-repo tasks
+Changes spanning several repositories (for example frontend + backend) are bound together by a single change-set id with `turbine task repo add`.
+
+---
+
+## How it works
+
+```text
+ Request / Jira ticket
+        │
+        ▼
+ ┌──────────────┐   AI drafts, human approves   ┌──────────────┐
+ │ Requirements │ ─────────────────────────────▶│     Plan     │
+ └──────────────┘        (hash-bound)           └──────────────┘
+                                                       │ human approves
+                                                       ▼
+ ┌──────────────┐    commits in worktree        ┌──────────────┐
+ │  AI review + │ ◀──────────────────────────── │ Implement    │
+ │ human review │                               │ (agent/dev)  │
+ └──────────────┘                               └──────────────┘
+        │ human approves
+        ▼
+ ┌──────────────┐  every P0 ticked by a human   ┌──────────────┐
+ │ Verify: real │ ─────────────────────────────▶│   ACCEPTED   │──▶ PR / merge
+ │ checks run   │                               └──────────────┘
+ └──────────────┘
+```
+
+1. **Intake.** Create a task from plain text or a Jira issue. Turbine keeps the original and opens an **Engineering Evidence Contract (EEC)**, the list of obligations the task has to satisfy.
+2. **Assess and specify.** The requirements-analyst and spec-writer roles draft requirements and questions. You edit `SPEC.md` and approve.
+3. **Plan.** The engine inspects the repo and drafts a plan and test plan linked to the requirements. You approve.
+4. **Implement.** Your developer or AI agent works in the task worktree and commits.
+5. **Review.** Diff-grounded AI review runs, then a human code review.
+6. **Verify and accept.** Your real checks run. A human ticks each P0 requirement with what they observed. Then you open the PR.
+
+---
+
+## Quick start
+
+### Requirements
+
+- Node.js 22+ (uses the built-in `node:sqlite`)
 - pnpm 10+
+- Git
 
-## Install
+### Install
 
 ```bash
+git clone https://github.com/turbine-hall/turbine.git
+cd turbine
 pnpm install
 pnpm build
 ```
 
-Optional alias (run from any project directory; point `--dir` at your local clone):
+Optional alias so you can run `turbine` from any project directory:
 
 ```bash
 alias turbine='pnpm --dir /path/to/turbine turbine'
 ```
 
-## Use in an existing project
+### Use it in an existing project
 
 ```bash
-cd /path/to/your-app          # e.g. 6senseWeb or 6senseHQ-frontend-v3a
-turbine init --project .          # creates .turbine/ in THIS directory
-turbine doctor                    # projectRoot should be your app, not the factory repo
+cd /path/to/your-app
+turbine init --project .     # creates .turbine/ in this directory
+turbine doctor               # projectRoot should be your app, not the turbine repo
 
-# Create a task
-turbine task create --title "..." --file /tmp/request.md
+# Create your first task
+turbine task create --title "Add password reset endpoint" --file ./request.md
 ```
 
-### Configure checks (required)
+### Configure quality checks (required)
 
-Verification really runs your commands in the task worktree; with none configured it is blocked.
-Edit `.turbine/project.yaml`:
+Verification runs your own commands in the task worktree. With no checks configured, verification is blocked. Edit `.turbine/project.yaml`:
 
 ```yaml
 quality:
@@ -57,51 +182,43 @@ quality:
   checks: [npm run lint, npm run typecheck, npm test, npm run build]
 ```
 
-Optional: `quality.dependencyAudit` (default `auto`: `npm`/`pnpm`/`yarn audit` at high severity, chosen from the lockfile; `off` to disable) runs when a change adds or changes dependencies.
+`quality.dependencyAudit` (default `auto`) runs `npm`/`pnpm`/`yarn audit` at high severity, chosen from your lockfile, whenever a change adds or updates dependencies. Set it to `off` to disable.
 
-### Markdown-first workflow
+### The daily loop
 
-Each work item gets three short documents (plus raw data) under:
-
-`.turbine/tasks/<work-id>/`
-
-| File | Purpose |
-|---|---|
-| `STATUS.md` | Start here: state, who acts next, gate progress diagram, blockers |
-| `SPEC.md` | Requirements (FR-001, P0/P1/P2), open questions, verified context vs assumptions, plan + test plan |
-| `REVIEW.md` | What changed (from git), traceability per requirement, AI review, check results, acceptance checklist |
-| `evidence/` | Raw JSON and logs behind the documents |
-
-Size scales with the task (trivial / standard / full track). `turbine task analyze <id>` checks requirements ↔ plan ↔ code consistency; `turbine task lint <id>` checks the documents. CRITICAL analysis findings and lint errors block approval. Terms are explained in `.turbine/GLOSSARY.md`.
-
-Typical loop (let the CLI drive):
+Let the CLI drive:
 
 ```bash
-turbine task next <work-id>          # always start here — exact next action + commands
-# follow Do now (edit MD Decision if asked)
+turbine task next <work-id>    # always start here: the exact next action and commands
+# follow "Do now" (edit SPEC.md / REVIEW.md if asked)
 turbine task sync <work-id>
-turbine task next <work-id>          # repeat until ACCEPTED, then open PR / merge / pull
+turbine task next <work-id>    # repeat until ACCEPTED, then open a PR and merge
 ```
 
-After **ACCEPTED**, your main project folder is still old until you merge `turbine/<work-id>` into `staging`/`main` and `git pull`.
+Human decisions happen only in your own terminal:
 
-Agents: see [docs/AGENT_DRIVER.md](docs/AGENT_DRIVER.md) and `.turbine/HOW_TO_DRIVE.md` (written on `turbine init`).
+```bash
+turbine task approve <work-id>   # asks you to type the short hash of what you approve
+turbine task reject <work-id>
+```
 
-CLI approve commands (`requirements approve`, `plan approve`, …) still work; `sync` + `next` is the preferred path.
+Useful extras: `turbine task analyze <id>` checks consistency between requirements, plan and code (CRITICAL findings block approval). `turbine task lint <id>` checks the documents. `turbine task gate <id>` shows gate status. Terms are explained in `.turbine/GLOSSARY.md`.
 
-If `doctor` shows `projectRoot` pointing at the factory repo, re-init with an absolute path:
+> **ACCEPTED is not merged.** After acceptance, merge `turbine/<work-id>` into `staging`/`main` and `git pull` in your main folder.
+
+If `doctor` shows `projectRoot` pointing at the turbine repo, re-init with an absolute path:
 
 ```bash
 turbine init --project /absolute/path/to/your-app
 ```
 
-### Real model mode (not mock)
+### Use a real LLM (OpenAI-compatible)
 
-Default is mock. To use a live OpenAI-compatible API:
+The default model is an offline mock. To use a live model:
 
 ```bash
 export OPENAI_API_KEY='sk-...'
-# optional for proxies / Azure-compatible gateways:
+# optional, for proxies or Azure-compatible gateways:
 # export OPENAI_BASE_URL='https://api.openai.com/v1'
 
 cd /path/to/your-app
@@ -110,33 +227,132 @@ turbine model test gpt-4.1-mini
 turbine doctor   # should show provider openai-compatible
 ```
 
-Then create a **new** task (old tasks already used mock drafts).
+Then create a **new** task (older tasks already used mock drafts).
 
-**Note:** Real model mode makes assess/plan/review/implement-notes live.  
-`turbine task execute` is still **manual-supervised** by design: it prepares worktree(s) + a brief and does not autonomously rewrite your app. Work in the worktree path from `04-EXECUTION_BRIEF.md`, commit there, then `turbine task sync` — the task stays in IMPLEMENTING until a real commit exists.
+Live models power assess, plan, review and implementation notes. `turbine task execute` is **manual-supervised by design**: it prepares the worktree(s) and a brief but does not rewrite your app on its own. Work in the worktree, commit, then run `turbine task sync`. The task stays in `IMPLEMENTING` until a real commit exists.
 
-Human decisions are made only with `turbine task approve <id>` / `turbine task reject <id>` in your own terminal.
+### Driving Turbine with an AI agent
 
-Binary name is provisional (`turbine`). Package scope is `@turbine-hall/*`.
+Point your agent (Cursor, Claude Code, etc.) at [docs/AGENT_DRIVER.md](docs/AGENT_DRIVER.md) and the `.turbine/HOW_TO_DRIVE.md` file that `turbine init` writes. The agent runs `next` and `sync`, writes code in the worktree, and stops whenever a human decision is needed.
 
-## Scripts
+---
+
+## Turbine vs. other approaches
+
+| | Prompting an AI agent directly | Spec-driven prompt kits | **Turbine** |
+|---|---|---|---|
+| Written requirements before code | Optional | ✅ | ✅ with FR IDs and priorities |
+| Human approval enforced in code | ❌ | ❌ | ✅ hash-bound, human-only |
+| Stale approvals detected | ❌ | ❌ | ✅ automatic on new commits or spec changes |
+| Tests actually executed and recorded | Agent says so | Agent says so | ✅ in an isolated worktree, per-check evidence |
+| Requirement → code → test traceability | ❌ | Partial | ✅ FULL / PARTIAL / NONE |
+| Risk-based reviewer selection | ❌ | ❌ | ✅ ARSP |
+| Vendor / model lock-in | Tool-specific | Often tool-specific | Tool- and model-independent |
+
+---
+
+## Built-in roles and skills
+
+**16 roles:** requirements analyst, spec writer, project manager, architect, UX designer, frontend developer, backend developer, database engineer, code reviewer, code quality checker, security reviewer, unit tester, test-case SQA, API SQA, E2E SQA, release engineer. See [`roles/`](roles).
+
+**Core skills:** assess requirements, write specification, plan change, execute code change, surgical changes, systematic debugging, review change, verify acceptance. See [`skills/core/`](skills/core).
+
+Roles are **responsibility contracts, not chat personas**. Each model call runs *as* a role, with tool grants limited to that role's capabilities intersected with your project's tool policy.
+
+---
+
+## Project structure
+
+```text
+apps/cli/            Turbine Hall CLI (`turbine`)
+packages/core        Workflow engine, state machine, gates
+packages/contracts   Zod schemas for work packages and evidence
+packages/evidence-contract  Engineering Evidence Contract (EEC)
+packages/lineage-impact     Typed lineage, invalidation, recovery
+packages/executor    Worktree execution and supervised handoff
+packages/models      Mock + OpenAI-compatible model adapters
+packages/adapter-*   Git, Jira, test-runner adapters
+packages/storage-sqlite     Local store on node:sqlite
+roles/  skills/      Role manifests and skill definitions
+frameworks/turbine/  Versioned framework definition (0.5.0)
+examples/            Plain-text, Jira and backend API sample tasks
+```
+
+### Development scripts
 
 | Script | Purpose |
 |---|---|
 | `pnpm build` | Build all packages |
-| `pnpm test` | Offline unit/integration tests |
+| `pnpm test` | Offline unit and integration tests (Vitest) |
 | `pnpm lint` | ESLint |
 | `pnpm typecheck` | TypeScript project checks |
-| `pnpm turbine -- <cmd>` | Run CLI via tsx |
+| `pnpm turbine -- <cmd>` | Run the CLI via tsx |
 
-## Docs
+---
 
-- [Turbine (framework)](docs/TURBINE_FRAMEWORK_v0.5.md)
-- [Turbine Hall (app requirements)](docs/TURBINE_HALL_REQUIREMENTS_v0.5.md)
+## Project status and roadmap
+
+Turbine is at **v0.5**, a working baseline for pilot use on real projects. Phases 0–6 (scaffold, contracts, workflow/EEC/ARSP, skills, planning + Jira read, executor + review, verify + accept) and hardening phases 1–4 (gate integrity, real evidence, packet doc standard, risk selection and lineage) are implemented and tested. Full details are in [Implementation status](docs/IMPLEMENTATION_STATUS.md).
+
+**Known limitations, stated plainly:**
+
+- Local approvals are local attestations, not authenticated identity. For code review and acceptance, `humanGates.requirePrApproval: true` adds a GitHub PR approval that an agent account cannot grant itself.
+- The worktree isolates changes, but it is not a security sandbox.
+- Jira write-back, GitHub PR automation, a web UI and a hosted multi-tenant service are not built yet.
+- Turbine makes no claims about productivity percentages. Its value is a hypothesis being tested in pilots, and results will be published as they come in.
+
+The binary name (`turbine`) is provisional. The package scope is `@turbine-hall/*`.
+
+---
+
+## Documentation
+
+- [Turbine framework specification](docs/TURBINE_FRAMEWORK_v0.5.md): philosophy, lifecycle, EEC, ARSP, roles, governance
+- [Turbine Hall app requirements](docs/TURBINE_HALL_REQUIREMENTS_v0.5.md)
 - [Implementation status](docs/IMPLEMENTATION_STATUS.md)
-- [Agent driver](docs/AGENT_DRIVER.md)
+- [Agent driver playbook](docs/AGENT_DRIVER.md): how to drive Turbine from Cursor, Claude Code or another agent
+
+---
+
+## FAQ
+
+**What is Turbine in one sentence?**
+Turbine is an open-source CLI and framework that puts human-approved requirements, independent AI and human code review, real test execution and audit trails around AI-assisted software development.
+
+**Does Turbine replace Cursor, Claude Code or GitHub Copilot?**
+No. Turbine sits on top of the AI coding tools you already use. It governs the workflow and evidence, and your agent still writes the code.
+
+**Can the AI approve its own pull request or skip review?**
+No. Requirements, plan, code review and acceptance approvals are human-only. They require an interactive terminal and a typed content hash, and they are refused in agent sessions. In Cursor, a hook installed by `turbine init` blocks those commands. For stronger guarantees, you can require a GitHub PR approval.
+
+**Does it work with Jira?**
+Yes, for intake: Turbine reads Jira issues and normalizes them into work packages. Writing back to Jira is on the roadmap.
+
+**Which LLMs are supported?**
+An offline mock model by default, plus any OpenAI-compatible API through `OPENAI_BASE_URL`, which covers OpenAI and Azure-compatible gateways.
+
+**Does it replace Scrum or Kanban?**
+No. Keep your sprint or Kanban process for prioritization. Turbine governs how each individual work item is built and verified.
+
+**Is my code sent anywhere?**
+Turbine runs locally and stores state in a local SQLite database. Code context is only sent to an LLM if you configure a real model provider.
+
+**Is Turbine a good fit for a software agency?**
+Yes, it was designed with them in mind. The first target users are 10–100 developer services firms that use Jira/GitHub and several AI coding tools and want one consistent, auditable delivery standard across teams and clients.
+
+---
+
+## Contributing
+
+Feedback from engineering teams trying AI-assisted delivery is the most valuable contribution right now. Open an [issue](https://github.com/turbine-hall/turbine/issues) to report a bug, share pilot results, or propose a role, skill or adapter. Pull requests are welcome. Please run `pnpm lint && pnpm typecheck && pnpm test` before submitting.
+
+If Turbine is useful to you, please ⭐ **star the repo**. It helps other teams find it.
+
+---
 
 ## Attribution
 
 - **Framework proposed by** [Ahsan Aasim](https://github.com/ahsanaasim)
 - **Open-source project maintained by** [6sense HQ Ltd.](https://6sensehq.com)
+
+<sub>Keywords: AI software development framework, AI coding agent governance, human-in-the-loop AI development, AI code review, spec-driven development, requirements traceability, software delivery workflow, AI SDLC, Cursor workflow, Claude Code workflow, GitHub Copilot governance, engineering audit trail, open-source developer tools.</sub>
