@@ -241,11 +241,13 @@ describe('criterion 1 — `turbine understand` on a fresh repo builds a snapshot
     const before = buildSnapshot(dir, head(dir));
     rmSync(join(dir, 'package.json')); // the working tree no longer has it
     rmSync(join(dir, 'src'), { recursive: true });
+    // resolve HEAD before the wrapper is on PATH, so the log holds only the calls made by buildSnapshot
+    const afterHead = head(dir);
     const oldPath = process.env.PATH;
     process.env.PATH = `${bin}:${oldPath}`;
     let after: RepoSnapshot;
     try {
-      after = buildSnapshot(dir, head(dir));
+      after = buildSnapshot(dir, afterHead);
     } finally {
       process.env.PATH = oldPath;
     }
