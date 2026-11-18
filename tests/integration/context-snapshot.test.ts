@@ -1388,10 +1388,12 @@ describe('review round 3 (PR #9): the second batch of review items stays closed'
   describe('HEAD', () => {
     it('a corrupt branch ref is broken, not an unborn branch; a branch with no commit yet is unborn', () => {
       const dir = newRepo(appFiles());
-      writeFileSync(join(dir, '.git', 'refs', 'heads', 'main'), 'not-a-sha\n');
+      // Corrupt the branch the fixture's HEAD actually names (the default branch depends on git's configuration).
+      const branch = git(dir, 'symbolic-ref', '--short', 'HEAD').stdout.trim();
+      writeFileSync(join(dir, '.git', 'refs', 'heads', branch), 'not-a-sha\n');
       expect(headState(dir)).toMatchObject({ kind: 'broken' });
       const fresh = tmp('turbine-unborn-');
-      git(fresh, 'init', '-q', '-b', 'main');
+      git(fresh, 'init', '-q');
       expect(headState(fresh)).toEqual({ kind: 'unborn' });
     });
   });
@@ -1580,5 +1582,73 @@ describe('review round 3 (PR #9): the second batch of review items stays closed'
       db.close();
       expect(() => store.claimWork('w1', 'planning')).not.toThrow();
     });
+  });
+});
+
+describe('review round 4 (PR #9): the third review batch stays closed', () => {
+  const snap = (files: Record<string, string>) => {
+    const dir = newRepo(files);
+    return { dir, s: buildSnapshot(dir, head(dir)) };
+  };
+  const byKey = <T extends { key: string }>(xs: T[], key: string) => xs.find((x) => x.key === key);
+
+  it('an odd tsconfig value (an object, not a plain setting) is unconfirmed; the valid settings are still stated', () => {
+    const { s } = snap({
+      'package.json': json({ name: 'p' }),
+      'tsconfig.json': '{"compilerOptions":{"strict":true,"lib":[{"__proto__":{"x":1}}],"target":"ES2022"}}\n',
+    });
+    expect(byKey(s.conventions, 'convention:tsconfig:tsconfig.json:strict')).toMatchObject({ status: 'confirmed' });
+    expect(byKey(s.facts, 'language:tsconfig.json:target')).toBeDefined();
+    expect(byKey(s.unconfirmed, 'unconfirmed:tsconfig.json:lib')).toBeDefined();
+    expect(byKey(s.facts, 'language:tsconfig.json:lib')).toBeUndefined();
+  });
+
+  it('an EditorConfig value of "unset" is not stated as a convention', () => {
+    const { s } = snap({ '.editorconfig': '[*]\nindent_style = unset\n', 'package.json': json({ name: 'p' }) });
+    expect(byKey(s.conventions, 'convention:editorconfig:indent_style')).toBeUndefined();
+  });
+
+  it('package.yaml with "prettier: null" is not a configuration, so .prettierrc still applies', () => {
+    const { s } = snap({ 'package.yaml': 'prettier: null\n', '.prettierrc': '{"semi": false}\n' });
+    expect(byKey(s.conventions, 'convention:prettier:.prettierrc:semi')).toMatchObject({ status: 'confirmed' });
+  });
+
+  it('lint reports an output that git does not ignore, even when the snapshot itself is ignored', () => {
+    const dir = newRepo(appFiles());
+    understandProject(openStore(), dir);
+    // Exclude the directory's contents (not the directory itself) so one file can be re-included.
+    writeFileSync(join(dir, '.turbine', '.gitignore'), 'context/*\n!context/PROJECT.md\n');
+    const issues = lintProjectContext(dir);
+    expect(issues).toContainEqual(expect.objectContaining({ level: 'error', message: expect.stringContaining('PROJECT.md') }));
+    expect(issues.find((i) => i.level === 'error')?.message).not.toContain('snapshot.json');
+  });
+
+  it('a publish lock that is a symlink is refused, never followed', () => {
+    const dir = newRepo(appFiles());
+    const s = buildSnapshot(dir, head(dir));
+    mkdirSync(contextPaths(dir).dir, { recursive: true });
+    const target = join(tmp('turbine-lock-target-'), 'victim');
+    writeFileSync(target, '0');
+    symlinkSync(target, join(contextPaths(dir).dir, '.publish.lock'));
+    expect(() => writeContextFiles(dir, s)).toThrow(/cannot be opened safely|not a small regular file/);
+    expect(readFileSync(target, 'utf8')).toBe('0');
+  });
+
+  it('a lock whose owner was reused by another process (start time differs) is taken over', () => {
+    const file = join(tmp('turbine-claim-'), 'engine.db');
+    const store = new WorkStore(file);
+    stores.push(store);
+    const db = new DatabaseSync(file);
+    db.prepare('INSERT INTO work_claims(work_id, owner, purpose, claimed_at) VALUES (?, ?, ?, ?)').run('w2', `${process.pid}|Thu Jan  1 00:00:00 1970|x`, 'planning', new Date().toISOString());
+    db.close();
+    expect(() => store.claimWork('w2', 'planning')).not.toThrow();
+  });
+
+  it('a live claim whose process still has the same start time is never taken over', () => {
+    const file = join(tmp('turbine-claim-'), 'engine.db');
+    const store = new WorkStore(file);
+    stores.push(store);
+    store.claimWork('w3', 'planning');
+    expect(() => store.claimWork('w3', 'planning')).toThrow(/already in progress/);
   });
 });

@@ -93,10 +93,19 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
     return ev;
   }
 
-  const load = (head: RepoHead): RepoSnapshot => {
+  // HEAD can move between the read and the publication. That one case gets a single rebuild at the new HEAD;
+  // any other failure, or a second move, stops the task (the old facts are never served).
+  const load = (head: RepoHead, retriesLeft = 1): RepoSnapshot => {
     if (opts.store) {
       const fresh = ensureFreshSnapshot(opts.store, projectRoot, head);
-      publishFresh(opts.store, projectRoot, fresh);
+      try {
+        publishFresh(opts.store, projectRoot, fresh);
+      } catch (e) {
+        const headMoved = (e as { details?: { reason?: unknown } }).details?.reason === 'head-moved';
+        const now = headMoved && retriesLeft > 0 ? repoHead(projectRoot) : undefined;
+        if (now && !('error' in now)) return load(now, retriesLeft - 1);
+        throw e;
+      }
       return fresh.snapshot;
     }
     return buildOrThrow(head, null, buildSnapshot);

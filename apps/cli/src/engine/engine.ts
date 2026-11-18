@@ -861,21 +861,31 @@ export class Engine {
     }
 
     const specForEvidence = this.ctx.store.getLatestArtifact(work.id, 'specification');
-    const projectEvidence = collectProjectEvidence(
-      this.ctx.projectRoot,
-      `${work.title}\n${specForEvidence ? this.ctx.store.getArtifactContent(specForEvidence.id) : ''}`,
-      { store: this.ctx.store },
-    );
-    let repoContext = JSON.stringify(projectEvidence, null, 2);
-    try {
-      // The planner sees live git state only when it describes the same commit as the facts. Otherwise the
-      // two would disagree (HEAD can move between the reads), and the facts alone are what it is given.
-      const info = inspectRepo(this.ctx.projectRoot);
-      if (projectEvidence.snapshot && info.head === projectEvidence.snapshot.commit) {
-        repoContext = JSON.stringify({ git: info, projectEvidence }, null, 2);
+    const evidenceText = `${work.title}\n${specForEvidence ? this.ctx.store.getArtifactContent(specForEvidence.id) : ''}`;
+    // The facts and the live git state must describe the same commit. HEAD can move between the two reads, so
+    // on a mismatch both are read once more; if they still disagree, the checkout cannot be pinned and the task stops.
+    const gather = () => {
+      const evidence = collectProjectEvidence(this.ctx.projectRoot, evidenceText, { store: this.ctx.store });
+      let info: ReturnType<typeof inspectRepo> | undefined;
+      try {
+        info = inspectRepo(this.ctx.projectRoot);
+      } catch {
+        info = undefined; // not a git checkout: the facts alone are what the planner is given
       }
-    } catch {
-      // projectEvidence alone is enough
+      return { evidence, info };
+    };
+    const pinned = (g: ReturnType<typeof gather>) => !g.info || !g.evidence.snapshot || g.info.head === g.evidence.snapshot.commit;
+    let gathered = gather();
+    if (!pinned(gathered)) gathered = gather();
+    if (!pinned(gathered)) {
+      throw err('E_CONTEXT_UNAVAILABLE', 'HEAD moved twice while the project facts were read, so they cannot be pinned to one commit. Retry when the checkout is quiet.');
+    }
+    const projectEvidence = gathered.evidence;
+    let repoContext = JSON.stringify(projectEvidence, null, 2);
+    if (gathered.info && projectEvidence.snapshot) {
+      // The branch is the one pinned with the facts (from the same observation), never a separate read.
+      const { root, head, dirty, remotes } = gathered.info;
+      repoContext = JSON.stringify({ git: { root, head, dirty, remotes, branch: projectEvidence.git?.branch }, projectEvidence }, null, 2);
     }
 
     this.checkBudget(work.id);
@@ -922,22 +932,26 @@ export class Engine {
       schemaId: 'plan',
       maxOutputTokens: 4000,
     });
-    this.ctx.store.incrementBudget(work.id, 1);
-
-    // Publication is one transaction. BEGIN IMMEDIATE takes the write lock first, so the claim check, the
-    // state and requirements re-checks, and every write below see one consistent state.
-    const published = this.ctx.store.transaction(() => {
+    // Publication is one transaction. BEGIN IMMEDIATE takes the write lock first, so the checks and every write
+    // below see one consistent state. The model call is charged in every outcome: a plan that is discarded still
+    // cost the call, so the charge and a "plan.discarded" event are kept. Checks return their reason as a value
+    // (a throw would roll the charge back).
+    const outcome = this.ctx.store.transaction(() => {
+      this.ctx.store.incrementBudget(work.id, 1);
+      const current = this.ctx.store.getWork(work.id);
+      const discard = (code: 'E_CONCURRENT' | 'E_INVALID_TRANSITION', message: string) => {
+        this.ctx.store.appendEvent({ workId: work.id, type: 'plan.discarded', payload: { reason: message } });
+        return { discarded: { code, message } } as const;
+      };
       // The model call took a while: only save the plan if this attempt still owns the task.
       if (!this.ctx.store.holdsClaim(work.id, claim)) {
-        throw err('E_CONCURRENT', `Planning for ${work.id} lost its claim while the model was running; the plan was not saved. Run sync again.`);
+        return discard('E_CONCURRENT', `Planning for ${work.id} lost its claim while the model was running; the plan was not saved. Run sync again.`);
       }
-      const current = this.ctx.store.getWork(work.id);
       if (current.currentState !== 'PLANNING') {
-        throw err('E_INVALID_TRANSITION', `${work.id} moved to ${current.currentState} while it was being planned; the plan was not saved.`);
+        return discard('E_INVALID_TRANSITION', `${work.id} moved to ${current.currentState} while it was being planned; the plan was not saved.`);
       }
-      const latestSpec = this.ctx.store.getLatestArtifact(work.id, 'specification');
-      if (latestSpec?.id !== spec?.id) {
-        throw err('E_CONCURRENT', `The requirements of ${work.id} changed while it was being planned; the plan was not saved. Run sync again.`);
+      if (this.ctx.store.getLatestArtifact(work.id, 'specification')?.id !== spec?.id) {
+        return discard('E_CONCURRENT', `The requirements of ${work.id} changed while it was being planned; the plan was not saved. Run sync again.`);
       }
       const planArt = this.saveArtifact({
         workId: work.id,
@@ -975,8 +989,9 @@ export class Engine {
       );
       return { work: next, planArt };
     });
-    work = published.work;
-    const planArt = published.planArt;
+    if ('discarded' in outcome) throw err(outcome.discarded.code, outcome.discarded.message);
+    work = outcome.work;
+    const planArt = outcome.planArt;
 
     this.render(work.id);
 

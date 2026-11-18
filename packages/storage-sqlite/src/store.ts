@@ -28,6 +28,7 @@ import {
   err,
 } from '@turbine-hall/turbine-contracts';
 import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import type { SqliteDb } from './db.js';
 import { openDatabase } from './db.js';
 
@@ -439,7 +440,8 @@ export class WorkStore {
    * because a slow live planner must not be displaced. Returns the token to release with.
    */
   claimWork(workId: string, purpose: string): string {
-    const token = `${process.pid}:${randomUUID()}`;
+    // Owner = pid | process start time | unique id. The start time tells a live owner from a reused pid.
+    const token = `${process.pid}|${processStart(process.pid) ?? ''}|${randomUUID()}`;
     for (let attempt = 0; attempt < 2; attempt++) {
       const inserted = this.db
         .prepare(`INSERT OR IGNORE INTO work_claims(work_id, owner, purpose, claimed_at) VALUES (?, ?, ?, ?)`)
@@ -492,14 +494,35 @@ export class WorkStore {
   }
 }
 
-/** True only when the process that holds the claim is confirmed gone. Age alone never qualifies. */
+/**
+ * When a process started, as the OS reports it (`ps -o lstart=`). Undefined where that cannot be read, in
+ * which case a claim cannot be told apart from a reused pid and is treated as held while its pid lives.
+ */
+function processStart(pid: number): string | undefined {
+  const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8' });
+  if (r.status !== 0) return undefined;
+  const text = r.stdout.trim();
+  return text === '' ? undefined : text;
+}
+
+/**
+ * True only when the claim's owner is confirmed gone: its pid no longer exists, or the pid now belongs to a
+ * different process (its start time differs). Age alone never qualifies.
+ */
 function claimOwnerIsDead(owner: string): boolean {
-  const pid = Number(owner.split(':')[0]);
+  const parts = owner.split('|');
+  // Owners written before the start time was recorded look like "pid:uuid".
+  const pid = parts.length > 1 ? Number(parts[0]) : Number(owner.split(':')[0]);
   if (!Number.isInteger(pid) || pid <= 0) return true; // not a token we issued: nobody can be defending it
   try {
     process.kill(pid, 0); // signal 0 only checks that the process exists
-    return false;
   } catch (e) {
     return (e as NodeJS.ErrnoException).code === 'ESRCH';
   }
+  const recorded = parts.length > 2 ? parts[1] : undefined;
+  if (recorded) {
+    const now = processStart(pid);
+    if (now !== undefined && now !== recorded) return true; // the pid was reused by another process
+  }
+  return false;
 }

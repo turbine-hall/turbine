@@ -1,4 +1,5 @@
-import { closeSync, existsSync, fchmodSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { constants, existsSync, fchmodSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync, closeSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import {
   RepoSnapshotSchema,
@@ -225,7 +226,8 @@ function isLink(path: string): boolean {
   }
 }
 
-function writeAtomic(file: string, content: string): void {
+/** A temp file next to `file`, fully written, ready to be renamed into place. Refuses symlinks and non-files. */
+function stage(file: string, content: string): { file: string; tmp: string } {
   let mode: number | undefined; // undefined: a new file gets 0666 minus the user's umask, as any new file does
   if (isLink(file)) throw new Error(`${file} is not a regular file (a symlink?); refusing to write generated context through it`);
   if (existsSync(file)) {
@@ -233,7 +235,7 @@ function writeAtomic(file: string, content: string): void {
     if (!st.isFile()) throw new Error(`${file} is not a regular file (a symlink?); refusing to write generated context through it`);
     mode = st.mode & 0o777; // regenerating must not make a private file readable by more users
   }
-  const tmp = join(dirname(file), `.${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`);
+  const tmp = join(dirname(file), `.${process.pid}-${Date.now()}-${randomUUID()}.tmp`);
   // O_EXCL: never follows a link, never reuses a file. An existing file's mode is applied before any
   // content is written, so the replacement is never readable by more users than the original.
   const fd = openSync(tmp, 'wx', mode === undefined ? 0o666 : 0o600);
@@ -244,11 +246,24 @@ function writeAtomic(file: string, content: string): void {
     } finally {
       closeSync(fd);
     }
-    renameSync(tmp, file); // only a complete file is ever published
   } catch (e) {
     rmSync(tmp, { force: true });
     throw e;
   }
+  return { file, tmp };
+}
+
+/** Rename staged files into place. Only complete files are ever published; leftovers are removed. */
+function publish(staged: Array<{ file: string; tmp: string }>): void {
+  try {
+    for (const t of staged) renameSync(t.tmp, t.file); // rename replaces the name, never a link's target
+  } finally {
+    for (const t of staged) rmSync(t.tmp, { force: true });
+  }
+}
+
+function writeAtomic(file: string, content: string): void {
+  publish([stage(file, content)]);
 }
 
 /**
@@ -257,28 +272,7 @@ function writeAtomic(file: string, content: string): void {
  */
 function withPublishLock<T>(projectRoot: string, fn: () => T): T {
   const lock = join(contextPaths(projectRoot).dir, '.publish.lock');
-  const acquire = () => {
-    const fd = openSync(lock, 'wx');
-    writeFileSync(fd, String(process.pid), 'utf8');
-    closeSync(fd);
-  };
-  try {
-    acquire();
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
-    const owner = Number(readFileSync(lock, 'utf8').trim());
-    let alive = true;
-    if (Number.isInteger(owner) && owner > 0) {
-      try {
-        process.kill(owner, 0);
-      } catch (err) {
-        alive = (err as NodeJS.ErrnoException).code !== 'ESRCH';
-      }
-    } else alive = false;
-    if (alive) throw new Error('another `turbine understand` is writing the project context; wait for it to finish and retry');
-    rmSync(lock, { force: true });
-    acquire();
-  }
+  acquireLock(lock);
   try {
     return fn();
   } finally {
@@ -286,23 +280,122 @@ function withPublishLock<T>(projectRoot: string, fn: () => T): T {
   }
 }
 
+function isAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0); // signal 0 only checks that the process exists
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+/**
+ * Create the lock with its owner's pid already inside. The pid is written to a private temp file first and
+ * then hard-linked to the lock name: link fails when the lock exists, and a lock never becomes visible
+ * without its content, so a contender can never read an empty or half-written owner.
+ */
+function createLock(lock: string): void {
+  const tmp = `${lock}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    const fd = openSync(tmp, 'wx', 0o600);
+    try {
+      writeFileSync(fd, String(process.pid), 'utf8');
+    } finally {
+      closeSync(fd);
+    }
+    linkSync(tmp, lock);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+/** Owner of an existing lock and the inode it was read from. Never follows a link; bounded read. */
+function readLockOwner(lock: string): { pid: number; ino: number } | undefined {
+  let fd: number;
+  try {
+    fd = openSync(lock, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined; // released meanwhile
+    throw new Error(`the publish lock ${lock} cannot be opened safely (${(e as Error).message}); remove it if no turbine process is running`);
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > 64) throw new Error(`the publish lock ${lock} is not a small regular file; remove it if no turbine process is running`);
+    const buf = Buffer.alloc(st.size);
+    readSync(fd, buf, 0, st.size, 0);
+    return { pid: Number(buf.toString('utf8').trim()), ino: st.ino };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function acquireLock(lock: string): void {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      createLock(lock);
+      return;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+    }
+    const owner = readLockOwner(lock);
+    if (!owner) continue; // released between the two steps: try again
+    if (isAlive(owner.pid)) throw new Error('another `turbine understand` is writing the project context; wait for it to finish and retry');
+    // The owner is gone. Take over only the lock instance that was inspected: move it aside, then check the
+    // moved file is that same instance. A different one means a live writer replaced it; hand it back.
+    const aside = `${lock}.stale.${process.pid}.${randomUUID()}`;
+    try {
+      renameSync(lock, aside);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw e;
+    }
+    if (lstatSync(aside).ino !== owner.ino) {
+      try {
+        linkSync(aside, lock); // restore the lock that was moved by mistake (fails if a new one already exists)
+      } catch {
+        /* a new lock is already in place */
+      }
+      rmSync(aside, { force: true });
+      throw new Error('the publish lock changed while it was being recovered; retry');
+    }
+    rmSync(aside, { force: true });
+  }
+  throw new Error('could not take the publish lock for the project context; retry');
+}
+
+/** HEAD moved before the generated files could be published. Nothing was published; a rebuild is needed. */
+export class HeadMovedError extends Error {}
+
 /**
  * Write snapshot.json and the Facts section of PROJECT.md. Returns the files written.
  * `stillCurrent` is asked, under the lock and after everything is rendered, whether the snapshot is still
  * the one for HEAD. If HEAD moved, nothing is published (the caller rebuilds for the new HEAD).
  */
-export function writeContextFiles(projectRoot: string, s: RepoSnapshot, stillCurrent: () => boolean = () => true): string[] {
+export function writeContextFiles(
+  projectRoot: string,
+  s: RepoSnapshot,
+  stillCurrent: () => boolean = () => true,
+  record?: () => void,
+): string[] {
   const p = contextPaths(projectRoot);
   assertRealDirs(projectRoot, p.dir);
   mkdirSync(p.dir, { recursive: true });
   assertRealDirs(projectRoot, p.dir);
   return withPublishLock(projectRoot, () => {
-    // Build everything first so a damaged PROJECT.md stops the run before anything is written.
+    // Build and stage both files completely before anything is renamed into place, so the HEAD check below
+    // happens after both are ready. Staging touches only temp files.
     const project = renderProjectMd(s, readRegular(p.project));
-    if (!stillCurrent()) throw new Error('HEAD changed while the project context was being written; nothing was published. Run again.');
-    writeAtomic(p.snapshot, `${JSON.stringify(s, null, 2)}\n`);
-    writeAtomic(p.project, project);
+    const staged = [stage(p.snapshot, `${JSON.stringify(s, null, 2)}\n`), stage(p.project, project)];
+    try {
+      if (!stillCurrent()) throw new HeadMovedError('HEAD changed while the project context was being written; nothing was published. Run again.');
+    } catch (e) {
+      for (const t of staged) rmSync(t.tmp, { force: true });
+      throw e;
+    }
+    publish(staged);
     ensureContextIgnored(projectRoot);
+    record?.(); // the store is updated only after the files are in place, still under the lock
     return [p.snapshot, p.project];
   });
 }
@@ -315,15 +408,17 @@ export function ensureContextIgnored(projectRoot: string): boolean {
   const file = join(projectRoot, '.turbine', '.gitignore');
   const text = readRegular(file);
   if (text !== undefined && contextIgnored(text)) return false;
-  // Already ignored by git through some other rule: nothing to add. (undefined: not a repository.)
-  if (isGitIgnored(projectRoot, GENERATED_PROBE) === true) return false;
+  // Every generated output already ignored by git (through any rule): leave the file alone. undefined means
+  // this is not a repository, where the textual rule is the only evidence and is used as is.
+  const verdicts = GENERATED_PROBES.map((probe) => isGitIgnored(projectRoot, probe));
+  if (verdicts.every((v) => v !== false)) return false;
   mkdirSync(dirname(file), { recursive: true });
   writeAtomic(file, `${(text ?? '').replace(/\n*$/, text ? '\n' : '')}${CONTEXT_DIR}/\n`);
   return true;
 }
 
-/** A path inside the generated directory, used to ask git whether its files are ignored. */
-const GENERATED_PROBE = `.turbine/${CONTEXT_DIR}/snapshot.json`;
+/** Paths inside the generated directory, used to ask git whether each generated output is ignored. */
+const GENERATED_PROBES = [`.turbine/${CONTEXT_DIR}/snapshot.json`, `.turbine/${CONTEXT_DIR}/PROJECT.md`];
 
 /** Git applies ignore rules in order, so the LAST rule that mentions the directory decides. */
 function contextIgnored(gitignore: string): boolean {
@@ -355,8 +450,9 @@ export function lintProjectContext(projectRoot: string): LintIssue[] {
   const hasSnapshot = exists(p.snapshot);
   const hasProject = exists(p.project);
   if (!hasSnapshot && !hasProject) return issues;
-  if (isGitIgnored(projectRoot, GENERATED_PROBE) === false) {
-    issues.push({ level: 'error', file: '.turbine/.gitignore', message: 'git does not ignore .turbine/context/ (a later rule un-ignores it), so the generated files would be committed; remove that rule or add `.turbine/context/` after it' });
+  const unignored = GENERATED_PROBES.filter((probe) => isGitIgnored(projectRoot, probe) === false).map((probe) => probe.split('/').pop());
+  if (unignored.length) {
+    issues.push({ level: 'error', file: '.turbine/.gitignore', message: `git does not ignore ${unignored.join(', ')} (a later rule un-ignores .turbine/context/), so generated files would be committed; remove that rule or add \`.turbine/context/\` after it` });
   }
 
   let snapshot: RepoSnapshot | undefined;

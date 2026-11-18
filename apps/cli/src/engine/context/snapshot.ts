@@ -709,6 +709,15 @@ function tsconfigFacts(b: Builder, regular: TreeEntry[]): void {
     const options = isObj(jc.value) && isObj(jc.value.compilerOptions) ? jc.value.compilerOptions : {};
     for (const opt of TSCONFIG_LANGUAGE_OPTIONS) {
       if (options[opt] === undefined) continue;
+      // Only plain values are copied into facts (a string, number, boolean, or an array of strings such as
+      // "lib"). Anything else is reported as unconfirmed, so one odd setting cannot fail the whole snapshot.
+      const value = options[opt];
+      const plain = typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
+      const strings = Array.isArray(value) && value.every((x) => typeof x === 'string');
+      if (!plain && !strings) {
+        b.unconfirm(`unconfirmed:${e.path}:${opt}`, `\`${e.path}\` sets compilerOptions.${opt} to a value that is not a plain setting, so it is not stated`, 'non-plain tsconfig value', b.source(e.path, jc.lines(['compilerOptions', opt])));
+        continue;
+      }
       b.fact({
         key: `language:${e.path}:${opt}`,
         category: 'language',
@@ -1012,7 +1021,8 @@ function prettierConventions(b: Builder, regular: TreeEntry[], root: Pkg | null)
     const text = b.text('package.yaml');
     const y = text === undefined ? undefined : parseYamlLines(text);
     if (!y || y.errors.length) yaml = 'unknown';
-    else if (isObj(y.value) && y.value.prettier !== undefined) yaml = { value: y.value.prettier as Json, lines: (o) => y.lines(['prettier', o]) };
+    // A falsy setting (for example "prettier: null") is not a configuration, so it does not shadow .prettierrc.
+    else if (isObj(y.value) && y.value.prettier) yaml = { value: y.value.prettier as Json, lines: (o) => y.lines(['prettier', o]) };
   }
   const candidates: string[] = [];
   if (root && root.data.prettier !== undefined) candidates.push(root.path);
@@ -1117,6 +1127,8 @@ function editorconfigConventions(b: Builder): void {
       continue;
     }
     const effective = global[global.length - 1]!;
+    // "unset" removes the setting for matching files, so no value is in effect to state.
+    if (effective.value.toLowerCase() === 'unset') continue;
     b.convention({
       key: `convention:editorconfig:${key}`,
       topic: `editorconfig ${key}`,

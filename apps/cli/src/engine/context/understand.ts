@@ -3,7 +3,7 @@ import { dirname, join, resolve } from 'node:path';
 import { err, shortSnapshotId, type RepoSnapshot, type SnapshotDiff } from '@turbine-hall/turbine-contracts';
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import { hasUncommittedChanges, headState, repoToplevel } from './git-read.js';
-import { contextFilesCurrent, ensureContextIgnored, writeContextFiles } from './render.js';
+import { HeadMovedError, contextFilesCurrent, ensureContextIgnored, writeContextFiles } from './render.js';
 import { buildSnapshot, diffSnapshots } from './snapshot.js';
 
 /**
@@ -102,9 +102,10 @@ export function ensureFreshSnapshot(
 }
 
 /**
- * Publish a snapshot: write the generated files (or repair them), then record the snapshot in the store.
- * The files are written under the publish lock and only while HEAD is still the snapshot's commit; if HEAD
- * moved, nothing is published and the caller must rebuild. Returns the files written.
+ * Publish a snapshot: write the generated files, then record the snapshot in the store. Both happen under the
+ * publish lock, and the store is written only after the files are in place. If HEAD moved before publication,
+ * nothing is published and the error has reason 'head-moved' (the caller may rebuild once at the new HEAD).
+ * Returns the files written.
  */
 export function publishFresh(store: WorkStore, projectRoot: string, fresh: FreshSnapshot): string[] {
   const commit = fresh.snapshot.commit;
@@ -112,19 +113,19 @@ export function publishFresh(store: WorkStore, projectRoot: string, fresh: Fresh
     const h = repoHead(projectRoot);
     return !('error' in h) && h.head === commit;
   };
-  let written: string[];
+  const record = fresh.status === 'current' ? undefined : () => store.saveSnapshot(fresh.snapshot, projectRoot);
   try {
     if (fresh.status === 'current' && contextFilesCurrent(projectRoot, fresh.snapshot)) {
       // Nothing to regenerate, but an earlier run may have stopped before the ignore rule was added.
-      written = ensureContextIgnored(projectRoot) ? [join(projectRoot, '.turbine', '.gitignore')] : [];
-    } else {
-      written = writeContextFiles(projectRoot, fresh.snapshot, stillCurrent);
+      return ensureContextIgnored(projectRoot) ? [join(projectRoot, '.turbine', '.gitignore')] : [];
     }
+    return writeContextFiles(projectRoot, fresh.snapshot, stillCurrent, record);
   } catch (e) {
+    if (e instanceof HeadMovedError) {
+      throw err('E_CONTEXT_UNAVAILABLE', e.message, { reason: 'head-moved', commit });
+    }
     throw err('E_CONTEXT_UNAVAILABLE', `Project context could not be published for ${commit.slice(0, 8)}: ${(e as Error).message}`, { commit });
   }
-  if (fresh.status !== 'current') store.saveSnapshot(fresh.snapshot, projectRoot);
-  return written;
 }
 
 export type UnderstandOutcome = FreshSnapshot & {
