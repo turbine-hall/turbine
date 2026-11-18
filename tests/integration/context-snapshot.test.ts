@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   ConventionSchema,
   ContextFactSchema,
+  hasUnsafeKey,
   DependencyFactSchema,
   RepoSnapshotSchema,
   sealSnapshot,
@@ -21,6 +22,7 @@ import {
   type RepoSnapshot,
 } from '../../packages/contracts/dist/index.js';
 import { WorkStore } from '../../packages/storage-sqlite/dist/index.js';
+import { DatabaseSync } from 'node:sqlite';
 import { initProject, openContext } from '../../apps/cli/src/engine/project.js';
 import { Engine } from '../../apps/cli/src/engine/engine.js';
 import { collectProjectEvidence } from '../../apps/cli/src/engine/project-context.js';
@@ -407,7 +409,8 @@ describe('criterion 5 — a convention without an enforcing config and under 100
     const c = s.conventions.find((x) => x.key === 'convention:imports:relative-js-extension')!;
     expect(c.status).toBe('unconfirmed');
     expect(c.basis).toBe('count');
-    expect(c.measured).toEqual({ matched: 47, total: 50, exhaustive: true, scope: expect.stringContaining('tracked source files') });
+    // A textual scan cannot prove every import was seen, so the count is never exhaustive.
+    expect(c.measured).toEqual({ matched: 47, total: 50, exhaustive: false, scope: expect.stringContaining('textual scan') });
     expect(c.statement).toContain('47 of 50 relative import specifiers end in .js');
     expect(c.statement).toContain('not a confirmed convention');
     expect(c.counterexamples).toHaveLength(3);
@@ -423,12 +426,12 @@ describe('criterion 5 — a convention without an enforcing config and under 100
     expect(unconfirmed).toContain('47 of 50 relative import specifiers end in .js');
   });
 
-  it('an exhaustive count of 100% is confirmed; one stray file makes it unconfirmed again', () => {
+  it('even a 100% import count is unconfirmed: a textual scan cannot prove it saw every import', () => {
     const dir = newRepo({ 'package.json': json({ name: 'p' }), 'src/index.ts': relImports(10, 10) });
     const full = buildSnapshot(dir, head(dir)).conventions.find((x) => x.key === 'convention:imports:relative-js-extension')!;
-    expect(full.status).toBe('confirmed');
-    expect(full.measured).toMatchObject({ matched: 10, total: 10, exhaustive: true });
-    expect(full.statement).toContain('All 10 relative import specifiers end in .js');
+    expect(full.status).toBe('unconfirmed');
+    expect(full.measured).toMatchObject({ matched: 10, total: 10, exhaustive: false });
+    expect(full.statement).toContain('not a confirmed convention');
     const next = commitFiles(dir, { 'src/other.ts': "import './stray';\n" });
     const partial = buildSnapshot(dir, next).conventions.find((x) => x.key === 'convention:imports:relative-js-extension')!;
     expect(partial.status).toBe('unconfirmed');
@@ -945,15 +948,15 @@ describe('review follow-ups (PR #9): every hole a reviewer found stays closed', 
       expect(conv(s).status).toBe('unconfirmed');
     });
 
-    it('a clean file set is still confirmed', () => {
+    it('a clean file set is still unconfirmed: import counts are never confirmed', () => {
       const { s } = snap({ 'src/a.ts': "import './b.js';\nexport * from './c.js';\n", 'src/b.ts': 'export {};\n', 'src/c.ts': 'export {};\n' });
-      expect(conv(s)).toMatchObject({ status: 'confirmed', measured: { matched: 2, total: 2, exhaustive: true } });
+      expect(conv(s)).toMatchObject({ status: 'unconfirmed', measured: { matched: 2, total: 2, exhaustive: false } });
     });
 
-    it('the schema refuses counterexamples on a confirmed convention', () => {
+    it('the schema refuses counterexamples on a confirmed convention (config-enforced ones)', () => {
       const { s } = snap({ 'src/a.ts': "import './b.js';\n", 'src/b.ts': 'export {};\n' });
-      const c = conv(s);
-      expect(ConventionSchema.safeParse({ ...c, counterexamples: [c.source] }).success).toBe(false);
+      // an unconfirmed count may list counterexamples
+      expect(ConventionSchema.safeParse({ ...conv(s), counterexamples: [conv(s).source] }).success).toBe(true);
       const config = byKey(snap({ 'package.json': json({ name: 'p' }), 'tsconfig.json': '{"compilerOptions":{"strict":true}}\n' }).s.conventions, 'convention:tsconfig:tsconfig.json:strict')!;
       expect(ConventionSchema.safeParse({ ...config, counterexamples: [config.source] }).success).toBe(false);
     });
@@ -1352,6 +1355,230 @@ describe('review follow-ups (PR #9): every hole a reviewer found stays closed', 
       rmSync(ignore);
       understandProject(store, dir);
       expect(readFileSync(ignore, 'utf8')).toContain('context/');
+    });
+  });
+});
+
+describe('review round 3 (PR #9): the second batch of review items stays closed', () => {
+  const snap = (files: Record<string, string>) => {
+    const dir = newRepo(files);
+    return { dir, s: buildSnapshot(dir, head(dir)) };
+  };
+  const byKey = <T extends { key: string }>(xs: T[], key: string) => xs.find((x) => x.key === key);
+
+  describe('git environment', () => {
+    it('a GIT_* variable inherited from the caller cannot redirect the read to another repository', () => {
+      const { dir, s } = snap(appFiles());
+      const commit = head(dir); // resolved before the environment is changed
+      const other = newRepo({ 'package.json': json({ name: 'other' }) });
+      const saved = { GIT_DIR: process.env.GIT_DIR, GIT_INDEX_FILE: process.env.GIT_INDEX_FILE };
+      process.env.GIT_DIR = join(other, '.git');
+      process.env.GIT_INDEX_FILE = join(other, '.git', 'index');
+      try {
+        expect(buildSnapshot(dir, commit).hash).toBe(s.hash);
+      } finally {
+        for (const [k, v] of Object.entries(saved)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    });
+  });
+
+  describe('HEAD', () => {
+    it('a corrupt branch ref is broken, not an unborn branch; a branch with no commit yet is unborn', () => {
+      const dir = newRepo(appFiles());
+      writeFileSync(join(dir, '.git', 'refs', 'heads', 'main'), 'not-a-sha\n');
+      expect(headState(dir)).toMatchObject({ kind: 'broken' });
+      const fresh = tmp('turbine-unborn-');
+      git(fresh, 'init', '-q', '-b', 'main');
+      expect(headState(fresh)).toEqual({ kind: 'unborn' });
+    });
+  });
+
+  describe('parsers', () => {
+    it('CRLF and bare CR line endings give the same line numbers as LF', () => {
+      const lf = '{\n"a": 1,\n"b": {\n"c": 2}}';
+      for (const text of [lf, lf.replace(/\n/g, '\r\n'), lf.replace(/\n/g, '\r')]) {
+        const jc = parseJsonc(text);
+        expect(jc.lines(['a'])).toEqual({ start: 2, end: 2 });
+        expect(jc.lines(['b', 'c'])).toEqual({ start: 4, end: 4 });
+      }
+    });
+
+    it('a comment ends at a bare CR too, so the line after it is read', () => {
+      expect(parseJsonc('{\r// note\r"a": 1}').value).toEqual({ a: 1 });
+    });
+
+    it('a duplicate member replaces the earlier one, including the positions of its children', () => {
+      const jc = parseJsonc('{"a": {"x": 1},\n"a": 2}');
+      expect(jc.value).toEqual({ a: 2 });
+      expect(jc.lines(['a', 'x'])).toBeUndefined();
+      expect(jc.lines(['a'])).toEqual({ start: 2, end: 2 });
+    });
+
+    it('a number that overflows to Infinity is refused, not stated', () => {
+      expect(() => parseJsonc('{"a": 1e400}')).toThrow();
+    });
+
+    it('a version range with one arm the reader does not understand is unchecked, even when another arm matches', () => {
+      expect(satisfies('1.2.3', '^1.0.0 || 1.2.x')).toBe('unchecked');
+      expect(satisfies('1.2.3', '^1.0.0 || ^2.0.0')).toBe('match');
+      expect(satisfies('3.0.0', '^1.0.0 || ^2.0.0')).toBe('mismatch');
+    });
+  });
+
+  describe('contracts', () => {
+    it('a __proto__ own key is detected before parsing, so it can never be silently dropped or reinterpreted', () => {
+      expect(hasUnsafeKey(JSON.parse('{"__proto__": {"x": 1}}'))).toBe(true);
+      expect(hasUnsafeKey(JSON.parse('{"a": [{"__proto__": 1}]}'))).toBe(true);
+      expect(hasUnsafeKey(JSON.parse('{"a": {"b": 1}}'))).toBe(false);
+    });
+  });
+
+  describe('project files read at the commit', () => {
+    it('.nvmrc with two selectors does not state a version; the ambiguity is listed as not confirmed', () => {
+      const { s } = snap({ 'package.json': json({ name: 'p' }), '.nvmrc': '20\n22\n' });
+      expect(byKey(s.facts, 'version:node:.nvmrc')).toBeUndefined();
+      expect(byKey(s.unconfirmed, 'unconfirmed:node:.nvmrc')).toBeDefined();
+    });
+
+    it('.nvmrc comments are stripped, so "22 # lts" pins 22', () => {
+      const { s } = snap({ 'package.json': json({ name: 'p' }), '.nvmrc': '22.1.0 # lts\n' });
+      expect(byKey(s.facts, 'version:node:.nvmrc')?.statement).toContain('pins Node `22.1.0`');
+    });
+
+    it('an EditorConfig key overridden in a more specific section is not stated for every file', () => {
+      const { s } = snap({ '.editorconfig': 'root = true\n[*]\nindent_style = space\n[*.md]\nindent_style = tab\n', 'package.json': json({ name: 'p' }) });
+      expect(byKey(s.conventions, 'convention:editorconfig:indent_style')).toBeUndefined();
+      expect(byKey(s.unconfirmed, 'unconfirmed:editorconfig:indent_style')).toBeDefined();
+    });
+
+    it('an EditorConfig key set only under [*] is stated with its effective (last) value', () => {
+      const { s } = snap({ '.editorconfig': '[*]\nindent_style = space\nindent_style = tab\n', 'package.json': json({ name: 'p' }) });
+      expect(byKey(s.conventions, 'convention:editorconfig:indent_style')).toMatchObject({ status: 'confirmed', statement: expect.stringContaining('indent_style = tab') });
+    });
+
+    it('package.yaml is read before .prettierrc: its Prettier setting wins and the .prettierrc one is shadowed', () => {
+      const { s } = snap({ 'package.yaml': 'prettier:\n  semi: false\n', '.prettierrc': '{"semi": true}\n' });
+      expect(byKey(s.conventions, 'convention:prettier:package.yaml:semi')).toMatchObject({ status: 'confirmed' });
+      expect(byKey(s.unconfirmed, 'shadowed:prettier:.prettierrc')).toBeDefined();
+    });
+
+    it('a .prettierrc.json with a comment is refused (strict JSON, as Prettier reads it), not read leniently', () => {
+      const { s } = snap({ '.prettierrc.json': '{ // c\n"semi": false }\n', 'package.json': json({ name: 'p' }) });
+      expect(s.conventions.some((c) => c.key.startsWith('convention:prettier:.prettierrc.json'))).toBe(false);
+      expect(byKey(s.unconfirmed, 'unparsed:.prettierrc.json')).toBeDefined();
+    });
+
+    it('npm workspaces with exclusion patterns: membership is unknown, since the order is not evaluated', () => {
+      const { s } = snap({
+        'package.json': json({ name: 'root', workspaces: ['packages/*', '!packages/b'] }),
+        'packages/a/package.json': json({ name: 'a' }),
+        'packages/b/package.json': json({ name: 'b' }),
+      });
+      expect(s.facts.filter((f) => f.category === 'workspace' && f.key !== 'workspace:declaration')).toHaveLength(0);
+      expect(byKey(s.unconfirmed, 'workspace:negation-order')).toBeDefined();
+    });
+
+    it('a tracked pnpm-workspace.yaml that is a symlink is unknown; package.json workspaces are not used in its place', () => {
+      const dir = newRepo({
+        'package.json': json({ name: 'root', workspaces: ['packages/*'] }),
+        'packages/a/package.json': json({ name: 'a' }),
+      });
+      symlinkSync('package.json', join(dir, 'pnpm-workspace.yaml'));
+      git(dir, 'add', 'pnpm-workspace.yaml');
+      git(dir, 'commit', '-q', '-m', 'link');
+      const s = buildSnapshot(dir, head(dir));
+      expect(s.facts.some((f) => f.key === 'workspace:packages/a' || (f.category === 'workspace' && f.key !== 'workspace:declaration'))).toBe(false);
+      expect(byKey(s.unconfirmed, 'workspace:unreadable')).toBeDefined();
+    });
+
+    it('package.yaml is admitted as a config file, so its Prettier setting can be read', () => {
+      const { s } = snap({ 'package.yaml': 'name: x\nprettier:\n  printWidth: 100\n' });
+      expect(byKey(s.conventions, 'convention:prettier:package.yaml:printWidth')).toMatchObject({ status: 'confirmed' });
+    });
+  });
+
+  describe('publication and the generated files', () => {
+    it('a HEAD that moved before publication publishes nothing', () => {
+      const dir = newRepo(appFiles());
+      const s = buildSnapshot(dir, head(dir));
+      expect(() => writeContextFiles(dir, s, () => false)).toThrow(/nothing was published/);
+      expect(existsSync(contextPaths(dir).snapshot)).toBe(false);
+      expect(existsSync(contextPaths(dir).project)).toBe(false);
+    });
+
+    it('a live publisher holds the lock (the second is refused); a dead publisher\'s lock is taken over', () => {
+      const dir = newRepo(appFiles());
+      const s = buildSnapshot(dir, head(dir));
+      const lock = join(contextPaths(dir).dir, '.publish.lock');
+      mkdirSync(contextPaths(dir).dir, { recursive: true });
+      writeFileSync(lock, String(process.pid));
+      expect(() => writeContextFiles(dir, s)).toThrow(/another `turbine understand` is writing/);
+      writeFileSync(lock, '999999999'); // no such process
+      expect(() => writeContextFiles(dir, s)).not.toThrow();
+      expect(existsSync(lock)).toBe(false);
+    });
+
+    it('a new generated file follows the umask, not a fixed 0644', () => {
+      const dir = newRepo(appFiles());
+      const s = buildSnapshot(dir, head(dir));
+      writeContextFiles(dir, s);
+      const umask = process.umask();
+      expect(statSync(contextPaths(dir).snapshot).mode & 0o777).toBe(0o666 & ~umask);
+    });
+
+    it('CRLF PROJECT.md (written on Windows) is recognised: no false "edited by hand" error', () => {
+      const dir = newRepo(appFiles());
+      understandProject(openStore(), dir);
+      const file = contextPaths(dir).project;
+      writeFileSync(file, readFileSync(file, 'utf8').replace(/\n/g, '\r\n'));
+      expect(lintProjectContext(dir).filter((i) => i.level === 'error')).toEqual([]);
+    });
+
+    it('generated files that git tracks are a lint warning', () => {
+      const dir = newRepo(appFiles());
+      understandProject(openStore(), dir);
+      git(dir, 'add', '-f', '.turbine/context/snapshot.json');
+      git(dir, 'commit', '-q', '-m', 'oops');
+      expect(lintProjectContext(dir)).toContainEqual(expect.objectContaining({ level: 'warning', file: '.turbine/context/snapshot.json' }));
+    });
+
+    it('a generated directory that is a file (not a directory) is an error, not followed', () => {
+      const dir = newRepo(appFiles());
+      mkdirSync(join(dir, '.turbine'), { recursive: true });
+      writeFileSync(join(dir, '.turbine', 'context'), 'not a directory');
+      expect(lintProjectContext(dir)).toContainEqual(expect.objectContaining({ level: 'error', file: '.turbine/context' }));
+    });
+
+    it('git decides the ignore: a later rule that un-ignores the generated files is an error from lint', () => {
+      const dir = newRepo(appFiles());
+      understandProject(openStore(), dir);
+      writeFileSync(join(dir, '.turbine', '.gitignore'), `${readFileSync(join(dir, '.turbine', '.gitignore'), 'utf8')}!context/\n`);
+      expect(lintProjectContext(dir)).toContainEqual(expect.objectContaining({ level: 'error', file: '.turbine/.gitignore' }));
+    });
+  });
+
+  describe('storage', () => {
+    it('a claim held by a live process is never taken over, however old it is', () => {
+      const file = join(tmp('turbine-claim-'), 'engine.db');
+      const store = new WorkStore(file);
+      stores.push(store);
+      const db = new DatabaseSync(file);
+      db.prepare('INSERT INTO work_claims(work_id, owner, purpose, claimed_at) VALUES (?, ?, ?, ?)').run('w1', `${process.pid}:old`, 'planning', '1970-01-01T00:00:00.000Z');
+      db.close();
+      expect(() => store.claimWork('w1', 'planning')).toThrow(/already in progress/);
+    });
+
+    it('a claim whose process is gone is taken over', () => {
+      const file = join(tmp('turbine-claim-'), 'engine.db');
+      const store = new WorkStore(file);
+      stores.push(store);
+      const db = new DatabaseSync(file);
+      db.prepare('INSERT INTO work_claims(work_id, owner, purpose, claimed_at) VALUES (?, ?, ?, ?)').run('w1', '999999999:dead', 'planning', new Date().toISOString());
+      db.close();
+      expect(() => store.claimWork('w1', 'planning')).not.toThrow();
     });
   });
 });

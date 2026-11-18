@@ -3,7 +3,7 @@ import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import type { Fact } from './docs/normalize.js';
 import { hasUncommittedChanges, listTree, observeBranch } from './context/git-read.js';
 import { buildSnapshot } from './context/snapshot.js';
-import { brokenHeadError, buildOrThrow, ensureFreshSnapshot, refreshContextFiles, repoHead, type RepoHead } from './context/understand.js';
+import { brokenHeadError, buildOrThrow, ensureFreshSnapshot, publishFresh, repoHead, type RepoHead } from './context/understand.js';
 
 /**
  * Project facts for assess/plan. This is a thin wrapper over the commit snapshot
@@ -96,18 +96,27 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
   const load = (head: RepoHead): RepoSnapshot => {
     if (opts.store) {
       const fresh = ensureFreshSnapshot(opts.store, projectRoot, head);
-      refreshContextFiles(projectRoot, fresh);
+      publishFresh(opts.store, projectRoot, fresh);
       return fresh.snapshot;
     }
     return buildOrThrow(head, null, buildSnapshot);
   };
   let snapshot = load(at);
 
-  // Branch and commit come from ONE git observation. If HEAD moved while the snapshot was read, the
-  // snapshot is stale: rebuild it at the commit HEAD is at now. If that cannot be done (or HEAD keeps
-  // moving) the task stops; the old facts are never served.
-  let observed = observeBranch(at.repoRoot);
-  if (observed && observed.commit !== snapshot.commit) {
+  // Where HEAD is now. Branch and commit come from ONE git observation when that is consistent. When it is
+  // not (HEAD moved during the read), HEAD is resolved on its own: the commit is still known, and the branch
+  // is then not stated.
+  const pin = (): { commit: string; branch?: string } | undefined => {
+    const observed = observeBranch(at.repoRoot);
+    if (observed) return observed;
+    const h = repoHead(projectRoot);
+    return 'error' in h ? undefined : { commit: h.head };
+  };
+  let observed = pin();
+  if (!observed || observed.commit !== snapshot.commit) {
+    // HEAD moved while the snapshot was read (or cannot be read now): rebuild at the commit it is at now.
+    // If that cannot be done, or HEAD keeps moving, the task stops; the old facts are never served.
+    if (!observed) throw err('E_CONTEXT_UNAVAILABLE', 'HEAD could not be read after project facts were read; retry when the repository is quiet', { snapshot: snapshot.commit });
     const moved: RepoHead = { repoRoot: at.repoRoot, head: observed.commit };
     try {
       snapshot = load(moved);
@@ -118,7 +127,7 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
         { from: at.head, to: observed.commit },
       );
     }
-    observed = observeBranch(at.repoRoot);
+    observed = pin();
     if (!observed || observed.commit !== snapshot.commit) {
       throw err(
         'E_CONTEXT_UNAVAILABLE',
@@ -190,7 +199,7 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
   }
 
   ev.relatedFiles = relatedFiles(
-    listTree(at.repoRoot, at.head).map((e) => e.path),
+    listTree(at.repoRoot, snapshot.commit).map((e) => e.path),
     requestText,
   );
   if (ev.relatedFiles.length) {

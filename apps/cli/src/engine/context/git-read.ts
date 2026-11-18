@@ -1,4 +1,6 @@
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 /**
  * Reading a repository AT A COMMIT. Nothing here touches the working tree: tracked paths and
@@ -18,9 +20,13 @@ export type TreeEntry = {
 };
 
 function run(cwd: string, args: string[], input?: string | Buffer, maxBuffer = 256 * 1024 * 1024) {
-  // Never contact a remote while reading: a missing object is an error to report, not something to
-  // fetch lazily (partial clones), and never prompt.
-  const env = { ...process.env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' };
+  // Only the repository at `cwd` may be read. An inherited GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE,
+  // GIT_OBJECT_DIRECTORY, GIT_COMMON_DIR, ... would point git at a different repository, so every
+  // GIT_* variable is removed. Also never contact a remote: a missing object is an error to report,
+  // not something to fetch lazily (partial clones), and never prompt.
+  const env: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')));
+  env.GIT_NO_LAZY_FETCH = '1';
+  env.GIT_TERMINAL_PROMPT = '0';
   const r = spawnSync('git', ['--no-replace-objects', '-c', 'core.quotepath=off', ...args], { cwd, input, maxBuffer, env });
   if (r.error) throw new Error(`git ${args[0]} failed: ${r.error.message}`);
   return { status: r.status ?? 1, stdout: r.stdout as Buffer, stderr: (r.stderr as Buffer).toString('utf8').trim() };
@@ -65,31 +71,60 @@ export function headState(repoRoot: string): HeadState {
     if (run(repoRoot, ['symbolic-ref', '--quiet', ref]).status === 0) {
       return { kind: 'broken', reason: `${ref} is a symbolic ref that does not lead to a readable commit` };
     }
-    // `show-ref --verify` exits 1 when the ref does not exist (nothing committed on this branch yet)
-    // and 128 when it exists but points at a missing or invalid object (a broken HEAD).
+    // A loose ref FILE that exists is a ref, even when its content is garbage: that is broken, not a fresh
+    // branch. (git's own exit codes do not separate "absent" from "corrupt" reliably: a corrupt ref makes
+    // show-ref exit 1, the same as an absent one.)
+    const loose = run(repoRoot, ['rev-parse', '--git-path', ref]);
+    const loosePath = loose.stdout.toString('utf8').trim();
+    if (loose.status === 0 && loosePath && existsSync(resolve(repoRoot, loosePath))) {
+      return { kind: 'broken', reason: `${ref} exists but is not a readable commit` };
+    }
+    // Otherwise a packed or missing ref: show-ref --verify exits 1 only when the ref is absent.
     if (run(repoRoot, ['show-ref', '--verify', '--quiet', ref]).status === 1) return { kind: 'unborn' };
     return { kind: 'broken', reason: `${ref} does not point at a readable commit` };
   }
   return { kind: 'broken', reason: 'HEAD does not point at a readable commit' };
 }
 
+/** Branch and commit as git reports them right now (undefined branch when HEAD is detached). */
+function headPair(repoRoot: string): { commit: string; branch?: string } | null {
+  const oid = run(repoRoot, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']);
+  if (oid.status !== 0) return null;
+  const sym = run(repoRoot, ['symbolic-ref', '--quiet', 'HEAD']);
+  const ref = sym.status === 0 ? sym.stdout.toString('utf8').replace(/\n$/, '') : '';
+  return { commit: oid.stdout.toString('utf8').trim(), ...(ref.startsWith('refs/heads/') ? { branch: ref.slice('refs/heads/'.length) } : {}) };
+}
+
 /**
- * Branch name and commit from ONE git process (`status --branch` prints both from a single
- * observation), so they can be stated together. branch is undefined for a detached HEAD.
+ * Branch name and commit, stated together only when they can be shown to belong together. git has no
+ * single call that returns both atomically, so HEAD is read, then read again: if the two readings agree
+ * the pair is returned; if anything moved in between, null is returned and the caller must not state
+ * a branch. (branch is undefined for a detached HEAD.)
  */
 export function observeBranch(repoRoot: string): { commit: string; branch?: string } | null {
-  const r = run(repoRoot, ['status', '--porcelain=v2', '--branch', '--untracked-files=no', '-z']);
-  if (r.status !== 0) return null;
-  let commit: string | undefined;
-  let branch: string | undefined;
-  for (const rec of r.stdout.toString('utf8').split('\0')) {
-    if (rec.startsWith('# branch.oid ')) commit = rec.slice('# branch.oid '.length);
-    else if (rec.startsWith('# branch.head ')) {
-      const name = rec.slice('# branch.head '.length);
-      branch = name === '(detached)' ? undefined : name;
-    }
-  }
-  return commit && /^[0-9a-f]{40,64}$/.test(commit) ? { commit, ...(branch ? { branch } : {}) } : null;
+  const first = headPair(repoRoot);
+  if (!first) return null;
+  const second = headPair(repoRoot);
+  if (!second || second.commit !== first.commit || second.branch !== first.branch) return null;
+  return first;
+}
+
+/** Paths in the index (what is tracked) under `pathspec`. Reads the index only, never the working tree. */
+export function trackedPaths(repoRoot: string, pathspec: string): string[] {
+  const r = run(repoRoot, ['ls-files', '-z', '--', pathspec]);
+  if (r.status !== 0) return [];
+  return r.stdout.toString('utf8').split('\0').filter(Boolean);
+}
+
+/**
+ * Git's own answer to "would this path be ignored?" (all ignore files, in precedence order, including
+ * negations). undefined when the directory is not a repository, so the caller can fall back.
+ */
+export function isGitIgnored(repoRoot: string, path: string): boolean | undefined {
+  const r = run(repoRoot, ['check-ignore', '-q', '--no-index', '--', path]);
+  if (r.status === 0) return true;
+  if (r.status === 1) return false;
+  return undefined;
 }
 
 export function treeIdOf(repoRoot: string, commit: string): string {

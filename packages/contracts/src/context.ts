@@ -32,6 +32,22 @@ export const FactSourceSchema = z
   .strict();
 export type FactSource = z.infer<typeof FactSourceSchema>;
 
+/**
+ * True if any object in the value has an OWN key named __proto__. Zod and plain assignment would
+ * silently drop or reinterpret such a key (it would set a prototype), so it is refused before parsing.
+ */
+export function hasUnsafeKey(value: unknown, seen = new Set<unknown>()): boolean {
+  if (typeof value !== 'object' || value === null || seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some((v) => hasUnsafeKey(v, seen));
+  if (Object.prototype.hasOwnProperty.call(value, '__proto__')) return true;
+  return Object.values(value).some((v) => hasUnsafeKey(v, seen));
+}
+
+export function assertNoUnsafeKeys(value: unknown): void {
+  if (hasUnsafeKey(value)) throw new Error('snapshot data contains a "__proto__" key, which is refused');
+}
+
 export const FactCategorySchema = z.enum([
   'layout',
   'workspace',
@@ -211,6 +227,7 @@ export type RepoSnapshot = z.infer<typeof RepoSnapshotSchema>;
 
 /** Order every list by key so the same facts always serialise (and hash) the same way. */
 export function sealSnapshot(body: RepoSnapshotBody): RepoSnapshot {
+  assertNoUnsafeKeys(body);
   const byKey = <T extends { key: string }>(xs: T[]): T[] => [...xs].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
   const parsed = RepoSnapshotBodySchema.parse({
     ...body,

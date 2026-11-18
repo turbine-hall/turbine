@@ -868,8 +868,12 @@ export class Engine {
     );
     let repoContext = JSON.stringify(projectEvidence, null, 2);
     try {
+      // The planner sees live git state only when it describes the same commit as the facts. Otherwise the
+      // two would disagree (HEAD can move between the reads), and the facts alone are what it is given.
       const info = inspectRepo(this.ctx.projectRoot);
-      repoContext = JSON.stringify({ git: info, projectEvidence }, null, 2);
+      if (projectEvidence.snapshot && info.head === projectEvidence.snapshot.commit) {
+        repoContext = JSON.stringify({ git: info, projectEvidence }, null, 2);
+      }
     } catch {
       // projectEvidence alone is enough
     }
@@ -920,46 +924,59 @@ export class Engine {
     });
     this.ctx.store.incrementBudget(work.id, 1);
 
-    // The model call took a while: only save the plan if this attempt still owns the task.
-    if (!this.ctx.store.holdsClaim(work.id, claim)) {
-      throw err('E_CONCURRENT', `Planning for ${work.id} lost its claim while the model was running; the plan was not saved. Run sync again.`);
-    }
-    const planArt = this.saveArtifact({
-      workId: work.id,
-      type: 'plan',
-      content: result.content,
-      createdBy: { kind: 'agent', identifier: 'project-manager' },
-      parentArtifactIds: spec ? [spec.id] : [],
-    });
-
-    if (spec) {
-      const edge = createEdge({
+    // Publication is one transaction. BEGIN IMMEDIATE takes the write lock first, so the claim check, the
+    // state and requirements re-checks, and every write below see one consistent state.
+    const published = this.ctx.store.transaction(() => {
+      // The model call took a while: only save the plan if this attempt still owns the task.
+      if (!this.ctx.store.holdsClaim(work.id, claim)) {
+        throw err('E_CONCURRENT', `Planning for ${work.id} lost its claim while the model was running; the plan was not saved. Run sync again.`);
+      }
+      const current = this.ctx.store.getWork(work.id);
+      if (current.currentState !== 'PLANNING') {
+        throw err('E_INVALID_TRANSITION', `${work.id} moved to ${current.currentState} while it was being planned; the plan was not saved.`);
+      }
+      const latestSpec = this.ctx.store.getLatestArtifact(work.id, 'specification');
+      if (latestSpec?.id !== spec?.id) {
+        throw err('E_CONCURRENT', `The requirements of ${work.id} changed while it was being planned; the plan was not saved. Run sync again.`);
+      }
+      const planArt = this.saveArtifact({
         workId: work.id,
-        upstreamArtifactId: spec.id,
-        upstreamRevisionHash: spec.contentHash,
-        downstreamArtifactId: planArt.id,
-        downstreamRevisionHash: planArt.contentHash,
-        reason: 'specification-to-plan',
-        affectedObligationIds: ['obl_plan_approval'],
+        type: 'plan',
+        content: result.content,
+        createdBy: { kind: 'agent', identifier: 'project-manager' },
+        parentArtifactIds: spec ? [spec.id] : [],
       });
-      this.ctx.store.saveEdge(edge);
-    }
 
-    work = transition(work, 'PLAN_REVIEW');
-    this.ctx.store.transaction(() => {
-      this.ctx.store.saveWork(work);
+      if (spec) {
+        const edge = createEdge({
+          workId: work.id,
+          upstreamArtifactId: spec.id,
+          upstreamRevisionHash: spec.contentHash,
+          downstreamArtifactId: planArt.id,
+          downstreamRevisionHash: planArt.contentHash,
+          reason: 'specification-to-plan',
+          affectedObligationIds: ['obl_plan_approval'],
+        });
+        this.ctx.store.saveEdge(edge);
+      }
+
+      const next = transition(current, 'PLAN_REVIEW');
+      this.ctx.store.saveWork(next);
       this.ctx.store.appendEvent({
-        workId: work.id,
+        workId: next.id,
         type: 'plan.created',
         payload: { planArtifactId: planArt.id, hash: planArt.contentHash },
       });
-      const eec = this.ctx.store.getLatestEec(work.id)!;
+      const eec = this.ctx.store.getLatestEec(next.id)!;
       this.ctx.store.saveEec(
         bumpEecRevision(eec, {
           artifactRevisionIds: [...eec.artifactRevisionIds, planArt.id],
         }),
       );
+      return { work: next, planArt };
     });
+    work = published.work;
+    const planArt = published.planArt;
 
     this.render(work.id);
 

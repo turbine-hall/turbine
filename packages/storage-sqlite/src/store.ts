@@ -22,6 +22,7 @@ import {
   RecoveryPlanSchema,
   RepoSnapshotSchema,
   RoleRunSchema,
+  assertNoUnsafeKeys,
   WorkPackageSchema,
   createId,
   err,
@@ -45,8 +46,12 @@ export class WorkStore {
     this.db.close();
   }
 
+  /**
+   * BEGIN IMMEDIATE takes SQLite's write lock up front: reads inside `fn` (for example a claim check) and
+   * the writes that follow cannot be interleaved with another process's writes.
+   */
   transaction<T>(fn: () => T): T {
-    this.db.exec('BEGIN');
+    this.db.exec('BEGIN IMMEDIATE');
     try {
       const result = fn();
       this.db.exec('COMMIT');
@@ -419,7 +424,9 @@ export class WorkStore {
 
   /** The schema proves the JSON is a valid snapshot; this proves it is the one the row is filed under. */
   private parseSnapshotRow(row: { hash: string; data: string }): RepoSnapshot {
-    const parsed = RepoSnapshotSchema.parse(JSON.parse(row.data));
+    const raw: unknown = JSON.parse(row.data);
+    assertNoUnsafeKeys(raw);
+    const parsed = RepoSnapshotSchema.parse(raw);
     if (parsed.hash !== row.hash) {
       throw new Error(`snapshot stored under ${row.hash} actually has hash ${parsed.hash} (the row was replaced or corrupted)`);
     }
@@ -427,10 +434,11 @@ export class WorkStore {
   }
 
   /**
-   * Claim a work item for a long-running stage. Exactly one caller holds a claim at a time; a claim
-   * whose process is gone (or that is very old) can be taken over. Returns the token to release with.
+   * Claim a work item for a long-running stage. Exactly one caller holds a claim at a time. A claim is
+   * taken over ONLY when its owning process no longer exists: elapsed time alone never frees a claim,
+   * because a slow live planner must not be displaced. Returns the token to release with.
    */
-  claimWork(workId: string, purpose: string, staleAfterMs = 30 * 60 * 1000): string {
+  claimWork(workId: string, purpose: string): string {
     const token = `${process.pid}:${randomUUID()}`;
     for (let attempt = 0; attempt < 2; attempt++) {
       const inserted = this.db
@@ -441,7 +449,7 @@ export class WorkStore {
         | { owner: string; purpose: string; claimed_at: string }
         | undefined;
       if (!row) continue; // released between the two statements: try again
-      if (claimIsStale(row.owner, row.claimed_at, staleAfterMs)) {
+      if (claimOwnerIsDead(row.owner)) {
         const taken = this.db
           .prepare(`UPDATE work_claims SET owner = ?, purpose = ?, claimed_at = ? WHERE work_id = ? AND owner = ?`)
           .run(token, purpose, now(), workId, row.owner);
@@ -484,10 +492,10 @@ export class WorkStore {
   }
 }
 
-function claimIsStale(owner: string, claimedAt: string, staleAfterMs: number): boolean {
-  if (Date.now() - Date.parse(claimedAt) > staleAfterMs) return true;
+/** True only when the process that holds the claim is confirmed gone. Age alone never qualifies. */
+function claimOwnerIsDead(owner: string): boolean {
   const pid = Number(owner.split(':')[0]);
-  if (!Number.isInteger(pid) || pid <= 0) return true;
+  if (!Number.isInteger(pid) || pid <= 0) return true; // not a token we issued: nobody can be defending it
   try {
     process.kill(pid, 0); // signal 0 only checks that the process exists
     return false;

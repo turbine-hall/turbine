@@ -61,25 +61,18 @@ export function satisfies(installed: string, declared: string): Relation {
   const spec = declared.trim();
   if (!v || !spec) return 'unchecked'; // prerelease/build versions and empty specs are not judged
   if (spec === '*' || spec === 'x') return 'match';
-  const alternatives = spec.split('||').map((s) => s.trim());
-  let understood = true;
-  for (const alt of alternatives) {
-    // "1.2.3 - 2.0.0" hyphen ranges and anything with letters other than a plain version (a leading v/V is fine) are not judged.
-    if (/\s-\s/.test(alt) || /[a-uw-zA-UW-Z:/@]/.test(alt) || /[xX*]/.test(alt)) {
-      understood = false;
-      continue;
-    }
+  // Every arm of a union must be understood before any arm may decide: an unsupported arm could be the
+  // one that matches, so one unsupported arm makes the whole range unchecked.
+  const arms: Array<Array<(v: V) => boolean>> = [];
+  for (const alt of spec.split('||').map((s) => s.trim())) {
+    // "1.2.3 - 2.0.0" hyphen ranges and anything with letters other than a plain version (a leading v/V is fine)
+    // are not judged.
+    if (/\s-\s/.test(alt) || /[a-uw-zA-UW-Z:/@]/.test(alt) || /[xX*]/.test(alt)) return 'unchecked';
     const tokens = alt.replace(/(\^|~|>=|<=|>|<|=)\s+/g, '$1').split(/\s+/).filter(Boolean);
-    if (!tokens.length) {
-      understood = false;
-      continue;
-    }
+    if (!tokens.length) return 'unchecked';
     const tests = tokens.map(comparator);
-    if (tests.some((t) => t === null)) {
-      understood = false;
-      continue;
-    }
-    if (tests.every((t) => t!(v))) return 'match';
+    if (tests.some((t) => t === null)) return 'unchecked';
+    arms.push(tests as Array<(v: V) => boolean>);
   }
-  return understood ? 'mismatch' : 'unchecked';
+  return arms.some((tests) => tests.every((t) => t(v))) ? 'match' : 'mismatch';
 }

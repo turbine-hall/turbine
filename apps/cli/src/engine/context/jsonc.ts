@@ -16,8 +16,12 @@ const TOKEN = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null/y;
 
 export function parseJsonc(input: string): Jsonc {
   const text = input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
+  // LF, CRLF and bare CR all end a line; CRLF counts once.
   const lineStarts = [0];
-  for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 10) lineStarts.push(i + 1);
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 10 || (c === 13 && text.charCodeAt(i + 1) !== 10)) lineStarts.push(i + 1);
+  }
   const lineOf = (offset: number): number => {
     let lo = 0;
     let hi = lineStarts.length - 1;
@@ -51,6 +55,15 @@ export function parseJsonc(input: string): Jsonc {
     }
     return n?.range;
   };
+  const deletePosition = (path: Array<string | number>) => {
+    if (!path.length) return;
+    let n: Node | undefined = trie;
+    for (const k of path.slice(0, -1)) {
+      n = n.kids?.get(k);
+      if (!n) return;
+    }
+    n?.kids?.delete(path[path.length - 1]!);
+  };
   let i = 0;
 
   const fail = (msg: string): never => {
@@ -61,7 +74,7 @@ export function parseJsonc(input: string): Jsonc {
       const c = text[i];
       if (c === ' ' || c === '\t' || c === '\n' || c === '\r') i++;
       else if (c === '/' && text[i + 1] === '/') {
-        while (i < text.length && text[i] !== '\n') i++;
+        while (i < text.length && text[i] !== '\n' && text[i] !== '\r') i++;
       } else if (c === '/' && text[i + 1] === '*') {
         const end = text.indexOf('*/', i + 2);
         if (end < 0) fail('Unterminated comment');
@@ -74,7 +87,7 @@ export function parseJsonc(input: string): Jsonc {
     i++;
     while (i < text.length && text[i] !== '"') {
       if (text[i] === '\\') i++;
-      if (text[i] === '\n') fail('Unterminated string');
+      if (text[i] === '\n' || text[i] === '\r') fail('Unterminated string');
       i++;
     }
     if (text[i] !== '"') fail('Unterminated string');
@@ -101,6 +114,8 @@ export function parseJsonc(input: string): Jsonc {
         if (text[i] !== ':') fail('Expected ":"');
         i++;
         const child = [...path, key];
+        // A duplicate member replaces the earlier one, so the earlier value's positions (and its children's) go.
+        deletePosition(child);
         const v = value(child);
         // defineProperty: a member named "__proto__" must be an own property, never the prototype.
         Object.defineProperty(obj, key, { value: v, enumerable: true, writable: true, configurable: true });
@@ -133,7 +148,10 @@ export function parseJsonc(input: string): Jsonc {
     const m = TOKEN.exec(text);
     if (!m) return fail('Unexpected token');
     i += m[0].length;
-    return JSON.parse(m[0]);
+    const n: unknown = JSON.parse(m[0]);
+    // 1e400 parses to Infinity, which is not a JSON value a manifest can meaningfully state: refuse it
+    if (typeof n === 'number' && !Number.isFinite(n)) return fail('Number out of range');
+    return n;
   };
 
   const root = value([]);

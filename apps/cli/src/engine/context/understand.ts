@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { lstatSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { err, shortSnapshotId, type RepoSnapshot, type SnapshotDiff } from '@turbine-hall/turbine-contracts';
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
@@ -23,13 +23,23 @@ export type RepoHead = { repoRoot: string; head: string };
 /** The repository root and HEAD commit of a project, or the reason there is none. */
 export type NoHead = { error: 'not-a-repo' | 'no-commits' } | { error: 'broken-head'; reason: string };
 
+/** True if a directory entry exists at `path`, including a dangling symlink (lstat, not stat). */
+function entryExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function repoHead(projectRoot: string): RepoHead | NoHead {
   const repoRoot = repoToplevel(projectRoot);
   if (!repoRoot) {
     // git could not find a repository. If a .git entry exists on the way up, the repository is
     // there but unreadable (corrupt, bad permissions, ...): a failure, not "not a repository".
     for (let dir = resolve(projectRoot); ; dir = dirname(dir)) {
-      if (existsSync(join(dir, '.git'))) return { error: 'broken-head', reason: `${join(dir, '.git')} exists but git cannot open the repository` };
+      if (entryExists(join(dir, '.git'))) return { error: 'broken-head', reason: `${join(dir, '.git')} exists but git cannot open the repository` };
       if (dirname(dir) === dir) break;
     }
     return { error: 'not-a-repo' };
@@ -66,6 +76,11 @@ export function buildOrThrow(
   }
 }
 
+/**
+ * Build (or reuse) the snapshot for `at`. Nothing is stored here: a built snapshot is recorded only by
+ * `publishFresh`, after its generated files have been written, so the store never claims a snapshot
+ * whose files do not exist.
+ */
 export function ensureFreshSnapshot(
   store: WorkStore,
   projectRoot: string,
@@ -81,10 +96,35 @@ export function ensureFreshSnapshot(
   if (previous && previous.commit === at.head) return { status: 'current', snapshot: previous };
 
   const snapshot = buildOrThrow(at, previous, build);
-  store.saveSnapshot(snapshot, projectRoot);
   return previous
     ? { status: 'rebuilt', snapshot, previous, diff: diffSnapshots(previous, snapshot) }
     : { status: 'built', snapshot };
+}
+
+/**
+ * Publish a snapshot: write the generated files (or repair them), then record the snapshot in the store.
+ * The files are written under the publish lock and only while HEAD is still the snapshot's commit; if HEAD
+ * moved, nothing is published and the caller must rebuild. Returns the files written.
+ */
+export function publishFresh(store: WorkStore, projectRoot: string, fresh: FreshSnapshot): string[] {
+  const commit = fresh.snapshot.commit;
+  const stillCurrent = () => {
+    const h = repoHead(projectRoot);
+    return !('error' in h) && h.head === commit;
+  };
+  let written: string[];
+  try {
+    if (fresh.status === 'current' && contextFilesCurrent(projectRoot, fresh.snapshot)) {
+      // Nothing to regenerate, but an earlier run may have stopped before the ignore rule was added.
+      written = ensureContextIgnored(projectRoot) ? [join(projectRoot, '.turbine', '.gitignore')] : [];
+    } else {
+      written = writeContextFiles(projectRoot, fresh.snapshot, stillCurrent);
+    }
+  } catch (e) {
+    throw err('E_CONTEXT_UNAVAILABLE', `Project context could not be published for ${commit.slice(0, 8)}: ${(e as Error).message}`, { commit });
+  }
+  if (fresh.status !== 'current') store.saveSnapshot(fresh.snapshot, projectRoot);
+  return written;
 }
 
 export type UnderstandOutcome = FreshSnapshot & {
@@ -113,20 +153,8 @@ export function understandProject(store: WorkStore, projectRoot: string): Unders
   }
   const fresh = ensureFreshSnapshot(store, projectRoot, at);
   const dirty = hasUncommittedChanges(at.repoRoot);
-  if (fresh.status === 'current') {
-    if (contextFilesCurrent(projectRoot, fresh.snapshot)) {
-      // Nothing to regenerate, but an earlier run may have stopped before the ignore rule was added.
-      return { ...fresh, dirty, written: ensureContextIgnored(projectRoot) ? [join(projectRoot, '.turbine', '.gitignore')] : [], repaired: false };
-    }
-    return { ...fresh, dirty, written: writeContextFiles(projectRoot, fresh.snapshot), repaired: true };
-  }
-  return { ...fresh, dirty, written: writeContextFiles(projectRoot, fresh.snapshot), repaired: false };
-}
-
-/** Keep the generated files in step with the store after a task command refreshed the snapshot. */
-export function refreshContextFiles(projectRoot: string, fresh: FreshSnapshot): void {
-  if (fresh.status !== 'current' || !contextFilesCurrent(projectRoot, fresh.snapshot)) writeContextFiles(projectRoot, fresh.snapshot);
-  else ensureContextIgnored(projectRoot);
+  const repaired = fresh.status === 'current' && !contextFilesCurrent(projectRoot, fresh.snapshot);
+  return { ...fresh, dirty, written: publishFresh(store, projectRoot, fresh), repaired };
 }
 
 const MAX_DIFF_LINES = 80;

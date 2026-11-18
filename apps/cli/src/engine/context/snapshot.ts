@@ -38,6 +38,7 @@ const SOURCE_SCOPE = 'tracked source files (*.ts, *.tsx, *.js, *.jsx, *.mjs, *.c
 const LOCKFILES = ['pnpm-lock.yaml', 'npm-shrinkwrap.json', 'package-lock.json', 'yarn.lock', 'bun.lock', 'bun.lockb'] as const;
 const ROOT_CONFIGS = new Set([
   'pnpm-workspace.yaml',
+  'package.yaml',
   '.nvmrc',
   '.node-version',
   '.editorconfig',
@@ -125,6 +126,8 @@ class Builder {
   private readonly keys = new Set<string>();
   readonly byPath = new Map<string, TreeEntry>();
   blobs = new Map<string, Buffer>();
+  /** Paths whose content may be stated: the config files admitted within the byte budget. */
+  admitted = new Set<string>();
   undecodable = 0;
 
   constructor(
@@ -149,8 +152,9 @@ class Builder {
   text(path: string): string | undefined {
     const e = this.byPath.get(path);
     // A symlink's blob is its target path; it is not the file's content and may share a blob id
-    // with a regular file, so it is never read as configuration.
-    if (!e || e.mode === '120000') return undefined;
+    // with a regular file, so it is never read as configuration. A file that the budget did not
+    // admit is not read even when its blob is present because another path shares it.
+    if (!e || e.mode === '120000' || !this.admitted.has(path)) return undefined;
     return this.blobs.get(e.id)?.toString('utf8');
   }
 
@@ -324,6 +328,7 @@ export function buildSnapshot(repoRoot: string, commit: string): RepoSnapshot {
     sourceBytes += e.size;
     sources.push(e);
   }
+  b.admitted = new Set(configs.map((e) => e.path));
   const toRead = [...configs, ...sources];
   const sizes = new Map(toRead.map((e) => [e.id, e.size]));
   b.blobs = readBlobs(
@@ -357,16 +362,24 @@ export function buildSnapshot(repoRoot: string, commit: string): RepoSnapshot {
 
 function layoutFacts(b: Builder, entries: TreeEntry[]): void {
   const top = listTopLevel(b.repoRoot, b.commit);
+  // Blob counts per top-level directory, computed in one pass over the tree.
+  const filesUnder = new Map<string, number>();
+  for (const e of entries) {
+    if (e.type !== 'blob') continue;
+    const first = e.path.split('/')[0]!;
+    if (first !== e.path) filesUnder.set(first, (filesUnder.get(first) ?? 0) + 1);
+  }
+  const blobs = entries.filter((e) => e.type === 'blob').length;
   b.fact({
     key: 'layout:.',
     category: 'layout',
-    statement: `${entries.filter((e) => e.type === 'blob').length} tracked files in ${top.length} top-level entries`,
-    data: { files: entries.filter((e) => e.type === 'blob').length, topLevelEntries: top.length },
+    statement: `${blobs} tracked files in ${top.length} top-level entries`,
+    data: { files: blobs, topLevelEntries: top.length },
     source: b.treeSource(),
   });
   for (const e of top) {
     if (e.type === 'tree') {
-      const files = entries.filter((x) => x.type === 'blob' && x.path.startsWith(`${e.path}/`)).length;
+      const files = filesUnder.get(e.path) ?? 0;
       b.fact({
         key: `layout:${e.path}`,
         category: 'layout',
@@ -414,6 +427,12 @@ function findWorkspaces(b: Builder, root: Pkg | null, regular: TreeEntry[]): Pkg
   let declarationSource: FactSource | undefined;
 
   const pnpmText = b.text('pnpm-workspace.yaml');
+  if (b.byPath.has('pnpm-workspace.yaml') && pnpmText === undefined) {
+    // The file exists but was not read (over the size limit, or a symlink). It may be the one that decides,
+    // so membership is unknown; the manifest's workspaces field must not stand in for it.
+    b.unconfirm('workspace:unreadable', '`pnpm-workspace.yaml` is tracked but was not read, so workspace membership is unknown', 'pnpm workspace file not read', b.source('pnpm-workspace.yaml'));
+    return [];
+  }
   if (pnpmText !== undefined) {
     const y = parseYamlLines(pnpmText);
     if (y.errors.length) {
@@ -438,6 +457,12 @@ function findWorkspaces(b: Builder, root: Pkg | null, regular: TreeEntry[]): Pkg
     }
   }
   if (!declaredBy || !declarationSource) return [];
+  if (declaredBy === 'package.json workspaces' && patterns.some((p) => p.startsWith('!'))) {
+    // npm applies inclusions and exclusions in list order. That order is not evaluated here, so membership
+    // is not stated for any package rather than risk confirming one an exclusion removes.
+    b.unconfirm('workspace:negation-order', 'package.json workspaces uses exclusion patterns, whose order is not evaluated, so workspace membership is unknown', 'exclusion order not evaluated', declarationSource);
+    return [];
+  }
 
   b.fact({
     key: 'workspace:declaration',
@@ -641,10 +666,22 @@ function nodeVersionFacts(b: Builder): void {
   for (const file of ['.nvmrc', '.node-version']) {
     const text = b.text(file);
     if (text === undefined) continue;
-    const lines = text.split(/\r?\n/);
-    const i = lines.findIndex((l) => l.trim() !== '' && !l.trim().startsWith('#'));
-    if (i < 0) continue;
-    const value = lines[i]!.replace(/\s+#.*$/, '').trim(); // nvm ignores a trailing "# comment"
+    // nvm reads the first word of a line and ignores anything after "#" (even when it touches the version).
+    const selectors = text
+      .split(/\r?\n/)
+      .map((raw, i) => ({ value: raw.replace(/#.*$/, '').trim(), line: i + 1 }))
+      .filter((x) => x.value !== '');
+    if (!selectors.length) continue;
+    if (selectors.length > 1) {
+      b.unconfirm(
+        `unconfirmed:node:${file}`,
+        `\`${file}\` lists ${selectors.length} version selectors, so the Node version it selects is not stated`,
+        'more than one selector',
+        b.source(file, { start: selectors[0]!.line, end: selectors[selectors.length - 1]!.line }),
+      );
+      continue;
+    }
+    const { value, line } = selectors[0]!;
     b.fact({
       key: `version:node:${file}`,
       category: 'version',
@@ -652,7 +689,7 @@ function nodeVersionFacts(b: Builder): void {
         ? `\`${file}\` pins Node \`${value}\``
         : `\`${file}\` selects Node \`${value}\` (a version selector, not an exact pin)`,
       data: { file, version: value },
-      source: b.source(file, { start: i + 1, end: i + 1 }),
+      source: b.source(file, { start: line, end: line }),
     });
   }
 }
@@ -812,6 +849,10 @@ function dependencyFacts(b: Builder, packages: Pkg[], manager: PackageManager): 
           b.dependency({ ...base, installedStatus: 'not-in-lockfile', relation: 'unchecked', statement: `${head}; not found in \`${reader.file}\`` });
           continue;
         }
+        if (found.kind === 'locked' && found.version.trim() === '') {
+          b.dependency({ ...base, installedStatus: 'not-in-lockfile', relation: 'unchecked', statement: `${head}; the lockfile entry has no version, so the installed version is unknown` });
+          continue;
+        }
         const installed = { version: found.version, lockfile: reader.file, source: b.source(reader.file, found.lines) };
         if (found.kind === 'link') {
           b.dependency({ ...base, installed, installedStatus: 'workspace-link', relation: 'unchecked', statement: `${head}; resolved by \`${reader.file}\` to workspace ${found.version}` });
@@ -876,21 +917,19 @@ function countConvention(
 
 const FROM_RE = /^[ \t]*(?:import|export)\s[^;'"`()=]*?\bfrom\s*(['"])([^'"\n]+)\1/gm;
 const SIDE_EFFECT_RE = /^[ \t]*import\s*(['"])([^'"\n]+)\1/gm;
-// `\s*` then an OPTIONAL `(\s*` group: the two whitespace runs can never split the same spaces in two ways.
-const LOOSE_IMPORT_RE = /\b(?:from|import|require)\s*(?:\(\s*)?(['"])[^'"\n]+\1/g;
 
 function conventionFacts(b: Builder, regular: TreeEntry[], sources: TreeEntry[], skipped: number, root: Pkg | null): void {
   // --- measured over the commit's tracked files ---
+  // Import counts come from a TEXTUAL scan of import lines. A textual scan cannot prove it saw every import
+  // (multi-line statements, import(), require()), so these counts are never confirmed. Confirming them needs
+  // a syntax-aware scanner; until then they are reported as unconfirmed counts.
   const relative: Counted[] = [];
   const builtin: Counted[] = [];
-  let unreconciled = 0; // files where the textual scan and a looser scan disagree
   for (const entry of sources) {
     const text = b.blobs.get(entry.id)!.toString('utf8');
-    let seen = 0;
     for (const re of [FROM_RE, SIDE_EFFECT_RE]) {
       re.lastIndex = 0;
       for (let m = re.exec(text); m; m = re.exec(text)) {
-        seen++;
         const spec = m[2]!;
         const at = { text, index: m.index, length: m[0].length };
         if ((spec.startsWith('./') || spec.startsWith('../') || spec === '.' || spec === '..') && !ASSET_EXT.test(spec)) {
@@ -900,18 +939,10 @@ function conventionFacts(b: Builder, regular: TreeEntry[], sources: TreeEntry[],
         }
       }
     }
-    // The scan is textual. It is only called exhaustive if a looser scan (any `from '…'`,
-    // `import '…'`, `import('…')`, `require('…')`) finds exactly the specifiers it counted;
-    // otherwise (several imports on one line, dynamic imports, require) the file is not fully scanned.
-    LOOSE_IMPORT_RE.lastIndex = 0;
-    let loose = 0;
-    while (LOOSE_IMPORT_RE.exec(text)) loose++;
-    if (loose !== seen) unreconciled++;
   }
-  const importScope = SOURCE_SCOPE;
-  const notScanned = skipped + unreconciled + b.undecodable;
-  countConvention(b, { key: 'convention:imports:relative-js-extension', topic: 'relative imports carry a .js extension', noun: 'relative import specifiers', predicate: 'end in .js', items: relative, exhaustive: notScanned === 0, scope: importScope, skipped: notScanned });
-  countConvention(b, { key: 'convention:imports:node-prefix', topic: 'Node built-ins imported with the node: prefix', noun: 'Node built-in imports', predicate: 'use the node: prefix', items: builtin, exhaustive: notScanned === 0, scope: importScope, skipped: notScanned });
+  const importScope = `${SOURCE_SCOPE}; textual scan of import lines, not a parser`;
+  countConvention(b, { key: 'convention:imports:relative-js-extension', topic: 'relative imports carry a .js extension', noun: 'relative import specifiers', predicate: 'end in .js', items: relative, exhaustive: false, scope: importScope, skipped });
+  countConvention(b, { key: 'convention:imports:node-prefix', topic: 'Node built-ins imported with the node: prefix', noun: 'Node built-in imports', predicate: 'use the node: prefix', items: builtin, exhaustive: false, scope: importScope, skipped });
 
   const sourceFiles = regular.filter((e) => SOURCE_EXT.test(e.path));
   countConvention(b, {
@@ -971,15 +1002,33 @@ function prettierConventions(b: Builder, regular: TreeEntry[], root: Pkg | null)
       });
     }
   };
-  // Prettier uses the FIRST config it finds, in this order: the `prettier` key of package.json,
-  // then .prettierrc, .prettierrc.json, .prettierrc.yaml, .prettierrc.yml. Anything after the first
-  // is shadowed: it is a declaration, not what Prettier enforces, so it is never confirmed.
-  // Precedence is decided from what is TRACKED, before asking whether a file could be read.
+  // Prettier's search order: the `prettier` key of package.json, then of package.yaml, then .prettierrc,
+  // .prettierrc.json, .prettierrc.yaml, .prettierrc.yml. The first one found wins; the rest are shadowed.
+  const RC = ['.prettierrc', '.prettierrc.json', '.prettierrc.yaml', '.prettierrc.yml'];
+  // package.yaml: 'unknown' when tracked but unreadable or unparseable (it may or may not set Prettier),
+  // undefined when it does not set Prettier, otherwise its parsed prettier value.
+  let yaml: 'unknown' | { value: Json; lines: (opt: string) => LineRange | undefined } | undefined;
+  if (b.byPath.has('package.yaml')) {
+    const text = b.text('package.yaml');
+    const y = text === undefined ? undefined : parseYamlLines(text);
+    if (!y || y.errors.length) yaml = 'unknown';
+    else if (isObj(y.value) && y.value.prettier !== undefined) yaml = { value: y.value.prettier as Json, lines: (o) => y.lines(['prettier', o]) };
+  }
   const candidates: string[] = [];
   if (root && root.data.prettier !== undefined) candidates.push(root.path);
-  for (const file of ['.prettierrc', '.prettierrc.json', '.prettierrc.yaml', '.prettierrc.yml']) {
-    if (b.byPath.has(file)) candidates.push(file);
+  if (yaml && yaml !== 'unknown') candidates.push('package.yaml');
+  const rcTracked = RC.filter((f) => b.byPath.has(f));
+  if (yaml === 'unknown') {
+    if (!candidates.length && rcTracked.length) {
+      // Whether package.yaml wins is unknown, so no .prettierrc file can be stated to be the one in use.
+      for (const f of rcTracked) {
+        b.unconfirm(`unknown-precedence:prettier:${f}`, `\`${f}\` may be shadowed by package.yaml, whose Prettier setting could not be read, so its values are not stated`, 'package.yaml not read', b.source(f));
+      }
+      return;
+    }
+    b.unconfirm('unparsed:package.yaml', '`package.yaml` is tracked but its Prettier setting could not be read', 'package.yaml not read', b.source('package.yaml'));
   }
+  candidates.push(...rcTracked);
   const [winner, ...shadowed] = candidates;
   for (const file of shadowed) {
     b.unconfirm(
@@ -998,45 +1047,39 @@ function prettierConventions(b: Builder, regular: TreeEntry[], root: Pkg | null)
     }
     return;
   }
+  if (winner === 'package.yaml' && yaml && yaml !== 'unknown') {
+    const p = yaml.value;
+    if (isObj(p)) report('package.yaml', (o) => p[o], yaml.lines);
+    else if (typeof p === 'string') {
+      b.unconfirm('unconfirmed:prettier:package.yaml', `package.yaml uses shared Prettier config \`${p}\`, which is not resolved`, 'shared config not read', b.source('package.yaml'));
+    }
+    return;
+  }
   const text = b.text(winner);
   if (text === undefined) {
     // Tracked but not readable (over the size limit, or a symlink): it still wins, and it was not evaluated.
     b.unconfirm(`unevaluated:prettier:${winner}`, `\`${winner}\` is the Prettier config in use but could not be read, so no formatting convention is stated`, 'Prettier configuration not read', b.source(winner));
     return;
   }
-  // The parser follows the file name, as Prettier's own loaders do. Only the extensionless
-  // `.prettierrc` may be JSON or YAML.
-  const asYaml = winner.endsWith('.yaml') || winner.endsWith('.yml');
+  const unparsed = (message: string) => b.unconfirm(`unparsed:${winner}`, `\`${winner}\` could not be parsed, so nothing is stated from it`, message, b.source(winner));
   let value: unknown;
   let lines: (opt: string) => LineRange | undefined;
-  if (asYaml || winner === '.prettierrc') {
-    let parsed: { value: unknown; lines: (opt: string) => LineRange | undefined } | undefined;
-    if (!asYaml) {
-      try {
-        const jc = parseJsonc(text);
-        parsed = { value: jc.value, lines: (o) => jc.lines([o]) };
-      } catch {
-        /* not JSON: .prettierrc may be YAML */
-      }
-    }
-    if (!parsed) {
-      const y = parseYamlLines(text);
-      if (y.errors.length) {
-        b.unconfirm(`unparsed:${winner}`, `\`${winner}\` could not be parsed, so nothing is stated from it`, y.errors[0]!, b.source(winner));
-        return;
-      }
-      parsed = { value: y.value, lines: (o) => y.lines([o]) };
-    }
-    ({ value, lines } = parsed);
-  } else {
+  if (winner === '.prettierrc.json') {
+    // Strict JSON, as Prettier reads it: comments or trailing commas make the file invalid here too.
     try {
+      JSON.parse(text);
       const jc = parseJsonc(text);
       value = jc.value;
       lines = (o) => jc.lines([o]);
     } catch (e) {
-      b.unconfirm(`unparsed:${winner}`, `\`${winner}\` could not be parsed, so nothing is stated from it`, (e as Error).message, b.source(winner));
-      return;
+      return unparsed((e as Error).message);
     }
+  } else {
+    // .prettierrc, .prettierrc.yaml and .prettierrc.yml are YAML (JSON is a subset of YAML).
+    const y = parseYamlLines(text);
+    if (y.errors.length) return unparsed(y.errors[0]!);
+    value = y.value;
+    lines = (o) => y.lines([o]);
   }
   if (isObj(value)) report(winner, (o) => (value as Json)[o], lines);
 }
@@ -1044,6 +1087,10 @@ function prettierConventions(b: Builder, regular: TreeEntry[], root: Pkg | null)
 function editorconfigConventions(b: Builder): void {
   const text = b.text('.editorconfig');
   if (text === undefined) return;
+  // Settings in file order, with the section each one sits in. A later setting replaces an earlier one
+  // for the same files, so only the effective value of [*] is stated, and only when no other section
+  // sets the same key (that section would override it for some files).
+  const entries: Array<{ key: string; value: string; section: string; line: number }> = [];
   let section = '';
   text.split(/\r?\n/).forEach((raw, i) => {
     const line = raw.trim();
@@ -1053,18 +1100,32 @@ function editorconfigConventions(b: Builder): void {
       return;
     }
     const m = /^([A-Za-z_]+)\s*[=:]\s*(.*)$/.exec(line);
-    if (!m || section !== '*') return;
+    if (!m) return;
     const key = m[1]!.toLowerCase();
-    if (!EDITORCONFIG_KEYS.has(key)) return;
+    if (EDITORCONFIG_KEYS.has(key)) entries.push({ key, value: m[2]!.trim(), section, line: i + 1 });
+  });
+  for (const key of [...new Set(entries.map((e) => e.key))].sort()) {
+    const mine = entries.filter((e) => e.key === key);
+    const global = mine.filter((e) => e.section === '*');
+    if (mine.length !== global.length) {
+      b.unconfirm(
+        `unconfirmed:editorconfig:${key}`,
+        `\`${key}\` is set in .editorconfig for some files but overridden in another section, so no single value is stated`,
+        'overridden by a more specific section',
+        b.source('.editorconfig', { start: mine[0]!.line, end: mine[mine.length - 1]!.line }),
+      );
+      continue;
+    }
+    const effective = global[global.length - 1]!;
     b.convention({
       key: `convention:editorconfig:${key}`,
       topic: `editorconfig ${key}`,
       status: 'confirmed',
       basis: 'config',
-      statement: `\`${key} = ${m[2]!.trim()}\` under [*] in .editorconfig`,
-      source: b.source('.editorconfig', { start: i + 1, end: i + 1 }),
+      statement: `\`${key} = ${effective.value}\` under [*] in .editorconfig`,
+      source: b.source('.editorconfig', { start: effective.line, end: effective.line }),
     });
-  });
+  }
 }
 
 // ------------------------------------------------------------------ diff
