@@ -1,7 +1,7 @@
 import { posix } from 'node:path';
 import type { ImportEdge, ImportKind } from '@turbine-hall/turbine-contracts';
 import { parseJsonc } from './jsonc.js';
-import { scanModule, type ScannedExport } from './js-scan.js';
+import { jsxFile, scanModule, type ScannedExport } from './js-scan.js';
 
 /**
  * The import graph of the files at ONE commit. Every edge is a statement found in a blob at that commit,
@@ -64,19 +64,47 @@ function probe(base: string, files: Set<string>): { path: string; how: string } 
   return undefined;
 }
 
+/** What one `exports` value says for one mode. */
+type Pick = { target: string } | 'blocked' | 'invalid' | 'unmatched';
+
+/** A target Node accepts: relative to the package, starts with `./`, no `..`, no `node_modules`, no pattern. */
+function validTarget(t: string): boolean {
+  return t.startsWith('./') && !t.includes('*') && !t.split('/').some((seg) => seg === '..' || seg.toLowerCase() === 'node_modules');
+}
+
 /**
- * The targets of an `exports` value for one mode. Conditions are tried in the order the manifest writes them and
- * the first one that applies decides (Node's rule), even when its value is `null`: that blocks the package.
- * Applicable here: the mode itself, `default` and `node`. Others (`types`, `browser`, ...) are not claimed.
+ * Node's choice for one `exports` value and one mode:
+ *   - an array: the first valid target wins. An invalid entry is skipped, but a valid target whose file is missing
+ *     is NOT skipped: Node does not fall back to the next entry, it reports the file missing;
+ *   - conditions: in manifest order, the first condition that applies decides. A condition that gives no answer
+ *     (`unmatched`, such as a nested object with no applicable key) is passed over and the next one is tried;
+ *   - `null` anywhere blocks the package. Applicable conditions: the mode itself, `default` and `node`.
  */
-function conditionTargets(value: unknown, mode: 'import' | 'require', depth = 0): string[] {
-  if (typeof value === 'string') return [value];
-  if (Array.isArray(value)) return value.flatMap((v) => conditionTargets(v, mode, depth + 1));
-  if (!isObj(value) || depth > 4) return [];
-  for (const [key, v] of Object.entries(value)) {
-    if (key === mode || key === 'default' || key === 'node') return conditionTargets(v, mode, depth + 1);
+function pickExport(value: unknown, mode: 'import' | 'require', depth = 0): Pick {
+  if (depth > 8) return 'invalid';
+  if (value === null) return 'blocked';
+  if (typeof value === 'string') return validTarget(value) ? { target: value } : 'invalid';
+  if (Array.isArray(value)) {
+    if (value.length === 0) return 'blocked';
+    let skipped = false;
+    for (const v of value) {
+      const r = pickExport(v, mode, depth + 1);
+      if (r === 'unmatched') continue;
+      if (r === 'invalid') {
+        skipped = true;
+        continue;
+      }
+      return r;
+    }
+    return skipped ? 'invalid' : 'unmatched';
   }
-  return [];
+  if (!isObj(value)) return 'invalid';
+  for (const [key, v] of Object.entries(value)) {
+    if (key !== mode && key !== 'default' && key !== 'node') continue;
+    const r = pickExport(v, mode, depth + 1);
+    if (r !== 'unmatched') return r;
+  }
+  return 'unmatched';
 }
 
 export function makeResolver(files: Set<string>, text: (path: string) => string | undefined, workspaces: WorkspacePackage[]): Resolver {
@@ -85,7 +113,7 @@ export function makeResolver(files: Set<string>, text: (path: string) => string 
   /** By package and mode: the same package can have one entry for `import` and another for `require`. */
   const entries = new Map<string, Resolution | undefined>();
 
-  /** The entry file of a workspace package, proven from its package.json (and tsconfig.json) at the commit. */
+  /** The entry file of a workspace package for one mode, proven from its manifest (and tsconfig) at the commit. */
   const workspaceEntry = (pkg: WorkspacePackage, mode: 'import' | 'require'): { to: string; how: string } | undefined => {
     const manifest = pkg.dir === '.' ? 'package.json' : `${pkg.dir}/package.json`;
     const raw = text(manifest);
@@ -98,21 +126,25 @@ export function makeResolver(files: Set<string>, text: (path: string) => string 
     } catch {
       return undefined;
     }
-    const targets: string[] = [];
-    const ex = data.exports;
-    if (ex !== undefined && ex !== null) {
-      // "exports" encapsulates the package: main/module are not consulted when it is present.
-      if (typeof ex === 'string' || Array.isArray(ex)) targets.push(...conditionTargets(ex, mode));
-      else if (isObj(ex)) {
-        const keys = Object.keys(ex);
-        // "exports" is either a map of sub-paths or the conditions of "." directly.
-        if (keys.some((k) => k.startsWith('.'))) targets.push(...conditionTargets(ex['.'], mode));
-        else targets.push(...conditionTargets(ex, mode));
+
+    // With "exports", Node reads only that (main and module are not consulted) and the target must be exactly a file.
+    // Without it, the legacy entries are probed the way Node and TypeScript probe them.
+    const candidates: Array<{ target: string; exact: boolean }> = [];
+    const viaExports = data.exports !== undefined;
+    if (viaExports) {
+      const ex = data.exports;
+      let top: Pick;
+      if (isObj(ex) && Object.keys(ex).some((k) => k.startsWith('.'))) {
+        // a map of sub-paths: the package entry is the "." key
+        top = ex['.'] === undefined ? 'unmatched' : pickExport(ex['.'], mode);
+      } else {
+        top = pickExport(ex, mode);
       }
-      if (!targets.length) return undefined;
+      if (typeof top !== 'object') return undefined; // blocked, invalid or not exported: nothing is claimed
+      candidates.push({ target: top.target, exact: true });
     } else {
-      for (const f of ['module', 'main', 'types', 'typings'] as const) if (typeof data[f] === 'string') targets.push(data[f] as string);
-      if (!targets.length) targets.push('index.js');
+      for (const f of ['module', 'main', 'types', 'typings'] as const) if (typeof data[f] === 'string') candidates.push({ target: data[f] as string, exact: false });
+      if (!candidates.length) candidates.push({ target: 'index.js', exact: false });
     }
 
     const tsconfig = `${pkg.dir === '.' ? '' : `${pkg.dir}/`}tsconfig.json`;
@@ -129,11 +161,11 @@ export function makeResolver(files: Set<string>, text: (path: string) => string 
       }
     }
 
-    for (const target of [...new Set(targets)]) {
+    for (const { target, exact } of candidates) {
       const path = posix.join(pkg.dir, target);
       if (path === '..' || path.startsWith('../')) continue;
-      const direct = probe(path, files);
-      if (direct) return { to: direct.path, how: `entry "${target}" of ${manifest} (${direct.how})` };
+      const direct = exact ? (files.has(path) ? { path, how: 'exact file' } : undefined) : probe(path, files);
+      if (direct) return { to: direct.path, how: `entry "${target}" of ${manifest} (${viaExports ? 'exports' : 'main'}: ${direct.how})` };
       if (outDir && rootDir) {
         const outAbs = posix.join(pkg.dir, outDir);
         const rootAbs = posix.join(pkg.dir, rootDir);
@@ -206,7 +238,7 @@ export function buildGraph(sourcePaths: string[], text: (path: string) => string
   for (const path of sourcePaths) {
     const t = text(path);
     if (t === undefined) continue;
-    const scan = scanModule(t);
+    const scan = scanModule(t, { jsx: jsxFile(path) });
     if (!scan.ok) {
       unreadable.push(path);
       continue;

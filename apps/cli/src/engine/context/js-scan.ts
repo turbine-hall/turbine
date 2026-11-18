@@ -51,7 +51,15 @@ class ScanError extends Error {}
 const REGEX_AFTER_WORD = new Set(['return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'throw', 'case', 'do', 'else', 'yield', 'await']);
 const WORD = /[A-Za-z0-9_$\u0080-\uffff]/;
 
-export function scanModule(input: string): ModuleScan {
+/** Whether a file can contain JSX. TypeScript does not allow JSX in `.ts` files, where `<T>x` is a cast. */
+export function jsxFile(path: string): boolean {
+  return !/\.[cm]?ts$/.test(path);
+}
+
+const JSX_NAME = /[A-Za-z_$][\w$.:-]*/y;
+
+export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }): ModuleScan {
+  const jsx = opts.jsx;
   const s = input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
   const n = s.length;
   const tokens: Tok[] = [];
@@ -174,17 +182,14 @@ export function scanModule(input: string): ModuleScan {
         i = end;
         continue;
       }
+      // A JSX element where an expression may start: its text is not code, its `{ … }` braces are.
+      if (c === '<' && jsx && regexAllowed() && /[A-Za-z_$>]/.test(s[i + 1] ?? '')) {
+        const end = lexJsx(i, out);
+        push('x', '<', i, end);
+        i = end;
+        continue;
+      }
       if (c === '/') {
-        // `</div>` and `</>`: the slash closes a JSX element, it does not start a regular expression. The whole
-        // closing tag is consumed as one token so nothing inside it is read as code.
-        if (prev && prev.t === 'p' && prev.v === '<' && prev.end === i) {
-          const tag = /^\/(?:[A-Za-z_$][\w$.:-]*\s*)?>/.exec(s.slice(i, i + 200));
-          if (tag) {
-            push('p', '>', i, i + tag[0].length);
-            i += tag[0].length;
-            continue;
-          }
-        }
         if (regexAllowed()) {
           const end = skipRegex(i);
           push('x', '/', i, end);
@@ -238,6 +243,79 @@ export function scanModule(input: string): ModuleScan {
       j++;
     }
     return fail('unterminated template literal', i);
+  };
+
+  /**
+   * A JSX element or fragment whose `<` is at `start`. Returns the index after its closing tag. Text between tags is
+   * never read. Braces (in children, attribute values and spread attributes) are JavaScript and go through `lex`,
+   * so their tokens are recorded in `out`. Anything unexpected fails the scan (nothing is stated for the file).
+   */
+  const lexJsx = (start: number, out: Tok[] | null): number => {
+    let i = start + 1;
+    const ws = () => {
+      while (i < n && /\s/.test(s[i]!)) i++;
+    };
+    const name = (): boolean => {
+      JSX_NAME.lastIndex = i;
+      const m = JSX_NAME.exec(s);
+      if (!m) return false;
+      i += m[0].length;
+      return true;
+    };
+    if (s[i] !== '>') {
+      if (!name()) fail('invalid JSX tag', start);
+      for (;;) {
+        ws();
+        if (i >= n) fail('unterminated JSX tag', start);
+        const c = s[i]!;
+        if (c === '/') {
+          if (s[i + 1] !== '>') fail('invalid JSX tag', i);
+          return i + 2;
+        }
+        if (c === '>') break;
+        if (c === '{') {
+          i = lex(i + 1, true, out);
+          continue;
+        }
+        if (!name()) fail('invalid JSX attribute', i);
+        ws();
+        if (s[i] !== '=') continue;
+        i++;
+        ws();
+        const v = s[i];
+        if (v === '"' || v === "'") {
+          const close = s.indexOf(v, i + 1);
+          if (close < 0) fail('unterminated JSX attribute', i);
+          i = close + 1;
+        } else if (v === '{') {
+          i = lex(i + 1, true, out);
+        } else if (v === '<') {
+          i = lexJsx(i, out);
+        } else {
+          fail('invalid JSX attribute value', i);
+        }
+      }
+    }
+    i++; // the `>` of the opening tag, or of a fragment
+    for (;;) {
+      while (i < n && s[i] !== '<' && s[i] !== '{') i++;
+      if (i >= n) fail('unterminated JSX element', start);
+      if (s[i] === '{') {
+        i = lex(i + 1, true, out);
+        continue;
+      }
+      if (s[i + 1] === '/') {
+        i += 2;
+        ws();
+        if (s[i] !== '>') {
+          if (!name()) fail('invalid JSX closing tag', i);
+          ws();
+        }
+        if (s[i] !== '>') fail('invalid JSX closing tag', i);
+        return i + 1;
+      }
+      i = lexJsx(i, out);
+    }
   };
 
   try {

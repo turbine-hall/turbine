@@ -27,7 +27,7 @@ import { packetPaths } from '../../apps/cli/src/engine/packet.js';
 import { computeNextStep } from '../../apps/cli/src/engine/next-step.js';
 import { scanModule } from '../../apps/cli/src/engine/context/js-scan.js';
 import { applyBudget, rankFiles, verifyRelevantFiles, type VerifyInput } from '../../apps/cli/src/engine/context/relevance.js';
-import { makeResolver, modeOf } from '../../apps/cli/src/engine/context/import-graph.js';
+import { makeResolver, modeOf, type WorkspacePackage } from '../../apps/cli/src/engine/context/import-graph.js';
 import { buildTaskContext } from '../../apps/cli/src/engine/context/task-context.js';
 import {
   NOTES_LABEL,
@@ -1177,6 +1177,117 @@ describe('review follow-ups (PR #11): every hole a reviewer found stays closed',
       rmSync(paths.evidenceDir, { force: true });
       await engine.execute(work.id);
       expect(engine.ctx.store.getWork(work.id).currentState).toBe('IMPLEMENTING');
+    });
+  });
+});
+
+// =================================================================== review round 2 (PR #11)
+
+describe('review round 2 (PR #11): exports targets, JSX text, and the fallback rules', () => {
+  const pkgJson = (name: string, extra: Record<string, unknown>) => json({ name, version: '1.0.0', ...extra });
+  const resolverFor = (files: string[], manifests: Record<string, string>, workspaces: WorkspacePackage[]) =>
+    makeResolver(new Set(files), (p) => manifests[p], workspaces);
+
+  describe('an exports value resolves to what Node would load, or to nothing', () => {
+    const files = [
+      'packages/arr/present.cjs',
+      'packages/arr2/present.cjs',
+      'packages/arr2/other.cjs',
+      'packages/nest/cjs.cjs',
+      'packages/nest/esm.mjs',
+      'packages/blocked/esm.mjs',
+      'packages/bare/entry.js',
+      'packages/exact/ghostly.ts',
+      'packages/hidden/old.js',
+    ];
+    const manifests: Record<string, string> = {
+      // a missing first target is NOT skipped: Node reports it missing; no claim for present.cjs
+      'packages/arr/package.json': pkgJson('@w/arr', { exports: { require: ['./missing.cjs', './present.cjs'] } }),
+      // the first valid target wins
+      'packages/arr2/package.json': pkgJson('@w/arr2', { exports: { require: ['./present.cjs', './other.cjs'] } }),
+      // an unmatched nested condition falls through to default
+      'packages/nest/package.json': pkgJson('@w/nest', { exports: { node: { require: './cjs.cjs' }, default: './esm.mjs' } }),
+      // explicit null blocks the package for that mode, and does not fall through
+      'packages/blocked/package.json': pkgJson('@w/blocked', { exports: { import: null, default: './esm.mjs' } }),
+      // a target must start with ./
+      'packages/bare/package.json': pkgJson('@w/bare', { exports: 'entry.js' }),
+      // exports targets are exact files: no extension is added (Node does not do that for exports)
+      'packages/exact/package.json': pkgJson('@w/exact', { exports: './ghostly' }),
+      // exports hides main
+      'packages/hidden/package.json': pkgJson('@w/hidden', { main: 'old.js', exports: { './sub': './sub.js' } }),
+    };
+    const workspaces: WorkspacePackage[] = [
+      { dir: 'packages/arr', name: '@w/arr' },
+      { dir: 'packages/arr2', name: '@w/arr2' },
+      { dir: 'packages/nest', name: '@w/nest' },
+      { dir: 'packages/blocked', name: '@w/blocked' },
+      { dir: 'packages/bare', name: '@w/bare' },
+      { dir: 'packages/exact', name: '@w/exact' },
+      { dir: 'packages/hidden', name: '@w/hidden' },
+    ];
+
+    it('an array: the first valid target is the only candidate; a missing one is not replaced by the next', () => {
+      const r = resolverFor(files, manifests, workspaces);
+      expect(r.resolve('src/a.ts', '@w/arr', 'require')).toEqual({ unresolved: 'package' });
+      expect(r.resolve('src/a.ts', '@w/arr', 'import')).toEqual({ unresolved: 'package' });
+      expect(r.resolve('src/a.ts', '@w/arr2', 'require')).toMatchObject({ to: 'packages/arr2/present.cjs' });
+    });
+
+    it('a nested condition with no answer for this mode falls through to default; an explicit null does not', () => {
+      const r = resolverFor(files, manifests, workspaces);
+      expect(r.resolve('src/a.ts', '@w/nest', 'import')).toMatchObject({ to: 'packages/nest/esm.mjs' });
+      expect(r.resolve('src/a.ts', '@w/nest', 'require')).toMatchObject({ to: 'packages/nest/cjs.cjs' });
+      expect(r.resolve('src/a.ts', '@w/blocked', 'import')).toEqual({ unresolved: 'package' });
+      expect(r.resolve('src/a.ts', '@w/blocked', 'require')).toMatchObject({ to: 'packages/blocked/esm.mjs' });
+    });
+
+    it('a target without ./ is invalid; a target is an exact file; exports hides main', () => {
+      const r = resolverFor(files, manifests, workspaces);
+      expect(r.resolve('src/a.ts', '@w/bare', 'import')).toEqual({ unresolved: 'package' });
+      expect(r.resolve('src/a.ts', '@w/exact', 'import')).toEqual({ unresolved: 'package' });
+      expect(r.resolve('src/a.ts', '@w/hidden', 'import')).toEqual({ unresolved: 'package' });
+    });
+
+    it('the statement mode decides (checked against the file the edge would state)', () => {
+      const all = [...files, 'src/a.ts'];
+      const r = resolverFor(all, manifests, workspaces);
+      expect(r.resolve('src/a.ts', '@w/nest', modeOf('import'))).toMatchObject({ to: 'packages/nest/esm.mjs' });
+      expect(r.resolve('src/a.ts', '@w/nest', modeOf('require'))).toMatchObject({ to: 'packages/nest/cjs.cjs' });
+    });
+  });
+
+  describe('JSX: text is not code, braces are', () => {
+    const imports = (src: string, jsx = true) => {
+      const r = scanModule(src, { jsx });
+      if (!r.ok) throw new Error(r.reason);
+      return r.imports.map((i) => `${i.kind}:${i.specifier}`);
+    };
+
+    it('require() and import written as JSX text states nothing (a planted false import)', () => {
+      expect(imports("export const view = <div>require('./ghost')</div>;")).toEqual([]);
+      expect(imports("export const view = <p>import x from './ghost'</p>;")).toEqual([]);
+      expect(imports("import a from './a';\nexport const view = <div>require('./ghost')</div>;\nimport b from './b';")).toEqual(['import:./a', 'import:./b']);
+    });
+
+    it('a require() inside a JSX brace is code and is stated', () => {
+      expect(imports("export const v = <div>{require('./real')}</div>;")).toEqual(['require:./real']);
+    });
+
+    it('a `<` operator before a `/` is not a closing tag: the regular expression after it is read as one', () => {
+      expect(imports("import a from './a';\nexport const X = ({ x }: { x: string }) => <div>{x</div>/.source}</div>;\nimport b from './b';")).toEqual(['import:./a', 'import:./b']);
+    });
+
+    it('quotes and braces inside attribute values do not end the tag', () => {
+      expect(imports("export const v = <a title=\"x>y {z\">t</a>; import b from './b';")).toEqual(['import:./b']);
+    });
+
+    it('a TypeScript cast in a .ts file is not JSX', () => {
+      expect(imports("const a = <T>x;\nimport b from './b';", false)).toEqual(['import:./b']);
+    });
+
+    it('a JSX shape that cannot be read exactly states nothing for the file', () => {
+      expect(scanModule("export const v = <div>unterminated", { jsx: true }).ok).toBe(false);
+      expect(scanModule("export const v = <div a=\"x></div>", { jsx: true }).ok).toBe(false);
     });
   });
 });
