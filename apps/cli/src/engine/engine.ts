@@ -455,7 +455,7 @@ export class Engine {
         return raw;
       }
     })();
-    const projectEvidence = collectProjectEvidence(this.ctx.projectRoot, `${work.title}\n${sourceText}`);
+    const projectEvidence = collectProjectEvidence(this.ctx.projectRoot, `${work.title}\n${sourceText}`, { store: this.ctx.store });
     const groundedFacts = projectEvidenceFacts(projectEvidence);
     const model = getModel(this.ctx.config.models.profiles.analysis?.model ?? 'mock-default');
     const skill = getSkill(this.ctx.factoryRoot, 'core/assess-requirements');
@@ -843,6 +843,7 @@ export class Engine {
     const projectEvidence = collectProjectEvidence(
       this.ctx.projectRoot,
       `${work.title}\n${specForEvidence ? this.ctx.store.getArtifactContent(specForEvidence.id) : ''}`,
+      { store: this.ctx.store },
     );
     let repoContext = JSON.stringify(projectEvidence, null, 2);
     try {

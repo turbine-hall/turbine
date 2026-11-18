@@ -1,25 +1,30 @@
-import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { shortSnapshotId, type DependencyFact, type RepoSnapshot } from '@turbine-hall/turbine-contracts';
 import { inspectRepo } from '@turbine-hall/turbine-adapter-git';
+import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import type { Fact } from './docs/normalize.js';
+import { hasUncommittedChanges, listTree } from './context/git-read.js';
+import { buildSnapshot } from './context/snapshot.js';
+import { buildOrThrow, ensureFreshSnapshot, refreshContextFiles, repoHead } from './context/understand.js';
 
 /**
- * Deterministic project snapshot for assess/plan. Everything here is read from disk/git,
- * so it is reported as verified facts with a source. It is kept task-relevant: what the
- * project is built with, which scripts exist, and which existing files look related to
- * the request — not a dump of every dependency version.
+ * Project facts for assess/plan. This is a thin wrapper over the commit snapshot
+ * (`engine/context/snapshot.ts`): everything here was read from git objects at one commit, so
+ * it is stated as verified. With a store the snapshot is kept in step with HEAD (a stale one is
+ * rebuilt first; if that fails this throws and the task stops). Declared and installed versions
+ * are reported separately.
  */
 export type ProjectEvidence = {
   projectRoot: string;
   collectedAt: string;
   git?: { branch: string; head: string; dirty: boolean };
+  snapshot?: { hash: string; commit: string };
   packageManager?: string;
   packageName?: string;
   scripts: string[];
-  stack: Array<{ name: string; version: string }>;
+  stack: Array<{ name: string; version: string; installed?: string }>;
   testRunner?: string;
   typescript?: string;
+  typescriptInstalled?: string;
   relatedFiles: string[];
   facts: Fact[];
 };
@@ -33,27 +38,15 @@ const STACK: Array<[string, string]> = [
 const TEST_RUNNERS = ['vitest', 'jest', 'mocha', '@playwright/test', 'cypress'];
 const STOP = new Set(['the', 'and', 'for', 'with', 'from', 'that', 'this', 'into', 'add', 'update', 'make', 'user', 'users', 'can', 'should', 'when', 'will', 'new', 'all', 'not']);
 
-function readJson(path: string): Record<string, unknown> | null {
-  try {
-    return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
 /**
- * Existing tracked files whose path mentions DISTINCTIVE words from the request (cap 12).
+ * Tracked files at the commit whose path mentions DISTINCTIVE words from the request (cap 12).
  * Words are weighted by rarity across the repo (IDF), so common words like "section" or
  * "content" do not pull in unrelated files.
  */
-function relatedFiles(projectRoot: string, requestText: string): string[] {
+function relatedFiles(allFiles: string[], requestText: string): string[] {
   const words = [...new Set(requestText.toLowerCase().match(/[a-z][a-z0-9-]{3,}/g) ?? [])].filter((w) => !STOP.has(w));
   if (!words.length) return [];
-  const r = spawnSync('git', ['ls-files'], { cwd: projectRoot, encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 });
-  if (r.status !== 0) return [];
-  const files = r.stdout
-    .split('\n')
-    .filter((f) => f && !/(^|\/)(node_modules|dist|build|\.next|coverage|public)\//.test(f) && !/\.(lock|png|jpe?g|svg|ico|woff2?|gif|webp|mp4)$/.test(f));
+  const files = allFiles.filter((f) => f && !/(^|\/)(node_modules|dist|build|\.next|coverage|public)\//.test(f) && !/\.(lock|png|jpe?g|svg|ico|woff2?|gif|webp|mp4)$/.test(f));
   if (!files.length) return [];
   const lower = files.map((f) => f.toLowerCase());
   const idf = new Map<string, number>();
@@ -70,7 +63,12 @@ function relatedFiles(projectRoot: string, requestText: string): string[] {
   return scored.filter((x) => x.score >= top * 0.5).slice(0, 12).map((x) => x.f);
 }
 
-export function collectProjectEvidence(projectRoot: string, requestText = ''): ProjectEvidence {
+function describe(d: DependencyFact): string {
+  return `${d.declared.spec}${d.installed ? `, installed ${d.installed.version}` : ''}`;
+}
+
+/** Evidence from the snapshot (and live git state). Throws if the project facts cannot be made current. */
+export function collectProjectEvidence(projectRoot: string, requestText = '', opts: { store?: WorkStore } = {}): ProjectEvidence {
   const facts: Fact[] = [];
   const ev: ProjectEvidence = {
     projectRoot,
@@ -80,41 +78,88 @@ export function collectProjectEvidence(projectRoot: string, requestText = ''): P
     relatedFiles: [],
     facts,
   };
-  try {
-    const git = inspectRepo(projectRoot);
-    ev.git = { branch: git.branch, head: git.head, dirty: git.dirty };
-    facts.push({ text: `Base branch is ${git.branch} at ${git.head.slice(0, 8)}${git.dirty ? ' (main checkout has uncommitted changes)' : ''}`, source: 'git' });
-  } catch {
-    facts.push({ text: 'Project is not a git repository', source: 'git' });
+  const at = repoHead(projectRoot);
+  if ('error' in at) {
+    facts.push({
+      text: at.error === 'not-a-repo' ? 'Project is not a git repository' : 'Repository has no commits yet, so no project facts can be stated',
+      source: 'git',
+    });
+    return ev;
   }
 
-  const pkg = readJson(join(projectRoot, 'package.json'));
-  if (pkg) {
-    const deps = { ...((pkg.dependencies as Record<string, string>) ?? {}), ...((pkg.devDependencies as Record<string, string>) ?? {}) };
-    ev.packageName = typeof pkg.name === 'string' ? pkg.name : undefined;
-    ev.scripts = Object.keys((pkg.scripts as Record<string, string>) ?? {});
-    for (const [dep, name] of STACK) {
-      if (deps[dep] && !ev.stack.some((s) => s.name === name)) ev.stack.push({ name, version: deps[dep]! });
-    }
-    ev.testRunner = TEST_RUNNERS.find((t) => deps[t]);
-    ev.typescript = deps.typescript;
-    if (ev.stack.length) facts.push({ text: `Built with ${ev.stack.map((s) => `${s.name} ${s.version}`).join(', ')}`, source: 'package.json' });
-    const useful = ev.scripts.filter((s) => /^(lint|test|typecheck|type-check|build|e2e|check)/.test(s));
-    if (useful.length) facts.push({ text: `Scripts available: ${useful.join(', ')}`, source: 'package.json' });
-    if (ev.testRunner) facts.push({ text: `Test runner: ${ev.testRunner}`, source: 'package.json' });
+  let snapshot: RepoSnapshot;
+  if (opts.store) {
+    const fresh = ensureFreshSnapshot(opts.store, projectRoot, at);
+    refreshContextFiles(projectRoot, fresh);
+    snapshot = fresh.snapshot;
+  } else {
+    snapshot = buildOrThrow(at, null, buildSnapshot);
+  }
+  ev.snapshot = { hash: snapshot.hash, commit: snapshot.commit };
+
+  const dirty = hasUncommittedChanges(at.repoRoot);
+  try {
+    const git = inspectRepo(projectRoot);
+    ev.git = { branch: git.branch, head: at.head, dirty };
+    facts.push({ text: `Base branch is ${git.branch} at ${at.head.slice(0, 8)} (project snapshot ${shortSnapshotId(snapshot.hash)})`, source: 'git' });
+  } catch {
+    facts.push({ text: `Project facts are read from commit ${at.head.slice(0, 8)} (snapshot ${shortSnapshotId(snapshot.hash)})`, source: 'git' });
+  }
+  if (dirty) facts.push({ text: 'Uncommitted changes exist in the main checkout (not included)', source: 'git status' });
+
+  const fact = (key: string) => snapshot.facts.find((f) => f.key === key);
+  const root = fact('package:.');
+  ev.packageName = typeof root?.data?.name === 'string' ? root.data.name : undefined;
+  ev.scripts = snapshot.facts.filter((f) => f.key.startsWith('script:.:')).map((f) => String(f.data?.name));
+
+  // Root dependencies first, then workspace packages.
+  const deps = [...snapshot.dependencies].sort((a, b) => Number(a.workspace !== '.') - Number(b.workspace !== '.'));
+  const find = (name: string) => deps.find((d) => d.name === name && d.section !== 'peerDependencies');
+  for (const [dep, name] of STACK) {
+    const d = find(dep);
+    if (d && !ev.stack.some((s) => s.name === name)) ev.stack.push({ name, version: d.declared.spec, installed: d.installed?.version });
+  }
+  ev.testRunner = TEST_RUNNERS.find((t) => find(t));
+  const ts = find('typescript');
+  ev.typescript = ts?.declared.spec;
+  ev.typescriptInstalled = ts?.installed?.version;
+
+  if (ev.stack.length) {
+    facts.push({
+      text: `Built with ${ev.stack.map((s) => `${s.name} declared ${s.version}${s.installed ? ` (installed ${s.installed})` : ''}`).join(', ')}`,
+      source: 'package.json',
+    });
+  }
+  const useful = ev.scripts.filter((s) => /^(lint|test|typecheck|type-check|build|e2e|check)/.test(s));
+  if (useful.length) facts.push({ text: `Scripts available: ${useful.join(', ')}`, source: 'package.json' });
+  for (const f of snapshot.facts.filter((x) => x.category === 'command')) facts.push({ text: f.statement, source: f.source.path });
+  if (root) {
+    if (ev.testRunner) facts.push({ text: `Test runner: ${ev.testRunner} (${describe(find(ev.testRunner)!)})`, source: 'package.json' });
     else facts.push({ text: 'No JavaScript test runner dependency found', source: 'package.json' });
-    if (ev.typescript) facts.push({ text: `TypeScript ${ev.typescript}`, source: 'package.json' });
   }
-  for (const [file, pm] of [['pnpm-lock.yaml', 'pnpm'], ['package-lock.json', 'npm'], ['yarn.lock', 'yarn'], ['bun.lockb', 'bun']] as const) {
-    if (existsSync(join(projectRoot, file))) {
-      ev.packageManager = pm;
-      facts.push({ text: `Package manager: ${pm}`, source: file });
-      break;
-    }
+  if (ts) facts.push({ text: `TypeScript declared ${describe(ts)}`, source: 'package.json' });
+  const pm = fact('package-manager');
+  const lock = snapshot.facts.find((f) => f.key.startsWith('lockfile:'));
+  if (pm) ev.packageManager = String(pm.data?.name);
+  else if (lock) ev.packageManager = ({ 'pnpm-lock.yaml': 'pnpm', 'package-lock.json': 'npm', 'npm-shrinkwrap.json': 'npm', 'yarn.lock': 'yarn', 'bun.lock': 'bun', 'bun.lockb': 'bun' } as Record<string, string>)[String(lock.data?.file)];
+  if (ev.packageManager) facts.push({ text: `Package manager: ${ev.packageManager}`, source: pm ? 'package.json' : lock!.source.path });
+  const workspaces = snapshot.facts.filter((f) => f.category === 'workspace' && f.key !== 'workspace:declaration');
+  if (workspaces.length) {
+    facts.push({
+      text: `Workspace packages (${workspaces.length}): ${workspaces.slice(0, 8).map((w) => String(w.data?.dir)).join(', ')}${workspaces.length > 8 ? `, +${workspaces.length - 8} more` : ''}`,
+      source: fact('workspace:declaration')?.source.path ?? 'package.json',
+    });
   }
-  ev.relatedFiles = relatedFiles(projectRoot, requestText);
+  for (const d of deps.filter((x) => x.relation === 'mismatch').slice(0, 5)) {
+    facts.push({ text: `Version drift: ${d.name} declared ${d.declared.spec} but installed ${d.installed!.version}`, source: d.installed!.lockfile });
+  }
+
+  ev.relatedFiles = relatedFiles(
+    listTree(at.repoRoot, at.head).map((e) => e.path),
+    requestText,
+  );
   if (ev.relatedFiles.length) {
-    facts.push({ text: `Existing files that look related: ${ev.relatedFiles.slice(0, 6).join(', ')}${ev.relatedFiles.length > 6 ? ` (+${ev.relatedFiles.length - 6})` : ''}`, source: 'git ls-files' });
+    facts.push({ text: `Existing files that look related: ${ev.relatedFiles.slice(0, 6).join(', ')}${ev.relatedFiles.length > 6 ? ` (+${ev.relatedFiles.length - 6})` : ''}`, source: 'git ls-tree' });
   }
   return ev;
 }

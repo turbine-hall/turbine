@@ -7,6 +7,7 @@ import type {
   EngineEvent,
   Evidence,
   RecoveryPlan,
+  RepoSnapshot,
   RoleRun,
   WorkPackage,
 } from '@turbine-hall/turbine-contracts';
@@ -19,6 +20,7 @@ import {
   EngineEventSchema,
   EvidenceSchema,
   RecoveryPlanSchema,
+  RepoSnapshotSchema,
   RoleRunSchema,
   WorkPackageSchema,
   createId,
@@ -383,6 +385,34 @@ export class WorkStore {
     if (rows.length === 0) return null;
     const plans = rows.map((r) => RecoveryPlanSchema.parse(JSON.parse(r.data)));
     return plans.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] ?? null;
+  }
+
+  /**
+   * Store a repository snapshot. The schema re-checks the hash, so only a snapshot whose
+   * content matches its hash can be stored. Saving a hash again moves it to "latest" for the repo.
+   */
+  saveSnapshot(snapshot: RepoSnapshot, repoPath: string): void {
+    const parsed = RepoSnapshotSchema.parse(snapshot);
+    // REPLACE deletes the old row and inserts a new one in a single statement, so a re-saved
+    // hash gets a fresh rowid and becomes the latest for this repository.
+    this.db
+      .prepare(`INSERT OR REPLACE INTO repo_snapshots(hash, repo_path, "commit", data, created_at) VALUES (?, ?, ?, ?, ?)`)
+      .run(parsed.hash, repoPath, parsed.commit, JSON.stringify(parsed), now());
+  }
+
+  getSnapshot(hash: string): RepoSnapshot | null {
+    const row = this.db.prepare(`SELECT data FROM repo_snapshots WHERE hash = ?`).get(hash) as
+      | { data: string }
+      | undefined;
+    return row ? RepoSnapshotSchema.parse(JSON.parse(row.data)) : null;
+  }
+
+  /** The snapshot most recently saved for this repository path. */
+  getLatestSnapshotFor(repoPath: string): RepoSnapshot | null {
+    const row = this.db
+      .prepare(`SELECT data FROM repo_snapshots WHERE repo_path = ? ORDER BY rowid DESC LIMIT 1`)
+      .get(repoPath) as { data: string } | undefined;
+    return row ? RepoSnapshotSchema.parse(JSON.parse(row.data)) : null;
   }
 
   getBudget(workId: string): { modelCalls: number; estimatedCost: number } {
