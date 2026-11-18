@@ -120,6 +120,19 @@ CREATE TABLE IF NOT EXISTS repo_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_repo_snapshots_repo ON repo_snapshots(repo_path);
+CREATE INDEX IF NOT EXISTS idx_repo_snapshots_hash ON repo_snapshots(hash);
+`,
+  },
+  {
+    version: 3,
+    sql: `
+-- One row per work item that a long-running stage (planning) currently owns.
+CREATE TABLE IF NOT EXISTS work_claims (
+  work_id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  claimed_at TEXT NOT NULL
+);
 `,
   },
 ];

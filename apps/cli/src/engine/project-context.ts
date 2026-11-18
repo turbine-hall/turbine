@@ -1,10 +1,9 @@
-import { shortSnapshotId, type DependencyFact, type RepoSnapshot } from '@turbine-hall/turbine-contracts';
-import { inspectRepo } from '@turbine-hall/turbine-adapter-git';
+import { err, shortSnapshotId, type DependencyFact, type RepoSnapshot } from '@turbine-hall/turbine-contracts';
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import type { Fact } from './docs/normalize.js';
-import { hasUncommittedChanges, listTree } from './context/git-read.js';
+import { hasUncommittedChanges, listTree, observeBranch } from './context/git-read.js';
 import { buildSnapshot } from './context/snapshot.js';
-import { brokenHeadError, buildOrThrow, ensureFreshSnapshot, refreshContextFiles, repoHead } from './context/understand.js';
+import { brokenHeadError, buildOrThrow, ensureFreshSnapshot, refreshContextFiles, repoHead, type RepoHead } from './context/understand.js';
 
 /**
  * Project facts for assess/plan. This is a thin wrapper over the commit snapshot
@@ -21,7 +20,7 @@ export type ProjectEvidence = {
   packageManager?: string;
   packageName?: string;
   scripts: string[];
-  stack: Array<{ name: string; version: string; installed?: string; source: string }>;
+  stack: Array<{ name: string; version: string; installed?: string; source: string; installedSource?: string }>;
   testRunner?: string;
   typescript?: string;
   typescriptInstalled?: string;
@@ -63,6 +62,11 @@ function relatedFiles(allFiles: string[], requestText: string): string[] {
   return scored.filter((x) => x.score >= top * 0.5).slice(0, 12).map((x) => x.f);
 }
 
+/** Where a dependency fact came from: the manifest that declares it, plus the lockfile when it states an installed version. */
+function sourcesOf(d: DependencyFact): string {
+  return d.installed ? `${d.declared.source.path}, ${d.installed.lockfile}` : d.declared.source.path;
+}
+
 function describe(d: DependencyFact): string {
   return `${d.declared.spec} in ${d.declared.source.path}${d.installed ? `, installed ${d.installed.version} per ${d.installed.lockfile}` : ''}`;
 }
@@ -89,26 +93,49 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
     return ev;
   }
 
-  let snapshot: RepoSnapshot;
-  if (opts.store) {
-    const fresh = ensureFreshSnapshot(opts.store, projectRoot, at);
-    refreshContextFiles(projectRoot, fresh);
-    snapshot = fresh.snapshot;
-  } else {
-    snapshot = buildOrThrow(at, null, buildSnapshot);
+  const load = (head: RepoHead): RepoSnapshot => {
+    if (opts.store) {
+      const fresh = ensureFreshSnapshot(opts.store, projectRoot, head);
+      refreshContextFiles(projectRoot, fresh);
+      return fresh.snapshot;
+    }
+    return buildOrThrow(head, null, buildSnapshot);
+  };
+  let snapshot = load(at);
+
+  // Branch and commit come from ONE git observation. If HEAD moved while the snapshot was read, the
+  // snapshot is stale: rebuild it at the commit HEAD is at now. If that cannot be done (or HEAD keeps
+  // moving) the task stops; the old facts are never served.
+  let observed = observeBranch(at.repoRoot);
+  if (observed && observed.commit !== snapshot.commit) {
+    const moved: RepoHead = { repoRoot: at.repoRoot, head: observed.commit };
+    try {
+      snapshot = load(moved);
+    } catch (e) {
+      throw err(
+        'E_CONTEXT_UNAVAILABLE',
+        `HEAD moved from ${at.head.slice(0, 8)} to ${observed.commit.slice(0, 8)} while project facts were read, and rebuilding them failed: ${(e as Error).message}`,
+        { from: at.head, to: observed.commit },
+      );
+    }
+    observed = observeBranch(at.repoRoot);
+    if (!observed || observed.commit !== snapshot.commit) {
+      throw err(
+        'E_CONTEXT_UNAVAILABLE',
+        `HEAD keeps moving (snapshot at ${snapshot.commit.slice(0, 8)}, HEAD is ${observed?.commit.slice(0, 8) ?? 'unreadable'}); project facts cannot be pinned to one commit. Retry when the checkout is quiet.`,
+        { snapshot: snapshot.commit, head: observed?.commit },
+      );
+    }
   }
   ev.snapshot = { hash: snapshot.hash, commit: snapshot.commit };
 
   const dirty = hasUncommittedChanges(at.repoRoot);
-  try {
-    const git = inspectRepo(projectRoot);
-    // Branch and commit come from two separate git calls. They are stated together only if they agree
-    // with the commit the snapshot was built from; otherwise only the snapshot commit is stated.
-    if (git.head !== at.head) throw new Error('HEAD moved while the snapshot was read');
-    ev.git = { branch: git.branch, head: at.head, dirty };
-    facts.push({ text: `Base branch is ${git.branch} at ${at.head.slice(0, 8)} (project snapshot ${shortSnapshotId(snapshot.hash)})`, source: 'git' });
-  } catch {
-    facts.push({ text: `Project facts are read from commit ${at.head.slice(0, 8)} (snapshot ${shortSnapshotId(snapshot.hash)})`, source: 'git' });
+  if (observed?.branch) {
+    ev.git = { branch: observed.branch, head: snapshot.commit, dirty };
+    facts.push({ text: `Base branch is ${observed.branch} at ${snapshot.commit.slice(0, 8)} (project snapshot ${shortSnapshotId(snapshot.hash)})`, source: 'git' });
+  } else {
+    // detached HEAD, or the branch could not be observed together with the commit: state the commit only
+    facts.push({ text: `Project facts are read from commit ${snapshot.commit.slice(0, 8)} (snapshot ${shortSnapshotId(snapshot.hash)})`, source: 'git' });
   }
   if (dirty) facts.push({ text: 'Uncommitted changes exist in the main checkout (not included)', source: 'git status' });
 
@@ -122,7 +149,7 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
   const find = (name: string) => deps.find((d) => d.name === name && d.section !== 'peerDependencies');
   for (const [dep, name] of STACK) {
     const d = find(dep);
-    if (d && !ev.stack.some((s) => s.name === name)) ev.stack.push({ name, version: d.declared.spec, installed: d.installed?.version, source: d.declared.source.path });
+    if (d && !ev.stack.some((s) => s.name === name)) ev.stack.push({ name, version: d.declared.spec, installed: d.installed?.version, source: d.declared.source.path, installedSource: d.installed?.lockfile });
   }
   ev.testRunner = TEST_RUNNERS.find((t) => find(t));
   const ts = find('typescript');
@@ -132,7 +159,7 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
   if (ev.stack.length) {
     facts.push({
       text: `Built with ${ev.stack.map((s) => `${s.name} declared ${s.version}${s.installed ? ` (installed ${s.installed})` : ''}`).join(', ')}`,
-      source: [...new Set(ev.stack.map((s) => s.source))].join(', '),
+      source: [...new Set(ev.stack.flatMap((s) => [s.source, ...(s.installedSource ? [s.installedSource] : [])]))].join(', '),
     });
   }
   const useful = ev.scripts.filter((s) => /^(lint|test|typecheck|type-check|build|e2e|check)/.test(s));
@@ -141,11 +168,11 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
   if (root) {
     if (ev.testRunner) {
       const runner = find(ev.testRunner)!;
-      facts.push({ text: `Test runner: ${ev.testRunner} (${describe(runner)})`, source: runner.declared.source.path });
+      facts.push({ text: `Test runner: ${ev.testRunner} (${describe(runner)})`, source: sourcesOf(runner) });
     }
     else facts.push({ text: 'No JavaScript test runner dependency found', source: 'package.json' });
   }
-  if (ts) facts.push({ text: `TypeScript declared ${describe(ts)}`, source: ts.declared.source.path });
+  if (ts) facts.push({ text: `TypeScript declared ${describe(ts)}`, source: sourcesOf(ts) });
   const pm = fact('package-manager');
   const lock = snapshot.facts.find((f) => f.key.startsWith('lockfile:'));
   if (pm) ev.packageManager = String(pm.data?.name);

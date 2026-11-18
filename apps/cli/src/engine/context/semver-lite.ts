@@ -12,7 +12,8 @@ const PARTIAL = /^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$/;
 
 /** Components beyond 2^53 cannot be compared exactly as numbers, so they are not judged. */
 function exact(parts: Array<string | undefined>): boolean {
-  return parts.every((p) => p === undefined || Number.isSafeInteger(Number(p)));
+  // npm's strict SemVer has no leading zeros ("01" is not a valid component).
+  return parts.every((p) => p === undefined || (!/^0\d/.test(p) && Number.isSafeInteger(Number(p))));
 }
 
 function full(v: string): V | null {

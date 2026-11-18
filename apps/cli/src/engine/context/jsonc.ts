@@ -11,6 +11,7 @@ export type Jsonc = {
   lines(path: Array<string | number>): LineRange | undefined;
 };
 
+const MAX_DEPTH = 128;
 const TOKEN = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null/y;
 
 export function parseJsonc(input: string): Jsonc {
@@ -28,8 +29,28 @@ export function parseJsonc(input: string): Jsonc {
     return lo + 1;
   };
 
-  const positions = new Map<string, LineRange>();
-  const keyOf = (path: Array<string | number>) => JSON.stringify(path);
+  // Positions live in a trie, so paths share their prefixes instead of each member storing a copy
+  // of its whole path. Map keys keep strings and numbers apart ("0" is not 0).
+  type Node = { range?: LineRange; kids?: Map<string | number, Node> };
+  const trie: Node = {};
+  const setPosition = (path: Array<string | number>, range: LineRange) => {
+    let n = trie;
+    for (const k of path) {
+      n.kids ??= new Map();
+      let c = n.kids.get(k);
+      if (!c) n.kids.set(k, (c = {}));
+      n = c;
+    }
+    n.range = range;
+  };
+  const getPosition = (path: Array<string | number>): LineRange | undefined => {
+    let n: Node | undefined = trie;
+    for (const k of path) {
+      n = n?.kids?.get(k);
+      if (!n) return undefined;
+    }
+    return n?.range;
+  };
   let i = 0;
 
   const fail = (msg: string): never => {
@@ -61,6 +82,7 @@ export function parseJsonc(input: string): Jsonc {
     return JSON.parse(text.slice(start, i)) as string;
   };
   const value = (path: Array<string | number>): unknown => {
+    if (path.length > MAX_DEPTH) fail('Nested too deeply');
     skip();
     const c = text[i];
     if (c === '{') {
@@ -82,7 +104,7 @@ export function parseJsonc(input: string): Jsonc {
         const v = value(child);
         // defineProperty: a member named "__proto__" must be an own property, never the prototype.
         Object.defineProperty(obj, key, { value: v, enumerable: true, writable: true, configurable: true });
-        positions.set(keyOf(child), { start: lineOf(keyStart), end: lineOf(i - 1) });
+        setPosition(child, { start: lineOf(keyStart), end: lineOf(i - 1) });
         skip();
         if (text[i] === ',') i++;
         else if (text[i] !== '}') fail('Expected "," or "}"');
@@ -100,7 +122,7 @@ export function parseJsonc(input: string): Jsonc {
         const itemStart = i;
         const child = [...path, arr.length];
         arr.push(value(child));
-        positions.set(keyOf(child), { start: lineOf(itemStart), end: lineOf(i - 1) });
+        setPosition(child, { start: lineOf(itemStart), end: lineOf(i - 1) });
         skip();
         if (text[i] === ',') i++;
         else if (text[i] !== ']') fail('Expected "," or "]"');
@@ -117,5 +139,5 @@ export function parseJsonc(input: string): Jsonc {
   const root = value([]);
   skip();
   if (i < text.length) fail('Unexpected content after the JSON value');
-  return { value: root, lines: (path) => positions.get(keyOf(path)) };
+  return { value: root, lines: getPosition };
 }

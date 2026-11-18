@@ -18,7 +18,10 @@ export type TreeEntry = {
 };
 
 function run(cwd: string, args: string[], input?: string | Buffer, maxBuffer = 256 * 1024 * 1024) {
-  const r = spawnSync('git', ['--no-replace-objects', '-c', 'core.quotepath=off', ...args], { cwd, input, maxBuffer });
+  // Never contact a remote while reading: a missing object is an error to report, not something to
+  // fetch lazily (partial clones), and never prompt.
+  const env = { ...process.env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' };
+  const r = spawnSync('git', ['--no-replace-objects', '-c', 'core.quotepath=off', ...args], { cwd, input, maxBuffer, env });
   if (r.error) throw new Error(`git ${args[0]} failed: ${r.error.message}`);
   return { status: r.status ?? 1, stdout: r.stdout as Buffer, stderr: (r.stderr as Buffer).toString('utf8').trim() };
 }
@@ -32,7 +35,9 @@ function must(cwd: string, args: string[], input?: string | Buffer, maxBuffer?: 
 /** Top level of the repository containing `dir`, or null if it is not a git repository. */
 export function repoToplevel(dir: string): string | null {
   const r = run(dir, ['rev-parse', '--show-toplevel']);
-  return r.status === 0 ? r.stdout.toString('utf8').replace(/\r?\n$/, '') : null;
+  // git ends the path with ONE newline; on POSIX a carriage return can be part of the directory name.
+  const eol = process.platform === 'win32' ? /\r?\n$/ : /\n$/;
+  return r.status === 0 ? r.stdout.toString('utf8').replace(eol, '') : null;
 }
 
 /** Full commit id for a revision (default HEAD), or null when it does not resolve (e.g. no commits yet). */
@@ -52,15 +57,39 @@ export type HeadState =
 export function headState(repoRoot: string): HeadState {
   const head = resolveCommit(repoRoot, 'HEAD');
   if (head) return { kind: 'commit', commit: head };
-  const sym = run(repoRoot, ['symbolic-ref', '--quiet', 'HEAD']);
+  // The IMMEDIATE target of HEAD only: following a chain could hide a dangling link as "unborn".
+  const sym = run(repoRoot, ['symbolic-ref', '--no-recurse', '--quiet', 'HEAD']);
   if (sym.status === 0) {
-    const ref = sym.stdout.toString('utf8').replace(/\r?\n$/, '');
+    const ref = sym.stdout.toString('utf8').replace(/\n$/, '');
+    // The target is itself a symbolic ref that does not lead to a commit: not a fresh branch.
+    if (run(repoRoot, ['symbolic-ref', '--quiet', ref]).status === 0) {
+      return { kind: 'broken', reason: `${ref} is a symbolic ref that does not lead to a readable commit` };
+    }
     // `show-ref --verify` exits 1 when the ref does not exist (nothing committed on this branch yet)
     // and 128 when it exists but points at a missing or invalid object (a broken HEAD).
     if (run(repoRoot, ['show-ref', '--verify', '--quiet', ref]).status === 1) return { kind: 'unborn' };
     return { kind: 'broken', reason: `${ref} does not point at a readable commit` };
   }
   return { kind: 'broken', reason: 'HEAD does not point at a readable commit' };
+}
+
+/**
+ * Branch name and commit from ONE git process (`status --branch` prints both from a single
+ * observation), so they can be stated together. branch is undefined for a detached HEAD.
+ */
+export function observeBranch(repoRoot: string): { commit: string; branch?: string } | null {
+  const r = run(repoRoot, ['status', '--porcelain=v2', '--branch', '--untracked-files=no', '-z']);
+  if (r.status !== 0) return null;
+  let commit: string | undefined;
+  let branch: string | undefined;
+  for (const rec of r.stdout.toString('utf8').split('\0')) {
+    if (rec.startsWith('# branch.oid ')) commit = rec.slice('# branch.oid '.length);
+    else if (rec.startsWith('# branch.head ')) {
+      const name = rec.slice('# branch.head '.length);
+      branch = name === '(detached)' ? undefined : name;
+    }
+  }
+  return commit && /^[0-9a-f]{40,64}$/.test(commit) ? { commit, ...(branch ? { branch } : {}) } : null;
 }
 
 export function treeIdOf(repoRoot: string, commit: string): string {

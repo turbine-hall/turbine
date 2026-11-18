@@ -4,7 +4,7 @@
  * contradicts the committed one, a partial convention, version drift, a stale snapshot and a
  * failed rebuild).
  */
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -35,7 +35,7 @@ import {
 import { contextFilesCurrent, contextPaths, lintProjectContext, writeContextFiles } from '../../apps/cli/src/engine/context/render.js';
 import { parseJsonc } from '../../apps/cli/src/engine/context/jsonc.js';
 import { satisfies } from '../../apps/cli/src/engine/context/semver-lite.js';
-import { hasUncommittedChanges, headState, repoToplevel } from '../../apps/cli/src/engine/context/git-read.js';
+import { hasUncommittedChanges, headState, observeBranch, repoToplevel } from '../../apps/cli/src/engine/context/git-read.js';
 import { cleanup, commitIn, git, tempProject } from './fixture.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -232,7 +232,8 @@ describe('criterion 1 — `turbine understand` on a fresh repo builds a snapshot
     const real = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
     const bin = tmp('turbine-ctx-bin-');
     const log = join(bin, 'calls.log');
-    writeFileSync(join(bin, 'git'), `#!/bin/sh\necho "$*" >> "${log}"\nexec "${real}" "$@"\n`);
+    const envLog = join(bin, 'env.log');
+    writeFileSync(join(bin, 'git'), `#!/bin/sh\necho "$*" >> "${log}"\necho "$GIT_NO_LAZY_FETCH" >> "${envLog}"\nexec "${real}" "$@"\n`);
     chmodSync(join(bin, 'git'), 0o755);
     const before = buildSnapshot(dir, head(dir));
     rmSync(join(dir, 'package.json')); // the working tree no longer has it
@@ -249,6 +250,10 @@ describe('criterion 1 — `turbine understand` on a fresh repo builds a snapshot
     expect(calls.filter((c) => c.includes('cat-file'))).toEqual(['--no-replace-objects -c core.quotepath=off cat-file --batch']);
     expect(calls.some((c) => /\b(ls-files|show|diff)\b/.test(c))).toBe(false);
     expect(after.hash).toBe(before.hash);
+    // every git call forbids lazy fetching, so a missing object is reported and never fetched from a remote
+    const envs = readFileSync(envLog, 'utf8').trim().split('\n');
+    expect(envs.length).toBeGreaterThan(0);
+    expect(new Set(envs)).toEqual(new Set(['1']));
   });
 });
 
@@ -862,17 +867,52 @@ describe('review follow-ups (PR #9): every hole a reviewer found stays closed', 
       expect(s.unconfirmed.find((u) => u.key.startsWith('workspace:unsupported-pattern:'))?.statement).toContain('packages/[ab]*');
     });
 
-    it('a hostile pattern cannot cause catastrophic backtracking', () => {
+    it('a hostile pattern cannot cause catastrophic backtracking (matching runs in a child process with a hard timeout)', () => {
       const hostile = `${'*a'.repeat(30)}*b`;
       const deep = `${'a'.repeat(60)}/x`;
-      const started = Date.now();
-      const { s } = snap({
+      // fixture creation is not part of what is timed
+      const dir = newRepo({
         'package.json': json({ name: 'root' }),
         'pnpm-workspace.yaml': `packages:\n  - '${hostile}'\n`,
         [`${deep}/package.json`]: pkg('deep'),
       });
-      expect(Date.now() - started).toBeLessThan(5000);
-      expect(s.facts.some((f) => f.key === `workspace:${deep}`)).toBe(false);
+      const script = join(tmp('turbine-ctx-script-'), 'run.mts');
+      const modulePath = join(factory, 'apps', 'cli', 'src', 'engine', 'context', 'snapshot.ts');
+      writeFileSync(
+        script,
+        `import { buildSnapshot } from ${JSON.stringify(modulePath)};\nconst s = buildSnapshot(${JSON.stringify(dir)}, ${JSON.stringify(head(dir))});\nconsole.log(JSON.stringify(s.facts.some((f) => f.key === ${JSON.stringify(`workspace:${deep}`)})));\n`,
+      );
+      const started = Date.now();
+      const r = spawnSync(join(factory, 'node_modules', '.bin', 'tsx'), [script], { encoding: 'utf8', timeout: 20000, killSignal: 'SIGKILL' });
+      expect(r.error, 'the matcher must finish well inside the timeout').toBeUndefined();
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout.trim()).toBe('false');
+      expect(Date.now() - started).toBeLessThan(20000);
+    });
+
+    it('a wildcard never matches a hidden directory, but an explicit pattern does', () => {
+      const files = {
+        'package.json': json({ name: 'root' }),
+        'packages/ui/package.json': pkg('ui'),
+        'packages/.cache/package.json': pkg('cache'),
+      };
+      const wild = snap({ ...files, 'pnpm-workspace.yaml': "packages:\n  - 'packages/*'\n" }).s;
+      expect(wild.facts.map((f) => f.key)).toContain('workspace:packages/ui');
+      expect(wild.facts.map((f) => f.key)).not.toContain('workspace:packages/.cache');
+      const explicit = snap({ ...files, 'pnpm-workspace.yaml': "packages:\n  - 'packages/.cache'\n" }).s;
+      expect(explicit.facts.map((f) => f.key)).toContain('workspace:packages/.cache');
+    });
+
+    it('an exclusion Turbine cannot evaluate withholds the packages it might affect instead of confirming them', () => {
+      const { s } = snap({
+        'package.json': json({ name: 'root' }),
+        'pnpm-workspace.yaml': "packages:\n  - 'packages/*'\n  - '!packages/[ab]'\n",
+        'packages/a/package.json': json({ name: 'a', dependencies: { foo: '1.0.0' } }),
+      });
+      expect(s.facts.map((f) => f.key)).not.toContain('workspace:packages/a');
+      expect(s.dependencies.some((d) => d.workspace === 'packages/a')).toBe(false);
+      expect(byKey(s.unconfirmed, 'workspace:undetermined:packages/a')?.statement).toContain('exclusion pattern was not evaluated');
+      expect(s.unconfirmed.some((u) => u.key.startsWith('workspace:unsupported-pattern:'))).toBe(true);
     });
   });
 
@@ -1113,9 +1153,9 @@ describe('review follow-ups (PR #9): every hole a reviewer found stays closed', 
       });
       const ev = collectProjectEvidence(dir, '', { store: openStore() });
       const ts = ev.facts.find((f) => f.text.startsWith('TypeScript'))!;
-      expect(ts.source).toBe('packages/web/package.json');
+      expect(ts.source).toBe('packages/web/package.json, package-lock.json');
       expect(ts.text).toBe('TypeScript declared ^5.0.0 in packages/web/package.json, installed 5.5.0 per package-lock.json');
-      expect(ev.facts.find((f) => f.text.startsWith('Test runner'))?.source).toBe('packages/web/package.json');
+      expect(ev.facts.find((f) => f.text.startsWith('Test runner'))?.source).toBe('packages/web/package.json, package-lock.json');
     });
   });
 
@@ -1142,6 +1182,176 @@ describe('review follow-ups (PR #9): every hole a reviewer found stays closed', 
       const resumed = await engine.syncFromMarkdown(work.id);
       expect(resumed.action).toBe('plan');
       expect(engine.ctx.store.getWork(work.id).currentState).toBe('PLAN_REVIEW');
+    });
+  });
+
+  describe('second review round', () => {
+    it('HEAD: a symbolic-ref chain that leads nowhere is broken, not "unborn"; a .git that git cannot open is not "not a repo"', () => {
+      const chain = tmp('turbine-ctx-chain-');
+      git(chain, 'init', '-q', '-b', 'main');
+      git(chain, 'symbolic-ref', 'refs/heads/main', 'refs/heads/gone');
+      expect(headState(chain).kind).toBe('broken');
+
+      const garbage = tmp('turbine-ctx-garbage-');
+      mkdirSync(join(garbage, '.git'));
+      expect(repoHead(garbage)).toMatchObject({ error: 'broken-head' });
+      expect(() => understandProject(openStore(), garbage)).toThrow(/Project facts cannot be read/);
+      const plain = tmp('turbine-ctx-plain-');
+      expect(repoHead(plain)).toEqual({ error: 'not-a-repo' });
+    });
+
+    it('the repository path keeps a trailing carriage return', () => {
+      const odd = join(tmpdir(), `turbine-ctx-cr-${process.pid}\r`);
+      mkdirSync(odd);
+      dirs.push(odd);
+      git(odd, 'init', '-q');
+      expect(repoToplevel(odd)).toBe(realpathSync(odd));
+    });
+
+    it('branch and commit come from one observation; a detached HEAD has no branch', () => {
+      const dir = newRepo(appFiles());
+      const branch = git(dir, 'symbolic-ref', '--short', 'HEAD').stdout.trim();
+      expect(observeBranch(dir)).toEqual({ commit: head(dir), branch });
+      git(dir, 'checkout', '-q', '--detach');
+      expect(observeBranch(dir)).toEqual({ commit: head(dir) });
+      const ev = collectProjectEvidence(dir, '', { store: openStore() });
+      expect(ev.git).toBeUndefined();
+      expect(ev.facts.map((f) => f.text).join('\n')).toContain('Project facts are read from commit');
+    });
+
+    it('jsonc refuses absurd nesting instead of building huge index structures', () => {
+      expect(() => parseJsonc('['.repeat(300) + ']'.repeat(300))).toThrow(/Nested too deeply/);
+      const ok = parseJsonc('{"a":{"b":[1,{"c":2}]}}');
+      expect(ok.lines(['a', 'b', 1, 'c'])).toEqual({ start: 1, end: 1 });
+      expect(ok.lines(['a', 'b', '1'])).toBeUndefined(); // "1" (a key) is not 1 (an index)
+    });
+
+    it('semver-lite: leading zeros are not valid SemVer and are not judged', () => {
+      expect(satisfies('1.2.3', '^01.2.3')).toBe('unchecked');
+      expect(satisfies('1.0.0', '^1.0.0')).toBe('match');
+      expect(satisfies('0.2.0', '^0.2.0')).toBe('match');
+    });
+
+    it('.nvmrc: a trailing comment does not turn an exact pin into a selector', () => {
+      const { s } = snap({ 'package.json': json({ name: 'p' }), '.nvmrc': '22.1.0 # keep CI on this patch\n' });
+      const f = byKey(s.facts, 'version:node:.nvmrc')!;
+      expect(f.statement).toContain('pins Node `22.1.0`');
+      expect(f.source.lines).toEqual({ start: 1, end: 1 });
+    });
+
+    it('the import scan stays fast on a pathological line of whitespace', () => {
+      const { s } = snap({ 'src/a.ts': `import${' '.repeat(200000)}x;\n` });
+      expect(byKey(s.conventions, 'convention:imports:relative-js-extension')).toBeUndefined();
+    });
+
+    it('Prettier: a tracked config that cannot be read still wins; .prettierrc.json is JSON only', () => {
+      const dir = tmp('turbine-ctx-prettier-');
+      git(dir, 'init', '-q');
+      git(dir, 'config', 'user.email', 't@e.c');
+      git(dir, 'config', 'user.name', 'T');
+      writeFileSync(join(dir, 'package.json'), json({ name: 'p' }));
+      writeFileSync(join(dir, 'real.json'), '{ "semi": true }\n');
+      symlinkSync('real.json', join(dir, '.prettierrc')); // tracked, but a symlink: not read
+      writeFileSync(join(dir, '.prettierrc.json'), '{ "semi": false }\n');
+      git(dir, 'add', '.');
+      git(dir, 'commit', '-qm', 'x');
+      const s = buildSnapshot(dir, head(dir));
+      expect(byKey(s.unconfirmed, 'unevaluated:prettier:.prettierrc')).toBeDefined();
+      expect(byKey(s.unconfirmed, 'shadowed:prettier:.prettierrc.json')).toBeDefined();
+      expect(s.conventions.some((c) => c.key.startsWith('convention:prettier:'))).toBe(false);
+
+      const yamlInJson = snap({ 'package.json': json({ name: 'p' }), '.prettierrc.json': 'semi: false\n' }).s;
+      expect(byKey(yamlInJson.unconfirmed, 'unparsed:.prettierrc.json')).toBeDefined();
+      expect(yamlInJson.conventions.some((c) => c.key.startsWith('convention:prettier:'))).toBe(false);
+      const yamlOk = snap({ 'package.json': json({ name: 'p' }), '.prettierrc': 'semi: false\n' }).s;
+      expect(byKey(yamlOk.conventions, 'convention:prettier:.prettierrc:semi')?.status).toBe('confirmed');
+    });
+
+    it('storage: a valid snapshot filed under the wrong hash is rejected', () => {
+      const dir = newRepo(appFiles());
+      const store = openStore();
+      const s1 = buildSnapshot(dir, head(dir));
+      const s2 = buildSnapshot(dir, commitFiles(dir, { 'docs/x.md': '# x\n' }));
+      store.saveSnapshot(s1, dir);
+      store.saveSnapshot(s2, dir);
+      store.db.prepare('UPDATE repo_snapshots SET data = (SELECT data FROM repo_snapshots WHERE hash = ?) WHERE hash = ?').run(s2.hash, s1.hash);
+      expect(() => store.getSnapshot(s1.hash)).toThrow(/actually has hash/);
+      expect(store.getSnapshot(s2.hash)).toEqual(s2);
+      const indexes = (store.db.prepare(`PRAGMA index_list(repo_snapshots)`).all() as Array<{ name: string }>).map((i) => i.name);
+      expect(indexes).toContain('idx_repo_snapshots_hash');
+    });
+
+    it('storage: only one claim on a work item at a time; a dead owner can be replaced; releasing frees it', () => {
+      const store = openStore();
+      const token = store.claimWork('w1', 'planning');
+      expect(store.holdsClaim('w1', token)).toBe(true);
+      expect(() => store.claimWork('w1', 'planning')).toThrowError(expect.objectContaining({ code: 'E_CONCURRENT' }));
+      store.releaseClaim('w1', 'someone-else');
+      expect(store.holdsClaim('w1', token)).toBe(true); // only the owner can release
+      store.releaseClaim('w1', token);
+      const again = store.claimWork('w1', 'planning');
+      store.db.prepare(`UPDATE work_claims SET owner = '2147483646:ghost' WHERE work_id = 'w1'`).run(); // no such process
+      const taken = store.claimWork('w1', 'planning');
+      expect(store.holdsClaim('w1', taken)).toBe(true);
+      expect(store.holdsClaim('w1', again)).toBe(false);
+    });
+
+    it('engine: planning is refused while another attempt owns the task, and the claim is released after a failure', async () => {
+      const dir = tempProject('turbine-ctx-claim-', dirs);
+      const engine = new Engine(openContext(dir));
+      stores.push(engine.ctx.store);
+      const work = engine.createTask({ title: 'Upload sources', text: '# Upload\n\nUsers upload a spreadsheet.', type: 'feature' });
+      await engine.assess(work.id);
+      engine.editRequirements(work.id, {
+        acceptanceCriteria: [{ id: 'ac_1', statement: 'User can upload a spreadsheet', kind: 'behavioral', status: 'confirmed' }],
+        unknowns: [],
+      });
+      const spec = engine.ctx.store.getLatestArtifact(work.id, 'specification')!;
+      engine.approveRequirements(work.id, spec.contentHash, 'pm');
+
+      const other = engine.ctx.store.claimWork(work.id, 'planning');
+      await expect(engine.plan(work.id)).rejects.toMatchObject({ code: 'E_CONCURRENT' });
+      expect(engine.ctx.store.getWork(work.id).currentState).toBe('REQUIREMENTS_APPROVED'); // untouched
+      engine.ctx.store.releaseClaim(work.id, other);
+
+      commitIn(dir, 'src/new.ts', 'export const created = true;\n');
+      destroyBlob(dir, 'src/new.ts');
+      await expect(engine.plan(work.id)).rejects.toMatchObject({ code: 'E_CONTEXT_UNAVAILABLE' });
+      // the failed attempt gave the task back, so a retry is not blocked by a leftover claim
+      const free = engine.ctx.store.claimWork(work.id, 'planning');
+      engine.ctx.store.releaseClaim(work.id, free);
+    });
+
+    it('generated files: markers only count as whole lines; permissions of an existing file are kept; the ignore file is created and ordered rules are honoured', () => {
+      const dir = newRepo(appFiles());
+      initProject({ projectPath: dir, nonInteractive: true });
+      const store = openStore();
+      understandProject(store, dir);
+      const p = contextPaths(dir);
+
+      // a note that merely quotes the marker inside a sentence is not a marker
+      const md = readFileSync(p.project, 'utf8');
+      writeFileSync(p.project, `${md}\nNote: a line ending with <!-- turbine:facts end --> is how a section closes.\n`);
+      expect(lintProjectContext(dir)).toEqual([]);
+      commitFiles(dir, { 'docs/n.md': '# n\n' });
+      understandProject(store, dir);
+      expect(readFileSync(p.project, 'utf8')).toContain('Note: a line ending with');
+
+      // private stays private
+      chmodSync(p.project, 0o600);
+      commitFiles(dir, { 'docs/m.md': '# m\n' });
+      understandProject(store, dir);
+      expect(statSync(p.project).mode & 0o777).toBe(0o600);
+      expect(readdirSync(p.dir).filter((f) => f.endsWith('.tmp'))).toEqual([]); // no temp file is left behind
+
+      // a later rule that un-ignores the directory is repaired; a missing file is created
+      const ignore = join(dir, '.turbine', '.gitignore');
+      writeFileSync(ignore, `${readFileSync(ignore, 'utf8')}!context/\n`);
+      expect(understandProject(store, dir).status).toBe('current');
+      expect(git(dir, 'check-ignore', '-q', '.turbine/context/PROJECT.md').status).toBe(0);
+      rmSync(ignore);
+      understandProject(store, dir);
+      expect(readFileSync(ignore, 'utf8')).toContain('context/');
     });
   });
 });

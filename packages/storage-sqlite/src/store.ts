@@ -26,6 +26,7 @@ import {
   createId,
   err,
 } from '@turbine-hall/turbine-contracts';
+import { randomUUID } from 'node:crypto';
 import type { SqliteDb } from './db.js';
 import { openDatabase } from './db.js';
 
@@ -402,18 +403,63 @@ export class WorkStore {
   }
 
   getSnapshot(hash: string): RepoSnapshot | null {
-    const row = this.db.prepare(`SELECT data FROM repo_snapshots WHERE hash = ? ORDER BY rowid DESC LIMIT 1`).get(hash) as
-      | { data: string }
-      | undefined;
-    return row ? RepoSnapshotSchema.parse(JSON.parse(row.data)) : null;
+    const row = this.db
+      .prepare(`SELECT hash, data FROM repo_snapshots WHERE hash = ? ORDER BY rowid DESC LIMIT 1`)
+      .get(hash) as { hash: string; data: string } | undefined;
+    return row ? this.parseSnapshotRow(row) : null;
   }
 
   /** The snapshot most recently saved for this repository path. */
   getLatestSnapshotFor(repoPath: string): RepoSnapshot | null {
     const row = this.db
-      .prepare(`SELECT data FROM repo_snapshots WHERE repo_path = ? ORDER BY rowid DESC LIMIT 1`)
-      .get(repoPath) as { data: string } | undefined;
-    return row ? RepoSnapshotSchema.parse(JSON.parse(row.data)) : null;
+      .prepare(`SELECT hash, data FROM repo_snapshots WHERE repo_path = ? ORDER BY rowid DESC LIMIT 1`)
+      .get(repoPath) as { hash: string; data: string } | undefined;
+    return row ? this.parseSnapshotRow(row) : null;
+  }
+
+  /** The schema proves the JSON is a valid snapshot; this proves it is the one the row is filed under. */
+  private parseSnapshotRow(row: { hash: string; data: string }): RepoSnapshot {
+    const parsed = RepoSnapshotSchema.parse(JSON.parse(row.data));
+    if (parsed.hash !== row.hash) {
+      throw new Error(`snapshot stored under ${row.hash} actually has hash ${parsed.hash} (the row was replaced or corrupted)`);
+    }
+    return parsed;
+  }
+
+  /**
+   * Claim a work item for a long-running stage. Exactly one caller holds a claim at a time; a claim
+   * whose process is gone (or that is very old) can be taken over. Returns the token to release with.
+   */
+  claimWork(workId: string, purpose: string, staleAfterMs = 30 * 60 * 1000): string {
+    const token = `${process.pid}:${randomUUID()}`;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const inserted = this.db
+        .prepare(`INSERT OR IGNORE INTO work_claims(work_id, owner, purpose, claimed_at) VALUES (?, ?, ?, ?)`)
+        .run(workId, token, purpose, now());
+      if (Number(inserted.changes) === 1) return token;
+      const row = this.db.prepare(`SELECT owner, purpose, claimed_at FROM work_claims WHERE work_id = ?`).get(workId) as
+        | { owner: string; purpose: string; claimed_at: string }
+        | undefined;
+      if (!row) continue; // released between the two statements: try again
+      if (claimIsStale(row.owner, row.claimed_at, staleAfterMs)) {
+        const taken = this.db
+          .prepare(`UPDATE work_claims SET owner = ?, purpose = ?, claimed_at = ? WHERE work_id = ? AND owner = ?`)
+          .run(token, purpose, now(), workId, row.owner);
+        if (Number(taken.changes) === 1) return token;
+        continue;
+      }
+      throw err('E_CONCURRENT', `${row.purpose} is already in progress for ${workId} (started ${row.claimed_at}). Wait for it to finish, then retry.`);
+    }
+    throw err('E_CONCURRENT', `Could not claim ${workId} for ${purpose}; another process is changing it. Retry.`);
+  }
+
+  holdsClaim(workId: string, token: string): boolean {
+    const row = this.db.prepare(`SELECT owner FROM work_claims WHERE work_id = ?`).get(workId) as { owner: string } | undefined;
+    return row?.owner === token;
+  }
+
+  releaseClaim(workId: string, token: string): void {
+    this.db.prepare(`DELETE FROM work_claims WHERE work_id = ? AND owner = ?`).run(workId, token);
   }
 
   getBudget(workId: string): { modelCalls: number; estimatedCost: number } {
@@ -435,5 +481,17 @@ export class WorkStore {
            estimated_cost = estimated_cost + excluded.estimated_cost`,
       )
       .run(workId, modelCalls, estimatedCost);
+  }
+}
+
+function claimIsStale(owner: string, claimedAt: string, staleAfterMs: number): boolean {
+  if (Date.now() - Date.parse(claimedAt) > staleAfterMs) return true;
+  const pid = Number(owner.split(':')[0]);
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  try {
+    process.kill(pid, 0); // signal 0 only checks that the process exists
+    return false;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ESRCH';
   }
 }

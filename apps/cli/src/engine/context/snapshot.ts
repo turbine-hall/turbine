@@ -219,6 +219,8 @@ function expandBraces(p: string, depth = 0): string[] | null {
 
 /** `*` and `?` inside one path segment. Single back-tracking point, so cost is O(pattern x segment). */
 function segmentMatches(pat: string, text: string): boolean {
+  // A wildcard never matches a leading dot (hidden directories); only a pattern that starts with the dot does.
+  if (text.startsWith('.') && !pat.startsWith('.')) return false;
   let p = 0;
   let i = 0;
   let star = -1;
@@ -248,7 +250,7 @@ function pathMatches(pat: string[], segs: string[]): boolean {
     if (known !== undefined) return known;
     let r: boolean;
     if (pi === pat.length) r = si === segs.length;
-    else if (pat[pi] === '**') r = go(pi + 1, si) || (si < segs.length && go(pi, si + 1));
+    else if (pat[pi] === '**') r = go(pi + 1, si) || (si < segs.length && !segs[si]!.startsWith('.') && go(pi, si + 1));
     else r = si < segs.length && segmentMatches(pat[pi]!, segs[si]!) && go(pi + 1, si + 1);
     memo.set(k, r);
     return r;
@@ -296,8 +298,12 @@ export function buildSnapshot(repoRoot: string, commit: string): RepoSnapshot {
   const regular = entries.filter((e) => e.type === 'blob' && e.mode !== '120000' && !inNodeModules(e.path));
   const configs: TreeEntry[] = [];
   let configBytes = 0;
-  for (const e of regular) {
-    if (!(baseName(e.path) === 'package.json' || /^tsconfig(?:\..+)?\.json$/.test(baseName(e.path)) || ROOT_CONFIGS.has(e.path))) continue;
+  // The root manifest is admitted first, so optional files can never use up the budget it needs.
+  const candidates = regular.filter(
+    (e) => baseName(e.path) === 'package.json' || /^tsconfig(?:\..+)?\.json$/.test(baseName(e.path)) || ROOT_CONFIGS.has(e.path),
+  );
+  candidates.sort((x, y) => Number(y.path === 'package.json') - Number(x.path === 'package.json'));
+  for (const e of candidates) {
     if (e.size > MAX_CONFIG_FILE_BYTES || configBytes + e.size > MAX_CONFIG_TOTAL_BYTES) {
       // The root manifest is required for any fact; every other config is optional.
       if (e.path === 'package.json') throw new Error(`package.json is ${e.size} bytes, over the read limit, so a snapshot cannot be built`);
@@ -454,12 +460,24 @@ function findWorkspaces(b: Builder, root: Pkg | null, regular: TreeEntry[]): Pkg
     return matcher;
   };
   const include = patterns.filter((p) => !p.startsWith('!')).map((p) => compile(p, p)).filter((m): m is (dir: string) => boolean => m !== null);
-  const exclude = patterns.filter((p) => p.startsWith('!')).map((p) => compile(p, p.slice(1))).filter((m): m is (dir: string) => boolean => m !== null);
+  const excludeCompiled = patterns.filter((p) => p.startsWith('!')).map((p) => compile(p, p.slice(1)));
+  const exclude = excludeCompiled.filter((m): m is (dir: string) => boolean => m !== null);
+  // An exclusion Turbine cannot evaluate might remove any package: membership is then not known.
+  const unevaluatedExclusion = excludeCompiled.some((m) => m === null);
   const found: Pkg[] = [];
   for (const e of regular) {
     if (baseName(e.path) !== 'package.json' || e.path === 'package.json') continue;
     const dir = e.path.slice(0, -'/package.json'.length);
     if (!include.some((m) => m(dir)) || exclude.some((m) => m(dir))) continue;
+    if (unevaluatedExclusion) {
+      b.unconfirm(
+        `workspace:undetermined:${dir}`,
+        `\`${dir}\` matches a workspace pattern but an exclusion pattern was not evaluated, so it is not stated to be a workspace package and its dependencies are not read`,
+        'unsupported exclusion pattern',
+        b.source(e.path),
+      );
+      continue;
+    }
     const pkg = parseManifest(b, e.path);
     if (!pkg) continue;
     found.push(pkg);
@@ -626,7 +644,7 @@ function nodeVersionFacts(b: Builder): void {
     const lines = text.split(/\r?\n/);
     const i = lines.findIndex((l) => l.trim() !== '' && !l.trim().startsWith('#'));
     if (i < 0) continue;
-    const value = lines[i]!.trim();
+    const value = lines[i]!.replace(/\s+#.*$/, '').trim(); // nvm ignores a trailing "# comment"
     b.fact({
       key: `version:node:${file}`,
       category: 'version',
@@ -858,7 +876,8 @@ function countConvention(
 
 const FROM_RE = /^[ \t]*(?:import|export)\s[^;'"`()=]*?\bfrom\s*(['"])([^'"\n]+)\1/gm;
 const SIDE_EFFECT_RE = /^[ \t]*import\s*(['"])([^'"\n]+)\1/gm;
-const LOOSE_IMPORT_RE = /\b(?:from|import|require)\s*\(?\s*(['"])[^'"\n]+\1/g;
+// `\s*` then an OPTIONAL `(\s*` group: the two whitespace runs can never split the same spaces in two ways.
+const LOOSE_IMPORT_RE = /\b(?:from|import|require)\s*(?:\(\s*)?(['"])[^'"\n]+\1/g;
 
 function conventionFacts(b: Builder, regular: TreeEntry[], sources: TreeEntry[], skipped: number, root: Pkg | null): void {
   // --- measured over the commit's tracked files ---
@@ -955,10 +974,11 @@ function prettierConventions(b: Builder, regular: TreeEntry[], root: Pkg | null)
   // Prettier uses the FIRST config it finds, in this order: the `prettier` key of package.json,
   // then .prettierrc, .prettierrc.json, .prettierrc.yaml, .prettierrc.yml. Anything after the first
   // is shadowed: it is a declaration, not what Prettier enforces, so it is never confirmed.
+  // Precedence is decided from what is TRACKED, before asking whether a file could be read.
   const candidates: string[] = [];
   if (root && root.data.prettier !== undefined) candidates.push(root.path);
   for (const file of ['.prettierrc', '.prettierrc.json', '.prettierrc.yaml', '.prettierrc.yml']) {
-    if (b.text(file) !== undefined) candidates.push(file);
+    if (b.byPath.has(file)) candidates.push(file);
   }
   const [winner, ...shadowed] = candidates;
   for (const file of shadowed) {
@@ -978,22 +998,45 @@ function prettierConventions(b: Builder, regular: TreeEntry[], root: Pkg | null)
     }
     return;
   }
-  const text = b.text(winner)!;
+  const text = b.text(winner);
+  if (text === undefined) {
+    // Tracked but not readable (over the size limit, or a symlink): it still wins, and it was not evaluated.
+    b.unconfirm(`unevaluated:prettier:${winner}`, `\`${winner}\` is the Prettier config in use but could not be read, so no formatting convention is stated`, 'Prettier configuration not read', b.source(winner));
+    return;
+  }
+  // The parser follows the file name, as Prettier's own loaders do. Only the extensionless
+  // `.prettierrc` may be JSON or YAML.
+  const asYaml = winner.endsWith('.yaml') || winner.endsWith('.yml');
   let value: unknown;
   let lines: (opt: string) => LineRange | undefined;
-  try {
-    if (winner.endsWith('.yaml') || winner.endsWith('.yml')) throw new SyntaxError('yaml');
-    const jc = parseJsonc(text);
-    value = jc.value;
-    lines = (o) => jc.lines([o]);
-  } catch {
-    const y = parseYamlLines(text);
-    if (y.errors.length) {
-      b.unconfirm(`unparsed:${winner}`, `\`${winner}\` could not be parsed, so nothing is stated from it`, y.errors[0]!, b.source(winner));
+  if (asYaml || winner === '.prettierrc') {
+    let parsed: { value: unknown; lines: (opt: string) => LineRange | undefined } | undefined;
+    if (!asYaml) {
+      try {
+        const jc = parseJsonc(text);
+        parsed = { value: jc.value, lines: (o) => jc.lines([o]) };
+      } catch {
+        /* not JSON: .prettierrc may be YAML */
+      }
+    }
+    if (!parsed) {
+      const y = parseYamlLines(text);
+      if (y.errors.length) {
+        b.unconfirm(`unparsed:${winner}`, `\`${winner}\` could not be parsed, so nothing is stated from it`, y.errors[0]!, b.source(winner));
+        return;
+      }
+      parsed = { value: y.value, lines: (o) => y.lines([o]) };
+    }
+    ({ value, lines } = parsed);
+  } else {
+    try {
+      const jc = parseJsonc(text);
+      value = jc.value;
+      lines = (o) => jc.lines([o]);
+    } catch (e) {
+      b.unconfirm(`unparsed:${winner}`, `\`${winner}\` could not be parsed, so nothing is stated from it`, (e as Error).message, b.source(winner));
       return;
     }
-    value = y.value;
-    lines = (o) => y.lines([o]);
   }
   if (isObj(value)) report(winner, (o) => (value as Json)[o], lines);
 }

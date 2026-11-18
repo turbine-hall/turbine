@@ -825,6 +825,27 @@ export class Engine {
     planHash: string;
     packetDir: string;
   }> {
+    const first = this.ctx.store.getWork(idOrAlias);
+    if (!['PLAN_REVIEW', 'CHANGES_REQUESTED', 'REQUIREMENTS_APPROVED', 'PLANNING'].includes(first.currentState)) {
+      throw err('E_INVALID_TRANSITION', `Cannot plan from ${first.currentState}; requirements must be approved`);
+    }
+    // PLANNING is also where a task stays when an attempt failed (for example the project facts could not
+    // be refreshed). Only one planning attempt may own the task: a second `sync` while one is running is
+    // refused, and a failed attempt releases its claim so the next `sync` can resume it.
+    const claim = this.ctx.store.claimWork(first.id, 'planning');
+    try {
+      return await this.planClaimed(first.id, claim);
+    } finally {
+      this.ctx.store.releaseClaim(first.id, claim);
+    }
+  }
+
+  private async planClaimed(idOrAlias: string, claim: string): Promise<{
+    work: WorkPackage;
+    plan: unknown;
+    planHash: string;
+    packetDir: string;
+  }> {
     let work = this.ctx.store.getWork(idOrAlias);
     if (work.currentState === 'PLAN_REVIEW' || work.currentState === 'CHANGES_REQUESTED') {
       work = { ...work, currentState: 'PLANNING', updatedAt: now() };
@@ -899,6 +920,10 @@ export class Engine {
     });
     this.ctx.store.incrementBudget(work.id, 1);
 
+    // The model call took a while: only save the plan if this attempt still owns the task.
+    if (!this.ctx.store.holdsClaim(work.id, claim)) {
+      throw err('E_CONCURRENT', `Planning for ${work.id} lost its claim while the model was running; the plan was not saved. Run sync again.`);
+    }
     const planArt = this.saveArtifact({
       workId: work.id,
       type: 'plan',

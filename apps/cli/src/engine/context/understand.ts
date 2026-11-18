@@ -1,4 +1,5 @@
-import { join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { err, shortSnapshotId, type RepoSnapshot, type SnapshotDiff } from '@turbine-hall/turbine-contracts';
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import { hasUncommittedChanges, headState, repoToplevel } from './git-read.js';
@@ -24,7 +25,15 @@ export type NoHead = { error: 'not-a-repo' | 'no-commits' } | { error: 'broken-h
 
 export function repoHead(projectRoot: string): RepoHead | NoHead {
   const repoRoot = repoToplevel(projectRoot);
-  if (!repoRoot) return { error: 'not-a-repo' };
+  if (!repoRoot) {
+    // git could not find a repository. If a .git entry exists on the way up, the repository is
+    // there but unreadable (corrupt, bad permissions, ...): a failure, not "not a repository".
+    for (let dir = resolve(projectRoot); ; dir = dirname(dir)) {
+      if (existsSync(join(dir, '.git'))) return { error: 'broken-head', reason: `${join(dir, '.git')} exists but git cannot open the repository` };
+      if (dirname(dir) === dir) break;
+    }
+    return { error: 'not-a-repo' };
+  }
   const state = headState(repoRoot);
   if (state.kind === 'commit') return { repoRoot, head: state.commit };
   return state.kind === 'unborn' ? { error: 'no-commits' } : { error: 'broken-head', reason: state.reason };
