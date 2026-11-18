@@ -891,7 +891,9 @@ export class Engine {
           : { root: h.repoRoot, head: h.head, branch: observeBranch(h.repoRoot)?.branch, dirty: hasUncommittedChanges(h.repoRoot) };
       return { evidence, info };
     };
-    const pinned = (g: ReturnType<typeof gather>) => !g.info || !g.evidence.snapshot || g.info.head === g.evidence.snapshot.commit;
+    // Evidence without a snapshot has nothing to pin. With a snapshot, an unreadable HEAD (no info) is not a match.
+    const pinned = (g: ReturnType<typeof gather>) =>
+      !g.evidence.snapshot || (g.info !== undefined && g.info.head === g.evidence.snapshot.commit);
     let gathered = gather();
     if (!pinned(gathered)) gathered = gather();
     if (!pinned(gathered)) {

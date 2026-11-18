@@ -1649,7 +1649,9 @@ describe('review round 4 (PR #9): the third review batch stays closed', () => {
 
   // The process-start probe needs `ps`; without it a claim cannot be told from a reused pid, and these tests
   // would assert behaviour that the platform cannot provide.
-  const psAvailable = spawnSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], { encoding: 'utf8' }).stdout.trim() !== '';
+  const psProbe = spawnSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], { encoding: 'utf8' });
+  // A missing ps gives no stdout at all (null), so both the status and the output are checked.
+  const psAvailable = psProbe.status === 0 && (psProbe.stdout ?? '').trim() !== '';
 
   it.skipIf(!psAvailable)('a lock whose owner was reused by another process (start time differs) is taken over', () => {
     const file = join(tmp('turbine-claim-'), 'engine.db');
