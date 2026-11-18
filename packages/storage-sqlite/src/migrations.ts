@@ -110,11 +110,13 @@ CREATE INDEX IF NOT EXISTS idx_events_work ON events(work_id, sequence);
     version: 2,
     sql: `
 CREATE TABLE IF NOT EXISTS repo_snapshots (
-  hash TEXT PRIMARY KEY,
+  hash TEXT NOT NULL,
   repo_path TEXT NOT NULL,
   "commit" TEXT NOT NULL,
   data TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  -- two clones at the same commit share a hash, so a snapshot is keyed by (repository, hash)
+  PRIMARY KEY (repo_path, hash)
 );
 
 CREATE INDEX IF NOT EXISTS idx_repo_snapshots_repo ON repo_snapshots(repo_path);

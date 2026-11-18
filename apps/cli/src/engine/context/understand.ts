@@ -1,7 +1,8 @@
+import { join } from 'node:path';
 import { err, shortSnapshotId, type RepoSnapshot, type SnapshotDiff } from '@turbine-hall/turbine-contracts';
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
-import { hasUncommittedChanges, repoToplevel, resolveCommit } from './git-read.js';
-import { contextFilesCurrent, writeContextFiles } from './render.js';
+import { hasUncommittedChanges, headState, repoToplevel } from './git-read.js';
+import { contextFilesCurrent, ensureContextIgnored, writeContextFiles } from './render.js';
 import { buildSnapshot, diffSnapshots } from './snapshot.js';
 
 /**
@@ -19,11 +20,21 @@ export type FreshSnapshot = {
 export type RepoHead = { repoRoot: string; head: string };
 
 /** The repository root and HEAD commit of a project, or the reason there is none. */
-export function repoHead(projectRoot: string): RepoHead | { error: 'not-a-repo' | 'no-commits' } {
+export type NoHead = { error: 'not-a-repo' | 'no-commits' } | { error: 'broken-head'; reason: string };
+
+export function repoHead(projectRoot: string): RepoHead | NoHead {
   const repoRoot = repoToplevel(projectRoot);
   if (!repoRoot) return { error: 'not-a-repo' };
-  const head = resolveCommit(repoRoot, 'HEAD');
-  return head ? { repoRoot, head } : { error: 'no-commits' };
+  const state = headState(repoRoot);
+  if (state.kind === 'commit') return { repoRoot, head: state.commit };
+  return state.kind === 'unborn' ? { error: 'no-commits' } : { error: 'broken-head', reason: state.reason };
+}
+
+/** A HEAD that exists but cannot be read must stop the task: it is NOT the same as "no commits yet". */
+export function brokenHeadError(at: { reason: string }, projectRoot: string) {
+  return err('E_CONTEXT_UNAVAILABLE', `Project facts cannot be read in ${projectRoot}: ${at.reason}. Repair the repository (for example restore the missing git objects), then run: turbine understand`, {
+    reason: at.reason,
+  });
 }
 
 /** Build the snapshot at `at.head`, or throw a clear error. The previous snapshot is never a fallback. */
@@ -83,6 +94,7 @@ export type UnderstandOutcome = FreshSnapshot & {
 export function understandProject(store: WorkStore, projectRoot: string): UnderstandOutcome {
   const at = repoHead(projectRoot);
   if ('error' in at) {
+    if (at.error === 'broken-head') throw brokenHeadError(at, projectRoot);
     throw err(
       'E_CONTEXT_UNAVAILABLE',
       at.error === 'not-a-repo'
@@ -93,7 +105,10 @@ export function understandProject(store: WorkStore, projectRoot: string): Unders
   const fresh = ensureFreshSnapshot(store, projectRoot, at);
   const dirty = hasUncommittedChanges(at.repoRoot);
   if (fresh.status === 'current') {
-    if (contextFilesCurrent(projectRoot, fresh.snapshot)) return { ...fresh, dirty, written: [], repaired: false };
+    if (contextFilesCurrent(projectRoot, fresh.snapshot)) {
+      // Nothing to regenerate, but an earlier run may have stopped before the ignore rule was added.
+      return { ...fresh, dirty, written: ensureContextIgnored(projectRoot) ? [join(projectRoot, '.turbine', '.gitignore')] : [], repaired: false };
+    }
     return { ...fresh, dirty, written: writeContextFiles(projectRoot, fresh.snapshot), repaired: true };
   }
   return { ...fresh, dirty, written: writeContextFiles(projectRoot, fresh.snapshot), repaired: false };
@@ -102,6 +117,7 @@ export function understandProject(store: WorkStore, projectRoot: string): Unders
 /** Keep the generated files in step with the store after a task command refreshed the snapshot. */
 export function refreshContextFiles(projectRoot: string, fresh: FreshSnapshot): void {
   if (fresh.status !== 'current' || !contextFilesCurrent(projectRoot, fresh.snapshot)) writeContextFiles(projectRoot, fresh.snapshot);
+  else ensureContextIgnored(projectRoot);
 }
 
 const MAX_DIFF_LINES = 80;
@@ -136,6 +152,9 @@ export function formatOutcome(o: UnderstandOutcome): string[] {
 /** `turbine init` on a repository that already has commits. Returns the message to show, or undefined. */
 export function understandOnInit(store: WorkStore, projectRoot: string): string | undefined {
   const at = repoHead(projectRoot);
-  if ('error' in at) return undefined;
+  if ('error' in at) {
+    if (at.error === 'broken-head') throw brokenHeadError(at, projectRoot);
+    return undefined;
+  }
   return formatOutcome(understandProject(store, projectRoot)).join('\n');
 }

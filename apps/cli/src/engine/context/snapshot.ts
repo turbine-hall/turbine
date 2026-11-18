@@ -11,7 +11,7 @@ import {
   type SnapshotDiff,
   type UnconfirmedItem,
 } from '@turbine-hall/turbine-contracts';
-import { listTopLevel, listTree, readBlobs, resolveCommit, treeIdOf, type TreeEntry } from './git-read.js';
+import { listTopLevel, listTreeDetailed, readBlobs, resolveCommit, treeIdOf, type TreeEntry } from './git-read.js';
 import { parseJsonc, type Jsonc, type LineRange } from './jsonc.js';
 import { satisfies } from './semver-lite.js';
 
@@ -30,9 +30,12 @@ import { satisfies } from './semver-lite.js';
 
 const MAX_SOURCE_FILE_BYTES = 1024 * 1024;
 const MAX_SOURCE_TOTAL_BYTES = 256 * 1024 * 1024;
+/** Budget for manifests, lockfiles and other config blobs (these are read in addition to sources). */
+const MAX_CONFIG_FILE_BYTES = 32 * 1024 * 1024;
+const MAX_CONFIG_TOTAL_BYTES = 128 * 1024 * 1024;
 const SOURCE_EXT = /\.(?:[cm]?[jt]sx?)$/;
 const SOURCE_SCOPE = 'tracked source files (*.ts, *.tsx, *.js, *.jsx, *.mjs, *.cjs, *.mts, *.cts) outside node_modules';
-const LOCKFILES = ['pnpm-lock.yaml', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'bun.lock', 'bun.lockb'] as const;
+const LOCKFILES = ['pnpm-lock.yaml', 'npm-shrinkwrap.json', 'package-lock.json', 'yarn.lock', 'bun.lock', 'bun.lockb'] as const;
 const ROOT_CONFIGS = new Set([
   'pnpm-workspace.yaml',
   '.nvmrc',
@@ -92,9 +95,18 @@ type Yaml = { value: unknown; errors: string[]; lines(path: Array<string | numbe
 function parseYamlLines(text: string): Yaml {
   const lc = new LineCounter();
   const doc = parseDocument(text, { lineCounter: lc });
+  const errors = doc.errors.map((e) => e.message);
+  let value: unknown;
+  if (!errors.length) {
+    try {
+      value = doc.toJS(); // can throw, e.g. for an alias bomb or an unresolved alias
+    } catch (e) {
+      errors.push((e as Error).message);
+    }
+  }
   return {
-    value: doc.errors.length ? undefined : doc.toJS(),
-    errors: doc.errors.map((e) => e.message),
+    value,
+    errors,
     lines(path) {
       const node = doc.getIn(path, true);
       if (!isNode(node) || !node.range) return undefined;
@@ -113,6 +125,7 @@ class Builder {
   private readonly keys = new Set<string>();
   readonly byPath = new Map<string, TreeEntry>();
   blobs = new Map<string, Buffer>();
+  undecodable = 0;
 
   constructor(
     readonly repoRoot: string,
@@ -135,7 +148,10 @@ class Builder {
 
   text(path: string): string | undefined {
     const e = this.byPath.get(path);
-    return e ? this.blobs.get(e.id)?.toString('utf8') : undefined;
+    // A symlink's blob is its target path; it is not the file's content and may share a blob id
+    // with a regular file, so it is never read as configuration.
+    if (!e || e.mode === '120000') return undefined;
+    return this.blobs.get(e.id)?.toString('utf8');
   }
 
   private unique(key: string): string {
@@ -162,24 +178,98 @@ class Builder {
   }
 }
 
-function globToRegExp(glob: string): RegExp {
-  let re = '';
-  for (let i = 0; i < glob.length; i++) {
-    const ch = glob[i]!;
-    if (ch === '*') {
-      if (glob[i + 1] === '*') {
-        if (glob[i + 2] === '/') {
-          re += '(?:.*/)?';
-          i += 2;
-        } else {
-          re += '.*';
-          i += 1;
-        }
-      } else re += '[^/]*';
-    } else if (ch === '?') re += '[^/]';
-    else re += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+const MAX_GLOB_LENGTH = 256;
+const MAX_BRACE_EXPANSIONS = 64;
+
+/** Expand `{a,b}` groups into plain alternatives, or null if there are too many / it is malformed. */
+function expandBraces(p: string, depth = 0): string[] | null {
+  const open = p.indexOf('{');
+  if (open < 0) return p.includes('}') ? null : [p];
+  if (depth > 8) return null;
+  let level = 0;
+  let close = -1;
+  const commas: number[] = [];
+  for (let i = open; i < p.length; i++) {
+    const ch = p[i];
+    if (ch === '{') level++;
+    else if (ch === '}') {
+      level--;
+      if (level === 0) {
+        close = i;
+        break;
+      }
+    } else if (ch === ',' && level === 1) commas.push(i);
   }
-  return new RegExp(`^${re}$`);
+  if (close < 0 || commas.length === 0) return null;
+  const alternatives: string[] = [];
+  let from = open + 1;
+  for (const c of [...commas, close]) {
+    alternatives.push(p.slice(from, c));
+    from = c + 1;
+  }
+  const out: string[] = [];
+  for (const alt of alternatives) {
+    const expanded = expandBraces(p.slice(0, open) + alt + p.slice(close + 1), depth + 1);
+    if (!expanded) return null;
+    out.push(...expanded);
+    if (out.length > MAX_BRACE_EXPANSIONS) return null;
+  }
+  return out;
+}
+
+/** `*` and `?` inside one path segment. Single back-tracking point, so cost is O(pattern x segment). */
+function segmentMatches(pat: string, text: string): boolean {
+  let p = 0;
+  let i = 0;
+  let star = -1;
+  let mark = 0;
+  while (i < text.length) {
+    if (p < pat.length && pat[p] === '*') {
+      star = p++;
+      mark = i;
+    } else if (p < pat.length && (pat[p] === '?' || pat[p] === text[i])) {
+      p++;
+      i++;
+    } else if (star >= 0) {
+      p = star + 1;
+      i = ++mark;
+    } else return false;
+  }
+  while (p < pat.length && pat[p] === '*') p++;
+  return p === pat.length;
+}
+
+/** Segment-wise match where a `**` segment is any number (including zero) of directories; memoised. */
+function pathMatches(pat: string[], segs: string[]): boolean {
+  const memo = new Map<number, boolean>();
+  const go = (pi: number, si: number): boolean => {
+    const k = pi * (segs.length + 1) + si;
+    const known = memo.get(k);
+    if (known !== undefined) return known;
+    let r: boolean;
+    if (pi === pat.length) r = si === segs.length;
+    else if (pat[pi] === '**') r = go(pi + 1, si) || (si < segs.length && go(pi, si + 1));
+    else r = si < segs.length && segmentMatches(pat[pi]!, segs[si]!) && go(pi + 1, si + 1);
+    memo.set(k, r);
+    return r;
+  };
+  return go(0, 0);
+}
+
+/**
+ * Compile a workspace pattern (`*`, `?`, `**`, `{a,b}`) into a matcher with bounded cost, or null for
+ * syntax that is not supported (character classes, extglobs, escapes, too many alternatives). There is
+ * no regular expression here, so a repository-controlled pattern cannot cause catastrophic backtracking.
+ */
+function compileGlob(glob: string): ((dir: string) => boolean) | null {
+  if (!glob || glob.length > MAX_GLOB_LENGTH || /[[\]()\\!]/.test(glob)) return null;
+  const expanded = expandBraces(glob);
+  if (!expanded) return null;
+  const patterns = expanded.map((e) => e.split('/').filter((x) => x !== '' && x !== '.'));
+  return (dir) => {
+    const segs = dir.split('/');
+    return patterns.some((pat) => pathMatches(pat, segs));
+  };
 }
 
 const normalizeGlob = (g: string) => g.trim().replace(/^\.\//, '').replace(/\/package\.json$/, '').replace(/\/+$/, '');
@@ -189,14 +279,34 @@ export function buildSnapshot(repoRoot: string, commit: string): RepoSnapshot {
   const resolved = resolveCommit(repoRoot, commit);
   if (!resolved) throw new Error(`commit ${commit} does not exist in ${repoRoot}`);
   const tree = treeIdOf(repoRoot, resolved);
-  const entries = listTree(repoRoot, resolved);
+  const listing = listTreeDetailed(repoRoot, resolved);
+  const entries = listing.entries;
   const b = new Builder(repoRoot, resolved, tree, entries);
+  b.undecodable = listing.undecodable;
+  if (listing.undecodable > 0) {
+    b.unconfirm(
+      'paths:non-utf8',
+      `${listing.undecodable} tracked path(s) are not valid UTF-8 and are not described by this snapshot`,
+      'path bytes cannot be represented exactly',
+      b.treeSource(),
+    );
+  }
 
   // ---- choose the blobs to read, then read them all through ONE git process ----
   const regular = entries.filter((e) => e.type === 'blob' && e.mode !== '120000' && !inNodeModules(e.path));
-  const configs = regular.filter(
-    (e) => baseName(e.path) === 'package.json' || /^tsconfig(?:\..+)?\.json$/.test(baseName(e.path)) || ROOT_CONFIGS.has(e.path),
-  );
+  const configs: TreeEntry[] = [];
+  let configBytes = 0;
+  for (const e of regular) {
+    if (!(baseName(e.path) === 'package.json' || /^tsconfig(?:\..+)?\.json$/.test(baseName(e.path)) || ROOT_CONFIGS.has(e.path))) continue;
+    if (e.size > MAX_CONFIG_FILE_BYTES || configBytes + e.size > MAX_CONFIG_TOTAL_BYTES) {
+      // The root manifest is required for any fact; every other config is optional.
+      if (e.path === 'package.json') throw new Error(`package.json is ${e.size} bytes, over the read limit, so a snapshot cannot be built`);
+      b.unconfirm(`skipped:${e.path}`, `\`${e.path}\` is ${e.size} bytes, over the read limit, so nothing is stated from it`, 'over the size limit', b.source(e.path));
+      continue;
+    }
+    configBytes += e.size;
+    configs.push(e);
+  }
   const sources: TreeEntry[] = [];
   let sourceBytes = 0;
   let skippedSources = 0;
@@ -331,13 +441,25 @@ function findWorkspaces(b: Builder, root: Pkg | null, regular: TreeEntry[]): Pkg
     source: declarationSource,
   });
 
-  const include = patterns.filter((p) => !p.startsWith('!')).map((p) => globToRegExp(normalizeGlob(p)));
-  const exclude = patterns.filter((p) => p.startsWith('!')).map((p) => globToRegExp(normalizeGlob(p.slice(1))));
+  const compile = (pattern: string, glob: string) => {
+    const matcher = compileGlob(normalizeGlob(glob));
+    if (!matcher) {
+      b.unconfirm(
+        `workspace:unsupported-pattern:${pattern}`,
+        `Workspace pattern \`${pattern}\` uses glob syntax Turbine does not evaluate, so the packages it matches are not known`,
+        'unsupported glob syntax',
+        declarationSource!,
+      );
+    }
+    return matcher;
+  };
+  const include = patterns.filter((p) => !p.startsWith('!')).map((p) => compile(p, p)).filter((m): m is (dir: string) => boolean => m !== null);
+  const exclude = patterns.filter((p) => p.startsWith('!')).map((p) => compile(p, p.slice(1))).filter((m): m is (dir: string) => boolean => m !== null);
   const found: Pkg[] = [];
   for (const e of regular) {
     if (baseName(e.path) !== 'package.json' || e.path === 'package.json') continue;
     const dir = e.path.slice(0, -'/package.json'.length);
-    if (!include.some((r) => r.test(dir)) || exclude.some((r) => r.test(dir))) continue;
+    if (!include.some((m) => m(dir)) || exclude.some((m) => m(dir))) continue;
     const pkg = parseManifest(b, e.path);
     if (!pkg) continue;
     found.push(pkg);
@@ -371,16 +493,39 @@ function packageManagerFacts(b: Builder, root: Pkg | null): PackageManager {
   for (const l of out.lockfiles) {
     b.fact({ key: `lockfile:${l}`, category: 'package', statement: `Lockfile \`${l}\` is tracked`, data: { file: l }, source: b.source(l) });
   }
-  const forManager: Record<string, string[]> = {
-    pnpm: ['pnpm-lock.yaml'],
-    npm: ['package-lock.json', 'npm-shrinkwrap.json'],
-    yarn: ['yarn.lock'],
-    bun: ['bun.lock', 'bun.lockb'],
-  };
-  const preferred = out.declared ? (forManager[out.declared.name] ?? []).find((l) => out.lockfiles.includes(l)) : undefined;
-  out.selected = preferred ?? out.lockfiles[0];
-  const installerOf: Record<string, string> = { 'pnpm-lock.yaml': 'pnpm', 'package-lock.json': 'npm', 'npm-shrinkwrap.json': 'npm', 'yarn.lock': 'yarn', 'bun.lock': 'bun', 'bun.lockb': 'bun' };
-  out.installer = out.declared?.name && forManager[out.declared.name] ? out.declared.name : out.selected ? installerOf[out.selected] : undefined;
+  // A Map: a manifest saying `packageManager: "constructor"` must not find inherited object members.
+  const forManager = new Map<string, string[]>([
+    ['pnpm', ['pnpm-lock.yaml']],
+    ['npm', ['npm-shrinkwrap.json', 'package-lock.json']], // npm reads the shrinkwrap first when both exist
+    ['yarn', ['yarn.lock']],
+    ['bun', ['bun.lock', 'bun.lockb']],
+  ]);
+  const installerOf = new Map<string, string>([
+    ['pnpm-lock.yaml', 'pnpm'],
+    ['npm-shrinkwrap.json', 'npm'],
+    ['package-lock.json', 'npm'],
+    ['yarn.lock', 'yarn'],
+    ['bun.lock', 'bun'],
+    ['bun.lockb', 'bun'],
+  ]);
+  const known = out.declared ? forManager.get(out.declared.name) : undefined;
+  if (known && out.declared) {
+    // A recognised package manager only reads its own lockfile. Another manager's leftover lockfile
+    // is reported, never used to state installed versions.
+    out.selected = known.find((l) => out.lockfiles.includes(l));
+    if (!out.selected && out.lockfiles.length) {
+      b.unconfirm(
+        'lockfile:other-manager',
+        `package.json declares package manager \`${out.declared.name}\` but the tracked lockfile(s) ${out.lockfiles.map((l) => `\`${l}\``).join(', ')} belong to another manager, so installed versions are not read from them`,
+        'lockfile does not match the declared package manager',
+        b.source(out.lockfiles[0]!),
+      );
+    }
+    out.installer = out.declared.name;
+  } else {
+    out.selected = out.lockfiles[0];
+    out.installer = out.selected ? installerOf.get(out.selected) : undefined;
+  }
   if (out.lockfiles.length > 1 && out.selected) {
     b.unconfirm(
       'lockfile:multiple',
@@ -485,7 +630,9 @@ function nodeVersionFacts(b: Builder): void {
     b.fact({
       key: `version:node:${file}`,
       category: 'version',
-      statement: `\`${file}\` pins Node \`${value}\``,
+      statement: /^v?\d+\.\d+\.\d+$/.test(value)
+        ? `\`${file}\` pins Node \`${value}\``
+        : `\`${file}\` selects Node \`${value}\` (a version selector, not an exact pin)`,
       data: { file, version: value },
       source: b.source(file, { start: i + 1, end: i + 1 }),
     });
@@ -602,7 +749,12 @@ function makeLockReader(b: Builder, manager: PackageManager): LockReader {
     file,
     lookup(dir, _section, dep) {
       if (isObj(lock.packages)) {
-        const keys = dir === '.' ? [`node_modules/${dep}`] : [`${dir}/node_modules/${dep}`, `node_modules/${dep}`];
+        // node resolution: the nearest node_modules wins, so try every ancestor directory up to the root
+        const keys: string[] = [];
+        for (let d = dir; ; d = posix.dirname(d)) {
+          keys.push(d === '.' ? `node_modules/${dep}` : `${d}/node_modules/${dep}`);
+          if (d === '.' || d === '/') break;
+        }
         for (const key of keys) {
           const entry = lock.packages[key];
           if (!isObj(entry)) continue;
@@ -630,7 +782,7 @@ function dependencyFacts(b: Builder, packages: Pkg[], manager: PackageManager): 
         const head = `${name}: declared \`${spec}\` in ${pkg.path} (${section})`;
         const base = { key: `dep:${pkg.dir}:${section}:${name}`, name, workspace: pkg.dir, section, declared: { spec, source: declaredSource } };
         if (!reader) {
-          b.dependency({ ...base, installedStatus: 'no-lockfile', relation: 'unchecked', statement: `${head}; no lockfile is tracked, so the installed version is unknown` });
+          b.dependency({ ...base, installedStatus: 'no-lockfile', relation: 'unchecked', statement: `${head}; no lockfile for this package manager is tracked, so the installed version is unknown` });
           continue;
         }
         if ('notParsed' in reader) {
@@ -647,9 +799,18 @@ function dependencyFacts(b: Builder, packages: Pkg[], manager: PackageManager): 
           b.dependency({ ...base, installed, installedStatus: 'workspace-link', relation: 'unchecked', statement: `${head}; resolved by \`${reader.file}\` to workspace ${found.version}` });
           continue;
         }
-        const relation = satisfies(found.version, spec);
-        const verdict =
-          relation === 'match' ? 'satisfies the declared range' : relation === 'mismatch' ? 'does NOT satisfy the declared range (version drift)' : 'range not checked';
+        // npm installs the optionalDependencies entry when a name is in both sections, so the
+        // `dependencies` declaration is not what the lockfile was resolved against.
+        const optional = pkg.data.optionalDependencies;
+        const overridden = section === 'dependencies' && isObj(optional) && Object.hasOwn(optional, name);
+        const relation = overridden ? 'unchecked' : satisfies(found.version, spec);
+        const verdict = overridden
+          ? 'range not checked (overridden by optionalDependencies)'
+          : relation === 'match'
+            ? 'satisfies the declared range'
+            : relation === 'mismatch'
+              ? 'does NOT satisfy the declared range (version drift)'
+              : 'range not checked';
         b.dependency({ ...base, installed, installedStatus: 'locked', relation, statement: `${head}; installed ${found.version} per \`${reader.file}\` — ${verdict}` });
       }
     }
@@ -688,7 +849,7 @@ function countConvention(
     basis: 'count',
     statement: full
       ? `All ${total} ${args.noun} ${args.predicate} (exhaustive count over tracked files)`
-      : `${counts} (counted over tracked files${args.exhaustive ? '' : `; ${args.skipped ?? 0} files not scanned`}) — not a confirmed convention`,
+      : `${counts} (counted over tracked files${args.exhaustive ? '' : `; ${args.skipped ?? 0} files not fully scanned`}) — not a confirmed convention`,
     measured: { matched, total, exhaustive: args.exhaustive, scope: args.scope },
     counterexamples,
     source: b.treeSource(),
@@ -697,16 +858,20 @@ function countConvention(
 
 const FROM_RE = /^[ \t]*(?:import|export)\s[^;'"`()=]*?\bfrom\s*(['"])([^'"\n]+)\1/gm;
 const SIDE_EFFECT_RE = /^[ \t]*import\s*(['"])([^'"\n]+)\1/gm;
+const LOOSE_IMPORT_RE = /\b(?:from|import|require)\s*\(?\s*(['"])[^'"\n]+\1/g;
 
 function conventionFacts(b: Builder, regular: TreeEntry[], sources: TreeEntry[], skipped: number, root: Pkg | null): void {
   // --- measured over the commit's tracked files ---
   const relative: Counted[] = [];
   const builtin: Counted[] = [];
+  let unreconciled = 0; // files where the textual scan and a looser scan disagree
   for (const entry of sources) {
     const text = b.blobs.get(entry.id)!.toString('utf8');
+    let seen = 0;
     for (const re of [FROM_RE, SIDE_EFFECT_RE]) {
       re.lastIndex = 0;
       for (let m = re.exec(text); m; m = re.exec(text)) {
+        seen++;
         const spec = m[2]!;
         const at = { text, index: m.index, length: m[0].length };
         if ((spec.startsWith('./') || spec.startsWith('../') || spec === '.' || spec === '..') && !ASSET_EXT.test(spec)) {
@@ -716,10 +881,18 @@ function conventionFacts(b: Builder, regular: TreeEntry[], sources: TreeEntry[],
         }
       }
     }
+    // The scan is textual. It is only called exhaustive if a looser scan (any `from '…'`,
+    // `import '…'`, `import('…')`, `require('…')`) finds exactly the specifiers it counted;
+    // otherwise (several imports on one line, dynamic imports, require) the file is not fully scanned.
+    LOOSE_IMPORT_RE.lastIndex = 0;
+    let loose = 0;
+    while (LOOSE_IMPORT_RE.exec(text)) loose++;
+    if (loose !== seen) unreconciled++;
   }
   const importScope = SOURCE_SCOPE;
-  countConvention(b, { key: 'convention:imports:relative-js-extension', topic: 'relative imports carry a .js extension', noun: 'relative import specifiers', predicate: 'end in .js', items: relative, exhaustive: skipped === 0, scope: importScope, skipped });
-  countConvention(b, { key: 'convention:imports:node-prefix', topic: 'Node built-ins imported with the node: prefix', noun: 'Node built-in imports', predicate: 'use the node: prefix', items: builtin, exhaustive: skipped === 0, scope: importScope, skipped });
+  const notScanned = skipped + unreconciled + b.undecodable;
+  countConvention(b, { key: 'convention:imports:relative-js-extension', topic: 'relative imports carry a .js extension', noun: 'relative import specifiers', predicate: 'end in .js', items: relative, exhaustive: notScanned === 0, scope: importScope, skipped: notScanned });
+  countConvention(b, { key: 'convention:imports:node-prefix', topic: 'Node built-ins imported with the node: prefix', noun: 'Node built-in imports', predicate: 'use the node: prefix', items: builtin, exhaustive: notScanned === 0, scope: importScope, skipped: notScanned });
 
   const sourceFiles = regular.filter((e) => SOURCE_EXT.test(e.path));
   countConvention(b, {
@@ -730,7 +903,7 @@ function conventionFacts(b: Builder, regular: TreeEntry[], sources: TreeEntry[],
     items: sourceFiles
       .filter((e) => baseName(e.path).split('.')[0] !== '')
       .map((e) => ({ ok: /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(baseName(e.path).split('.')[0]!), entry: e })),
-    exhaustive: true,
+    exhaustive: b.undecodable === 0,
     scope: SOURCE_SCOPE,
   });
   countConvention(b, {
@@ -741,7 +914,7 @@ function conventionFacts(b: Builder, regular: TreeEntry[], sources: TreeEntry[],
     items: sourceFiles
       .filter((e) => /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(e.path))
       .map((e) => ({ ok: e.path.split('/').slice(0, -1).some((s) => s === 'tests' || s === 'test' || s === '__tests__'), entry: e })),
-    exhaustive: true,
+    exhaustive: b.undecodable === 0,
     scope: SOURCE_SCOPE,
   });
 
@@ -779,34 +952,50 @@ function prettierConventions(b: Builder, regular: TreeEntry[], root: Pkg | null)
       });
     }
   };
+  // Prettier uses the FIRST config it finds, in this order: the `prettier` key of package.json,
+  // then .prettierrc, .prettierrc.json, .prettierrc.yaml, .prettierrc.yml. Anything after the first
+  // is shadowed: it is a declaration, not what Prettier enforces, so it is never confirmed.
+  const candidates: string[] = [];
+  if (root && root.data.prettier !== undefined) candidates.push(root.path);
   for (const file of ['.prettierrc', '.prettierrc.json', '.prettierrc.yaml', '.prettierrc.yml']) {
-    const text = b.text(file);
-    if (text === undefined) continue;
-    let value: unknown;
-    let lines: (opt: string) => LineRange | undefined;
-    try {
-      if (file.endsWith('.yaml') || file.endsWith('.yml')) throw new SyntaxError('yaml');
-      const jc = parseJsonc(text);
-      value = jc.value;
-      lines = (o) => jc.lines([o]);
-    } catch {
-      const y = parseYamlLines(text);
-      if (y.errors.length) {
-        b.unconfirm(`unparsed:${file}`, `\`${file}\` could not be parsed, so nothing is stated from it`, y.errors[0]!, b.source(file));
-        continue;
-      }
-      value = y.value;
-      lines = (o) => y.lines([o]);
-    }
-    if (isObj(value)) report(file, (o) => (value as Json)[o], lines);
+    if (b.text(file) !== undefined) candidates.push(file);
   }
-  if (root) {
+  const [winner, ...shadowed] = candidates;
+  for (const file of shadowed) {
+    b.unconfirm(
+      `shadowed:prettier:${file}`,
+      `\`${file}\` also sets Prettier options but is shadowed by \`${winner}\`, which Prettier uses first, so its values are not stated`,
+      'shadowed Prettier configuration',
+      b.source(file),
+    );
+  }
+  if (!winner) return;
+  if (root && winner === root.path) {
     const p = root.data.prettier;
     if (isObj(p)) report(root.path, (o) => p[o], (o) => root.jc.lines(['prettier', o]));
     else if (typeof p === 'string') {
       b.unconfirm('unconfirmed:prettier:package.json', `package.json uses shared Prettier config \`${p}\`, which is not resolved`, 'shared config not read', b.source(root.path, root.jc.lines(['prettier'])));
     }
+    return;
   }
+  const text = b.text(winner)!;
+  let value: unknown;
+  let lines: (opt: string) => LineRange | undefined;
+  try {
+    if (winner.endsWith('.yaml') || winner.endsWith('.yml')) throw new SyntaxError('yaml');
+    const jc = parseJsonc(text);
+    value = jc.value;
+    lines = (o) => jc.lines([o]);
+  } catch {
+    const y = parseYamlLines(text);
+    if (y.errors.length) {
+      b.unconfirm(`unparsed:${winner}`, `\`${winner}\` could not be parsed, so nothing is stated from it`, y.errors[0]!, b.source(winner));
+      return;
+    }
+    value = y.value;
+    lines = (o) => y.lines([o]);
+  }
+  if (isObj(value)) report(winner, (o) => (value as Json)[o], lines);
 }
 
 function editorconfigConventions(b: Builder): void {

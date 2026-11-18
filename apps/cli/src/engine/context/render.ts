@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import {
   RepoSnapshotSchema,
   contentHashText,
@@ -80,13 +80,20 @@ export function renderFactsBody(s: RepoSnapshot): string {
   out.push('**Version drift (installed does not satisfy declared):**');
   out.push(...list(drift.map((d) => `- ${d.statement} _(declared: ${cite(d.declared.source)}${d.installed ? `; installed: ${cite(d.installed.source)}` : ''})_`)));
   out.push('');
-  const workspaces = [...new Set(deps.map((d) => d.workspace))].sort();
-  for (const w of workspaces) {
-    const mine = deps.filter((d) => d.workspace === w && d.installedStatus !== 'workspace-link');
+  const byWorkspace = new Map<string, typeof deps>();
+  for (const d of deps) {
+    if (!byWorkspace.has(d.workspace)) byWorkspace.set(d.workspace, []);
+    if (d.installedStatus !== 'workspace-link') byWorkspace.get(d.workspace)!.push(d);
+  }
+  for (const w of [...byWorkspace.keys()].sort()) {
+    const mine = byWorkspace.get(w)!;
     out.push(`**\`${w}\`** — ${mine.length} registry dependencies`);
     out.push(
       ...list(
-        mine.map((d) => `- \`${d.name}\` declared \`${d.declared.spec}\` (${d.section}); installed ${d.installed ? `\`${d.installed.version}\` (${d.installed.lockfile})` : `unknown (${d.installedStatus})`}`),
+        mine.map(
+          (d) =>
+            `- \`${d.name}\` declared \`${d.declared.spec}\` (${d.section}) _(${cite(d.declared.source)})_; installed ${d.installed ? `\`${d.installed.version}\` _(${cite(d.installed.source)})_` : `unknown (${d.installedStatus})`}`,
+        ),
         40,
       ),
     );
@@ -113,10 +120,37 @@ export function renderFactsBody(s: RepoSnapshot): string {
   return out.join('\n');
 }
 
+const count = (text: string, re: RegExp) => (text.match(re) ?? []).length;
+const BEGIN_ANY = /<!-- turbine:facts begin/g;
+const END_ANY = /<!-- turbine:facts end -->/g;
+
+/** Which marker the user has to restore, or undefined when there is no section or exactly one intact section. */
+function damagedMarker(text: string): string | undefined {
+  const begins = count(text, BEGIN_ANY);
+  const ends = count(text, END_ANY);
+  if (begins === 0 && ends === 0) return undefined;
+  if (begins === 1 && ends === 1 && SECTION.test(text)) return undefined;
+  if (begins === 0) return 'the "<!-- turbine:facts begin … -->" line';
+  if (ends === 0) return 'the "<!-- turbine:facts end -->" line';
+  if (begins > 1 || ends > 1) return 'a single "turbine:facts begin" / "turbine:facts end" pair (the file has more than one)';
+  return 'the "turbine:facts end" line, which must come after the "begin" line';
+}
+
+/** Repair is only safe when the section's boundaries are unambiguous; otherwise say what to restore. */
+function assertMarkersIntact(text: string): void {
+  const missing = damagedMarker(text);
+  if (missing) {
+    throw new Error(
+      `.turbine/context/PROJECT.md has a damaged generated Facts section; restore ${missing} (or delete the whole section), then run: turbine understand`,
+    );
+  }
+}
+
 function renderProjectMd(s: RepoSnapshot, existing: string | undefined): string {
   const body = renderFactsBody(s);
   const marker = `<!-- turbine:facts begin snapshot=${s.hash} commit=${s.commit} content=${contentHashText(body)} -->`;
   const section = `${marker}\n${body}\n<!-- turbine:facts end -->`;
+  if (existing) assertMarkersIntact(existing);
   if (existing && SECTION.test(existing)) return existing.replace(SECTION, () => section);
   if (existing) return `${existing.replace(/\n*$/, '\n')}\n${section}\n`;
   return `${FILE_HEADER}\n# Project context\n\n${section}\n`;
@@ -129,51 +163,114 @@ function attrs(raw: string): Record<string, string> {
 /** True when both generated files exist and match the snapshot exactly. */
 export function contextFilesCurrent(projectRoot: string, s: RepoSnapshot): boolean {
   const p = contextPaths(projectRoot);
-  if (!existsSync(p.snapshot) || !existsSync(p.project)) return false;
   try {
-    if (readFileSync(p.snapshot, 'utf8') !== `${JSON.stringify(s, null, 2)}\n`) return false;
-    const m = SECTION.exec(readFileSync(p.project, 'utf8'));
-    return !!m && m[2] === renderFactsBody(s) && attrs(m[1]!).snapshot === s.hash && attrs(m[1]!).content === contentHashText(m[2]!);
+    if (readRegular(p.snapshot) !== `${JSON.stringify(s, null, 2)}\n`) return false;
+    const project = readRegular(p.project);
+    if (project === undefined || damagedMarker(project)) return false;
+    const m = SECTION.exec(project);
+    if (!m) return false;
+    const a = attrs(m[1]!);
+    return m[2] === renderFactsBody(s) && a.snapshot === s.hash && a.commit === s.commit && a.content === contentHashText(m[2]!);
   } catch {
     return false;
+  }
+}
+
+/** Contents of a regular file, undefined if it does not exist; throws for a symlink, directory or other non-file. */
+function readRegular(file: string): string | undefined {
+  let st;
+  try {
+    st = lstatSync(file);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw e;
+  }
+  if (!st.isFile()) throw new Error(`${file} is not a regular file (a symlink or directory)`);
+  return readFileSync(file, 'utf8');
+}
+
+/**
+ * Generated files live inside the repository, which the repository's author controls. A checked-out
+ * symlink at a generated path would otherwise make a write land on whatever it points to. So: the
+ * directories must be real directories, the destination must not be a symlink, and the file is
+ * written to a new exclusive temp file and renamed into place (rename replaces the name, never the
+ * target of a link).
+ */
+function assertRealDirs(projectRoot: string, dir: string): void {
+  for (const d of [join(projectRoot, '.turbine'), dir]) {
+    if (!existsSync(d) && !isLink(d)) continue;
+    if (!lstatSync(d).isDirectory()) throw new Error(`${d} is not a real directory (a symlink?); refusing to write generated context through it`);
+  }
+}
+
+function isLink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function writeAtomic(file: string, content: string): void {
+  if (isLink(file) || (existsSync(file) && !lstatSync(file).isFile())) {
+    throw new Error(`${file} is not a regular file (a symlink?); refusing to write generated context through it`);
+  }
+  const tmp = join(dirname(file), `.${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`);
+  const fd = openSync(tmp, 'wx', 0o644); // O_EXCL: never follows a link, never reuses a file
+  try {
+    writeSync(fd, content, 0, 'utf8');
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    renameSync(tmp, file);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
   }
 }
 
 /** Write snapshot.json and the Facts section of PROJECT.md. Returns the files written. */
 export function writeContextFiles(projectRoot: string, s: RepoSnapshot): string[] {
   const p = contextPaths(projectRoot);
+  assertRealDirs(projectRoot, p.dir);
   mkdirSync(p.dir, { recursive: true });
-  writeFileSync(p.snapshot, `${JSON.stringify(s, null, 2)}\n`, 'utf8');
-  writeFileSync(p.project, renderProjectMd(s, existsSync(p.project) ? readFileSync(p.project, 'utf8') : undefined), 'utf8');
+  assertRealDirs(projectRoot, p.dir);
+  // Build everything first so a damaged PROJECT.md stops the run before anything is written.
+  const project = renderProjectMd(s, readRegular(p.project));
+  writeAtomic(p.snapshot, `${JSON.stringify(s, null, 2)}\n`);
+  writeAtomic(p.project, project);
   ensureContextIgnored(projectRoot);
   return [p.snapshot, p.project];
 }
 
 /**
  * The generated files cite the commit they were built from, so committing them would move
- * HEAD and make them stale again. Keep them out of git.
+ * HEAD and make them stale again. Keep them out of git. Returns true if the rule was added.
  */
-function ensureContextIgnored(projectRoot: string): void {
+export function ensureContextIgnored(projectRoot: string): boolean {
   const file = join(projectRoot, '.turbine', '.gitignore');
-  if (!existsSync(file)) return;
-  const text = readFileSync(file, 'utf8');
-  if (text.split('\n').some((l) => l.trim() === `${CONTEXT_DIR}/`)) return;
-  writeFileSync(file, `${text.replace(/\n*$/, '\n')}${CONTEXT_DIR}/\n`, 'utf8');
+  const text = readRegular(file);
+  if (text === undefined) return false;
+  if (text.split('\n').some((l) => l.trim() === `${CONTEXT_DIR}/`)) return false;
+  writeAtomic(file, `${text.replace(/\n*$/, '\n')}${CONTEXT_DIR}/\n`);
+  return true;
 }
 
 /** `turbine lint`: report hand edits to the generated project context. */
 export function lintProjectContext(projectRoot: string): LintIssue[] {
   const p = contextPaths(projectRoot);
   const issues: LintIssue[] = [];
-  const hasSnapshot = existsSync(p.snapshot);
-  const hasProject = existsSync(p.project);
+  const exists = (f: string) => existsSync(f) || isLink(f);
+  const hasSnapshot = exists(p.snapshot);
+  const hasProject = exists(p.project);
   if (!hasSnapshot && !hasProject) return issues;
 
   let snapshot: RepoSnapshot | undefined;
   if (!hasSnapshot) issues.push({ level: 'error', file: 'snapshot.json', message: 'missing; run: turbine understand' });
   else {
     try {
-      const parsed = RepoSnapshotSchema.safeParse(JSON.parse(readFileSync(p.snapshot, 'utf8')));
+      const parsed = RepoSnapshotSchema.safeParse(JSON.parse(readRegular(p.snapshot) ?? ''));
       if (parsed.success) snapshot = parsed.data;
       else issues.push({ level: 'error', file: 'snapshot.json', message: `was edited by hand or is corrupt (${parsed.error.issues[0]?.message ?? 'invalid'}); run: turbine understand` });
     } catch (e) {
@@ -185,15 +282,30 @@ export function lintProjectContext(projectRoot: string): LintIssue[] {
     issues.push({ level: 'error', file: 'PROJECT.md', message: 'missing; run: turbine understand' });
     return issues;
   }
-  const text = readFileSync(p.project, 'utf8');
+  let text: string;
+  try {
+    text = readRegular(p.project) ?? '';
+  } catch (e) {
+    issues.push({ level: 'error', file: 'PROJECT.md', message: `cannot be read (${(e as Error).message}); restore it or run: turbine understand` });
+    return issues;
+  }
+  const damaged = damagedMarker(text);
   const m = SECTION.exec(text);
-  if (!m || !BEGIN.test(text)) {
-    issues.push({ level: 'error', file: 'PROJECT.md', message: 'the generated Facts section is missing or its markers were edited; run: turbine understand' });
+  if (damaged || !m || !BEGIN.test(text)) {
+    issues.push({
+      level: 'error',
+      file: 'PROJECT.md',
+      message: damaged
+        ? `the generated Facts section is damaged; restore ${damaged}, or run: turbine understand after deleting the section`
+        : 'the generated Facts section is missing or its markers were edited; run: turbine understand',
+    });
     return issues;
   }
   const a = attrs(m[1]!);
   if (a.content !== contentHashText(m[2]!)) {
     issues.push({ level: 'error', file: 'PROJECT.md', message: 'the Facts section was edited by hand (content hash mismatch); manual edits are overwritten by: turbine understand' });
+  } else if (snapshot && a.commit !== snapshot.commit) {
+    issues.push({ level: 'error', file: 'PROJECT.md', message: 'the commit in the Facts marker was edited by hand and does not match snapshot.json; run: turbine understand' });
   } else if (snapshot && a.snapshot !== snapshot.hash) {
     issues.push({ level: 'error', file: 'PROJECT.md', message: 'the Facts section comes from a different snapshot than snapshot.json; run: turbine understand' });
   } else if (snapshot && m[2] !== renderFactsBody(snapshot)) {

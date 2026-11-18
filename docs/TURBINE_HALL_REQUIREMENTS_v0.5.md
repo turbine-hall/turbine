@@ -405,7 +405,7 @@ type RecoveryPlan = {
 - Use foreign keys and transactions for state/approval writes; WAL mode where suitable.
 - `events` and `eec_invalidation_events` are append-only at application level; updates to existing records forbidden by API.
 - Required additional entities: `eec_contracts`, `eec_revisions`, `eec_obligations`, `artifact_dependency_edges`, `eec_invalidation_events`, `recovery_plans`, `role_selection_observations`.
-- `repo_snapshots` (migration v2): `hash` (primary key), `repo_path`, `commit`, `data`, `created_at`. Holds the project-facts snapshot of FR-CTX-01. The hash covers the snapshot content only (no timestamps), so the same commit always gives the same hash; the schema re-checks the hash on every save and read.
+- `repo_snapshots` (migration v2): `hash` and `repo_path` (together the primary key, so two clones at the same commit each keep their own row), `commit`, `commit`, `data`, `created_at`. Holds the project-facts snapshot of FR-CTX-01. The hash covers the snapshot content only (no timestamps), so the same commit always gives the same hash; the schema re-checks the hash on every save and read.
 - EEC version and obligated evidence/approval IDs must be reconstructible from events after a restart; current obligation validity is a derived projection, **not a mutable assertion of historical truth**.
 - Dependencies are versioned edges: `upstream_artifact_id`, `upstream_revision_hash`, `downstream_artifact_id`, `reason`, `affected_obligation_ids`; validate referential integrity and acyclicity.
 - Persist monotonic event sequence per work item and timestamps. State updates and event append happen in a single transaction.
@@ -624,7 +624,7 @@ Detect Git root, branch, clean/dirty state, base commit, remote metadata, primar
 
 **Commands:** `turbine understand` (no snapshot: build; up to date: print `Project understood (snapshot <sha8>)` and change nothing; stale: rebuild and print the added / removed / changed facts) and `turbine lint`. `turbine init` runs `understand` automatically when the repository has commits.
 
-**Generated files** (never hand-edited, git-ignored because they cite the commit they were built from): `.turbine/context/snapshot.json` and the Facts section of `.turbine/context/PROJECT.md` (generated header + content hash). `turbine lint` reports a hand edit; `turbine understand` overwrites it.
+**Generated files** (never hand-edited, git-ignored because they cite the commit they were built from): `.turbine/context/snapshot.json` and the Facts section of `.turbine/context/PROJECT.md` (generated header + content hash). `turbine lint` reports a hand edit. Repair path: when HEAD has not moved and the generated files are intact, `turbine understand` prints `Project understood (snapshot <sha8>)` and writes nothing; when a generated file is missing or was edited by hand it regenerates the files and says so. Text outside the Facts markers is preserved. A damaged marker (for example a deleted end line) is not guessed at: `understand` stops and names the marker to restore. Generated files are never written through a symlink.
 
 | ID | Scenario | Pass condition (test in `tests/integration/context-snapshot.test.ts`) |
 |---|---|---|
@@ -655,11 +655,13 @@ Binary name `sf` is **provisional** and must be checked for package name collisi
 
 ### 8.2 R0 commands
 
+The shipped binary is `turbine`. `understand` and `lint` already exist, so they are written with the name users can run today; the other commands keep the provisional `sf` prefix until the binary-name decision in 8.1 is made.
+
 ```bash
 sf init [--project PATH] [--non-interactive]
 sf doctor [--json]
-sf understand [--json]                 # build/refresh project facts at HEAD (FR-CTX-01); `init` runs it when the repo has commits
-sf lint [--json]                       # report hand edits to the generated .turbine/context/ files
+turbine understand [--json]            # build/refresh project facts at HEAD (FR-CTX-01); `init` runs it when the repo has commits
+turbine lint [--json]                  # report hand edits to the generated .turbine/context/ files
 sf config show | set <key> <value>
 sf framework list | show <id> | use <id>@<version>
 sf role list | show <role-id>

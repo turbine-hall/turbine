@@ -2429,7 +2429,9 @@ export class Engine {
       };
     }
 
-    if (work.currentState === 'REQUIREMENTS_APPROVED') {
+    // PLANNING is where a task stays when the project facts could not be refreshed; re-running
+    // `sync` after the repository is repaired resumes planning (requirements are already approved).
+    if (work.currentState === 'REQUIREMENTS_APPROVED' || work.currentState === 'PLANNING') {
       const planned = await this.plan(work.id);
       return { action: 'plan', work: planned.work, detail: { planHash: planned.planHash, packetDir: planned.packetDir } };
     }

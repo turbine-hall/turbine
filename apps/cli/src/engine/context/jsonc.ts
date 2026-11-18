@@ -11,6 +11,8 @@ export type Jsonc = {
   lines(path: Array<string | number>): LineRange | undefined;
 };
 
+const TOKEN = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null/y;
+
 export function parseJsonc(input: string): Jsonc {
   const text = input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
   const lineStarts = [0];
@@ -27,7 +29,7 @@ export function parseJsonc(input: string): Jsonc {
   };
 
   const positions = new Map<string, LineRange>();
-  const keyOf = (path: Array<string | number>) => path.map(String).join('\u0000');
+  const keyOf = (path: Array<string | number>) => JSON.stringify(path);
   let i = 0;
 
   const fail = (msg: string): never => {
@@ -78,7 +80,8 @@ export function parseJsonc(input: string): Jsonc {
         i++;
         const child = [...path, key];
         const v = value(child);
-        obj[key] = v;
+        // defineProperty: a member named "__proto__" must be an own property, never the prototype.
+        Object.defineProperty(obj, key, { value: v, enumerable: true, writable: true, configurable: true });
         positions.set(keyOf(child), { start: lineOf(keyStart), end: lineOf(i - 1) });
         skip();
         if (text[i] === ',') i++;
@@ -104,7 +107,8 @@ export function parseJsonc(input: string): Jsonc {
       }
     }
     if (c === '"') return string();
-    const m = /^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)/.exec(text.slice(i, i + 40));
+    TOKEN.lastIndex = i;
+    const m = TOKEN.exec(text);
     if (!m) return fail('Unexpected token');
     i += m[0].length;
     return JSON.parse(m[0]);

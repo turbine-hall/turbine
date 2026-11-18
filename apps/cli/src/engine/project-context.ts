@@ -4,7 +4,7 @@ import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import type { Fact } from './docs/normalize.js';
 import { hasUncommittedChanges, listTree } from './context/git-read.js';
 import { buildSnapshot } from './context/snapshot.js';
-import { buildOrThrow, ensureFreshSnapshot, refreshContextFiles, repoHead } from './context/understand.js';
+import { brokenHeadError, buildOrThrow, ensureFreshSnapshot, refreshContextFiles, repoHead } from './context/understand.js';
 
 /**
  * Project facts for assess/plan. This is a thin wrapper over the commit snapshot
@@ -21,7 +21,7 @@ export type ProjectEvidence = {
   packageManager?: string;
   packageName?: string;
   scripts: string[];
-  stack: Array<{ name: string; version: string; installed?: string }>;
+  stack: Array<{ name: string; version: string; installed?: string; source: string }>;
   testRunner?: string;
   typescript?: string;
   typescriptInstalled?: string;
@@ -64,7 +64,7 @@ function relatedFiles(allFiles: string[], requestText: string): string[] {
 }
 
 function describe(d: DependencyFact): string {
-  return `${d.declared.spec}${d.installed ? `, installed ${d.installed.version}` : ''}`;
+  return `${d.declared.spec} in ${d.declared.source.path}${d.installed ? `, installed ${d.installed.version} per ${d.installed.lockfile}` : ''}`;
 }
 
 /** Evidence from the snapshot (and live git state). Throws if the project facts cannot be made current. */
@@ -80,6 +80,8 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
   };
   const at = repoHead(projectRoot);
   if ('error' in at) {
+    // A HEAD that exists but is unreadable is a failure, not "no facts yet": stop instead of continuing blind.
+    if (at.error === 'broken-head') throw brokenHeadError(at, projectRoot);
     facts.push({
       text: at.error === 'not-a-repo' ? 'Project is not a git repository' : 'Repository has no commits yet, so no project facts can be stated',
       source: 'git',
@@ -100,6 +102,9 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
   const dirty = hasUncommittedChanges(at.repoRoot);
   try {
     const git = inspectRepo(projectRoot);
+    // Branch and commit come from two separate git calls. They are stated together only if they agree
+    // with the commit the snapshot was built from; otherwise only the snapshot commit is stated.
+    if (git.head !== at.head) throw new Error('HEAD moved while the snapshot was read');
     ev.git = { branch: git.branch, head: at.head, dirty };
     facts.push({ text: `Base branch is ${git.branch} at ${at.head.slice(0, 8)} (project snapshot ${shortSnapshotId(snapshot.hash)})`, source: 'git' });
   } catch {
@@ -117,7 +122,7 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
   const find = (name: string) => deps.find((d) => d.name === name && d.section !== 'peerDependencies');
   for (const [dep, name] of STACK) {
     const d = find(dep);
-    if (d && !ev.stack.some((s) => s.name === name)) ev.stack.push({ name, version: d.declared.spec, installed: d.installed?.version });
+    if (d && !ev.stack.some((s) => s.name === name)) ev.stack.push({ name, version: d.declared.spec, installed: d.installed?.version, source: d.declared.source.path });
   }
   ev.testRunner = TEST_RUNNERS.find((t) => find(t));
   const ts = find('typescript');
@@ -127,17 +132,20 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
   if (ev.stack.length) {
     facts.push({
       text: `Built with ${ev.stack.map((s) => `${s.name} declared ${s.version}${s.installed ? ` (installed ${s.installed})` : ''}`).join(', ')}`,
-      source: 'package.json',
+      source: [...new Set(ev.stack.map((s) => s.source))].join(', '),
     });
   }
   const useful = ev.scripts.filter((s) => /^(lint|test|typecheck|type-check|build|e2e|check)/.test(s));
   if (useful.length) facts.push({ text: `Scripts available: ${useful.join(', ')}`, source: 'package.json' });
   for (const f of snapshot.facts.filter((x) => x.category === 'command')) facts.push({ text: f.statement, source: f.source.path });
   if (root) {
-    if (ev.testRunner) facts.push({ text: `Test runner: ${ev.testRunner} (${describe(find(ev.testRunner)!)})`, source: 'package.json' });
+    if (ev.testRunner) {
+      const runner = find(ev.testRunner)!;
+      facts.push({ text: `Test runner: ${ev.testRunner} (${describe(runner)})`, source: runner.declared.source.path });
+    }
     else facts.push({ text: 'No JavaScript test runner dependency found', source: 'package.json' });
   }
-  if (ts) facts.push({ text: `TypeScript declared ${describe(ts)}`, source: 'package.json' });
+  if (ts) facts.push({ text: `TypeScript declared ${describe(ts)}`, source: ts.declared.source.path });
   const pm = fact('package-manager');
   const lock = snapshot.facts.find((f) => f.key.startsWith('lockfile:'));
   if (pm) ev.packageManager = String(pm.data?.name);

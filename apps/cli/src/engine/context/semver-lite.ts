@@ -10,9 +10,14 @@ type V = [number, number, number];
 const FULL = /^v?(\d+)\.(\d+)\.(\d+)$/;
 const PARTIAL = /^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$/;
 
+/** Components beyond 2^53 cannot be compared exactly as numbers, so they are not judged. */
+function exact(parts: Array<string | undefined>): boolean {
+  return parts.every((p) => p === undefined || Number.isSafeInteger(Number(p)));
+}
+
 function full(v: string): V | null {
   const m = FULL.exec(v.trim());
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+  return m && exact([m[1], m[2], m[3]]) ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
 }
 
 function cmp(a: V, b: V): number {
@@ -26,7 +31,7 @@ function comparator(token: string): ((v: V) => boolean) | null {
   if (!m) return null;
   const op = m[1] ?? '=';
   const p = PARTIAL.exec(m[2]!.trim());
-  if (!p) return null;
+  if (!p || !exact([p[1], p[2], p[3]])) return null;
   const major = Number(p[1]);
   const hasMinor = p[2] !== undefined;
   const hasPatch = p[3] !== undefined;
@@ -58,8 +63,8 @@ export function satisfies(installed: string, declared: string): Relation {
   const alternatives = spec.split('||').map((s) => s.trim());
   let understood = true;
   for (const alt of alternatives) {
-    // "1.2.3 - 2.0.0" hyphen ranges and anything with letters other than a plain version are not judged.
-    if (/\s-\s/.test(alt) || /[a-wyzA-WYZ:/@]/.test(alt) || /[xX*]/.test(alt)) {
+    // "1.2.3 - 2.0.0" hyphen ranges and anything with letters other than a plain version (a leading v/V is fine) are not judged.
+    if (/\s-\s/.test(alt) || /[a-uw-zA-UW-Z:/@]/.test(alt) || /[xX*]/.test(alt)) {
       understood = false;
       continue;
     }

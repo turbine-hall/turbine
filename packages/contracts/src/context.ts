@@ -125,6 +125,10 @@ export const ConventionSchema = z
   })
   .strict()
   .superRefine((c, ctx) => {
+    // Counterexamples only make sense for a measured convention that is NOT confirmed.
+    if (c.counterexamples.length > 0 && !(c.basis === 'count' && c.status === 'unconfirmed')) {
+      ctx.addIssue({ code: 'custom', message: 'only an unconfirmed counted convention can list counterexamples' });
+    }
     if (c.basis === 'config') {
       if (c.status !== 'confirmed') ctx.addIssue({ code: 'custom', message: 'a config-enforced convention is confirmed' });
       return;

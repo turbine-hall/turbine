@@ -18,7 +18,7 @@ export type TreeEntry = {
 };
 
 function run(cwd: string, args: string[], input?: string | Buffer, maxBuffer = 256 * 1024 * 1024) {
-  const r = spawnSync('git', ['-c', 'core.quotepath=off', ...args], { cwd, input, maxBuffer });
+  const r = spawnSync('git', ['--no-replace-objects', '-c', 'core.quotepath=off', ...args], { cwd, input, maxBuffer });
   if (r.error) throw new Error(`git ${args[0]} failed: ${r.error.message}`);
   return { status: r.status ?? 1, stdout: r.stdout as Buffer, stderr: (r.stderr as Buffer).toString('utf8').trim() };
 }
@@ -32,7 +32,7 @@ function must(cwd: string, args: string[], input?: string | Buffer, maxBuffer?: 
 /** Top level of the repository containing `dir`, or null if it is not a git repository. */
 export function repoToplevel(dir: string): string | null {
   const r = run(dir, ['rev-parse', '--show-toplevel']);
-  return r.status === 0 ? r.stdout.toString('utf8').trim() : null;
+  return r.status === 0 ? r.stdout.toString('utf8').replace(/\r?\n$/, '') : null;
 }
 
 /** Full commit id for a revision (default HEAD), or null when it does not resolve (e.g. no commits yet). */
@@ -41,14 +41,56 @@ export function resolveCommit(repoRoot: string, rev = 'HEAD'): string | null {
   return r.status === 0 ? r.stdout.toString('utf8').trim() : null;
 }
 
+export type HeadState =
+  | { kind: 'commit'; commit: string }
+  /** HEAD names a branch that has no commits yet (a fresh `git init`). */
+  | { kind: 'unborn' }
+  /** HEAD exists but cannot be read as a commit (missing object, corrupt ref, ...). */
+  | { kind: 'broken'; reason: string };
+
+/** Tell a repository with no commits yet apart from one whose HEAD cannot be read. */
+export function headState(repoRoot: string): HeadState {
+  const head = resolveCommit(repoRoot, 'HEAD');
+  if (head) return { kind: 'commit', commit: head };
+  const sym = run(repoRoot, ['symbolic-ref', '--quiet', 'HEAD']);
+  if (sym.status === 0) {
+    const ref = sym.stdout.toString('utf8').replace(/\r?\n$/, '');
+    // `show-ref --verify` exits 1 when the ref does not exist (nothing committed on this branch yet)
+    // and 128 when it exists but points at a missing or invalid object (a broken HEAD).
+    if (run(repoRoot, ['show-ref', '--verify', '--quiet', ref]).status === 1) return { kind: 'unborn' };
+    return { kind: 'broken', reason: `${ref} does not point at a readable commit` };
+  }
+  return { kind: 'broken', reason: 'HEAD does not point at a readable commit' };
+}
+
 export function treeIdOf(repoRoot: string, commit: string): string {
   return must(repoRoot, ['rev-parse', '--verify', `${commit}^{tree}`]).toString('utf8').trim();
 }
 
-function parseTree(out: Buffer): TreeEntry[] {
+const UTF8 = new TextDecoder('utf-8', { fatal: true });
+
+/** Entries plus how many records had a path that is not valid UTF-8 (those are never emitted). */
+export type TreeListing = { entries: TreeEntry[]; undecodable: number };
+
+function parseTree(out: Buffer): TreeListing {
   const entries: TreeEntry[] = [];
-  for (const rec of out.toString('utf8').split('\0')) {
-    if (!rec) continue;
+  let undecodable = 0;
+  let pos = 0;
+  while (pos < out.length) {
+    let end = out.indexOf(0, pos);
+    if (end < 0) end = out.length;
+    const raw = out.subarray(pos, end);
+    pos = end + 1;
+    if (!raw.length) continue;
+    // git prints path bytes verbatim. Decoding invalid UTF-8 would turn two different paths into
+    // the same string, so such a path is not described at all (it is counted and reported).
+    let rec: string;
+    try {
+      rec = UTF8.decode(raw);
+    } catch {
+      undecodable++;
+      continue;
+    }
     const tab = rec.indexOf('\t');
     if (tab < 0) continue;
     const [mode, type, id, size] = rec.slice(0, tab).split(/\s+/);
@@ -58,19 +100,25 @@ function parseTree(out: Buffer): TreeEntry[] {
     if (type === 'blob' && !known) throw new Error(`git object ${id} (${path}) is missing from the repository`);
     entries.push({ mode: mode!, type: type!, id: id!, size: known ? Number(size) : 0, path });
   }
-  return entries;
+  return { entries, undecodable };
 }
 
+const byPath = (a: TreeEntry, b: TreeEntry) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+
 /** Every tracked file at the commit (recursive). Sorted by path so results are deterministic. */
+export function listTreeDetailed(repoRoot: string, commit: string): TreeListing {
+  const r = parseTree(must(repoRoot, ['ls-tree', '-r', '-l', '-z', '--full-tree', commit]));
+  return { entries: r.entries.sort(byPath), undecodable: r.undecodable };
+}
+
 export function listTree(repoRoot: string, commit: string): TreeEntry[] {
-  const out = must(repoRoot, ['ls-tree', '-r', '-l', '-z', '--full-tree', commit]);
-  return parseTree(out).sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return listTreeDetailed(repoRoot, commit).entries;
 }
 
 /** Entries directly under the repository root (directories carry their tree id). */
 export function listTopLevel(repoRoot: string, commit: string): TreeEntry[] {
   const out = must(repoRoot, ['ls-tree', '-l', '-z', '--full-tree', commit]);
-  return parseTree(out).sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return parseTree(out).entries.sort(byPath);
 }
 
 /**
@@ -103,6 +151,6 @@ export function readBlobs(repoRoot: string, blobIds: string[], expectedBytes = 0
  * Turbine's own `.turbine/` directory. Only used to say "uncommitted changes exist (not included)".
  */
 export function hasUncommittedChanges(repoRoot: string): boolean {
-  const r = run(repoRoot, ['status', '--porcelain', '-z', '--', '.', ':(exclude).turbine']);
+  const r = run(repoRoot, ['status', '--porcelain', '-z', '--untracked-files=normal', '--', '.', ':(exclude).turbine']);
   return r.status === 0 && r.stdout.length > 0;
 }
