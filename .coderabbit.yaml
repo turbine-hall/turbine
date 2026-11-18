@@ -1,0 +1,10 @@
+# CodeRabbit review settings for this repository.
+# AGENTS.md is auto-discovered as a review guideline; no filePatterns entry is needed for it.
+# These values match CodeRabbit's defaults (checked with @coderabbitai configuration on PR #11).
+
+reviews:
+  profile: chill
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
