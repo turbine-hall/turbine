@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { LINE_BUDGET, type Track } from './render.js';
 import { parseSpecMarkdown, type PacketPaths } from '../packet.js';
+import { lintContextFile } from '../context/task-render.js';
 
 /**
  * `turbine task lint` — structural checks on the packet documents. The engine generates them,
@@ -70,5 +71,7 @@ export function lintPacket(paths: PacketPaths, opts: { track: Track; requirement
       }
     }
   }
+  // CONTEXT.md is generated from the store; a hand edit to the generated part is reported (and overwritten).
+  if (existsSync(paths.context)) issues.push(...lintContextFile(readFileSync(paths.context, 'utf8')));
   return issues;
 }

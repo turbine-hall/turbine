@@ -23,6 +23,18 @@ export type NextStep = {
   agentPlaybook: string[];
 };
 
+/** States in which an agent plans or implements, so it must read the project and task context first. */
+export const CONTEXT_READING_STATES: ReadonlySet<WorkState> = new Set<WorkState>([
+  'REQUIREMENTS_APPROVED',
+  'PLANNING',
+  'PLAN_APPROVED',
+  'IMPLEMENTING',
+  'CHANGES_REQUESTED',
+]);
+
+const readFirst = (before: 'planning' | 'implementing') =>
+  `Read PROJECT.md and CONTEXT.md before ${before}. CONTEXT.md is a selection of files with a checkable reason each, not a complete list; PROJECT.md holds the verified project facts.`;
+
 function worktreePathFor(projectRoot: string, workId: string): string {
   return join(projectRoot, '.turbine', 'worktrees', workId);
 }
@@ -54,6 +66,8 @@ function computeNextStepRaw(input: {
   const paths = packetPaths(projectRoot, work.id);
   const wt = worktreePathFor(projectRoot, work.id);
   const branch = branchFor(work.id);
+  // The files an agent reads before it plans or implements (only those that exist).
+  const contextFiles = [paths.projectContext, paths.context].filter((p) => existsSync(p));
   const sync = `turbine task sync ${work.id}`;
   const next = `turbine task next ${work.id}`;
   const approve = `turbine task approve ${work.id}`;
@@ -129,8 +143,8 @@ function computeNextStepRaw(input: {
         who: 'either',
         doNow: 'Run sync to create the plan (in SPEC.md).',
         commands: [sync, next],
-        openFiles: [paths.status],
-        agentPlaybook: ['Run turbine task sync <id>.', 'Then ask the human to review SPEC.md → Plan.'],
+        openFiles: [paths.status, ...contextFiles],
+        agentPlaybook: [readFirst('planning'), 'Run turbine task sync <id>.', 'Then ask the human to review SPEC.md → Plan.'],
       };
 
     case 'PLAN_REVIEW':
@@ -151,7 +165,7 @@ function computeNextStepRaw(input: {
         who: 'either',
         doNow: 'Run sync (execute). Then implement ONLY in the worktree listed in STATUS.md.',
         commands: [sync, next],
-        openFiles: [paths.status],
+        openFiles: [paths.status, ...contextFiles],
         worktreePath: wt,
         branch,
         important: [
@@ -159,6 +173,7 @@ function computeNextStepRaw(input: {
           `After execute, open ${paths.executionBrief} and cd into the worktree — not the main checkout.`,
         ],
         agentPlaybook: [
+          readFirst('implementing'),
           'Run turbine task sync <id> (execute).',
           'Read SPEC.md → Requirements and Plan; follow the plan steps and file list.',
           'Make all code changes in the worktree path.',
@@ -179,10 +194,11 @@ function computeNextStepRaw(input: {
         commands: existsSync(wt)
           ? [`cd "${wt}"`, 'git status', 'git log -1 --oneline', `cd "${projectRoot}"`, sync, next]
           : [sync, next],
-        openFiles: [paths.executionBrief, paths.status].filter((p) => existsSync(p)),
+        openFiles: [...[paths.executionBrief, paths.status].filter((p) => existsSync(p)), ...contextFiles],
         worktreePath: existsSync(wt) ? wt : undefined,
         branch,
         agentPlaybook: [
+          readFirst('implementing'),
           'Never commit on staging/main for this task.',
           'Implement + typecheck in worktree.',
           'Commit on turbine/* branch.',

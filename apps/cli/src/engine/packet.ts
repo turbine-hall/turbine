@@ -8,6 +8,7 @@ import { join } from 'node:path';
  *     STATUS.md   — where the task is, who acts next, gate progress, blockers
  *     SPEC.md     — requirements, open questions, context, plan, test plan (humans edit requirements here)
  *     REVIEW.md   — what changed (git), traceability, AI review, checks, acceptance checklist
+ *     CONTEXT.md  — the files relevant to the task and why (generated from the store; "## Agent notes" kept)
  *     evidence/   — raw JSON and logs (never inlined in the documents above)
  *
  * The legacy keys (request, requirements, plan, …) are kept as aliases so callers that
@@ -18,6 +19,10 @@ export type PacketPaths = {
   status: string;
   spec: string;
   review: string;
+  /** CONTEXT.md: the files relevant to this task, each with a checkable reason (generated; notes kept). */
+  context: string;
+  /** The project facts the task context points to (`turbine understand`); shared by every task. */
+  projectContext: string;
   evidenceDir: string;
   legacyDir: string;
   // aliases
@@ -41,6 +46,8 @@ export function packetPaths(projectRoot: string, workId: string): PacketPaths {
     status,
     spec,
     review,
+    context: join(dir, 'CONTEXT.md'),
+    projectContext: join(projectRoot, '.turbine', 'context', 'PROJECT.md'),
     evidenceDir: join(dir, 'evidence'),
     legacyDir: join(dir, 'legacy'),
     request: spec,
