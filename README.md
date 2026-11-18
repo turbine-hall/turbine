@@ -352,7 +352,7 @@ If Turbine is useful to you, please ⭐ **star the repo**. It helps other teams 
 
 ## Attribution
 
-- **Framework proposed by** [Ahsan Aasim](https://github.com/ahsanaasim)
+- **Framework proposed by** [Ahsan Aasim](https://www.linkedin.com/in/ahsan-aasim/)
 - **Open-source project maintained by** [6sense HQ Ltd.](https://6sensehq.com)
 
 <sub>Keywords: AI software development framework, AI coding agent governance, human-in-the-loop AI development, AI code review, spec-driven development, requirements traceability, software delivery workflow, AI SDLC, Cursor workflow, Claude Code workflow, GitHub Copilot governance, engineering audit trail, open-source developer tools.</sub>
