@@ -1,5 +1,5 @@
 import { posix } from 'node:path';
-import type { ImportEdge } from '@turbine-hall/turbine-contracts';
+import type { ImportEdge, ImportKind } from '@turbine-hall/turbine-contracts';
 import { parseJsonc } from './jsonc.js';
 import { scanModule, type ScannedExport } from './js-scan.js';
 
@@ -9,7 +9,9 @@ import { scanModule, type ScannedExport } from './js-scan.js';
  *   - a relative specifier is resolved against the importing file's directory, probing extensions the way
  *     TypeScript / Node do (`./x.js` finds `x.ts`; `./dir` finds `dir/index.*`);
  *   - a workspace package name (`@scope/pkg`) is resolved to that package's entry file, when the entry can be
- *     proven from the commit (see `workspaceEntry`).
+ *     proven from the commit (see `workspaceEntry`). A package with `exports` is resolved by its conditions, in
+ *     manifest order, for the way the file imports it (`import` or `require`); where that way is not known
+ *     (a type-only import) and the targets differ, no edge is stated.
  * Not resolved, and therefore never stated: tsconfig `paths` / `baseUrl` aliases, sub-path imports of workspace
  * packages, packages from node_modules, and anything computed at run time.
  */
@@ -21,8 +23,16 @@ export type WorkspacePackage = { dir: string; name?: string };
 export type Resolution = { to: string; resolution: string };
 export type Unresolved = { unresolved: 'relative' | 'package' | 'external' };
 
+/** How a file reaches a package: the `import` or the `require` condition of its `exports`, or not known. */
+export type ResolveMode = 'import' | 'require' | 'unknown';
+
+/** The resolution mode of a statement: `require()` is CommonJS, type-only imports follow TypeScript's own choice. */
+export function modeOf(kind: ImportKind): ResolveMode {
+  return kind === 'require' ? 'require' : kind === 'import-type' ? 'unknown' : 'import';
+}
+
 export type Resolver = {
-  resolve(from: string, specifier: string): Resolution | Unresolved;
+  resolve(from: string, specifier: string, mode: ResolveMode): Resolution | Unresolved;
 };
 
 const PROBE_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts', '.json'];
@@ -54,21 +64,29 @@ function probe(base: string, files: Set<string>): { path: string; how: string } 
   return undefined;
 }
 
-function conditionTargets(value: unknown, depth = 0): string[] {
+/**
+ * The targets of an `exports` value for one mode. Conditions are tried in the order the manifest writes them and
+ * the first one that applies decides (Node's rule), even when its value is `null`: that blocks the package.
+ * Applicable here: the mode itself, `default` and `node`. Others (`types`, `browser`, ...) are not claimed.
+ */
+function conditionTargets(value: unknown, mode: 'import' | 'require', depth = 0): string[] {
   if (typeof value === 'string') return [value];
+  if (Array.isArray(value)) return value.flatMap((v) => conditionTargets(v, mode, depth + 1));
   if (!isObj(value) || depth > 4) return [];
-  const out: string[] = [];
-  for (const key of ['import', 'default', 'require', 'node', 'types']) if (key in value) out.push(...conditionTargets(value[key], depth + 1));
-  return out;
+  for (const [key, v] of Object.entries(value)) {
+    if (key === mode || key === 'default' || key === 'node') return conditionTargets(v, mode, depth + 1);
+  }
+  return [];
 }
 
 export function makeResolver(files: Set<string>, text: (path: string) => string | undefined, workspaces: WorkspacePackage[]): Resolver {
   const byName = new Map<string, WorkspacePackage>();
   for (const w of workspaces) if (w.name) byName.set(w.name, w);
+  /** By package and mode: the same package can have one entry for `import` and another for `require`. */
   const entries = new Map<string, Resolution | undefined>();
 
   /** The entry file of a workspace package, proven from its package.json (and tsconfig.json) at the commit. */
-  const workspaceEntry = (pkg: WorkspacePackage): { to: string; how: string } | undefined => {
+  const workspaceEntry = (pkg: WorkspacePackage, mode: 'import' | 'require'): { to: string; how: string } | undefined => {
     const manifest = pkg.dir === '.' ? 'package.json' : `${pkg.dir}/package.json`;
     const raw = text(manifest);
     if (raw === undefined) return undefined;
@@ -82,15 +100,20 @@ export function makeResolver(files: Set<string>, text: (path: string) => string 
     }
     const targets: string[] = [];
     const ex = data.exports;
-    if (typeof ex === 'string') targets.push(ex);
-    else if (isObj(ex)) {
-      const keys = Object.keys(ex);
-      // "exports" is either a map of sub-paths or the conditions of "." directly.
-      if (keys.some((k) => k.startsWith('.'))) targets.push(...conditionTargets(ex['.']));
-      else targets.push(...conditionTargets(ex));
+    if (ex !== undefined && ex !== null) {
+      // "exports" encapsulates the package: main/module are not consulted when it is present.
+      if (typeof ex === 'string' || Array.isArray(ex)) targets.push(...conditionTargets(ex, mode));
+      else if (isObj(ex)) {
+        const keys = Object.keys(ex);
+        // "exports" is either a map of sub-paths or the conditions of "." directly.
+        if (keys.some((k) => k.startsWith('.'))) targets.push(...conditionTargets(ex['.'], mode));
+        else targets.push(...conditionTargets(ex, mode));
+      }
+      if (!targets.length) return undefined;
+    } else {
+      for (const f of ['module', 'main', 'types', 'typings'] as const) if (typeof data[f] === 'string') targets.push(data[f] as string);
+      if (!targets.length) targets.push('index.js');
     }
-    for (const f of ['module', 'main', 'types', 'typings'] as const) if (typeof data[f] === 'string') targets.push(data[f] as string);
-    if (!targets.length) targets.push('index.js');
 
     const tsconfig = `${pkg.dir === '.' ? '' : `${pkg.dir}/`}tsconfig.json`;
     let outDir: string | undefined;
@@ -132,7 +155,7 @@ export function makeResolver(files: Set<string>, text: (path: string) => string 
   };
 
   return {
-    resolve(from, specifier) {
+    resolve(from, specifier, mode) {
       if (specifier.startsWith('.')) {
         const base = posix.join(posix.dirname(from), specifier);
         if (base === '..' || base.startsWith('../')) return { unresolved: 'relative' };
@@ -141,11 +164,19 @@ export function makeResolver(files: Set<string>, text: (path: string) => string 
       }
       const pkg = byName.get(specifier);
       if (!pkg) return { unresolved: 'external' };
-      if (!entries.has(pkg.dir)) {
-        const e = workspaceEntry(pkg);
-        entries.set(pkg.dir, e ? { to: e.to, resolution: `workspace package "${specifier}" (${pkg.dir}): ${e.how}` } : undefined);
-      }
-      return entries.get(pkg.dir) ?? { unresolved: 'package' };
+      const entry = (m: 'import' | 'require'): Resolution | undefined => {
+        const key = `${pkg.dir}\0${m}`;
+        if (!entries.has(key)) {
+          const e = workspaceEntry(pkg, m);
+          entries.set(key, e ? { to: e.to, resolution: `workspace package "${specifier}" (${pkg.dir}), ${m} condition: ${e.how}` } : undefined);
+        }
+        return entries.get(key);
+      };
+      if (mode !== 'unknown') return entry(mode) ?? { unresolved: 'package' };
+      // Mode not known: a target is claimed only when both modes agree on it.
+      const viaImport = entry('import');
+      const viaRequire = entry('require');
+      return viaImport && viaRequire && viaImport.to === viaRequire.to ? viaImport : { unresolved: 'package' };
     },
   };
 }
@@ -182,7 +213,7 @@ export function buildGraph(sourcePaths: string[], text: (path: string) => string
     }
     const edges: ImportEdge[] = [];
     for (const imp of scan.imports) {
-      const r = resolver.resolve(path, imp.specifier);
+      const r = resolver.resolve(path, imp.specifier, modeOf(imp.kind));
       if ('unresolved' in r) {
         if (r.unresolved === 'relative') unresolvedRelative++;
         else if (r.unresolved === 'package') unresolvedPackage++;

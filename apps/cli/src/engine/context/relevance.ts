@@ -1,6 +1,6 @@
 import { posix } from 'node:path';
 import type { ContextBudget, ImportEdge, OmittedFile, Reason, RelevantFile, SelectionLimits } from '@turbine-hall/turbine-contracts';
-import { buildGraph, makeResolver, SOURCE_EXT, type Graph, type WorkspacePackage } from './import-graph.js';
+import { buildGraph, makeResolver, modeOf, SOURCE_EXT, type Graph, type WorkspacePackage } from './import-graph.js';
 import { scanModule } from './js-scan.js';
 import { pathWordMatches } from './path-words.js';
 
@@ -213,6 +213,44 @@ function emptyLimits(input: RankInput, graph: Graph): SelectionLimits {
   };
 }
 
+type NamedReason = Extract<Reason, { kind: 'named-in-request' }>;
+
+/**
+ * The files the request names, each with the best reason. This is THE rule: ranking uses it to give reasons and
+ * the verifier uses it to re-derive them, so token boundaries, which rule wins and how many files a name could
+ * mean are the same in both. A file is named by (best first) its exact path, the end of its path, or its file name.
+ */
+function namedInRequest(request: string, pathSet: Set<string>, byBase: Map<string, string[]>): Map<string, NamedReason> {
+  const named = new Map<string, NamedReason>();
+  const keepBest = (path: string, r: NamedReason) => {
+    const have = named.get(path);
+    if (!have || r.points > have.points) named.set(path, r);
+  };
+  for (const tok of pathTokens(request)) {
+    const norm = stripDotSlash(tok.text);
+    if (pathSet.has(norm)) {
+      keepBest(norm, { kind: 'named-in-request', points: NAMED_EXACT, rule: 'exact-path', quote: tok.text, offset: tok.offset, sharedBy: 1 });
+    } else if (norm.includes('/')) {
+      const hits = (byBase.get(baseName(norm)) ?? []).filter((f) => f.endsWith(`/${norm}`));
+      for (const f of hits) keepBest(f, { kind: 'named-in-request', points: NAMED_SUFFIX, rule: 'path-suffix', quote: tok.text, offset: tok.offset, sharedBy: hits.length });
+    } else {
+      const usable = byBase.get(norm) ?? [];
+      if (!usable.length || usable.length > MAX_SHARED_BASENAME) continue;
+      for (const f of usable) {
+        keepBest(f, {
+          kind: 'named-in-request',
+          points: usable.length === 1 ? NAMED_UNIQUE : Math.max(NAMED_SHARED_MIN, Math.round(NAMED_UNIQUE / usable.length)),
+          rule: usable.length === 1 ? 'unique-basename' : 'shared-basename',
+          quote: tok.text,
+          offset: tok.offset,
+          sharedBy: usable.length,
+        });
+      }
+    }
+  }
+  return named;
+}
+
 export function rankFiles(input: RankInput): { ranked: RelevantFile[]; limits: SelectionLimits } {
   const paths = input.files.map((f) => f.path).sort(compare);
   const pathSet = new Set(paths);
@@ -237,34 +275,7 @@ export function rankFiles(input: RankInput): { ranked: RelevantFile[]; limits: S
   }
 
   // ---- 1. paths and basenames named in the request
-  const named = new Map<string, Extract<Reason, { kind: 'named-in-request' }>>();
-  const keepBest = (path: string, r: Extract<Reason, { kind: 'named-in-request' }>) => {
-    const have = named.get(path);
-    if (!have || r.points > have.points) named.set(path, r);
-  };
-  for (const tok of pathTokens(input.request)) {
-    const norm = stripDotSlash(tok.text);
-    if (pathSet.has(norm)) {
-      keepBest(norm, { kind: 'named-in-request', points: NAMED_EXACT, rule: 'exact-path', quote: tok.text, offset: tok.offset, sharedBy: 1 });
-    } else if (norm.includes('/')) {
-      const hits = (byBase.get(baseName(norm)) ?? []).filter((f) => f.endsWith(`/${norm}`));
-      for (const f of hits) keepBest(f, { kind: 'named-in-request', points: NAMED_SUFFIX, rule: 'path-suffix', quote: tok.text, offset: tok.offset, sharedBy: hits.length });
-    } else {
-      const usable = byBase.get(norm) ?? [];
-      if (!usable.length || usable.length > MAX_SHARED_BASENAME) continue;
-      for (const f of usable) {
-        keepBest(f, {
-          kind: 'named-in-request',
-          points: usable.length === 1 ? NAMED_UNIQUE : Math.max(NAMED_SHARED_MIN, Math.round(NAMED_UNIQUE / usable.length)),
-          rule: usable.length === 1 ? 'unique-basename' : 'shared-basename',
-          quote: tok.text,
-          offset: tok.offset,
-          sharedBy: usable.length,
-        });
-      }
-    }
-  }
-  for (const [path, r] of named) add(path, r);
+  for (const [path, r] of namedInRequest(input.request, pathSet, byBase)) add(path, r);
 
   // ---- 2. exported symbols the request mentions
   const words = requestWords(input.request);
@@ -453,6 +464,8 @@ export function verifyRelevantFiles(selected: RelevantFile[], input: VerifyInput
     byBase.get(b)!.push(p);
   }
   const words = requestWords(input.request);
+  let namedMap: Map<string, NamedReason> | undefined;
+  const namedByRequest = () => (namedMap ??= namedInRequest(input.request, pathSet, byBase));
 
   const edgeHolds = (e: ImportEdge, where: string): boolean => {
     const t = input.text(e.from);
@@ -461,7 +474,7 @@ export function verifyRelevantFiles(selected: RelevantFile[], input: VerifyInput
     if (!scan.ok) return (problems.push(`${where}: ${e.from} cannot be tokenised (${scan.reason})`), false);
     const found = scan.imports.find((i) => i.line === e.line && i.specifier === e.specifier && i.kind === e.kind && i.statement === e.statement);
     if (!found) return (problems.push(`${where}: no such statement at ${e.from}:${e.line}`), false);
-    const r = resolver.resolve(e.from, e.specifier);
+    const r = resolver.resolve(e.from, e.specifier, modeOf(e.kind));
     if ('unresolved' in r || r.to !== e.to || r.resolution !== e.resolution) {
       problems.push(`${where}: "${e.specifier}" in ${e.from} does not resolve to ${e.to} by the stated rule`);
       return false;
@@ -481,13 +494,15 @@ export function verifyRelevantFiles(selected: RelevantFile[], input: VerifyInput
             problems.push(`${where}: the request does not contain "${r.quote}" at ${r.offset}`);
             break;
           }
-          const norm = stripDotSlash(r.quote);
+          // The rule is the one ranking used: the same tokens, the same winner, the same count of files a name could mean.
+          const expected = namedByRequest().get(f.path);
           const ok =
-            r.rule === 'exact-path'
-              ? norm === f.path
-              : r.rule === 'path-suffix'
-                ? f.path.endsWith(`/${norm}`)
-                : baseName(f.path) === norm && (byBase.get(norm)?.length ?? 0) === r.sharedBy;
+            !!expected &&
+            expected.rule === r.rule &&
+            expected.quote === r.quote &&
+            expected.offset === r.offset &&
+            expected.sharedBy === r.sharedBy &&
+            expected.points === r.points;
           if (!ok) problems.push(`${where}: "${r.quote}" does not name this file by rule ${r.rule}`);
           break;
         }

@@ -27,6 +27,7 @@ import { packetPaths } from '../../apps/cli/src/engine/packet.js';
 import { computeNextStep } from '../../apps/cli/src/engine/next-step.js';
 import { scanModule } from '../../apps/cli/src/engine/context/js-scan.js';
 import { applyBudget, rankFiles, verifyRelevantFiles, type VerifyInput } from '../../apps/cli/src/engine/context/relevance.js';
+import { makeResolver, modeOf } from '../../apps/cli/src/engine/context/import-graph.js';
 import { buildTaskContext } from '../../apps/cli/src/engine/context/task-context.js';
 import {
   NOTES_LABEL,
@@ -959,5 +960,223 @@ describe('the import scanner states only what it can find at a line of the text'
       const scan = scanModule(src);
       expect(scan.ok).toBe(false);
     }
+  });
+});
+
+// =================================================================== review follow-ups (PR #11)
+
+describe('review follow-ups (PR #11): every hole a reviewer found stays closed', () => {
+  describe('conditional workspace exports are resolved for the way the file imports the package', () => {
+    const manifest = (name: string, extra: Record<string, unknown>) => json({ name, version: '1.0.0', ...extra });
+    const files = [
+      'packages/dual/package.json',
+      'packages/dual/esm.mjs',
+      'packages/dual/cjs.cjs',
+      'packages/same/package.json',
+      'packages/same/index.js',
+      'packages/ordered/package.json',
+      'packages/ordered/i.mjs',
+      'packages/ordered/d.js',
+      'packages/ordered/c.cjs',
+      'packages/hidden/package.json',
+      'packages/hidden/old.js',
+      'src/a.ts',
+    ];
+    const texts: Record<string, string> = {
+      'packages/dual/package.json': manifest('@w/dual', { exports: { '.': { import: './esm.mjs', require: './cjs.cjs' } } }),
+      'packages/same/package.json': manifest('@w/same', { exports: { import: './index.js', require: './index.js' } }),
+      'packages/ordered/package.json': manifest('@w/ordered', { exports: { require: './c.cjs', default: './d.js', import: './i.mjs' } }),
+      'packages/hidden/package.json': manifest('@w/hidden', { main: 'old.js', exports: { './sub': './sub.js' } }),
+    };
+    const workspaces = [
+      { dir: 'packages/dual', name: '@w/dual' },
+      { dir: 'packages/same', name: '@w/same' },
+      { dir: 'packages/ordered', name: '@w/ordered' },
+      { dir: 'packages/hidden', name: '@w/hidden' },
+    ];
+    const resolver = () => makeResolver(new Set(files), (p) => texts[p], workspaces);
+
+    it('import and require get their own target; the cache does not mix them', () => {
+      const r = resolver();
+      expect(r.resolve('src/a.ts', '@w/dual', 'import')).toMatchObject({ to: 'packages/dual/esm.mjs' });
+      expect(r.resolve('src/a.ts', '@w/dual', 'require')).toMatchObject({ to: 'packages/dual/cjs.cjs' });
+      expect(r.resolve('src/a.ts', '@w/dual', 'import')).toMatchObject({ to: 'packages/dual/esm.mjs', resolution: expect.stringContaining('import condition') });
+      expect(r.resolve('src/a.ts', '@w/dual', 'require')).toMatchObject({ resolution: expect.stringContaining('require condition') });
+    });
+
+    it('a type-only import (mode not known) states an edge only when both modes agree', () => {
+      const r = resolver();
+      expect(r.resolve('src/a.ts', '@w/dual', 'unknown')).toEqual({ unresolved: 'package' });
+      expect(r.resolve('src/a.ts', '@w/same', 'unknown')).toMatchObject({ to: 'packages/same/index.js' });
+      expect(modeOf('require')).toBe('require');
+      expect(modeOf('import-type')).toBe('unknown');
+      for (const k of ['import', 'side-effect', 're-export', 'dynamic'] as const) expect(modeOf(k)).toBe('import');
+    });
+
+    it('conditions are tried in the order the manifest writes them; main is not used when exports exist', () => {
+      const r = resolver();
+      expect(r.resolve('src/a.ts', '@w/ordered', 'import')).toMatchObject({ to: 'packages/ordered/d.js' }); // "default" comes before "import"
+      expect(r.resolve('src/a.ts', '@w/ordered', 'require')).toMatchObject({ to: 'packages/ordered/c.cjs' });
+      expect(r.resolve('src/a.ts', '@w/hidden', 'import')).toEqual({ unresolved: 'package' }); // exports hides main
+    });
+
+    it('the graph states the edge for the mode of the statement (checked through ranking)', () => {
+      const all = [...files, 'src/b.cts'];
+      const source: Record<string, string> = {
+        ...texts,
+        'src/a.ts': "import { x } from '@w/dual';\nexport const a = x;\n",
+        'src/b.cts': "const x = require('@w/dual');\nexport const b = x;\n",
+      };
+      const rank = (request: string) =>
+        rankFiles({ request, files: all.map((path) => ({ path, size: 1 })), text: (p) => source[p], workspaces, notScanned: { tooLarge: 0, overCap: 0 } }).ranked;
+      const fromA = rank('Change src/a.ts');
+      expect(fromA.map((f) => f.path)).toContain('packages/dual/esm.mjs');
+      expect(fromA.map((f) => f.path)).not.toContain('packages/dual/cjs.cjs');
+      const fromB = rank('Change src/b.cts');
+      expect(fromB.map((f) => f.path)).toContain('packages/dual/cjs.cjs');
+      expect(fromB.map((f) => f.path)).not.toContain('packages/dual/esm.mjs');
+      // and the verifier re-derives each edge in its own mode
+      const input = { request: 'Change src/b.cts', files: all.map((path) => ({ path, size: 1 })), text: (p: string) => source[p], workspaces };
+      expect(verifyRelevantFiles(fromB, input)).toEqual([]);
+    });
+  });
+
+  describe('JSX closing tags are not regular expressions', () => {
+    const imports = (src: string) => {
+      const r = scanModule(src);
+      if (!r.ok) throw new Error(r.reason);
+      return r.imports.map((i) => i.specifier);
+    };
+
+    it('imports after `</div>`, `</>` and `</Foo.Bar>` are still found', () => {
+      expect(imports("import a from './a';\nexport const X = () => <div>Hello</div>;\nimport b from './b';\n")).toEqual(['./a', './b']);
+      expect(imports("import a from './a';\nexport const Y = () => <><p>one</p><p>two</p></>;\nimport b from './b';\n")).toEqual(['./a', './b']);
+      expect(imports("import a from './a';\nexport const Z = () => <Foo.Bar>text</Foo.Bar>;\nimport b from './b';\n")).toEqual(['./a', './b']);
+    });
+
+    it('a regular expression inside a JSX expression is still a regular expression, and a division is still a division', () => {
+      expect(imports("import a from './a';\nexport const X = (s: string) => <div>{s.replace(/<\\/div>/g, '')}</div>;\nimport b from './b';\n")).toEqual(['./a', './b']);
+      expect(imports("import a from './a';\nconst half = (n: number) => n / 2;\nconst r = (n: number) => n < 3 ? n / 2 : 0;\nimport b from './b';\n")).toEqual(['./a', './b']);
+    });
+  });
+
+  describe('the verifier uses the ranking rule for names in the request, not substring matching', () => {
+    const files = ['src/cart.ts', 'src/cart.tsx', 'a/util.ts', 'b/util.ts'].map((path) => ({ path, size: 1 }));
+    const request = 'Update cart.tsx and see a/util.ts';
+    const input = { request, files, text: () => undefined, workspaces: [] };
+    const ranked = () => rankFiles({ ...input, notScanned: { tooLarge: 0, overCap: 0 } }).ranked;
+
+    it('what ranking produced verifies', () => {
+      expect(verifyRelevantFiles(ranked(), input)).toEqual([]);
+      expect(ranked().map((f) => f.path).sort()).toEqual(['a/util.ts', 'src/cart.tsx']);
+    });
+
+    it('a planted reason quoting "cart.ts" out of "cart.tsx" for src/cart.ts is rejected', () => {
+      const at = request.indexOf('cart.ts');
+      const forged: RelevantFile = {
+        path: 'src/cart.ts',
+        score: 70,
+        reasons: [{ kind: 'named-in-request', points: 70, rule: 'unique-basename', quote: 'cart.ts', offset: at, sharedBy: 1 }],
+      };
+      expect(request.slice(at, at + 'cart.ts'.length)).toBe('cart.ts'); // it is in the text, as a substring
+      expect(verifyRelevantFiles([forged], input).join('\n')).toMatch(/"cart\.ts" does not name this file/);
+    });
+
+    it('a wrong ambiguity count, wrong points or a wrong offset is rejected', () => {
+      const real = ranked().find((f) => f.path === 'src/cart.tsx')!;
+      const tweak = (patch: Partial<Extract<RelevantFile['reasons'][number], { kind: 'named-in-request' }>>): string[] => {
+        const f = structuredClone(real);
+        Object.assign(f.reasons[0]!, patch);
+        f.score = f.reasons.reduce((n, r) => n + r.points, 0);
+        return verifyRelevantFiles([f], input);
+      };
+      expect(tweak({ sharedBy: 2 }).join('\n')).toMatch(/does not name this file/);
+      expect(tweak({ points: 100 }).join('\n')).toMatch(/does not name this file/);
+      expect(tweak({ rule: 'exact-path' }).join('\n')).toMatch(/does not name this file/);
+      expect(tweak({ offset: request.indexOf('cart.tsx') + 1, quote: 'art.tsx' }).join('\n')).toMatch(/does not name this file/);
+    });
+  });
+
+  describe('assess reads the facts and the file selection at one commit', () => {
+    it('HEAD moving once between the two reads: both are read again and agree', async () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const real = engine.ensureTaskContext.bind(engine);
+      let calls = 0;
+      engine.ensureTaskContext = (w) => {
+        if (calls++ === 0) commitFiles(dir, { 'src/leave/moved.ts': 'export const moved = true;\n' });
+        return real(w);
+      };
+      const t = newTask(engine);
+      await engine.assess(t.id);
+      expect(calls).toBe(2);
+      const sel = storedContext(engine, t.id);
+      expect(sel.snapshot.commit).toBe(head(dir));
+      expect(engine.ctx.store.getLatestSnapshotFor(dir)!.commit).toBe(sel.snapshot.commit);
+      expect(engine.ctx.store.getWork(t.id).currentState).not.toBe('ASSESSING');
+    });
+
+    it('HEAD moving every time: the task stops before any model call, and can be retried', async () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const prompts: string[] = [];
+      const mock = createMockModelAdapter('ctx3-pin-spy');
+      registerModel({ ...mock, id: 'ctx3-pin-spy', async run(req) { prompts.push(req.schemaId); return mock.run(req); } });
+      engine.ctx.config.models.profiles.analysis = { provider: 'mock', model: 'ctx3-pin-spy', maxOutputTokens: 4000 };
+      const real = engine.ensureTaskContext.bind(engine);
+      let moving = true;
+      let n = 0;
+      engine.ensureTaskContext = (w) => {
+        if (moving) commitFiles(dir, { [`src/leave/moving-${n++}.ts`]: 'export const m = 1;\n' });
+        return real(w);
+      };
+      const t = newTask(engine);
+      await expect(engine.assess(t.id)).rejects.toMatchObject({ code: 'E_CONTEXT_UNAVAILABLE' });
+      expect(prompts).toEqual([]);
+      expect(engine.ctx.store.getWork(t.id).currentState).toBe('ASSESSING');
+      moving = false;
+      await engine.assess(t.id);
+      expect(prompts).toContain('assessment');
+      expect(storedContext(engine, t.id).snapshot.commit).toBe(head(dir));
+    });
+  });
+
+  describe('execute stays retryable when the context cannot be prepared', () => {
+    it('a failure refreshing the context leaves the task in PLAN_APPROVED with no worktree; fixing it lets execute run', async () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const work = await toPlanApproved(engine);
+      const paths = packetPaths(dir, work.id);
+      // The evidence folder cannot be written: a file stands where the folder belongs.
+      rmSync(paths.evidenceDir, { recursive: true, force: true });
+      writeFileSync(paths.evidenceDir, 'not a folder');
+      // A new commit makes the selection stale, so execute has to rebuild and write.
+      commitFiles(dir, { 'src/leave/late.ts': "import { formatRow } from './format.js';\nexport const late = formatRow;\n" });
+
+      await expect(engine.execute(work.id)).rejects.toThrow();
+      expect(engine.ctx.store.getWork(work.id).currentState).toBe('PLAN_APPROVED');
+      expect(existsSync(join(dir, '.turbine', 'worktrees', work.id))).toBe(false);
+      expect(engine.repoStates(work.id)).toEqual([]);
+
+      rmSync(paths.evidenceDir, { force: true });
+      const executed = await engine.execute(work.id);
+      expect(engine.ctx.store.getWork(work.id).currentState).toBe('IMPLEMENTING');
+      expect(existsSync(executed.result.worktreePath!)).toBe(true);
+      expect(storedContext(engine, work.id).snapshot.commit).toBe(head(dir));
+    });
+
+    it('the same holds when the task was sent back (CHANGES_REQUESTED stays CHANGES_REQUESTED)', async () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const work = await toChangesRequested(engine);
+      const paths = packetPaths(dir, work.id);
+      rmSync(paths.evidenceDir, { recursive: true, force: true });
+      writeFileSync(paths.evidenceDir, 'not a folder');
+      await expect(engine.execute(work.id)).rejects.toThrow();
+      expect(engine.ctx.store.getWork(work.id).currentState).toBe('CHANGES_REQUESTED');
+      rmSync(paths.evidenceDir, { force: true });
+      await engine.execute(work.id);
+      expect(engine.ctx.store.getWork(work.id).currentState).toBe('IMPLEMENTING');
+    });
   });
 });

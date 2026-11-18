@@ -606,9 +606,21 @@ export class Engine {
 
     this.checkBudget(work.id);
     const sourceText = this.sourceTextOf(work);
-    const projectEvidence = collectProjectEvidence(this.ctx.projectRoot, this.requestTextOf(work), { store: this.ctx.store });
-    // The file selection is built from the same commit as the facts above, then rendered for the model.
-    const taskContext = this.ensureTaskContext(work);
+    // The facts and the file selection must describe the same commit. HEAD can move between the two reads, so on a
+    // mismatch both are read once more; if they still disagree the task stops before any model call.
+    const gather = () => {
+      const evidence = collectProjectEvidence(this.ctx.projectRoot, this.requestTextOf(work), { store: this.ctx.store });
+      return { evidence, context: this.ensureTaskContext(work) };
+    };
+    const agree = (g: ReturnType<typeof gather>) =>
+      g.context.status === 'unavailable' || !g.evidence.snapshot || g.context.selection.snapshot.commit === g.evidence.snapshot.commit;
+    let gathered = gather();
+    if (!agree(gathered)) gathered = gather();
+    if (!agree(gathered)) {
+      throw err('E_CONTEXT_UNAVAILABLE', 'HEAD moved twice while the project facts and the task context were read, so they cannot be pinned to one commit. Retry when the checkout is quiet.');
+    }
+    const projectEvidence = gathered.evidence;
+    const taskContext = gathered.context;
     const model = getModel(this.ctx.config.models.profiles.analysis?.model ?? 'mock-default');
     const skill = getSkill(this.ctx.factoryRoot, 'core/assess-requirements');
     const assessContext = [
@@ -1039,27 +1051,24 @@ export class Engine {
         'error' in h
           ? undefined
           : { root: h.repoRoot, head: h.head, branch: observeBranch(h.repoRoot)?.branch, dirty: hasUncommittedChanges(h.repoRoot) };
-      return { evidence, info };
+      // The file selection is read at the commit the facts are pinned to; two commits in one plan prompt would
+      // make the reasons and the facts disagree.
+      return { evidence, info, context: this.ensureTaskContext(work) };
     };
-    // Evidence without a snapshot has nothing to pin. With a snapshot, an unreadable HEAD (no info) is not a match.
+    // Evidence without a snapshot has nothing to pin. With a snapshot, an unreadable HEAD (no info) is not a match,
+    // and neither is a file selection built at another commit than the facts.
     const pinned = (g: ReturnType<typeof gather>) =>
-      !g.evidence.snapshot || (g.info !== undefined && g.info.head === g.evidence.snapshot.commit);
+      !g.evidence.snapshot ||
+      (g.info !== undefined &&
+        g.info.head === g.evidence.snapshot.commit &&
+        (g.context.status === 'unavailable' || g.context.selection.snapshot.commit === g.evidence.snapshot.commit));
     let gathered = gather();
     if (!pinned(gathered)) gathered = gather();
     if (!pinned(gathered)) {
-      throw err('E_CONTEXT_UNAVAILABLE', 'HEAD moved twice while the project facts were read, so they cannot be pinned to one commit. Retry when the checkout is quiet.');
+      throw err('E_CONTEXT_UNAVAILABLE', 'HEAD moved twice while the project facts and the task context were read, so they cannot be pinned to one commit. Retry when the checkout is quiet.');
     }
     const projectEvidence = gathered.evidence;
-    // The file selection is read at the commit the facts were pinned to; two commits in one plan prompt would
-    // make the reasons and the facts disagree.
-    const taskContext = this.ensureTaskContext(work);
-    if (
-      taskContext.status !== 'unavailable' &&
-      projectEvidence.snapshot &&
-      taskContext.selection.snapshot.commit !== projectEvidence.snapshot.commit
-    ) {
-      throw err('E_CONTEXT_UNAVAILABLE', 'HEAD moved while the task context was selected, so it and the project facts describe different commits. Retry when the checkout is quiet.');
-    }
+    const taskContext = gathered.context;
     const repoContext = [
       gathered.info
         ? `Git: branch ${gathered.info.branch ?? '(detached)'}, HEAD ${gathered.info.head.slice(0, 12)}; ${gathered.info.dirty ? 'there are uncommitted changes (not read here)' : 'no uncommitted changes'}.`
@@ -1598,6 +1607,11 @@ export class Engine {
       );
     if (!planOk) throw err('E_STALE_REVISION', 'Current plan is not approved');
 
+    // Rebuilt when the base commit moved or this is a new CHANGES_REQUESTED cycle, before anything points at it.
+    // It runs before the task leaves PLAN_APPROVED / CHANGES_REQUESTED and before any worktree exists, so a
+    // failure here (an unreadable repository, an unwritable packet folder) leaves the task retryable.
+    const taskContext = this.ensureTaskContext(work);
+
     work = transition(work, 'IMPLEMENTING');
     this.ctx.store.saveWork(work);
 
@@ -1618,9 +1632,6 @@ export class Engine {
             primaryChecks: this.ctx.config.quality.checks,
             primarySetup: this.ctx.config.quality.setup,
           });
-
-    // Rebuilt when the base commit moved or this is a new CHANGES_REQUESTED cycle, before anything points at it.
-    const taskContext = this.ensureTaskContext(work);
 
     let modelNotes: unknown;
     if (existing.length === 0) {

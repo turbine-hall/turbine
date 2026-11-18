@@ -175,6 +175,16 @@ export function scanModule(input: string): ModuleScan {
         continue;
       }
       if (c === '/') {
+        // `</div>` and `</>`: the slash closes a JSX element, it does not start a regular expression. The whole
+        // closing tag is consumed as one token so nothing inside it is read as code.
+        if (prev && prev.t === 'p' && prev.v === '<' && prev.end === i) {
+          const tag = /^\/(?:[A-Za-z_$][\w$.:-]*\s*)?>/.exec(s.slice(i, i + 200));
+          if (tag) {
+            push('p', '>', i, i + tag[0].length);
+            i += tag[0].length;
+            continue;
+          }
+        }
         if (regexAllowed()) {
           const end = skipRegex(i);
           push('x', '/', i, end);
