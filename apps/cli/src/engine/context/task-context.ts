@@ -49,7 +49,8 @@ export type Now = {
   commit: string;
   /** Hash of the project snapshot stored for this commit, when there is one. */
   snapshotHash?: string;
-  budget: ContextBudget;
+  /** `source` and `roles`, when given, are compared too: another role declaring the same limits changes who is credited. */
+  budget: ContextBudget & { source?: 'default' | 'roles'; roles?: string[] };
   requestHash: string;
   changesCycle: number;
 };
@@ -60,7 +61,9 @@ export function stalenessOf(sel: TaskContext, now: Now): Staleness[] {
   if (sel.changesCycle !== now.changesCycle) out.push('changes-requested');
   if (sel.snapshot.commit !== now.commit) out.push('base-commit-changed');
   else if (now.snapshotHash && sel.snapshot.hash !== now.snapshotHash) out.push('snapshot-changed');
-  if (sel.budget.maxFiles !== now.budget.maxFiles || sel.budget.maxChars !== now.budget.maxChars) out.push('budget-changed');
+  const provenanceChanged =
+    now.budget.source !== undefined && (sel.budget.source !== now.budget.source || sel.budget.roles.join('\0') !== [...(now.budget.roles ?? [])].sort().join('\0'));
+  if (sel.budget.maxFiles !== now.budget.maxFiles || sel.budget.maxChars !== now.budget.maxChars || provenanceChanged) out.push('budget-changed');
   if (sel.request.hash !== now.requestHash) out.push('request-changed');
   if (sel.methodVersion !== METHOD_VERSION) out.push('method-changed');
   return out;

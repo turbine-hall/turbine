@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   DEFAULT_CONTEXT_BUDGET,
+  contentHashText,
   parseTaskContext,
   type RelevantFile,
   type TaskContext,
@@ -25,10 +26,11 @@ import { openContext } from '../../apps/cli/src/engine/project.js';
 import { Engine } from '../../apps/cli/src/engine/engine.js';
 import { packetPaths } from '../../apps/cli/src/engine/packet.js';
 import { computeNextStep } from '../../apps/cli/src/engine/next-step.js';
+import { prefixMatches, segmentMatches } from '../../apps/cli/src/engine/context/glob.js';
 import { scanModule } from '../../apps/cli/src/engine/context/js-scan.js';
 import { applyBudget, codeownersFor, parseCodeowners, rankFiles, verifyRelevantFiles, type VerifyInput } from '../../apps/cli/src/engine/context/relevance.js';
 import { makeResolver, type WorkspacePackage } from '../../apps/cli/src/engine/context/import-graph.js';
-import { buildTaskContext, readTaskFiles, snapshotHashAt } from '../../apps/cli/src/engine/context/task-context.js';
+import { buildTaskContext, readTaskFiles, snapshotHashAt, stalenessOf } from '../../apps/cli/src/engine/context/task-context.js';
 import { listTreeDetailed } from '../../apps/cli/src/engine/context/git-read.js';
 import { lintPacket } from '../../apps/cli/src/engine/docs/lint.js';
 import {
@@ -2051,7 +2053,7 @@ describe('review round 4b (PR #11): tsconfig outputs, legacy order, nearest mani
       const w = store.getWork(work.id);
       const changed = () => store.listEvents(work.id).filter((e) => e.type === 'task.changes-requested').length;
       const save = store.saveWork.bind(store);
-      let fail = true;
+      let fail = false;
       store.saveWork = (x) => {
         if (fail) throw new Error('disk full');
         return save(x);
@@ -2059,6 +2061,8 @@ describe('review round 4b (PR #11): tsconfig outputs, legacy order, nearest mani
       const toChanges = (engine as unknown as { toChangesRequested: (w: WorkPackage, c: string) => WorkPackage }).toChangesRequested.bind(engine);
       // the task must be in a state that may enter CHANGES_REQUESTED
       const reviewing = { ...w, currentState: 'HUMAN_CODE_REVIEW' } as WorkPackage;
+      store.saveWork(reviewing); // the stored state is the one the transition starts from
+      fail = true;
       expect(() => toChanges(reviewing, 'code-review')).toThrow(/disk full/);
       expect(changed()).toBe(0);
       fail = false;
@@ -2077,6 +2081,221 @@ describe('review round 4b (PR #11): tsconfig outputs, legacy order, nearest mani
       expect(stale(work, sel)).toEqual([]);
       // the snapshot was replaced at the same commit: the stored selection names the old one
       expect(stale(work, { ...sel, snapshot: { ...sel.snapshot, hash: `sha256:${'2'.repeat(64)}` } })).toEqual(['snapshot-changed']);
+    });
+  });
+});
+
+
+// =================================================================== review round 6 (PR #11): local CodeRabbit scan 4
+
+describe('review round 6 (PR #11): glob edge cases, config discovery, budget provenance, publication safety', () => {
+  const resolverOf = (files: string[], texts: Record<string, string>, workspaces: WorkspacePackage[]) => makeResolver(new Set(files), (p) => texts[p], workspaces);
+  const NONE = { unresolved: 'package' };
+  const rootBuilt = (tsconfig: unknown, extraFiles: Record<string, string> = {}) =>
+    resolverOf(
+      ['package.json', 'tsconfig.json', 'src/index.ts', 'src/a.ts', ...Object.keys(extraFiles)],
+      { 'package.json': json({ name: '@w/root', exports: { '.': { import: './dist/index.js' } } }), 'tsconfig.json': json(tsconfig), ...extraFiles },
+      [{ dir: '.', name: '@w/root' }],
+    ).resolve('src/a.ts', '@w/root', 'import');
+  const co = { rootDir: 'src', outDir: 'dist' };
+
+  describe('glob matching', () => {
+    it('`*` is a wildcard even when the text has a `*` in the same place', () => {
+      expect(segmentMatches('*.ts', '*draft.ts')).toBe(true);
+      expect(segmentMatches('*.ts', 'draft.ts')).toBe(true);
+      expect(segmentMatches('*d*', '*draft.ts')).toBe(true);
+      expect(segmentMatches('*.ts', '*draft.js')).toBe(false);
+      expect(segmentMatches('a?c', 'abc')).toBe(true);
+      expect(segmentMatches('a?c', 'ac')).toBe(false);
+    });
+
+    it('thousands of consecutive `**` segments cost no more than one', () => {
+      const pat = [...Array.from({ length: 5000 }, () => '**'), '*.ts'];
+      const path = [...Array.from({ length: 50 }, () => 'd'), 'x.ts'];
+      const t0 = Date.now();
+      const ok = prefixMatches(pat, path);
+      expect(Date.now() - t0).toBeLessThan(1000);
+      expect(ok[path.length]).toBe(true);
+      expect(ok[path.length - 1]).toBe(false);
+    });
+  });
+
+  describe('tsconfig discovery', () => {
+    it('include "." and "./" of a root config cover everything under it', () => {
+      expect(rootBuilt({ compilerOptions: co, include: ['.'] })).toMatchObject({ to: 'src/index.ts' });
+      expect(rootBuilt({ compilerOptions: co, include: ['./'] })).toMatchObject({ to: 'src/index.ts' });
+      expect(rootBuilt({ compilerOptions: co, include: ['lib'] })).toEqual(NONE);
+    });
+
+    it('extends "./base" reads the file named base when it exists, and base.json only otherwise', () => {
+      const both = { 'base': json({ compilerOptions: { noEmit: true } }), 'base.json': json({ compilerOptions: { strict: true } }) };
+      expect(rootBuilt({ extends: './base', compilerOptions: co }, both)).toEqual(NONE); // base says noEmit
+      expect(rootBuilt({ extends: './base', compilerOptions: co }, { 'base.json': both['base.json'] })).toMatchObject({ to: 'src/index.ts' });
+      expect(rootBuilt({ extends: './base.json', compilerOptions: co }, both)).toMatchObject({ to: 'src/index.ts' });
+    });
+
+    it('outFile (or out) bundles the inputs: no per-file output is claimed', () => {
+      expect(rootBuilt({ compilerOptions: { ...co, module: 'amd', outFile: 'dist/bundle.js' } })).toEqual(NONE);
+      expect(rootBuilt({ compilerOptions: { ...co, out: 'dist/bundle.js' } })).toEqual(NONE);
+      expect(rootBuilt({ compilerOptions: co })).toMatchObject({ to: 'src/index.ts' });
+    });
+  });
+
+  describe('the size limit text says what was kept', () => {
+    it('with omitted records fewer than omittedTotal, it states how many have no record', () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const t = newTask(engine);
+      engine.ensureTaskContext(engine.ctx.store.getWork(t.id));
+      const sel = storedContext(engine, t.id);
+      const f = sel.files[0]!;
+      const omitted = Array.from({ length: 3 }, (_, i) => ({ ...f, path: `x${i}.ts`, why: 'maxFiles' as const }));
+      const body = renderContextBody({ ...sel, omitted, omittedTotal: 50 } as TaskContext, { title: 't', workId: 'w', stale: [] });
+      expect(body).toContain('47 lower-scoring file(s) are counted but have no record anywhere (only the best 3 are kept)');
+      expect(body).not.toContain('47 more (lower scores) are in evidence/context.json');
+      const all = renderContextBody({ ...sel, omitted, omittedTotal: 3 } as TaskContext, { title: 't', workId: 'w', stale: [] });
+      expect(all).not.toContain('no record anywhere');
+    });
+  });
+
+  describe('lint says when it could not check a file', () => {
+    const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+    it.skipIf(isRoot || process.platform === 'win32')('a stat failure other than a missing file is an error for that file', () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const t = newTask(engine);
+      engine.ensureTaskContext(engine.ctx.store.getWork(t.id));
+      const taskDir = dirname(packetPaths(dir, t.id).context);
+      chmodSync(taskDir, 0o000);
+      try {
+        const issues = lintTaskContexts(dir);
+        expect(issues).toHaveLength(1);
+        expect(issues[0]).toMatchObject({ level: 'error', message: expect.stringContaining('cannot be checked') });
+      } finally {
+        chmodSync(taskDir, 0o755);
+      }
+      expect(lintTaskContexts(dir)).toEqual([]);
+    });
+  });
+
+  describe('budget provenance', () => {
+    it('another role declaring the same limits makes the stored selection stale (the credit changed)', () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const t = newTask(engine);
+      engine.ensureTaskContext(engine.ctx.store.getWork(t.id));
+      const sel = storedContext(engine, t.id);
+      const stored = { ...sel, budget: { ...sel.budget, source: 'roles' as const, roles: ['architect'] } };
+      const now = (roles: string[]) => ({ commit: sel.snapshot.commit, budget: { maxFiles: sel.budget.maxFiles, maxChars: sel.budget.maxChars, source: 'roles' as const, roles }, requestHash: sel.request.hash, changesCycle: sel.changesCycle });
+      expect(stalenessOf(stored, now(['architect']))).toEqual([]);
+      expect(stalenessOf(stored, now(['architect', 'developer']))).toEqual(['budget-changed']);
+      expect(stalenessOf(stored, { ...now(['architect']), budget: { maxFiles: sel.budget.maxFiles, maxChars: sel.budget.maxChars, source: 'default' as const, roles: [] } })).toEqual(['budget-changed']);
+    });
+  });
+
+  describe('publication', () => {
+    const prepared = () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const t = newTask(engine);
+      const work = engine.ctx.store.getWork(t.id);
+      engine.ensureTaskContext(work);
+      return { dir, engine, work, paths: packetPaths(dir, t.id), id: t.id };
+    };
+
+    it('evidence/context.json names the CONTEXT.md published with it, so a mismatched pair is detectable', () => {
+      const { paths } = prepared();
+      const json1 = JSON.parse(readFileSync(join(paths.evidenceDir, 'context.json'), 'utf8')) as { document: string };
+      expect(json1.document).toBe(contentHashText(readFileSync(paths.context, 'utf8')));
+    });
+
+    it('a write failure is E_CONTEXT_UNAVAILABLE: ensure stops with the old file in place, render records it and goes on', () => {
+      const { engine, work, paths, id } = prepared();
+      const before = readFileSync(paths.context);
+      const jsonPath = join(paths.evidenceDir, 'context.json');
+      rmSync(jsonPath);
+      mkdirSync(jsonPath); // a directory where the file belongs: the rename cannot succeed
+      let thrown: unknown;
+      try {
+        engine.ensureTaskContext(work);
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toMatchObject({ code: 'E_CONTEXT_UNAVAILABLE', message: expect.stringContaining('could not be written') });
+      expect(readFileSync(paths.context).equals(before)).toBe(true); // JSON is written first; CONTEXT.md is untouched
+      expect(() => engine.render(id)).not.toThrow();
+      expect(engine.ctx.store.listEvents(work.id).some((e) => e.type === 'context.render-failed')).toBe(true);
+    });
+
+    it('the selection record and its event are saved together: a failed event leaves no record, and the retry saves both', () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const t = newTask(engine);
+      const work = engine.ctx.store.getWork(t.id);
+      const store = engine.ctx.store;
+      const append = store.appendEvent.bind(store);
+      let fail = true;
+      store.appendEvent = (e) => {
+        if (fail && e.type === 'context.selected') throw new Error('event store unavailable');
+        return append(e);
+      };
+      expect(() => engine.ensureTaskContext(work)).toThrow(/event store unavailable/);
+      expect(store.getLatestArtifact(work.id, 'repo-context')).toBeFalsy();
+      fail = false;
+      engine.ensureTaskContext(work);
+      expect(store.getLatestArtifact(work.id, 'repo-context')).toBeDefined();
+      expect(store.listEvents(work.id).filter((e) => e.type === 'context.selected')).toHaveLength(1);
+    });
+
+    it('two requests for changes that both read the review state: only the first records a cycle', () => {
+      const { engine, work } = prepared();
+      const store = engine.ctx.store;
+      const w = store.getWork(work.id);
+      const reviewing = { ...w, currentState: 'HUMAN_CODE_REVIEW' } as WorkPackage;
+      store.saveWork(reviewing);
+      const toChanges = (engine as unknown as { toChangesRequested: (w: WorkPackage, c: string) => WorkPackage }).toChangesRequested.bind(engine);
+      toChanges(reviewing, 'code-review'); // the first request commits
+      expect(() => toChanges(reviewing, 'code-review')).toThrow(/CHANGES_REQUESTED|not HUMAN_CODE_REVIEW/); // the second still holds the old copy
+      expect(store.listEvents(work.id).filter((e) => e.type === 'task.changes-requested')).toHaveLength(1);
+    });
+  });
+
+  describe('plan', () => {
+    it('HEAD moving while the model runs: the plan is discarded and can be retried; nothing is saved from the old tree', async () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const work = await toRequirementsApproved(engine);
+      const mock = createMockModelAdapter('ctx3-plan-move');
+      let moving = true;
+      let n = 0;
+      registerModel({
+        ...mock,
+        id: 'ctx3-plan-move',
+        async run(req) {
+          if (moving && req.schemaId === 'plan') commitFiles(dir, { [`src/leave/during-plan-${n++}.ts`]: 'export const x = 1;\n' });
+          return mock.run(req);
+        },
+      });
+      engine.ctx.config.models.profiles.analysis = { provider: 'mock', model: 'ctx3-plan-move', maxOutputTokens: 4000 };
+      await expect(engine.plan(work.id)).rejects.toMatchObject({ code: 'E_CONCURRENT', message: expect.stringContaining('HEAD moved') });
+      expect(engine.ctx.store.getLatestArtifact(work.id, 'plan')).toBeFalsy();
+      expect(engine.ctx.store.getWork(work.id).currentState).toBe('PLANNING');
+      moving = false;
+      await engine.plan(work.id);
+      expect(engine.ctx.store.getWork(work.id).currentState).toBe('PLAN_REVIEW');
+      expect(storedContext(engine, work.id).snapshot.commit).toBe(head(dir));
+    });
+
+    it('planning from CHANGES_REQUESTED builds the selection of the new cycle before anything else reads it', async () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const work = await toChangesRequested(engine);
+      const old = storedContext(engine, work.id);
+      await engine.plan(work.id);
+      const fresh = storedContext(engine, work.id);
+      expect(fresh.trigger).toBe('changes-requested');
+      expect(fresh.changesCycle).toBe(old.changesCycle + 1);
+      expect(engine.ctx.store.getWork(work.id).currentState).toBe('PLAN_REVIEW');
     });
   });
 });

@@ -44,7 +44,7 @@ class Unproven extends Error {}
 /** A path written in a config, resolved against that config's directory. Absolute paths and paths leaving the repository are refused. */
 function resolveIn(dir: string, value: string): string {
   if (value === '' || value.startsWith('/') || value.startsWith('\\') || /^[A-Za-z]:/.test(value) || value.includes('\\')) throw new Unproven();
-  const joined = posix.join(dir, value);
+  const joined = posix.join(dir, value).replace(/\/+$/, '') || '.'; // `./` and `dir/` name the directory
   if (joined === '..' || joined.startsWith('../')) throw new Unproven();
   return joined;
 }
@@ -86,7 +86,9 @@ function load(file: string, text: (path: string) => string | undefined): BuildCo
     const ext: unknown = data.extends;
     if (ext === undefined) break;
     if (typeof ext !== 'string' || !(ext.startsWith('./') || ext.startsWith('../'))) throw new Unproven();
-    cur = resolveIn(dir, ext.endsWith('.json') ? ext : `${ext}.json`);
+    // TypeScript checks the exact path first and adds `.json` only when that file does not exist
+    const exact = resolveIn(dir, ext);
+    cur = ext.endsWith('.json') || text(exact) !== undefined ? exact : `${exact}.json`;
   }
 
   const cfg: BuildConfig = { file, noEmit: false, emitDeclarationOnly: false, declaration: false, composite: false, allowJs: false };
@@ -97,6 +99,8 @@ function load(file: string, text: (path: string) => string | undefined): BuildCo
   };
   for (const { dir, data } of chain) {
     const co = (data.compilerOptions ?? {}) as Record<string, unknown>;
+    // with `outFile` the inputs are bundled into one file: per-file output is not what the config produces
+    if (co.outFile !== undefined || co.out !== undefined) throw new Unproven();
     if (co.outDir !== undefined) cfg.outDir = pathIn(dir, co.outDir);
     if (co.declarationDir !== undefined) cfg.declarationDir = pathIn(dir, co.declarationDir);
     if (co.rootDir !== undefined) cfg.rootDir = pathIn(dir, co.rootDir);
@@ -127,6 +131,7 @@ const modelled = (pattern: string): boolean =>
 function matchInclude(pattern: string, source: string): Tri {
   const path = source.split('/');
   if (!modelled(pattern) || path.length > MAX_SEGMENTS) return 'unknown';
+  if (pattern === '.') return true; // the config directory itself (a root config's `.` or `./`): everything under it
   const segs = pattern.split('/');
   const last = segs[segs.length - 1]!;
   // a last segment with no wildcard and no extension names a directory

@@ -10,12 +10,13 @@ export function segmentMatches(pat: string, s: string): boolean {
   let star = -1;
   let mark = 0;
   while (i < s.length) {
-    if (p < pat.length && (pat[p] === '?' || pat[p] === s[i])) {
-      p++;
-      i++;
-    } else if (p < pat.length && pat[p] === '*') {
+    if (p < pat.length && pat[p] === '*') {
+      // a `*` is a wildcard before it is a character: the text `*draft.ts` is matched by `*.ts` and `*d*`
       star = p++;
       mark = i;
+    } else if (p < pat.length && (pat[p] === '?' || pat[p] === s[i])) {
+      p++;
+      i++;
     } else if (star >= 0) {
       p = star + 1;
       i = ++mark;
@@ -30,7 +31,9 @@ export function segmentMatches(pat: string, s: string): boolean {
  * segments. The pattern positions are advanced together, one path segment at a time: no recursion, and the work is
  * (pattern segments × path segments).
  */
-export function prefixMatches(pat: string[], path: string[]): boolean[] {
+export function prefixMatches(patSegments: string[], path: string[]): boolean[] {
+  // consecutive `**` segments mean the same as one: collapsing them keeps the closure to one step per position
+  const pat = patSegments.filter((seg, i) => !(seg === '**' && patSegments[i - 1] === '**'));
   const closure = (states: Set<number>): Set<number> => {
     for (const i of [...states]) for (let j = i; pat[j] === '**'; j++) states.add(j + 1);
     return states;

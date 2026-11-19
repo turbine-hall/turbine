@@ -194,8 +194,16 @@ export function renderContextBody(sel: TaskContext, o: BodyOptions): string {
     for (const f of sel.omitted.slice(0, OMITTED_ROWS)) {
       out.push(`| ${code(f.path)} | ${f.score} | ${f.why} | ${reasonText(f.reasons[0]!).replace(/\|/g, '\\|')} |`);
     }
-    const more = sel.omittedTotal - Math.min(OMITTED_ROWS, sel.omitted.length);
-    if (more > 0) out.push('', `_${more} more (lower scores) are in evidence/context.json${sel.omitted.length < sel.omittedTotal ? `; it keeps the best ${sel.omitted.length}` : ''}._`);
+    const shown = Math.min(OMITTED_ROWS, sel.omitted.length);
+    const inJson = sel.omitted.length - shown; // stored, not shown here
+    const notStored = sel.omittedTotal - sel.omitted.length; // counted, but no record kept
+    if (inJson > 0 || notStored > 0) {
+      const parts = [
+        ...(inJson > 0 ? [`${inJson} more (lower scores) are in evidence/context.json`] : []),
+        ...(notStored > 0 ? [`${notStored} lower-scoring file(s) are counted but have no record anywhere (only the best ${sel.omitted.length} are kept)`] : []),
+      ];
+      out.push('', `_${parts.join('; ')}._`);
+    }
   }
   out.push('');
 
@@ -322,12 +330,14 @@ export function lintTaskContexts(projectRoot: string): LintIssue[] {
   for (const id of readdirSync(tasks).sort()) {
     const file = join(tasks, id, 'CONTEXT.md');
     let st;
+    const name = `.turbine/tasks/${id}/CONTEXT.md`;
     try {
       st = lstatSync(file);
-    } catch {
+    } catch (e) {
+      // a task without a CONTEXT.md is fine; any other failure means this file was not checked, and says so
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') issues.push({ level: 'error', file: name, message: `cannot be checked: ${(e as Error).message}` });
       continue;
     }
-    const name = `.turbine/tasks/${id}/CONTEXT.md`;
     if (!st.isFile()) {
       issues.push({ level: 'error', file: name, message: 'is not a regular file (a symlink or directory)' });
       continue;

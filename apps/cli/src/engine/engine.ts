@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync, rmSync } from 'node:fs';
 import { basename, join, relative, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
@@ -466,6 +466,12 @@ export class Engine {
     // The event and the state are saved together: a failed state write must not leave an event that would count as
     // a review cycle, and a retried transition must add exactly one.
     this.ctx.store.transaction(() => {
+      // BEGIN IMMEDIATE holds the write lock: the stored state is read inside it, so two requests that both read
+      // the review state before either committed cannot both record a cycle.
+      const stored = this.ctx.store.getWork(work.id);
+      if (stored.currentState !== work.currentState) {
+        throw err('E_CONCURRENT', `${work.id} is ${stored.currentState}, not ${work.currentState}, so changes were not requested. Look at the task again.`);
+      }
       this.ctx.store.appendEvent({
         workId: work.id,
         type: 'task.changes-requested',
@@ -507,26 +513,36 @@ export class Engine {
   /** Records a selection as the next `repo-context` artifact, pinned to the Layer 1 snapshot it was read at. */
   private saveTaskContext(work: WorkPackage, selection: TaskContext): void {
     const source = this.ctx.store.getLatestArtifact(work.id, 'source');
-    this.saveArtifact({
-      workId: work.id,
-      type: 'repo-context',
-      content: selection,
-      createdBy: { kind: 'tool', identifier: 'task-context' },
-      parentArtifactIds: source ? [source.id] : [],
-      relatedCommit: selection.snapshot.commit,
-    });
-    this.ctx.store.appendEvent({
-      workId: work.id,
-      type: 'context.selected',
-      payload: {
-        snapshotHash: selection.snapshot.hash,
-        commit: selection.snapshot.commit,
-        files: selection.files.length,
-        omitted: selection.omitted.length,
-        trigger: selection.trigger,
-        changesCycle: selection.changesCycle,
-      },
-    });
+    // The record and its audit event are one unit: if the event cannot be written, the record is rolled back too,
+    // so a retry saves both instead of finding a "current" selection whose event is missing for good.
+    const written: { location?: string } = {};
+    try {
+      this.ctx.store.transaction(() => {
+        written.location = this.saveArtifact({
+          workId: work.id,
+          type: 'repo-context',
+          content: selection,
+          createdBy: { kind: 'tool', identifier: 'task-context' },
+          parentArtifactIds: source ? [source.id] : [],
+          relatedCommit: selection.snapshot.commit,
+        }).location;
+        this.ctx.store.appendEvent({
+          workId: work.id,
+          type: 'context.selected',
+          payload: {
+            snapshotHash: selection.snapshot.hash,
+            commit: selection.snapshot.commit,
+            files: selection.files.length,
+            omitted: selection.omitted.length,
+            trigger: selection.trigger,
+            changesCycle: selection.changesCycle,
+          },
+        });
+      });
+    } catch (e) {
+      if (written.location) rmSync(written.location, { force: true }); // the rolled-back revision's file
+      throw e;
+    }
   }
 
   /**
@@ -590,19 +606,24 @@ export class Engine {
           projectLink: existsSync(paths.projectContext) ? relative(paths.dir, paths.projectContext) : undefined,
         });
         file = renderContextFile(view.selection, body, notes);
-        evidence = `${JSON.stringify({ current: stale.length === 0, stale, selection: view.selection }, null, 2)}\n`;
+        // `document` is the hash of the CONTEXT.md published with this JSON: a reader compares it to the file it has
+        evidence = `${JSON.stringify({ current: stale.length === 0, stale, document: contentHashText(file), selection: view.selection }, null, 2)}\n`;
       } else {
         const reason = view.unavailable ?? 'no selection has been built';
         file = renderUnavailableFile(work.title, work.id, reason, notes);
-        evidence = `${JSON.stringify({ current: false, unavailable: reason }, null, 2)}\n`;
+        evidence = `${JSON.stringify({ current: false, document: contentHashText(file), unavailable: reason }, null, 2)}\n`;
       }
       const bytes = Buffer.byteLength(file, 'utf8');
       if (bytes > MAX_CONTEXT_FILE_BYTES) {
         throw err('E_CONTEXT_UNAVAILABLE', `The new CONTEXT.md of ${work.id} would be ${bytes} bytes, over the ${MAX_CONTEXT_FILE_BYTES} byte limit the reader accepts, so the old file is kept. Shorten the agent notes, then retry.`, { file: paths.context });
       }
       if (this.readContextText(work, paths.context) !== raw) continue; // changed while rendering: start again from the new notes
-      writeFileAtomic(join(paths.evidenceDir, 'context.json'), evidence);
-      writeFileAtomic(paths.context, file);
+      try {
+        writeFileAtomic(join(paths.evidenceDir, 'context.json'), evidence);
+        writeFileAtomic(paths.context, file);
+      } catch (e) {
+        throw err('E_CONTEXT_UNAVAILABLE', `CONTEXT.md of ${work.id} could not be written (${(e as Error).message.split('\n')[0]}), so the previous file is kept. Fix the cause, then retry.`, { file: paths.context });
+      }
       return;
     }
     throw err('E_CONTEXT_UNAVAILABLE', `CONTEXT.md of ${work.id} kept changing while it was rendered, so it was not replaced. Retry once nothing else is writing it.`, { file: paths.context });
@@ -1172,6 +1193,14 @@ export class Engine {
       }
       if (current.currentState !== 'PLANNING') {
         return discard('E_INVALID_TRANSITION', `${work.id} moved to ${current.currentState} while it was being planned; the plan was not saved.`);
+      }
+      // The plan was derived from the commit the facts and the file selection were pinned to. If the checkout moved
+      // while the model ran, that plan describes a tree that is no longer there: it is discarded, and sync retries.
+      if (gathered.info) {
+        const now = repoHead(this.ctx.projectRoot);
+        if ('error' in now || now.head !== gathered.info.head) {
+          return discard('E_CONCURRENT', `HEAD moved from ${gathered.info.head.slice(0, 12)} while ${work.id} was being planned; the plan was not saved. Run sync again.`);
+        }
       }
       if (this.ctx.store.getLatestArtifact(work.id, 'specification')?.id !== spec?.id) {
         return discard('E_CONCURRENT', `The requirements of ${work.id} changed while it was being planned; the plan was not saved. Run sync again.`);
