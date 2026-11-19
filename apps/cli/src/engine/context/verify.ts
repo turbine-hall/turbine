@@ -1,10 +1,10 @@
 import type * as TS from 'typescript';
-import { ClaimSchema, manifestPath } from '@turbine-hall/turbine-contracts';
+import { manifestPath, parseClaimSafe } from '@turbine-hall/turbine-contracts';
 import type { AbsencePattern, Claim, ClaimEvidence, ClaimVerifier } from '@turbine-hall/turbine-contracts';
 import { listTreeDetailed, readBlobs, resolveCommit } from './git-read.js';
 import type { TreeEntry, TreeListing } from './git-read.js';
 import { jsxFile, parseSource, scanModule } from './js-scan.js';
-import { parseJsonc } from './jsonc.js';
+import { JsoncLimitError, parseJsonc } from './jsonc.js';
 import type { LineRange } from './jsonc.js';
 
 /**
@@ -41,6 +41,8 @@ const MAX_SEARCH_FILE_BYTES = 32 * 1024 * 1024;
 const MAX_SEARCH_TOTAL_BYTES = 512 * 1024 * 1024;
 const SEARCH_BATCH_BYTES = 48 * 1024 * 1024;
 const MAX_REPORTED_MATCHES = 5;
+/** What one reader keeps of the blobs it has read. */
+const MAX_CACHED_BYTES = 32 * 1024 * 1024;
 
 const SOURCE_EXTENSION = /\.(?:[cm]?[jt]s|[jt]sx)$/;
 const UTF8 = new TextDecoder('utf-8', { fatal: true });
@@ -62,6 +64,7 @@ export class CommitReader {
   private listing: TreeListing | undefined;
   private byPath: Map<string, TreeEntry> | undefined;
   private readonly blobs = new Map<string, Buffer>();
+  private cached = 0;
 
   constructor(
     readonly repoRoot: string,
@@ -81,6 +84,11 @@ export class CommitReader {
     return this.byPath.get(path);
   }
 
+  /** Bytes of blobs held in the read cache right now (bounded by MAX_CACHED_BYTES). */
+  cachedBytes(): number {
+    return this.cached;
+  }
+
   /** The bytes of a tracked file at this commit, or why they cannot be used. */
   bytes(path: string, maxBytes = MAX_TEXT_BYTES): { ok: true; entry: TreeEntry; buf: Buffer } | { ok: false; reason: string } {
     const entry = this.entry(path);
@@ -92,6 +100,13 @@ export class CommitReader {
       buf = readBlobs(this.repoRoot, [entry.id], entry.size).get(entry.id);
       if (!buf) return { ok: false, reason: `${path} could not be read from git` };
       this.blobs.set(entry.id, buf);
+      this.cached += buf.length;
+      // Oldest first: one transition can cite thousands of distinct files, and each is read once more only if cited again.
+      for (const [id, old] of this.blobs) {
+        if (this.cached <= MAX_CACHED_BYTES || id === entry.id) break;
+        this.blobs.delete(id);
+        this.cached -= old.length;
+      }
     }
     return { ok: true, entry, buf };
   }
@@ -136,14 +151,32 @@ function verifyEvidence(reader: CommitReader, e: ClaimEvidence, mode: VerifyMode
 
 type Parsed = { ok: true; value: unknown; lines: (path: Array<string | number>) => LineRange | undefined } | { ok: false; result: VerifyResult };
 
+/**
+ * Files that tools read as JSON with comments and trailing commas. Every other `.json` file (above all `package.json`,
+ * which npm reads with a strict parser) must be strict JSON, or a value read from it is not a value the tool would see.
+ */
+const JSONC_FILE = /(?:\.jsonc|(?:^|\/)(?:[tj]sconfig(?:\.[^/]*)?\.json|\.eslintrc\.json))$/;
+
 function readJson(reader: CommitReader, path: string): Parsed {
   if (!/\.jsonc?$/.test(path)) return { ok: false, result: unconfirmed(`${path} is not a .json or .jsonc file, so its values cannot be read exactly`) };
   const t = reader.text(path);
   if (!t.ok) return { ok: false, result: unconfirmed(t.reason) };
+  if (!JSONC_FILE.test(path)) {
+    try {
+      JSON.parse(t.text.charCodeAt(0) === 0xfeff ? t.text.slice(1) : t.text);
+    } catch (e) {
+      if (e instanceof RangeError) return { ok: false, result: unconfirmed(`${path} is nested too deeply to read exactly`) };
+      return { ok: false, result: fail(`${path} is not valid JSON: ${e instanceof Error ? e.message : String(e)}`) };
+    }
+  }
   try {
-    const j = parseJsonc(t.text);
+    const j = parseJsonc(t.text, { exactIntegers: true });
     return { ok: true, value: j.value, lines: (p) => j.lines(p) };
   } catch (e) {
+    // A limit of this reader (nesting, a number out of range) does not say the file is wrong: nothing is decided.
+    if (e instanceof JsoncLimitError) {
+      return { ok: false, result: unconfirmed(e.limit === 'depth' ? `${path} is nested too deeply to read exactly (${e.message})` : `${path} has a number this reader cannot represent (${e.message})`) };
+    }
     return { ok: false, result: fail(`${path} is not valid JSON: ${e instanceof Error ? e.message : String(e)}`) };
   }
 }
@@ -175,6 +208,17 @@ export function jsonEqual(a: unknown, b: unknown): boolean {
   return ka.length === kb.length && ka.every((k) => own(b, k) && jsonEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
 }
 
+/** Whether a parsed value holds an exact (beyond 2^53) integer. Iterative. */
+function hasBigint(value: unknown): boolean {
+  const stack: unknown[] = [value];
+  while (stack.length) {
+    const v = stack.pop();
+    if (typeof v === 'bigint') return true;
+    if (typeof v === 'object' && v !== null) for (const child of Object.values(v)) stack.push(child);
+  }
+  return false;
+}
+
 const keyText = (key: ReadonlyArray<string | number>) => key.map((k) => (typeof k === 'number' ? `[${k}]` : `.${k}`)).join('').replace(/^\./, '');
 
 function verifyExists(reader: CommitReader, claim: Claim, v: Extract<ClaimVerifier, { kind: 'exists' }>): VerifyResult {
@@ -192,6 +236,12 @@ function verifyExists(reader: CommitReader, claim: Claim, v: Extract<ClaimVerifi
   return fail(elsewhere ? `${v.path} exports "${v.symbol}" at line ${elsewhere.line}, outside the cited lines` : `${v.path} has no top-level export named "${v.symbol}"`);
 }
 
+/** Statements the scanner found but could not state (a shadowed `require`, an escaped specifier): "no import" is not proven then. */
+function undecided(scan: { unconfirmed: number; escaped: number }, path: string): VerifyResult | undefined {
+  const n = scan.unconfirmed + scan.escaped;
+  return n ? unconfirmed(`${path} has ${n} import statement(s) that cannot be read exactly (a shadowed \`require\` or an escaped specifier), so a missing import is not proven`) : undefined;
+}
+
 function verifyImports(reader: CommitReader, claim: Claim, v: Extract<ClaimVerifier, { kind: 'imports' }>): VerifyResult {
   const t = reader.text(v.from);
   if (!t.ok) return unconfirmed(t.reason);
@@ -202,6 +252,8 @@ function verifyImports(reader: CommitReader, claim: Claim, v: Extract<ClaimVerif
   const matches = scan.imports.filter((i) => i.specifier === v.specifier);
   const hit = matches.find((i) => inLines(cited, i.line));
   if (hit) return pass(`${v.from} imports "${v.specifier}" (${hit.kind}) at line ${hit.line}`);
+  const hidden = undecided(scan, v.from);
+  if (hidden && !matches.length) return hidden;
   return fail(matches.length ? `${v.from} imports "${v.specifier}" at line ${matches.map((m) => m.line).join(', ')}, outside the cited lines` : `${v.from} does not import "${v.specifier}"`);
 }
 
@@ -215,6 +267,8 @@ function verifyUse(reader: CommitReader, claim: Claim, path: string, name: strin
   const uses = scan.imports.filter((i) => i.specifier === name || i.specifier.startsWith(`${name}/`));
   const hit = uses.find((i) => inLines(cited, i.line));
   if (hit) return pass(`${path} imports "${hit.specifier}" at line ${hit.line}`);
+  const hidden = undecided(scan, path);
+  if (hidden && !uses.length) return hidden;
   return fail(uses.length ? `${path} imports ${name} at line ${uses.map((m) => m.line).join(', ')}, outside the cited lines` : `${path} does not import ${name}`);
 }
 
@@ -224,15 +278,18 @@ function verifyCalls(reader: CommitReader, claim: Claim, v: Extract<ClaimVerifie
   const parsed = parseSource(t.text, { jsx: jsxFile(v.path) });
   if (!parsed.ok) return unconfirmed(`${v.path} cannot be parsed: ${parsed.reason}`);
   const { ts, sf, lineAt } = parsed;
-  /** `a`, `a.b.c`, `this.x`: the dotted name written at the call. Anything computed has no name. */
+  /** `a`, `a.b.c`, `this.x`: the dotted name written at the call. Anything computed has no name. A loop, not recursion: a chain can be tens of thousands of segments long. */
   const nameOf = (n: TS.Expression): string | undefined => {
-    if (ts.isIdentifier(n)) return n.text;
-    if (n.kind === ts.SyntaxKind.ThisKeyword) return 'this';
-    if (ts.isPropertyAccessExpression(n) && ts.isIdentifier(n.name)) {
-      const base = nameOf(n.expression);
-      return base === undefined ? undefined : `${base}.${n.name.text}`;
+    const parts: string[] = [];
+    let cur: TS.Expression = n;
+    while (ts.isPropertyAccessExpression(cur) && ts.isIdentifier(cur.name)) {
+      parts.push(cur.name.text);
+      cur = cur.expression;
     }
-    return undefined;
+    if (ts.isIdentifier(cur)) parts.push(cur.text);
+    else if (cur.kind === ts.SyntaxKind.ThisKeyword) parts.push('this');
+    else return undefined;
+    return parts.reverse().join('.');
   };
   const cited = citedLines(claim, v.path);
   const lines: number[] = [];
@@ -257,6 +314,8 @@ function verifyMember(reader: CommitReader, claim: Claim, path: string, key: Rea
   if (!json.ok) return json.result;
   const at = valueAt(json.value, key);
   if (!at.found) return fail(`${path} has no ${what} at ${keyText(key)}`);
+  // An integer the reader would have rounded is held as its exact digits (a bigint); a claim cannot state those exactly.
+  if (hasBigint(at.value)) return unconfirmed(`${path} ${keyText(key)} holds an integer beyond 2^53, which a claim cannot state exactly`);
   if (!jsonEqual(at.value, expected)) return fail(`${path} ${keyText(key)} is ${JSON.stringify(at.value)}, not ${JSON.stringify(expected)}`);
   const range = json.lines([...key]);
   if (!range) return unconfirmed(`the lines of ${keyText(key)} in ${path} are unknown`);
@@ -279,16 +338,22 @@ function needlesFor(pattern: AbsencePattern): Buffer[] {
   });
 }
 
-const excluded = (path: string, prefixes: readonly string[]): boolean => prefixes.some((p) => (p.endsWith('/') ? path.startsWith(p) || path === p.slice(0, -1) : path === p));
+/**
+ * A file prefix excludes that exact file; a directory prefix (ending in "/") excludes what is under it, and a gitlink
+ * (submodule) at that very path. A regular file named like the directory is NOT excluded by it.
+ */
+const excluded = (e: TreeEntry, prefixes: readonly string[]): boolean =>
+  prefixes.some((p) => (p.endsWith('/') ? e.path.startsWith(p) || (e.type !== 'blob' && e.path === p.slice(0, -1)) : e.path === p));
 
 function verifyAbsence(reader: CommitReader, v: Extract<ClaimVerifier, { kind: 'absence' }>): VerifyResult {
   const listing = reader.tree();
   if (listing.undecodable > 0) return unconfirmed(`${listing.undecodable} tracked path(s) are not valid UTF-8 and cannot be searched, so absence cannot be shown`);
   const scope: TreeEntry[] = [];
   for (const e of listing.entries) {
-    if (excluded(e.path, v.exclude)) continue;
-    if (v.pattern.type === 'import-specifier' && !SOURCE_EXTENSION.test(e.path)) continue;
+    if (excluded(e, v.exclude)) continue;
+    // Before the extension filter: a submodule's files are not in this commit whatever its path looks like.
     if (e.type !== 'blob') return unconfirmed(`${e.path} is a ${e.type} (a submodule), whose files are not in this commit, so absence cannot be shown`);
+    if (v.pattern.type === 'import-specifier' && !SOURCE_EXTENSION.test(e.path)) continue;
     if (e.size > MAX_SEARCH_FILE_BYTES) return unconfirmed(`${e.path} is ${e.size} bytes, over the ${MAX_SEARCH_FILE_BYTES}-byte search limit, so absence cannot be shown`);
     scope.push(e);
   }
@@ -298,7 +363,11 @@ function verifyAbsence(reader: CommitReader, v: Extract<ClaimVerifier, { kind: '
 
   const needles = needlesFor(v.pattern);
   const pathsOf = new Map<string, string[]>();
-  for (const e of scope) pathsOf.set(e.id, [...(pathsOf.get(e.id) ?? []), e.path]);
+  for (const e of scope) {
+    let group = pathsOf.get(e.id);
+    if (!group) pathsOf.set(e.id, (group = []));
+    group.push(e.path);
+  }
   const sizeOf = new Map(scope.map((e) => [e.id, e.size]));
   const ids = [...pathsOf.keys()];
   const matches: string[] = [];
@@ -318,7 +387,8 @@ function verifyAbsence(reader: CommitReader, v: Extract<ClaimVerifier, { kind: '
       if (buf.length >= 4 && ((buf[0] === 0xff && buf[1] === 0xfe && buf[2] === 0 && buf[3] === 0) || (buf[0] === 0 && buf[1] === 0 && buf[2] === 0xfe && buf[3] === 0xff))) {
         return unconfirmed(`${paths[0]} is UTF-32, which is not searched, so absence cannot be shown`);
       }
-      if (needles.some((n) => buf.includes(n))) matches.push(...paths);
+      // A loop, not a spread: tens of thousands of paths can share one blob.
+      if (needles.some((n) => buf.includes(n))) for (const p of paths) matches.push(p);
     }
   }
   const what = v.pattern.type === 'literal' ? `the text ${JSON.stringify(v.pattern.text)}` : `the specifier ${JSON.stringify(v.pattern.specifier)} in quotes`;
@@ -335,9 +405,10 @@ function verifyAbsence(reader: CommitReader, v: Extract<ClaimVerifier, { kind: '
  * those are `ok: false`. Only a broken repository (git failing) throws.
  */
 export function verifyClaim(reader: CommitReader, input: unknown, mode: VerifyMode = 'pinned'): VerifyResult {
-  const parsed = ClaimSchema.safeParse(input);
-  if (!parsed.success) return fail(`the claim is not valid: ${parsed.error.issues.map((i) => `${i.path.join('.') || 'claim'}: ${i.message}`).join('; ')}`);
-  const claim = parsed.data;
+  // The raw input is checked for a `__proto__` key first, and a claim too deeply nested to parse is refused, not thrown.
+  const parsed = parseClaimSafe(input);
+  if (!parsed.ok) return fail(`the claim is not valid: ${parsed.reason}`);
+  const claim = parsed.claim;
   for (const e of claim.evidence) {
     const bad = verifyEvidence(reader, e, mode);
     if (bad) return bad;

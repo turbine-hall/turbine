@@ -468,6 +468,8 @@ export class WorkStore {
    * claim stays and false is returned. Otherwise the record is stored (replacing an older record of the same id).
    */
   saveClaim(input: { repoPath: string; claim: Claim; status: ClaimStatus; reason?: string }): boolean {
+    // A row under an empty path could be written but never read back (the stored-claim schema needs a path).
+    if (typeof input.repoPath !== 'string' || input.repoPath === '') throw new Error('a claim is stored under a non-empty repository path');
     assertNoUnsafeKeys(input.claim);
     const claim = ClaimSchema.parse(input.claim);
     const status = ClaimStatusSchema.parse(input.status);
@@ -499,7 +501,7 @@ export class WorkStore {
     return row ? this.parseClaimRow(row) : null;
   }
 
-  /** Claims of one repository, oldest first. `statuses` / `section` / `commit` narrow the list. */
+  /** Claims of one repository, in the order each claim id was first stored (re-saving an id does not move it). `statuses` / `section` / `commit` narrow the list. */
   listClaims(repoPath: string, filter: { statuses?: readonly ClaimStatus[]; section?: string; commit?: string } = {}): StoredClaim[] {
     const where = ['repo_path = ?'];
     const args: string[] = [repoPath];

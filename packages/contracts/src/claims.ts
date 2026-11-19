@@ -111,7 +111,7 @@ export const ClaimVerifierSchema = z.discriminatedUnion('kind', [
       kind: z.literal('calls'),
       path: SafeRepoPathSchema,
       /** A name as written at the call: `foo` or `a.b.c`. Matched by name; no binding is resolved. */
-      callee: z.string().regex(/^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$/, 'expected a dotted name'),
+      callee: z.string().max(512).regex(/^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$/, 'expected a dotted name'),
     })
     .strict(),
   z
@@ -119,7 +119,7 @@ export const ClaimVerifierSchema = z.discriminatedUnion('kind', [
       kind: z.literal('config'),
       path: SafeRepoPathSchema,
       key: z.array(z.union([z.string(), z.number().int().min(0)])).min(1).max(32),
-      value: z.json(),
+      value: z.json().refine((v) => Buffer.byteLength(JSON.stringify(v), 'utf8') <= 65536, 'the expected value is over 64 KiB'),
     })
     .strict(),
   z
@@ -221,10 +221,29 @@ export function claimCommit(claim: Claim): string {
   return claim.evidence[0]!.commit;
 }
 
-/** Parse untrusted claim JSON: a `__proto__` key is refused before the schema sees it. */
+/** Parse untrusted claim JSON: a `__proto__` key is refused before the schema sees it. Throws on a bad claim. */
 export function parseClaim(raw: unknown): Claim {
   assertNoUnsafeKeys(raw);
   return ClaimSchema.parse(raw);
+}
+
+export type ClaimParse = { ok: true; claim: Claim } | { ok: false; reason: string };
+
+/**
+ * Like `parseClaim`, but a bad claim is an answer, not an exception. A `__proto__` key anywhere in the raw input is
+ * refused BEFORE the schema runs (zod would drop it, which would change what the claim says), and an input nested
+ * so deeply that parsing it overflows the stack is a refused claim, not a crash.
+ */
+export function parseClaimSafe(raw: unknown): ClaimParse {
+  try {
+    assertNoUnsafeKeys(raw);
+    const r = ClaimSchema.safeParse(raw);
+    if (r.success) return { ok: true, claim: r.data };
+    return { ok: false, reason: r.error.issues.map((i) => `${i.path.join('.') || 'claim'}: ${i.message}`).join('; ') };
+  } catch (e) {
+    if (e instanceof RangeError) return { ok: false, reason: 'the claim is nested too deeply to read' };
+    return { ok: false, reason: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 export const CLAIM_STATUSES = ['verified', 'rejected', 'withdrawn', 'attested'] as const;

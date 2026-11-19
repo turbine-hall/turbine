@@ -12,9 +12,28 @@ export type Jsonc = {
 };
 
 const MAX_DEPTH = 128;
+
+/** The text may be valid JSON, but this reader will not go further: the answer is "not decided", not "invalid". */
+export class JsoncLimitError extends SyntaxError {
+  constructor(
+    message: string,
+    readonly limit: 'depth' | 'number',
+  ) {
+    super(message);
+    this.name = 'JsoncLimitError';
+  }
+}
 const TOKEN = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null/y;
 
-export function parseJsonc(input: string): Jsonc {
+export type JsoncOptions = {
+  /**
+   * An integer beyond 2^53 is read as a `bigint` of its exact digits instead of a rounded `number`. Off by default
+   * (every existing reader gets a `number`); the claim verifiers turn it on so a rounded value is never taken as the digits written.
+   */
+  exactIntegers?: boolean;
+};
+
+export function parseJsonc(input: string, opts: JsoncOptions = {}): Jsonc {
   const text = input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
   // LF, CRLF and bare CR all end a line; CRLF counts once.
   const lineStarts = [0];
@@ -66,8 +85,9 @@ export function parseJsonc(input: string): Jsonc {
   };
   let i = 0;
 
-  const fail = (msg: string): never => {
-    throw new SyntaxError(`${msg} at line ${lineOf(Math.min(i, text.length))}`);
+  const fail = (msg: string, limit?: 'depth' | 'number'): never => {
+    const message = `${msg} at line ${lineOf(Math.min(i, text.length))}`;
+    throw limit ? new JsoncLimitError(message, limit) : new SyntaxError(message);
   };
   const skip = () => {
     for (;;) {
@@ -95,7 +115,7 @@ export function parseJsonc(input: string): Jsonc {
     return JSON.parse(text.slice(start, i)) as string;
   };
   const value = (path: Array<string | number>): unknown => {
-    if (path.length > MAX_DEPTH) fail('Nested too deeply');
+    if (path.length > MAX_DEPTH) fail('Nested too deeply', 'depth');
     skip();
     const c = text[i];
     if (c === '{') {
@@ -150,7 +170,8 @@ export function parseJsonc(input: string): Jsonc {
     i += m[0].length;
     const n: unknown = JSON.parse(m[0]);
     // 1e400 parses to Infinity, which is not a JSON value a manifest can meaningfully state: refuse it
-    if (typeof n === 'number' && !Number.isFinite(n)) return fail('Number out of range');
+    if (typeof n === 'number' && !Number.isFinite(n)) return fail('Number out of range', 'number');
+    if (opts.exactIntegers && typeof n === 'number' && /^-?\d+$/.test(m[0]) && !Number.isSafeInteger(n)) return BigInt(m[0]);
     return n;
   };
 

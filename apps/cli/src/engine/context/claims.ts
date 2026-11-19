@@ -1,7 +1,7 @@
-import { ClaimSchema, PUBLISHED_CLAIM_STATUSES, claimCommit } from '@turbine-hall/turbine-contracts';
+import { ClaimSchema, PUBLISHED_CLAIM_STATUSES, claimCommit, parseClaimSafe } from '@turbine-hall/turbine-contracts';
 import type { Claim, StoredClaim } from '@turbine-hall/turbine-contracts';
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
-import { changedBetween, resolveCommit, treeIdOf } from './git-read.js';
+import { resolveCommit, treeIdOf } from './git-read.js';
 import { CommitReader, verifyClaim } from './verify.js';
 
 /**
@@ -26,11 +26,10 @@ export type PublishOutcome =
 
 /** Verify a claim at the commit it names and, only if the verifier proves it, store it as `verified`. */
 export function publishClaim(store: WorkStore, repoRoot: string, repoPath: string, input: unknown): PublishOutcome {
-  const parsed = ClaimSchema.safeParse(input);
-  if (!parsed.success) {
-    return { published: false, reason: `the claim is not valid: ${parsed.error.issues.map((i) => `${i.path.join('.') || 'claim'}: ${i.message}`).join('; ')}`, unconfirmed: false, recorded: false };
-  }
-  const claim = parsed.data;
+  // A `__proto__` key is refused before the schema runs (zod would drop it and change what the claim says); nothing is written.
+  const parsed = parseClaimSafe(input);
+  if (!parsed.ok) return { published: false, reason: `the claim is not valid: ${parsed.reason}`, unconfirmed: false, recorded: false };
+  const claim = parsed.claim;
   const commit = claimCommit(claim);
   let result: ReturnType<typeof verifyClaim>;
   try {
@@ -41,8 +40,12 @@ export function publishClaim(store: WorkStore, repoRoot: string, repoPath: strin
     return reject(store, repoPath, claim, reason, true);
   }
   if (!result.ok) return reject(store, repoPath, claim, result.reason, result.unconfirmed === true);
-  store.transaction(() => store.saveClaim({ repoPath, claim, status: 'verified', reason: result.reason }));
-  return { published: true, claim: store.getClaim(repoPath, claim.id)! };
+  // The row is read in the same transaction that wrote it: another process may withdraw it the moment this one commits.
+  const stored = store.transaction(() => {
+    store.saveClaim({ repoPath, claim, status: 'verified', reason: result.reason });
+    return store.getClaim(repoPath, claim.id)!;
+  });
+  return { published: true, claim: stored };
 }
 
 function reject(store: WorkStore, repoPath: string, claim: Claim, reason: string, unconfirmed: boolean): PublishOutcome {
@@ -91,8 +94,17 @@ export function reverifyOnCommit(store: WorkStore, repoRoot: string, repoPath: s
 
   store.transaction(() => {
     const claims = store.listClaims(repoPath, { statuses: PUBLISHED_CLAIM_STATUSES, commit: prev });
-    const cited = [...new Set(claims.flatMap((c) => c.claim.evidence.map((e) => e.path)))];
-    const changed = new Set(changedBetween(repoRoot, prev, next, cited).map((c) => c.path));
+    // Compared by what the tree holds (object id and type), not by `git diff`: a mode-only change does not change the
+    // blob, and a diff over thousands of cited paths would overflow the command line.
+    const before = new CommitReader(repoRoot, prev);
+    const changed = new Set<string>();
+    for (const c of claims) {
+      for (const e of c.claim.evidence) {
+        const a = before.entry(e.path);
+        const b = reader.entry(e.path);
+        if (!a || !b || a.id !== b.id || a.type !== b.type) changed.add(e.path);
+      }
+    }
     const sections = new Set<string>();
 
     for (const stored of claims) {

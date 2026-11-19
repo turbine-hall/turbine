@@ -85,6 +85,14 @@ function newRepo(files: Record<string, string | Buffer | null> = BASE): string {
   git(dir, 'init', '-q');
   git(dir, 'config', 'user.email', 'test@example.com');
   git(dir, 'config', 'user.name', 'Test');
+  // A developer's global signing settings must not decide whether the fixture can commit.
+  git(dir, 'config', 'commit.gpgSign', 'false');
+  // Nor may a developer's hooks, line-ending conversion or attributes: the committed bytes are the bytes written.
+  const noHooks = mkdtempSync(join(tmpdir(), 'turbine-claims-hooks-'));
+  dirs.push(noHooks);
+  git(dir, 'config', 'core.hooksPath', noHooks);
+  git(dir, 'config', 'core.autocrlf', 'false');
+  git(dir, 'config', 'core.attributesFile', '/dev/null');
   commitFiles(dir, files, 'base');
   return dir;
 }
@@ -283,6 +291,8 @@ describe('positive cases — every kind is published when its verifier proves it
   it('reads a CRLF and a bare-CR file with the same line numbers as the parsers', () => {
     const d = newRepo({ 'a.ts': "import x from 'one';\r\nimport y from 'two';\rimport z from 'three';\r\nexport {};\r\n" });
     const cm = head(d);
+    // The committed blob holds the CRLF and the bare CR as written (no line-ending conversion happened).
+    expect(spawnSync('git', ['cat-file', 'blob', `${cm}:a.ts`], { cwd: d, encoding: 'latin1' }).stdout).toBe("import x from 'one';\r\nimport y from 'two';\rimport z from 'three';\r\nexport {};\r\n");
     for (const [spec, line] of [['one', 1], ['two', 2], ['three', 3]] as const) {
       const v = verifyClaim(new CommitReader(d, cm), claim({ kind: 'imports', evidence: [ev(d, cm, 'a.ts', line)], verifier: { kind: 'imports', from: 'a.ts', specifier: spec } }));
       expect(v.ok, `${spec}: ${v.reason}`).toBe(true);
@@ -501,7 +511,7 @@ describe('criterion 6 — the planted-false-claims suite: every false claim is r
   const falseClaims = planted;
 
   it('the fixture is dirty: an uncommitted file and an uncommitted edit exist', () => {
-    expect(git(dir, 'status', '--porcelain')).toMatch(/src\/draft\.ts/);
+    expect(git(dir, 'status', '--porcelain')).toMatch(/^A {2}src\/draft\.ts$/m); // staged, not merely untracked
     expect(git(dir, 'status', '--porcelain')).toMatch(/ M src\/app\.ts/);
   });
 
@@ -720,12 +730,16 @@ describe('storage — migration v4 and the claim methods', () => {
     expect(() => store.getClaim(dir, parsed.id)).toThrow(/section/);
     store.db.prepare('UPDATE claims SET section = ? WHERE id = ?').run('architecture', parsed.id);
     store.db.prepare('UPDATE claims SET data = replace(data, ?, ?) WHERE id = ?').run('"kind":"quote"', '"kind":"vibes"', parsed.id);
-    expect(() => store.getClaim(dir, parsed.id)).toThrow();
+    expect(() => store.getClaim(dir, parsed.id)).toThrow(/kind/);
+    // Put the valid JSON back, so only the id is wrong when the row is read.
+    store.db.prepare('UPDATE claims SET data = replace(data, ?, ?) WHERE id = ?').run('"kind":"vibes"', '"kind":"quote"', parsed.id);
+    expect(store.getClaim(dir, parsed.id)).toMatchObject({ status: 'verified' });
     store.db.prepare('UPDATE claims SET id = ? WHERE id = ?').run('other', parsed.id);
-    expect(() => store.listClaims(dir)).toThrow();
+    expect(() => store.listClaims(dir)).toThrow(/actually has id/);
+    expect(() => store.getClaim(dir, 'other')).toThrow(/actually has id/);
   });
 
-  it('status "verified" is written only by the engine code that runs a verifier', () => {
+  it('source layout: the literal status "verified" is written only in engine/context/claims.ts (behaviour is tested below)', () => {
     const root = resolve(here, '../../apps/cli/src');
     const hits: string[] = [];
     const walk = (d: string) => {
@@ -892,5 +906,402 @@ describe('criterion 4 — changing a cited file so a claim becomes false removes
     expect(() => reverifyOnCommit(store, dir, dir, 'HEAD', c1)).toThrow(/full commit id/);
     expect(() => reverifyOnCommit(store, dir, dir, c1, 'f'.repeat(40))).toThrow(/not a commit/);
     expect(store.getClaim(dir, id)).toMatchObject({ status: 'verified', commit: c1 });
+  });
+});
+
+describe('review round 1 (PR #12): findings from the first CodeRabbit pass', () => {
+  const quoteClaim = (dir: string, c: string) => validClaims(dir, c).quote!;
+
+  it('publishClaim returns the row it stored, even if another process withdraws the claim right after the commit', () => {
+    const dir = newRepo();
+    const c = head(dir);
+    const input = quoteClaim(dir, c);
+    const store = openStore();
+    // A second writer that withdraws the claim the moment this call's transaction has committed.
+    const racing = new Proxy(store, {
+      get(target, prop) {
+        if (prop === 'transaction') {
+          return <T>(fn: () => T): T => {
+            const r = target.transaction(fn);
+            target.withdrawClaim(dir, input.id as string, 'withdrawn by another process');
+            return r;
+          };
+        }
+        const v = Reflect.get(target, prop) as unknown;
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    const out = publishClaim(racing, dir, dir, input);
+    expect(out.published).toBe(true);
+    if (out.published) expect(out.claim.status).toBe('verified');
+  });
+
+  describe('manifests are strict JSON; JSONC is only for the configuration files that allow it', () => {
+    const lineOfBuild = (text: string) => splitLines(text).findIndex((l) => l.includes('"build"')) + 1;
+    const commandClaim = (d: string, c: string, manifest: string) =>
+      claim({ kind: 'command', evidence: [ev(d, c, 'package.json', lineOfBuild(manifest))], verifier: { kind: 'command', script: 'build', command: 'tsc' } });
+
+    it('a package.json with a trailing comma, or a comment, proves nothing', () => {
+      for (const manifest of ['{\n  "scripts": {\n    "build": "tsc",\n  },\n}\n', '{\n  // note\n  "scripts": {\n    "build": "tsc"\n  }\n}\n']) {
+        const d = newRepo({ 'package.json': manifest });
+        const c = head(d);
+        const out = publishClaim(openStore(), d, d, commandClaim(d, c, manifest));
+        expect(out.published, manifest).toBe(false);
+        if (!out.published) expect(out.reason).toMatch(/not valid JSON/);
+      }
+    });
+
+    it('a strict package.json (with a byte order mark) is accepted', () => {
+      const manifest = '\ufeff{\n  "scripts": {\n    "build": "tsc"\n  }\n}\n';
+      const d = newRepo({ 'package.json': manifest });
+      const out = publishClaim(openStore(), d, d, commandClaim(d, head(d), manifest));
+      expect(out.published, out.published ? '' : out.reason).toBe(true);
+    });
+
+    it('a tsconfig.json with comments and a trailing comma is still read', () => {
+      const text = '{\n  // strict mode\n  "compilerOptions": {\n    "strict": true,\n  },\n}\n';
+      const d = newRepo({ 'tsconfig.json': text, 'other.json': text });
+      const c = head(d);
+      const mk = (path: string) => claim({ kind: 'config', evidence: [ev(d, c, path, 4)], verifier: { kind: 'config', path, key: ['compilerOptions', 'strict'], value: true } });
+      expect(publishClaim(openStore(), d, d, mk('tsconfig.json')).published).toBe(true);
+      // A .json file that is not a known JSONC configuration is judged as the JSON it is named.
+      expect(publishClaim(openStore(), d, d, mk('other.json')).published).toBe(false);
+    });
+  });
+
+  describe('a parser limit is "unconfirmed", an invalid file is not', () => {
+    const deep = (n: number) => `${'['.repeat(n)}${']'.repeat(n)}`;
+    it('valid JSON nested past the parser limit, with the cited member correct, is unconfirmed', () => {
+      const text = `{"scripts":{"build":"tsc"},"deep":${deep(200)}}\n`;
+      const d = newRepo({ 'package.json': text, 'tsconfig.json': `{"compilerOptions":{"strict":true},"deep":${deep(200)}}\n` });
+      const c = head(d);
+      const cmd = claim({ kind: 'command', evidence: [ev(d, c, 'package.json', 1)], verifier: { kind: 'command', script: 'build', command: 'tsc' } });
+      const cfg = claim({ kind: 'config', evidence: [ev(d, c, 'tsconfig.json', 1)], verifier: { kind: 'config', path: 'tsconfig.json', key: ['compilerOptions', 'strict'], value: true } });
+      for (const k of [cmd, cfg]) {
+        const out = publishClaim(openStore(), d, d, k);
+        expect(out).toMatchObject({ published: false, unconfirmed: true });
+        if (!out.published) expect(out.reason).toMatch(/nested too deeply/);
+      }
+    });
+
+    it('a number out of range is unconfirmed; a syntax error is a definite failure; a value mismatch stays definite', () => {
+      const d = newRepo({ 'big.json': '{"a": 1e400, "b": true}\n', 'bad.json': '{"b": true,,}\n', 'ok.json': '{"b": true}\n' });
+      const c = head(d);
+      const mk = (path: string, value: unknown) => claim({ kind: 'config', evidence: [ev(d, c, path, 1)], verifier: { kind: 'config', path, key: ['b'], value } });
+      expect(publishClaim(openStore(), d, d, mk('big.json', true))).toMatchObject({ published: false, unconfirmed: true });
+      expect(publishClaim(openStore(), d, d, mk('bad.json', true))).toMatchObject({ published: false, unconfirmed: false });
+      expect(publishClaim(openStore(), d, d, mk('ok.json', false))).toMatchObject({ published: false, unconfirmed: false });
+    });
+  });
+
+  it('a call chain with tens of thousands of segments does not exhaust the stack', () => {
+    const d = newRepo({ 'long.ts': `a${'.b'.repeat(30000)}();\n` });
+    const c = head(d);
+    const k = claim({ kind: 'calls', evidence: [ev(d, c, 'long.ts', 1)], verifier: { kind: 'calls', path: 'long.ts', callee: 'a.b' } });
+    const v = verifyClaim(new CommitReader(d, c), k);
+    expect(v.ok).toBe(false); // either "no such call" or "cannot be parsed": it must be an answer, not a thrown RangeError
+    expect(() => publishClaim(openStore(), d, d, k)).not.toThrow();
+  });
+
+  it('a callee is bounded, so a claim cannot ask for an unbounded name', () => {
+    const d = newRepo();
+    const c = head(d);
+    const k = claim({ kind: 'calls', evidence: [ev(d, c, 'src/app.ts', 7)], verifier: { kind: 'calls', path: 'src/app.ts', callee: `a${'.b'.repeat(500)}` } });
+    expect(ClaimSchema.safeParse(k).success).toBe(false);
+  });
+
+  it('a "__proto__" key in the expected value is refused before parsing; no row is written and nothing is proven', () => {
+    const d = newRepo({ 'c.json': '{"a": {}}\n' });
+    const c = head(d);
+    const raw = JSON.parse(
+      `{"id":"proto1","section":"architecture","statement":"A","kind":"config","evidence":[${JSON.stringify(ev(d, c, 'c.json', 1))}],"verifier":{"kind":"config","path":"c.json","key":["a"],"value":{"__proto__":1}}}`,
+    ) as unknown;
+    const store = openStore();
+    const out = publishClaim(store, d, d, raw);
+    expect(out).toMatchObject({ published: false, recorded: false });
+    if (!out.published) expect(out.reason).toMatch(/__proto__/);
+    expect(store.listClaims(d)).toEqual([]);
+    expect(verifyClaim(new CommitReader(d, c), raw)).toMatchObject({ ok: false });
+    // An ordinary expected value still passes unchanged.
+    const ok = claim({ kind: 'config', evidence: [ev(d, c, 'c.json', 1)], verifier: { kind: 'config', path: 'c.json', key: ['a'], value: {} } });
+    expect(publishClaim(store, d, d, ok).published).toBe(true);
+  });
+
+  it('a claim nested too deeply to parse is an answer, not a thrown RangeError', () => {
+    const d = newRepo({ 'c.json': '{"a": 1}\n' });
+    const c = head(d);
+    let value: unknown = 1;
+    for (let i = 0; i < 20000; i++) value = [value];
+    const raw = { id: 'deep1', section: 'architecture', statement: 'A', kind: 'config', evidence: [ev(d, c, 'c.json', 1)], verifier: { kind: 'config', path: 'c.json', key: ['a'], value } };
+    const out = publishClaim(openStore(), d, d, raw);
+    expect(out).toMatchObject({ published: false, recorded: false });
+    expect(verifyClaim(new CommitReader(d, c), raw).ok).toBe(false);
+  });
+
+  it('import-specifier absence refuses when a submodule is in scope, as the literal pattern does', () => {
+    const d = newRepo({ 'a.ts': 'export const a = 1;\n' });
+    git(d, 'update-index', '--add', '--cacheinfo', `160000,${head(d)},vendor/lib`);
+    git(d, 'commit', '-qm', 'add a gitlink');
+    const cm = head(d);
+    const absence = (exclude: string[]) =>
+      claim({ kind: 'absence', statement: 'Nothing imports moment', evidence: [ev(d, cm, 'a.ts')], verifier: { kind: 'absence', pattern: { type: 'import-specifier', specifier: 'moment' }, exclude } });
+    expect(verifyClaim(new CommitReader(d, cm), absence([]))).toMatchObject({ ok: false, unconfirmed: true });
+    expect(verifyClaim(new CommitReader(d, cm), absence(['vendor/lib/'])).ok).toBe(true);
+  });
+
+  it('absence over a very large number of paths that share one blob is linear and reports every path', () => {
+    const d = newRepo({ 'a.txt': 'x\n' });
+    const id = spawnSync('git', ['hash-object', '-w', '--stdin'], { cwd: d, input: 'needle-text\n', encoding: 'utf8' }).stdout.trim();
+    const N = 150_000;
+    const lines: string[] = [];
+    for (let i = 0; i < N; i++) lines.push(`100644 ${id} 0\tmany/f${i}.txt`);
+    const r = spawnSync('git', ['update-index', '--add', '--index-info'], { cwd: d, input: `${lines.join('\n')}\n`, encoding: 'utf8', maxBuffer: 1 << 28 });
+    expect(r.status, r.stderr).toBe(0);
+    git(d, 'commit', '-qm', 'many paths');
+    const cm = head(d);
+    const k = claim({ kind: 'absence', statement: 'No needle', evidence: [ev(d, cm, 'a.txt')], verifier: { kind: 'absence', pattern: { type: 'literal', text: 'needle-text' } } });
+    const started = Date.now();
+    const v = verifyClaim(new CommitReader(d, cm), k);
+    expect(v.ok).toBe(false);
+    expect(v.reason).toMatch(new RegExp(`occurs in ${N} file\\(s\\)`));
+    expect(Date.now() - started).toBeLessThan(30_000);
+  }, 120_000);
+
+  it('saveClaim refuses an empty repository path, so a successful write is always readable', () => {
+    const dir = newRepo();
+    const store = openStore();
+    const parsed = ClaimSchema.parse(quoteClaim(dir, head(dir)));
+    expect(() => store.saveClaim({ repoPath: '', claim: parsed, status: 'verified', reason: 'proof' })).toThrow(/repository path/);
+    expect(store.listClaims('')).toEqual([]);
+  });
+
+  it('fixture repositories commit even when the developer signs commits globally with an unavailable key', () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-claims-gpg-'));
+    dirs.push(root);
+    const globalConfig = join(root, 'gitconfig');
+    writeFileSync(globalConfig, '[commit]\n\tgpgSign = true\n[gpg]\n\tprogram = /usr/bin/false\n');
+    const before = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      expect(() => newRepo()).not.toThrow();
+    } finally {
+      if (before === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = before;
+    }
+  });
+
+  it('every row of a table in IMPLEMENTATION_STATUS.md has as many cells as its header (an unescaped "|" splits a cell)', () => {
+    const lines = readFileSync(resolve(here, '../../docs/IMPLEMENTATION_STATUS.md'), 'utf8').split('\n');
+    const cells = (l: string) => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split(/(?<!\\)\|/).length;
+    let header = 0;
+    let checked = 0;
+    for (const [i, l] of lines.entries()) {
+      if (!l.trimStart().startsWith('|')) {
+        header = 0;
+        continue;
+      }
+      if (!header) header = cells(l);
+      else {
+        expect(cells(l), `line ${i + 1}: ${l.slice(0, 60)}`).toBe(header);
+        checked++;
+      }
+    }
+    expect(checked).toBeGreaterThan(5);
+  });
+});
+
+describe('review round 2 (PR #12): findings from the local CodeRabbit review', () => {
+  it('a failed or unconfirmed verifier never leaves a "verified" row, whatever the claim (behavioural)', () => {
+    const d = newRepo({ 'ok.ts': "import a from 'a';\n", 'broken.ts': "import { b from 'b';\n" });
+    const c = head(d);
+    const store = openStore();
+    const falseOne = claim({ kind: 'imports', evidence: [ev(d, c, 'ok.ts', 1)], verifier: { kind: 'imports', from: 'ok.ts', specifier: 'zzz' } });
+    const unconfirmedOne = claim({ kind: 'imports', evidence: [ev(d, c, 'broken.ts', 1)], verifier: { kind: 'imports', from: 'broken.ts', specifier: 'b' } });
+    expect(publishClaim(store, d, d, falseOne)).toMatchObject({ published: false, recorded: true, unconfirmed: false });
+    expect(publishClaim(store, d, d, unconfirmedOne)).toMatchObject({ published: false, recorded: true, unconfirmed: true });
+    expect(store.listClaims(d).map((s) => s.status)).toEqual(['rejected', 'rejected']);
+    expect(store.listClaims(d, { statuses: ['verified'] })).toEqual([]);
+  });
+
+  describe('imports the scanner could not read are "unconfirmed", not disproven', () => {
+    const run = (text: string, specifier: string, line = 1) => {
+      const d = newRepo({ 'm.js': text });
+      const cm = head(d);
+      return publishClaim(openStore(), d, d, claim({ kind: 'imports', evidence: [ev(d, cm, 'm.js', line)], verifier: { kind: 'imports', from: 'm.js', specifier } }));
+    };
+
+    it('a top-level require next to a parameter named require', () => {
+      const out = run("const x = require('pkg');\nfunction f(require) { return require; }\n", 'pkg');
+      expect(out).toMatchObject({ published: false, unconfirmed: true });
+    });
+
+    it('an import whose specifier is written with an escape', () => {
+      const out = run("import '\\u0066oo';\n", 'foo');
+      expect(out).toMatchObject({ published: false, unconfirmed: true });
+    });
+
+    it('an import that is independently proven is still accepted, and a plain miss is still a definite failure', () => {
+      expect(run("import '\\u0066oo';\nimport bar from 'bar';\n", 'bar', 2).published).toBe(true);
+      expect(run("import 'foo';\n", 'zzz')).toMatchObject({ published: false, unconfirmed: false });
+    });
+
+    it('the same holds for the import a dependency claim cites', () => {
+      const manifest = '{\n  "dependencies": {\n    "pkg": "^1.0.0"\n  }\n}\n';
+      const d = newRepo({ 'package.json': manifest, 'm.js': "import '\\u0070kg';\n" });
+      const cm = head(d);
+      const out = publishClaim(
+        openStore(),
+        d,
+        d,
+        claim({
+          kind: 'dependency',
+          evidence: [ev(d, cm, 'package.json', 3), ev(d, cm, 'm.js', 1)],
+          verifier: { kind: 'dependency', section: 'dependencies', name: 'pkg', spec: '^1.0.0', usedIn: 'm.js' },
+        }),
+      );
+      expect(out).toMatchObject({ published: false, unconfirmed: true });
+    });
+  });
+
+  describe('reverifyOnCommit compares what the tree holds, not what git diff reports', () => {
+    it('a mode-only change (644 to 755) keeps an attestation: the blob did not change', () => {
+      const dir = newRepo();
+      const c1 = head(dir);
+      const store = openStore();
+      const exists = ClaimSchema.parse(validClaims(dir, c1).exists);
+      store.saveClaim({ repoPath: dir, claim: exists, status: 'attested', reason: 'attested by a person' });
+      git(dir, 'update-index', '--chmod=+x', 'docs/notes.md');
+      git(dir, 'commit', '-qm', 'make it executable');
+      const c2 = head(dir);
+      expect(git(dir, 'rev-parse', `${c1}:docs/notes.md`)).toBe(git(dir, 'rev-parse', `${c2}:docs/notes.md`)); // same blob
+      const r = reverifyOnCommit(store, dir, dir, c1, c2);
+      expect(r.withdrawn).toEqual([]);
+      expect(r.kept).toEqual([exists.id]);
+      expect(store.getClaim(dir, exists.id)).toMatchObject({ status: 'attested', commit: c2 });
+    });
+
+    it('thousands of cited paths do not overflow the command line (and a path missing from a tree is a change)', () => {
+      const dir = newRepo();
+      const c1 = head(dir);
+      const store = openStore();
+      const template = ClaimSchema.parse(validClaims(dir, c1).exists);
+      const blob = template.evidence[0]!.blob;
+      const N = 8000;
+      store.transaction(() => {
+        for (let i = 0; i < N; i++) {
+          const path = `cited/d${i}/${'x'.repeat(380)}.ts`; // about 400 bytes each: over 3 MB of arguments in all
+          const k = ClaimSchema.parse({ ...template, id: `many${i}`, evidence: [{ path, commit: c1, blob }], verifier: { kind: 'exists', path } });
+          store.saveClaim({ repoPath: dir, claim: k, status: 'attested', reason: 'attested by a person' });
+        }
+      });
+      const c2 = commitFiles(dir, { 'README.md': '# readme\n' });
+      const r = reverifyOnCommit(store, dir, dir, c1, c2);
+      expect(r.withdrawn).toHaveLength(N); // none of those paths exists at either commit
+      expect(store.listClaims(dir, { statuses: PUBLISHED_CLAIM_STATUSES })).toEqual([]);
+    }, 120_000);
+  });
+
+  it('an integer beyond 2^53, which the JSON reader would round, is "unconfirmed"; ordinary integers verify', () => {
+    const d = newRepo({ 'n.json': '{"big": 9007199254740993, "ok": 42, "neg": -9007199254740993}\n' });
+    const c = head(d);
+    const mk = (key: string, value: unknown) => claim({ kind: 'config', evidence: [ev(d, c, 'n.json', 1)], verifier: { kind: 'config', path: 'n.json', key: [key], value } });
+    // The rounded value of 9007199254740993 is 9007199254740992: it must not be taken as a match, nor as a mismatch.
+    expect(publishClaim(openStore(), d, d, mk('big', 9007199254740992))).toMatchObject({ published: false, unconfirmed: true });
+    expect(publishClaim(openStore(), d, d, mk('big', Number.MAX_SAFE_INTEGER + 2))).toMatchObject({ published: false, unconfirmed: true });
+    expect(publishClaim(openStore(), d, d, mk('ok', 42)).published).toBe(true);
+  });
+
+  it('the expected-value limit is counted in UTF-8 bytes, not UTF-16 code units', () => {
+    const d = newRepo({ 'c.json': '{"a": 1}\n' });
+    const c = head(d);
+    const mk = (value: unknown) => ({ id: `big${counter++}`, section: 'architecture', statement: 'A', kind: 'config', evidence: [ev(d, c, 'c.json', 1)], verifier: { kind: 'config', path: 'c.json', key: ['a'], value } });
+    expect(ClaimSchema.safeParse(mk('€'.repeat(30000))).success).toBe(false); // 30,000 characters, about 90,000 bytes
+    expect(ClaimSchema.safeParse(mk('€'.repeat(10000))).success).toBe(true); // about 30,000 bytes
+  });
+
+  describe('a directory exclusion covers what is under it and a gitlink there, not a regular file of that name', () => {
+    it('a regular file named like the excluded directory is still searched', () => {
+      const d = newRepo({ vendor: 'zz-forbidden-zz\n', 'a.txt': 'hello\n' });
+      const cm = head(d);
+      const k = (exclude: string[]) =>
+        claim({ kind: 'absence', statement: 'No marker', evidence: [ev(d, cm, 'a.txt')], verifier: { kind: 'absence', pattern: { type: 'literal', text: 'zz-forbidden-zz' }, exclude } });
+      const v = verifyClaim(new CommitReader(d, cm), k(['vendor/']));
+      expect(v.ok).toBe(false);
+      expect(v.reason).toMatch(/vendor/);
+      // Excluding that exact file is a different, explicit statement and still works.
+      expect(verifyClaim(new CommitReader(d, cm), k(['vendor'])).ok).toBe(true);
+    });
+
+    it('a directory exclusion still covers files under it', () => {
+      const d = newRepo({ 'vendor/x.txt': 'zz-forbidden-zz\n', 'a.txt': 'hello\n' });
+      const cm = head(d);
+      const k = claim({
+        kind: 'absence',
+        statement: 'No marker',
+        evidence: [ev(d, cm, 'a.txt')],
+        verifier: { kind: 'absence', pattern: { type: 'literal', text: 'zz-forbidden-zz' }, exclude: ['vendor/'] },
+      });
+      expect(verifyClaim(new CommitReader(d, cm), k).ok).toBe(true);
+    });
+
+    it('a directory replaced by a file between commits withdraws the absence claim on reverify', () => {
+      const d = newRepo({ 'vendor/x.txt': 'fine\n', 'a.txt': 'hello\n' });
+      const c1 = head(d);
+      const store = openStore();
+      const k = claim({
+        kind: 'absence',
+        statement: 'No marker',
+        evidence: [ev(d, c1, 'a.txt')],
+        verifier: { kind: 'absence', pattern: { type: 'literal', text: 'zz-forbidden-zz' }, exclude: ['vendor/'] },
+      });
+      expect(publishClaim(store, d, d, k).published).toBe(true);
+      const c2 = commitFiles(d, { 'vendor/x.txt': null, vendor: 'zz-forbidden-zz\n' });
+      const r = reverifyOnCommit(store, d, d, c1, c2);
+      expect(r.withdrawn.map((w) => w.id)).toEqual([k.id]);
+    });
+  });
+
+  it('a reader holds a bounded amount of blob data however many files are read', () => {
+    const files: Record<string, string> = {};
+    for (let i = 0; i < 10; i++) files[`big/f${i}.txt`] = `${String(i).repeat(1024)}\n`.repeat(5 * 1024); // about 5 MiB each, all different
+    const d = newRepo(files);
+    const reader = new CommitReader(d, head(d));
+    for (let i = 0; i < 10; i++) expect(reader.bytes(`big/f${i}.txt`).ok).toBe(true);
+    expect(reader.cachedBytes()).toBeLessThanOrEqual(32 * 1024 * 1024);
+    expect(reader.cachedBytes()).toBeGreaterThan(0);
+    // An evicted blob is read again, not lost.
+    expect(reader.bytes('big/f0.txt')).toMatchObject({ ok: true });
+  });
+
+  it('listClaims keeps the order in which each id was first stored, even when an earlier claim is saved again', () => {
+    const dir = newRepo();
+    const c = head(dir);
+    const store = openStore();
+    const a = ClaimSchema.parse(validClaims(dir, c).quote);
+    const b = ClaimSchema.parse(validClaims(dir, c).exists);
+    store.saveClaim({ repoPath: dir, claim: a, status: 'verified', reason: 'proof' });
+    store.saveClaim({ repoPath: dir, claim: b, status: 'verified', reason: 'proof' });
+    store.saveClaim({ repoPath: dir, claim: a, status: 'verified', reason: 'proof again' });
+    expect(store.listClaims(dir).map((s) => s.claim.id)).toEqual([a.id, b.id]);
+  });
+
+  it('fixture repositories commit despite a global pre-commit hook that fails', () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-claims-hook-'));
+    dirs.push(root);
+    const hooks = join(root, 'hooks');
+    mkdirSync(hooks);
+    writeFileSync(join(hooks, 'pre-commit'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const globalConfig = join(root, 'gitconfig');
+    writeFileSync(globalConfig, `[core]\n\thooksPath = ${hooks}\n\tautocrlf = true\n`);
+    const before = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      const d = newRepo({ 'a.txt': 'a\r\nb\r\n' });
+      // And a global autocrlf=true did not turn the committed CRLF into LF.
+      expect(spawnSync('git', ['cat-file', 'blob', `${head(d)}:a.txt`], { cwd: d, encoding: 'latin1' }).stdout).toBe('a\r\nb\r\n');
+    } finally {
+      if (before === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = before;
+    }
   });
 });

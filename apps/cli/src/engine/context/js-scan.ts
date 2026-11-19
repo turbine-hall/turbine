@@ -45,6 +45,8 @@ export type ModuleScan =
       exports: ScannedExport[];
       /** `require()` calls found but not stated, because `require` is bound in the file and may not be the loader. */
       unconfirmed: number;
+      /** Statements whose specifier is a string written with an escape (`'\\u0066oo'`): found, but not stated, so not silently dropped. */
+      escaped: number;
     }
   | { ok: false; reason: string };
 
@@ -120,7 +122,13 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
   let requireBound = false;
 
   /** A string literal written without escapes: its value is exactly the text between the quotes. */
-  const plainString = (n: TS.Node | undefined): TS.StringLiteral | undefined => (n && ts.isStringLiteral(n) && s.slice(startOf(n) + 1, n.end - 1) === n.text ? n : undefined);
+  let escaped = 0;
+  const plainString = (n: TS.Node | undefined): TS.StringLiteral | undefined => {
+    if (!n || !ts.isStringLiteral(n)) return undefined;
+    if (s.slice(startOf(n) + 1, n.end - 1) === n.text) return n;
+    escaped++;
+    return undefined;
+  };
   const addImport = (kind: ImportKind, spec: TS.StringLiteral, from: number, to: number, viaCall = false) =>
     imports.push({ specifier: spec.text, kind, line: lineAt(from), statement: text(from, to), ...(viaCall ? { viaCall: true as const } : {}) });
   const addExport = (name: string, from: number, to: number) => exports.push({ name, line: lineAt(from), statement: text(from, to) });
@@ -225,5 +233,5 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
     if (viaCall && requireBound) unconfirmed++;
     else kept.push(imp);
   }
-  return { ok: true, imports: kept, exports, unconfirmed };
+  return { ok: true, imports: kept, exports, unconfirmed, escaped };
 }
