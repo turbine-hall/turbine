@@ -50,7 +50,9 @@ afterAll(() => {
  * from the process that runs the tests may point them at another checkout. GIT_CONFIG_GLOBAL is kept, for the tests that exercise it.
  */
 function gitEnv(): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_') || k === 'GIT_CONFIG_GLOBAL'));
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_') || k === 'GIT_CONFIG_GLOBAL'));
+  // The system-wide attributes file (for example `*.ts text eol=lf`) and system config must not change the committed bytes.
+  return { ...env, GIT_ATTR_NOSYSTEM: '1', GIT_CONFIG_NOSYSTEM: '1' };
 }
 function spawnGit(args: string[], opts: { cwd: string; encoding: BufferEncoding; input?: string; maxBuffer?: number }) {
   return spawnSync('git', args, { ...opts, env: gitEnv() });
@@ -76,6 +78,11 @@ function commitFiles(dir: string, files: Record<string, string | Buffer | null>,
   git(dir, 'commit', '-qm', msg);
   return head(dir);
 }
+
+/** Cells of a Markdown table row, with or without leading and trailing pipes; an escaped pipe stays in its cell. */
+const tableCells = (l: string): number => l.trim().replace(/^\|/, '').replace(/(?<!\\)\|$/, '').split(/(?<!\\)\|/).length;
+/** A GFM delimiter row: cells of dashes with optional colons, separated by pipes (a pipe is required: it is what makes a table). */
+const isTableDelimiter = (l: string): boolean => l.includes('|') && /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(l);
 
 const json = (v: unknown) => `${JSON.stringify(v, null, 2)}\n`;
 
@@ -717,6 +724,14 @@ describe('storage — migration v4 and the claim methods', () => {
     expect(stored).toMatchObject({ repoPath: dir, commit: c, section: 'architecture', status: 'verified', reason: 'proof' });
     expect(stored.claim).toEqual(parsed);
     expect(store.getClaim('/elsewhere', parsed.id)).toBeNull();
+    // The same id under two repository paths is two claims, each keeping its own reason.
+    expect(store.saveClaim({ repoPath: '/elsewhere', claim: parsed, status: 'rejected', reason: 'rejected elsewhere' })).toBe(true);
+    expect(store.getClaim(dir, parsed.id)).toMatchObject({ status: 'verified', reason: 'proof' });
+    expect(store.getClaim('/elsewhere', parsed.id)).toMatchObject({ status: 'rejected', reason: 'rejected elsewhere' });
+    expect(store.listClaims(dir)).toHaveLength(1);
+    expect(store.listClaims('/elsewhere')).toHaveLength(1);
+    expect(store.withdrawClaim('/elsewhere', parsed.id, 'gone')).toBe(true);
+    expect(store.getClaim(dir, parsed.id)).toMatchObject({ status: 'verified', reason: 'proof' });
     expect(store.listClaims(dir)).toHaveLength(1);
     expect(store.listClaims(dir, { section: 'security' })).toEqual([]);
     expect(store.listClaims(dir, { commit: c })).toHaveLength(1);
@@ -1124,21 +1139,28 @@ describe('review round 1 (PR #12): findings from the first CodeRabbit pass', () 
 
   it('every row of a table in IMPLEMENTATION_STATUS.md has as many cells as its header (an unescaped "|" splits a cell)', () => {
     const lines = readFileSync(resolve(here, '../../docs/IMPLEMENTATION_STATUS.md'), 'utf8').split('\n');
-    const cells = (l: string) => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split(/(?<!\\)\|/).length;
-    let header = 0;
     let checked = 0;
-    for (const [i, l] of lines.entries()) {
-      if (!l.trimStart().startsWith('|')) {
-        header = 0;
-        continue;
-      }
-      if (!header) header = cells(l);
-      else {
-        expect(cells(l), `line ${i + 1}: ${l.slice(0, 60)}`).toBe(header);
+    for (let i = 0; i + 1 < lines.length; i++) {
+      if (!lines[i]!.includes('|') || !isTableDelimiter(lines[i + 1]!)) continue;
+      const header = tableCells(lines[i]!);
+      expect(tableCells(lines[i + 1]!), `line ${i + 2}: delimiter row`).toBe(header);
+      for (let j = i + 2; j < lines.length && lines[j]!.trim() !== '' && lines[j]!.includes('|'); j++) {
+        expect(tableCells(lines[j]!), `line ${j + 1}: ${lines[j]!.slice(0, 60)}`).toBe(header);
         checked++;
       }
     }
     expect(checked).toBeGreaterThan(5);
+  });
+
+  it('the table check reads a table written without leading pipes, and catches an extra cell in it', () => {
+    expect(isTableDelimiter('--- | ---')).toBe(true);
+    expect(isTableDelimiter(':--|--:')).toBe(true);
+    expect(isTableDelimiter('| --- | :---: |')).toBe(true);
+    expect(isTableDelimiter('a | b')).toBe(false);
+    expect(tableCells('Layer | Status')).toBe(2);
+    expect(tableCells('a | b | c')).toBe(3); // the extra cell a leading-pipe-only check would never see
+    expect(tableCells('| a | b |')).toBe(2);
+    expect(tableCells('| a \\| b | c |')).toBe(2); // an escaped pipe stays inside its cell
   });
 });
 
@@ -1561,39 +1583,97 @@ describe('review round 4 (PR #12): findings from the third local CodeRabbit revi
       expect(store.getClaim(dir, input.id as string)!.commit).toBe(c3);
     });
 
-    it('a withdrawn claim can be published again at any commit', () => {
+    it('once withdrawn, the claim can be published at the older commit again', () => {
       const dir = newRepo();
       const c1 = head(dir);
       const store = openStore();
       const input = validClaims(dir, c1).quote!;
       publishClaim(store, dir, dir, input);
+      const c2 = commitFiles(dir, { 'README.md': 'x\n' });
+      reverifyOnCommit(store, dir, dir, c1, c2); // the row is now carried at c2
+      expect(publishClaim(store, dir, dir, input)).toMatchObject({ published: false, recorded: false }); // c1 is behind it
       store.withdrawClaim(dir, input.id as string, 'gone');
-      expect(publishClaim(store, dir, dir, input).published).toBe(true);
+      expect(publishClaim(store, dir, dir, input).published).toBe(true); // nothing published is ahead of c1 any more
+      expect(store.getClaim(dir, input.id as string)).toMatchObject({ status: 'verified', commit: c1 });
+    });
+
+    it('a NEW claim is not published at a commit the published claims have already moved past', () => {
+      const dir = newRepo();
+      const c1 = head(dir);
+      const store = openStore();
+      const first = validClaims(dir, c1).quote!;
+      publishClaim(store, dir, dir, first);
+      const c2 = commitFiles(dir, { 'README.md': 'x\n' });
+      reverifyOnCommit(store, dir, dir, c1, c2);
+      const late = validClaims(dir, c1).imports!; // a different id, proven at c1, which reverify has left behind
+      const out = publishClaim(store, dir, dir, late);
+      expect(out).toMatchObject({ published: false, recorded: false, unconfirmed: false });
+      if (!out.published) expect(out.reason).toMatch(/does not descend/);
+      expect(store.getClaim(dir, late.id as string)).toBeNull(); // nothing stored, not even a rejection
+      // At the commit the claims are carried at, or after it, it is accepted.
+      const atC2 = ClaimSchema.parse({ ...late, evidence: (late.evidence as Array<Record<string, unknown>>).map((e) => ({ ...e, commit: c2, blob: git(dir, 'rev-parse', `${c2}:${e.path as string}`).trim() })) });
+      expect(publishClaim(store, dir, dir, atC2).published).toBe(true);
+    });
+
+    it('a claim on a branch that diverged from the published claims is not published', () => {
+      const dir = newRepo();
+      const base = head(dir);
+      const store = openStore();
+      git(dir, 'checkout', '-q', '-b', 'side');
+      const side = commitFiles(dir, { 'side.txt': 's\n' });
+      git(dir, 'checkout', '-q', '-');
+      const main = commitFiles(dir, { 'main.txt': 'm\n' });
+      expect(publishClaim(store, dir, dir, validClaims(dir, main).quote!).published).toBe(true);
+      const out = publishClaim(store, dir, dir, validClaims(dir, side).imports!);
+      expect(out).toMatchObject({ published: false, recorded: false, unconfirmed: false });
+      expect(base).not.toBe(side);
+    });
+
+    it('a git failure while comparing commits is unconfirmed (retryable), keeps the stored row, and does not blame the commit', () => {
+      const dir = newRepo();
+      const c = head(dir);
+      const store = openStore();
+      // A published row at a commit this repository does not have (the trusted low-level write allows it).
+      const ghost = ClaimSchema.parse({ ...validClaims(dir, c).exists, id: 'ghost', evidence: [{ path: 'docs/notes.md', commit: 'a'.repeat(40), blob: 'b'.repeat(40) }] });
+      store.saveClaim({ repoPath: dir, claim: ghost, status: 'verified', reason: 'seeded' });
+      const out = publishClaim(store, dir, dir, validClaims(dir, c).quote!);
+      expect(out).toMatchObject({ published: false, unconfirmed: true, recorded: false });
+      if (!out.published) {
+        expect(out.reason).toMatch(/could not compare/);
+        expect(out.reason).not.toMatch(/does not descend/);
+      }
+      expect(store.getClaim(dir, 'ghost')).toMatchObject({ status: 'verified', commit: 'a'.repeat(40) });
     });
   });
 
-  it('publish checks the transaction at the verifier and at the save: both run inside the same one', () => {
+  it('verification and the save run inside ONE transaction (the same token), not two back to back', () => {
     const dir = newRepo();
     const c = head(dir);
     const store = openStore();
-    const inTransaction = (): boolean => {
-      try {
-        store.db.exec('BEGIN IMMEDIATE'); // a second BEGIN fails while publishClaim's transaction is open
-        store.db.exec('ROLLBACK');
-        return false;
-      } catch {
-        return true;
-      }
-    };
-    const seen: Record<string, boolean> = {};
+    let issued = 0;
+    let current = 0; // the token of the transaction being run; 0 outside any
+    const seen: Record<string, number> = {};
     hooks.onVerify = () => {
-      seen.verify = inTransaction();
+      seen.verify = current;
     };
     const spy = new Proxy(store, {
       get(target, prop) {
+        if (prop === 'transaction') {
+          return (fn: () => unknown) => {
+            const token = ++issued;
+            return target.transaction(() => {
+              current = token;
+              try {
+                return fn();
+              } finally {
+                current = 0;
+              }
+            });
+          };
+        }
         if (prop === 'saveClaim') {
           return (...a: Parameters<WorkStore['saveClaim']>) => {
-            seen.save = inTransaction();
+            seen.save = current;
             return target.saveClaim(...a);
           };
         }
@@ -1606,7 +1686,9 @@ describe('review round 4 (PR #12): findings from the third local CodeRabbit revi
     } finally {
       hooks.onVerify = undefined;
     }
-    expect(seen).toEqual({ verify: true, save: true });
+    expect(seen.verify).toBeGreaterThan(0);
+    expect(seen.save).toBe(seen.verify);
+    expect(issued).toBe(1); // one transaction for the whole publish
   });
 
   it('fixture repositories ignore a template directory that supplies attributes', () => {
@@ -1651,5 +1733,81 @@ describe('review round 4 (PR #12): findings from the third local CodeRabbit revi
     const v = verifyClaim(new CommitReader(d, cm), k);
     expect(v.ok).toBe(false);
     expect(v.reason).toMatch(/some-link/);
+  });
+});
+
+describe('review round 5 (PR #12): findings from the fourth local CodeRabbit review', () => {
+  const publishExists = (d: string, c: string, path: string, symbol: string, line: number) =>
+    publishClaim(openStore(), d, d, claim({ kind: 'exists', evidence: [ev(d, c, path, line)], verifier: { kind: 'exists', path, symbol } }));
+
+  it('exists(symbol: "default") is proven by every explicit form of a default export, at its line', () => {
+    const d = newRepo({
+      'a.ts': 'const fn = () => 1;\nexport { fn as default };\n',
+      'b.ts': 'export default function main() {}\n',
+      'c.ts': 'export default class {}\n',
+      'd.ts': 'const v = 1;\nexport default v;\n',
+      'e.ts': "export { default } from './a.js';\n",
+      'f.ts': 'export const named = 1;\n',
+    });
+    const c = head(d);
+    expect(publishExists(d, c, 'a.ts', 'default', 2).published).toBe(true);
+    expect(publishExists(d, c, 'b.ts', 'default', 1).published).toBe(true);
+    expect(publishExists(d, c, 'c.ts', 'default', 1).published).toBe(true);
+    expect(publishExists(d, c, 'd.ts', 'default', 2).published).toBe(true);
+    expect(publishExists(d, c, 'e.ts', 'default', 1).published).toBe(true);
+    // Not a default export, and not on the cited line.
+    expect(publishExists(d, c, 'f.ts', 'default', 1).published).toBe(false);
+    expect(publishExists(d, c, 'a.ts', 'default', 1).published).toBe(false);
+    // The named exports are as before: `default` is not one of them.
+    expect(publishExists(d, c, 'b.ts', 'main', 1).published).toBe(false);
+  });
+
+  it('a blob larger than the whole cache budget is returned without being cached', () => {
+    const d = newRepo({ 'big.txt': `${'x'.repeat(1023)}\n`.repeat(33 * 1024) }); // 33 MiB
+    const reader = new CommitReader(d, head(d));
+    const r = reader.bytes('big.txt', 40 * 1024 * 1024);
+    expect(r.ok && r.buf.length).toBe(33 * 1024 * 1024);
+    expect(reader.cachedBytes()).toBe(0);
+    expect(reader.cachedBytes()).toBeLessThanOrEqual(32 * 1024 * 1024);
+  }, 60_000);
+
+  it('a specifier inside parentheses or a type assertion is read, not dropped', () => {
+    const d = newRepo({ 'm.ts': "export const a = () => import(('pkg'));\nexport const b = () => import('other' as string);\nexport const c = () => import((`tpl`));\n" });
+    const cm = head(d);
+    const imp = (specifier: string, line: number) =>
+      publishClaim(openStore(), d, d, claim({ kind: 'imports', evidence: [ev(d, cm, 'm.ts', line)], verifier: { kind: 'imports', from: 'm.ts', specifier } }));
+    expect(imp('pkg', 1).published).toBe(true);
+    expect(imp('other', 2).published).toBe(true);
+    expect(imp('tpl', 3)).toMatchObject({ published: false, unconfirmed: true }); // a template stays unreadable, inside parentheses too
+    expect(imp('missing', 1)).toMatchObject({ published: false, unconfirmed: false }); // a plain miss is still a miss
+  });
+
+  it('an integer written with an exponent that a double cannot hold exactly is unconfirmed; exact ones verify', () => {
+    const d = newRepo({ 'n.json': '{"big": 1e23, "ok": 1e3, "half": 1.5e1, "zero": 0e5, "frac": 0.5, "neg": -2e22, "tiny": 1e-400}\n' });
+    const c = head(d);
+    const cfg = (key: string, value: unknown) =>
+      publishClaim(openStore(), d, d, claim({ kind: 'config', evidence: [ev(d, c, 'n.json', 1)], verifier: { kind: 'config', path: 'n.json', key: [key], value } }));
+    expect(cfg('big', 1e23)).toMatchObject({ published: false, unconfirmed: true });
+    expect(cfg('neg', -2e22)).toMatchObject({ published: false, unconfirmed: true });
+    expect(cfg('tiny', 0)).toMatchObject({ published: false, unconfirmed: true });
+    expect(cfg('ok', 1000).published).toBe(true);
+    expect(cfg('half', 15).published).toBe(true);
+    expect(cfg('zero', 0).published).toBe(true);
+    expect(cfg('frac', 0.5).published).toBe(true);
+  });
+
+  it('IMPLEMENTATION_STATUS.md names the JSONC filename forms exactly as the verifier accepts them', () => {
+    const doc = readFileSync(resolve(here, '../../docs/IMPLEMENTATION_STATUS.md'), 'utf8');
+    expect(doc).toContain('`tsconfig.<name>.json`');
+    expect(doc).toContain('`tsconfig-base.json` is strict');
+    const d = newRepo({
+      'tsconfig.base.json': '{\n  // c\n  "a": 1\n}\n',
+      'tsconfig-base.json': '{\n  // c\n  "a": 1\n}\n',
+    });
+    const c = head(d);
+    const cfg = (path: string) =>
+      publishClaim(openStore(), d, d, claim({ kind: 'config', evidence: [ev(d, c, path, 3)], verifier: { kind: 'config', path, key: ['a'], value: 1 } }));
+    expect(cfg('tsconfig.base.json').published).toBe(true);
+    expect(cfg('tsconfig-base.json').published).toBe(false); // strict JSON: the comment is a syntax error
   });
 });

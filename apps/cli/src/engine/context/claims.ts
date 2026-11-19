@@ -51,24 +51,33 @@ export function publishClaim(store: WorkStore, repoRoot: string, repoPath: strin
       return reject(store, repoPath, claim, e instanceof Error ? e.message : String(e), true);
     }
     if (!result.ok) return reject(store, repoPath, claim, result.reason, result.unconfirmed === true);
-    // A publication must not move a claim back: if this claim is already carried at a commit that this one does not
-    // descend from, writing it here would make `reverifyOnCommit` (which starts from the stored commit) miss later changes.
-    const current = store.getClaim(repoPath, claim.id);
-    const moveBack = (): boolean => {
-      if (!current || !PUBLISHED_CLAIM_STATUSES.includes(current.status) || current.commit === commit) return false;
+    // `reverifyOnCommit` carries only the rows stored at its `prev` commit. A claim stored at a commit that the published
+    // claims have already moved past (or on another line of history) would never be carried again, and would stay
+    // `verified` while its cited files change. So a publication is accepted only at a commit that every published
+    // claim of this repository is an ancestor of (or equal to). Once no claim is published, any commit is accepted.
+    const carriedAt = new Set(store.listClaims(repoPath, { statuses: PUBLISHED_CLAIM_STATUSES }).map((s) => s.commit));
+    carriedAt.delete(commit);
+    for (const other of carriedAt) {
+      let descends: boolean;
       try {
-        return !isAncestor(repoRoot, current.commit, commit);
-      } catch {
-        return true; // the stored commit cannot be compared with this one: do not move the claim
+        descends = isAncestor(repoRoot, other, commit);
+      } catch (e) {
+        // A failed git check does not show that the commits are unrelated: nothing is stored, and the call can be retried.
+        return {
+          published: false,
+          reason: `could not compare commit ${commit} with commit ${other}, where claims are already published; try again (${e instanceof Error ? e.message : String(e)})`,
+          unconfirmed: true,
+          recorded: false,
+        };
       }
-    };
-    if (current && moveBack()) {
-      return {
-        published: false,
-        reason: `claim ${claim.id} is already published at commit ${current.commit}, which commit ${commit} does not descend from; publish it at a commit that does, or withdraw it first`,
-        unconfirmed: false,
-        recorded: false,
-      };
+      if (!descends) {
+        return {
+          published: false,
+          reason: `claims are already published at commit ${other}, which commit ${commit} does not descend from; publish at ${other} or a commit after it`,
+          unconfirmed: false,
+          recorded: false,
+        };
+      }
     }
     store.saveClaim({ repoPath, claim, status: 'verified', reason: clip(result.reason) });
     // Read in the same transaction that wrote it, so the result is what this call stored.

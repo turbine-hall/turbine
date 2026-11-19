@@ -43,6 +43,8 @@ export type ModuleScan =
       ok: true;
       imports: ScannedImport[];
       exports: ScannedExport[];
+      /** The default export (`export default …`, `export { x as default }`), named "default". Kept apart from `exports`, which the import graph reads as named exports. */
+      defaultExports: ScannedExport[];
       /** `require()` calls found but not stated, because `require` is bound in the file and may not be the loader. */
       unconfirmed: number;
       /** Lines of the `require()` calls counted in `unconfirmed`. */
@@ -121,12 +123,16 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
   const startOf = (n: TS.Node) => n.getStart(sf);
   const imports: Array<ScannedImport & { viaCall?: true }> = [];
   const exports: ScannedExport[] = [];
+  const defaultExports: ScannedExport[] = [];
   let requireBound = false;
 
   /** A string literal written without escapes: its value is exactly the text between the quotes. */
   const unreadableAt: number[] = [];
   /** `from` is where the statement that holds the string starts: an escaped specifier is recorded against that line. */
-  const plainString = (n: TS.Node | undefined, from: number): TS.StringLiteral | undefined => {
+  const plainString = (arg: TS.Node | undefined, from: number): TS.StringLiteral | undefined => {
+    // `import(('pkg'))`, `import('pkg' as string)`: the same module name, written inside wrappers that do not change it.
+    let n = arg;
+    while (n && (ts.isParenthesizedExpression(n) || ts.isAsExpression(n) || ts.isNonNullExpression(n) || ts.isSatisfiesExpression(n) || ts.isTypeAssertionExpression(n))) n = n.expression;
     if (!n) return undefined;
     // `import(`pkg`)`: a template without substitutions names a module, but is not a string literal this scanner trusts.
     if (ts.isNoSubstitutionTemplateLiteral(n)) {
@@ -141,6 +147,7 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
   const addImport = (kind: ImportKind, spec: TS.StringLiteral, from: number, to: number, viaCall = false) =>
     imports.push({ specifier: spec.text, kind, line: lineAt(from), statement: text(from, to), ...(viaCall ? { viaCall: true as const } : {}) });
   const addExport = (name: string, from: number, to: number) => exports.push({ name, line: lineAt(from), statement: text(from, to) });
+  const addDefault = (from: number, to: number) => defaultExports.push({ name: 'default', line: lineAt(from), statement: text(from, to) });
 
   const modifiersOf = (n: TS.Node): readonly TS.Modifier[] => (ts.canHaveModifiers(n) ? (ts.getModifiers(n) ?? []) : []);
 
@@ -197,11 +204,23 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
         addExport(clause.name.text, from, clause.name.end);
         return;
       }
-      for (const el of clause.elements) if (el.name.text !== 'default') addExport(el.name.text, from, clause.end);
+      for (const el of clause.elements) {
+        if (el.name.text === 'default') addDefault(from, clause.end);
+        else addExport(el.name.text, from, clause.end);
+      }
+      return;
+    }
+    if (ts.isExportAssignment(n)) {
+      if (!n.isExportEquals) addDefault(startOf(n), n.end);
       return;
     }
     const exportKeyword = modifiersOf(n).find((m) => m.kind === ts.SyntaxKind.ExportKeyword);
-    if (!exportKeyword || modifiersOf(n).some((m) => m.kind === ts.SyntaxKind.DefaultKeyword)) return;
+    const defaultKeyword = modifiersOf(n).find((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
+    if (exportKeyword && defaultKeyword) {
+      addDefault(startOf(exportKeyword), defaultKeyword.end);
+      return;
+    }
+    if (!exportKeyword) return;
     const from = startOf(exportKeyword);
     if (ts.isVariableStatement(n)) {
       for (const d of n.declarationList.declarations) if (ts.isIdentifier(d.name)) addExport(d.name.text, from, d.name.end);
@@ -245,5 +264,5 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
       unconfirmedAt.push(imp.line);
     } else kept.push(imp);
   }
-  return { ok: true, imports: kept, exports, unconfirmed, unconfirmedAt, unreadableAt };
+  return { ok: true, imports: kept, exports, defaultExports, unconfirmed, unconfirmedAt, unreadableAt };
 }

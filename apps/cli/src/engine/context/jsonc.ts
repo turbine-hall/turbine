@@ -192,7 +192,7 @@ export function parseJsonc(input: string, opts: JsoncOptions = {}): Jsonc {
     // 1e400 parses to Infinity, which is not a JSON value a manifest can meaningfully state: refuse it
     if (typeof n === 'number' && !Number.isFinite(n)) return fail('Number out of range', 'number');
     // A double holds any decimal of up to 15 significant digits, and any safe integer, exactly. Anything else may be rounded.
-    if (opts.exactNumbers && typeof n === 'number' && !(/^-?\d+$/.test(m[0]) ? Number.isSafeInteger(n) : significantDigits(m[0]) <= 15 && (n === 0 ? significantDigits(m[0]) === 0 : Math.abs(n) >= MIN_NORMAL))) return new InexactNumber(m[0]);
+    if (opts.exactNumbers && typeof n === 'number' && !(/^-?\d+$/.test(m[0]) || (Number.isInteger(n) && n !== 0 && /[eE]/.test(m[0])) ? Number.isSafeInteger(n) : significantDigits(m[0]) <= 15 && (n === 0 ? significantDigits(m[0]) === 0 : Math.abs(n) >= MIN_NORMAL))) return new InexactNumber(m[0]);
     return n;
   };
 

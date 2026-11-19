@@ -110,6 +110,8 @@ export class CommitReader {
     if (!buf) {
       buf = readBlobs(this.repoRoot, [entry.id], entry.size).get(entry.id);
       if (!buf) return { ok: false, reason: `${path} could not be read from git` };
+      // A blob that alone is over the budget is returned, not kept: the cache never holds more than its bound.
+      if (buf.length > MAX_CACHED_BYTES) return { ok: true, entry, buf };
       this.blobs.set(entry.id, buf);
       this.cached += buf.length;
       // Oldest first: one transition can cite thousands of distinct files, and each is read once more only if cited again.
@@ -241,9 +243,10 @@ function verifyExists(reader: CommitReader, claim: Claim, v: Extract<ClaimVerifi
   const scan = scanModule(t.text, { jsx: jsxFile(v.path) });
   if (!scan.ok) return unconfirmed(`${v.path} cannot be parsed: ${scan.reason}`);
   const cited = citedLines(claim, v.path);
-  const hit = scan.exports.find((x) => x.name === v.symbol && inLines(cited, x.line));
+  const exported = v.symbol === 'default' ? scan.defaultExports : scan.exports;
+  const hit = exported.find((x) => x.name === v.symbol && inLines(cited, x.line));
   if (hit) return pass(`${v.path} exports "${v.symbol}" at line ${hit.line}`);
-  const elsewhere = scan.exports.find((x) => x.name === v.symbol);
+  const elsewhere = exported.find((x) => x.name === v.symbol);
   return fail(elsewhere ? `${v.path} exports "${v.symbol}" at line ${elsewhere.line}, outside the cited lines` : `${v.path} has no top-level export named "${v.symbol}"`);
 }
 
