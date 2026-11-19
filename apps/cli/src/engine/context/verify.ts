@@ -93,8 +93,13 @@ export class CommitReader {
     return this.cached;
   }
 
-  /** The bytes of a tracked file at this commit, or why they cannot be used. */
+  /** The bytes of a tracked file at this commit, or why they cannot be used. The caller gets a copy: the cached bytes are never handed out. */
   bytes(path: string, maxBytes = MAX_TEXT_BYTES): { ok: true; entry: TreeEntry; buf: Buffer } | { ok: false; reason: string } {
+    const r = this.read(path, maxBytes);
+    return r.ok ? { ok: true, entry: r.entry, buf: Buffer.from(r.buf) } : r;
+  }
+
+  private read(path: string, maxBytes: number): { ok: true; entry: TreeEntry; buf: Buffer } | { ok: false; reason: string } {
     const entry = this.entry(path);
     if (!entry) return { ok: false, reason: `${path} is not tracked at commit ${this.commit.slice(0, 12)}` };
     if (entry.type !== 'blob') return { ok: false, reason: `${path} is a ${entry.type}, not a file` };
@@ -119,7 +124,7 @@ export class CommitReader {
 
   /** The file as UTF-8 text. A file that is not valid UTF-8, or has a NUL byte, is not text. */
   text(path: string): Text {
-    const b = this.bytes(path);
+    const b = this.read(path, MAX_TEXT_BYTES);
     if (!b.ok) return b;
     if (b.buf.includes(0)) return { ok: false, reason: `${path} is not a text file (it contains a NUL byte)` };
     try {
@@ -246,8 +251,8 @@ function verifyExists(reader: CommitReader, claim: Claim, v: Extract<ClaimVerifi
  * Statements the scanner found but could not state (a shadowed `require`, an escaped specifier). One that starts on a
  * cited line might be the import the claim is about, so a miss is then not proven; one elsewhere cannot be.
  */
-function undecided(scan: { unconfirmedAt: number[]; escapedAt: number[] }, path: string, cited: Array<{ start: number; end: number }>): VerifyResult | undefined {
-  const lines = [...scan.unconfirmedAt, ...scan.escapedAt].filter((l) => inLines(cited, l));
+function undecided(scan: { unconfirmedAt: number[]; unreadableAt: number[] }, path: string, cited: Array<{ start: number; end: number }>): VerifyResult | undefined {
+  const lines = [...scan.unconfirmedAt, ...scan.unreadableAt].filter((l) => inLines(cited, l));
   return lines.length ? unconfirmed(`${path} has ${lines.length} import statement(s) on the cited lines that cannot be read exactly (a shadowed \`require\` or an escaped specifier), so a missing import is not proven`) : undefined;
 }
 

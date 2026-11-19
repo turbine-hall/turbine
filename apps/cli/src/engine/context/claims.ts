@@ -1,7 +1,7 @@
 import { ClaimSchema, PUBLISHED_CLAIM_STATUSES, claimCommit, parseClaimSafe } from '@turbine-hall/turbine-contracts';
 import type { Claim, StoredClaim } from '@turbine-hall/turbine-contracts';
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
-import { resolveCommit, treeIdOf } from './git-read.js';
+import { isAncestor, resolveCommit, treeIdOf } from './git-read.js';
 import { CommitReader, SYMLINK_MODE, verifyClaim } from './verify.js';
 
 /**
@@ -51,6 +51,25 @@ export function publishClaim(store: WorkStore, repoRoot: string, repoPath: strin
       return reject(store, repoPath, claim, e instanceof Error ? e.message : String(e), true);
     }
     if (!result.ok) return reject(store, repoPath, claim, result.reason, result.unconfirmed === true);
+    // A publication must not move a claim back: if this claim is already carried at a commit that this one does not
+    // descend from, writing it here would make `reverifyOnCommit` (which starts from the stored commit) miss later changes.
+    const current = store.getClaim(repoPath, claim.id);
+    const moveBack = (): boolean => {
+      if (!current || !PUBLISHED_CLAIM_STATUSES.includes(current.status) || current.commit === commit) return false;
+      try {
+        return !isAncestor(repoRoot, current.commit, commit);
+      } catch {
+        return true; // the stored commit cannot be compared with this one: do not move the claim
+      }
+    };
+    if (current && moveBack()) {
+      return {
+        published: false,
+        reason: `claim ${claim.id} is already published at commit ${current.commit}, which commit ${commit} does not descend from; publish it at a commit that does, or withdraw it first`,
+        unconfirmed: false,
+        recorded: false,
+      };
+    }
     store.saveClaim({ repoPath, claim, status: 'verified', reason: clip(result.reason) });
     // Read in the same transaction that wrote it, so the result is what this call stored.
     return { published: true, claim: store.getClaim(repoPath, claim.id)! };

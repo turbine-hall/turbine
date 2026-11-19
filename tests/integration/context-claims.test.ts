@@ -9,11 +9,24 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { afterAll, afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaimSchema, PUBLISHED_CLAIM_STATUSES, UNIVERSAL_WORDS, claimCommit, parseClaim, universalWordIn } from '../../packages/contracts/dist/index.js';
 import { WorkStore } from '../../packages/storage-sqlite/dist/index.js';
 import { publishClaim, reverifyOnCommit } from '../../apps/cli/src/engine/context/claims.js';
 import { CommitReader, jsonEqual, splitLines, verifyClaim } from '../../apps/cli/src/engine/context/verify.js';
+
+// publishClaim calls the verifier through this module: a test can observe the moment it runs (and change nothing else).
+const hooks = vi.hoisted(() => ({ onVerify: undefined as (() => void) | undefined }));
+vi.mock('../../apps/cli/src/engine/context/verify.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../apps/cli/src/engine/context/verify.js')>();
+  return {
+    ...real,
+    verifyClaim: (...args: Parameters<typeof real.verifyClaim>) => {
+      hooks.onVerify?.();
+      return real.verifyClaim(...args);
+    },
+  };
+});
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dirs: string[] = [];
@@ -93,7 +106,10 @@ const BASE: Record<string, string | Buffer> = {
 function newRepo(files: Record<string, string | Buffer | null> = BASE): string {
   const dir = mkdtempSync(join(tmpdir(), 'turbine-claims-'));
   dirs.push(dir);
-  git(dir, 'init', '-q');
+  // An empty template: a developer's init.templateDir (hooks, info/attributes, ...) is not copied into the fixture.
+  const emptyTemplate = mkdtempSync(join(tmpdir(), 'turbine-claims-template-'));
+  dirs.push(emptyTemplate);
+  git(dir, 'init', '-q', `--template=${emptyTemplate}`);
   git(dir, 'config', 'user.email', 'test@example.com');
   git(dir, 'config', 'user.name', 'Test');
   // A developer's global signing settings must not decide whether the fixture can commit.
@@ -1468,23 +1484,116 @@ describe('review round 3 (PR #12): findings from the second local CodeRabbit rev
     expect(readFileSync(join(decoy, '.git', 'config'), 'utf8')).toBe(before);
     expect(spawnGit(['log', '--oneline'], { cwd: decoy, encoding: 'utf8' }).stdout.trim()).toBe(''); // no fixture commit landed in it
   });
+});
 
-  it('publish writes the verified row inside the transaction that also holds the verification', () => {
+describe('review round 4 (PR #12): findings from the third local CodeRabbit review', () => {
+  it('a number token with a long run of zeros inside it is read in linear time (no backtracking)', () => {
+    const token = `1.${'0'.repeat(200_000)}5`; // many interior zeros, then a nonzero digit
+    const d = newRepo({ 'n.json': `{"n": ${token}, "ok": 1}\n` });
+    const c = head(d);
+    const k = claim({ kind: 'config', evidence: [ev(d, c, 'n.json', 1)], verifier: { kind: 'config', path: 'n.json', key: ['n'], value: 1 } });
+    const started = Date.now();
+    const out = publishClaim(openStore(), d, d, k);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(out).toMatchObject({ published: false, unconfirmed: true }); // more than 15 significant digits
+  }, 60_000);
+
+  it('a nonzero literal that underflows to zero, or lands in the subnormal range, is not taken as an exact number', () => {
+    const d = newRepo({ 'n.json': '{"tiny": 1e-400, "sub": 5e-324, "norm": 1e-300, "zero": 0}\n' });
+    const c = head(d);
+    const mk = (key: string, value: unknown) => claim({ kind: 'config', evidence: [ev(d, c, 'n.json', 1)], verifier: { kind: 'config', path: 'n.json', key: [key], value } });
+    expect(publishClaim(openStore(), d, d, mk('tiny', 0))).toMatchObject({ published: false, unconfirmed: true });
+    expect(publishClaim(openStore(), d, d, mk('sub', 5e-324))).toMatchObject({ published: false, unconfirmed: true });
+    expect(publishClaim(openStore(), d, d, mk('norm', 1e-300)).published).toBe(true);
+    expect(publishClaim(openStore(), d, d, mk('zero', 0)).published).toBe(true);
+  });
+
+  it('a drive-rooted path is not a repository-relative path', () => {
+    const d = newRepo();
+    const c = head(d);
+    const blob = git(d, 'rev-parse', `${c}:docs/notes.md`).trim();
+    const withPath = (path: string) => claim({ kind: 'exists', evidence: [{ path, commit: c, blob }], verifier: { kind: 'exists', path } });
+    for (const path of ['C:/src/a.ts', 'c:src/a.ts', 'Z:a.ts']) expect(ClaimSchema.safeParse(withPath(path)).success, path).toBe(false);
+    expect(ClaimSchema.safeParse(withPath('docs/notes.md')).success).toBe(true); // the same shape, with a repository-relative path
+    expect(ClaimSchema.safeParse(validClaims(d, c).exists).success).toBe(true);
+  });
+
+  describe('an import written as a template literal, or a re-export with an escaped specifier', () => {
+    it('import(`pkg`) is not reported as a missing import: it is unconfirmed', () => {
+      const d = newRepo({ 'm.ts': 'export const load = () => import(`pkg`);\n' });
+      const c = head(d);
+      const out = publishClaim(openStore(), d, d, claim({ kind: 'imports', evidence: [ev(d, c, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } }));
+      expect(out).toMatchObject({ published: false, unconfirmed: true });
+    });
+
+    it('export { foo } from an escaped specifier still states the export "foo"', () => {
+      const d = newRepo({ 'm.ts': "export { foo } from './m\\u006fd.js';\n" });
+      const c = head(d);
+      const out = publishClaim(openStore(), d, d, claim({ kind: 'exists', evidence: [ev(d, c, 'm.ts', 1)], verifier: { kind: 'exists', path: 'm.ts', symbol: 'foo' } }));
+      expect(out.published, out.published ? '' : out.reason).toBe(true);
+      // The import edge is still withheld, and a claim about it is unconfirmed rather than disproven.
+      const imp = publishClaim(openStore(), d, d, claim({ kind: 'imports', evidence: [ev(d, c, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: './mod.js' } }));
+      expect(imp).toMatchObject({ published: false, unconfirmed: true });
+    });
+  });
+
+  describe('a publication at an older commit does not move a claim back', () => {
+    it('refuses to republish a claim at a commit its stored commit does not descend from; a descendant is fine', () => {
+      const dir = newRepo();
+      const c1 = head(dir);
+      const store = openStore();
+      const input = validClaims(dir, c1).quote!;
+      expect(publishClaim(store, dir, dir, input).published).toBe(true);
+      const c2 = commitFiles(dir, { 'README.md': 'x\n' });
+      expect(reverifyOnCommit(store, dir, dir, c1, c2).kept).toEqual([input.id]);
+      expect(store.getClaim(dir, input.id as string)!.commit).toBe(c2);
+
+      // Publishing the same claim again at the OLD commit would move it back to c1.
+      const out = publishClaim(store, dir, dir, input);
+      expect(out).toMatchObject({ published: false, recorded: false, unconfirmed: false });
+      if (!out.published) expect(out.reason).toMatch(/does not descend/);
+      expect(store.getClaim(dir, input.id as string)).toMatchObject({ status: 'verified', commit: c2 });
+
+      // At a descendant of c2 it is allowed.
+      const c3 = commitFiles(dir, { 'README.md': 'y\n' });
+      const atC3 = ClaimSchema.parse({ ...input, evidence: (input.evidence as Array<Record<string, unknown>>).map((e) => ({ ...e, commit: c3, blob: git(dir, 'rev-parse', `${c3}:${e.path as string}`).trim() })) });
+      expect(publishClaim(store, dir, dir, atC3).published).toBe(true);
+      expect(store.getClaim(dir, input.id as string)!.commit).toBe(c3);
+    });
+
+    it('a withdrawn claim can be published again at any commit', () => {
+      const dir = newRepo();
+      const c1 = head(dir);
+      const store = openStore();
+      const input = validClaims(dir, c1).quote!;
+      publishClaim(store, dir, dir, input);
+      store.withdrawClaim(dir, input.id as string, 'gone');
+      expect(publishClaim(store, dir, dir, input).published).toBe(true);
+    });
+  });
+
+  it('publish checks the transaction at the verifier and at the save: both run inside the same one', () => {
     const dir = newRepo();
     const c = head(dir);
     const store = openStore();
-    let openWhileVerifying = false;
+    const inTransaction = (): boolean => {
+      try {
+        store.db.exec('BEGIN IMMEDIATE'); // a second BEGIN fails while publishClaim's transaction is open
+        store.db.exec('ROLLBACK');
+        return false;
+      } catch {
+        return true;
+      }
+    };
+    const seen: Record<string, boolean> = {};
+    hooks.onVerify = () => {
+      seen.verify = inTransaction();
+    };
     const spy = new Proxy(store, {
       get(target, prop) {
         if (prop === 'saveClaim') {
           return (...a: Parameters<WorkStore['saveClaim']>) => {
-            // saveClaim is reached from inside publishClaim's transaction: a second BEGIN would fail here.
-            try {
-              target.db.exec('BEGIN IMMEDIATE');
-              target.db.exec('ROLLBACK');
-            } catch {
-              openWhileVerifying = true;
-            }
+            seen.save = inTransaction();
             return target.saveClaim(...a);
           };
         }
@@ -1492,7 +1601,55 @@ describe('review round 3 (PR #12): findings from the second local CodeRabbit rev
         return typeof v === 'function' ? (v as (...x: unknown[]) => unknown).bind(target) : v;
       },
     });
-    expect(publishClaim(spy, dir, dir, validClaims(dir, c).quote!).published).toBe(true);
-    expect(openWhileVerifying).toBe(true);
+    try {
+      expect(publishClaim(spy, dir, dir, validClaims(dir, c).quote!).published).toBe(true);
+    } finally {
+      hooks.onVerify = undefined;
+    }
+    expect(seen).toEqual({ verify: true, save: true });
+  });
+
+  it('fixture repositories ignore a template directory that supplies attributes', () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-claims-template-'));
+    dirs.push(root);
+    mkdirSync(join(root, 'tpl', 'info'), { recursive: true });
+    writeFileSync(join(root, 'tpl', 'info', 'attributes'), '*.ts text eol=lf\n');
+    const globalConfig = join(root, 'gitconfig');
+    writeFileSync(globalConfig, `[init]\n\ttemplateDir = ${join(root, 'tpl')}\n`);
+    const before = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      const d = newRepo({ 'a.ts': 'a\r\nb\r\n' });
+      expect(spawnGit(['cat-file', 'blob', `${head(d)}:a.ts`], { cwd: d, encoding: 'latin1' }).stdout).toBe('a\r\nb\r\n');
+    } finally {
+      if (before === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = before;
+    }
+  });
+
+  it('the bytes a reader hands out are copies: changing them does not change what is later verified', () => {
+    const dir = newRepo();
+    const c = head(dir);
+    const reader = new CommitReader(dir, c);
+    const first = reader.bytes('src/util.ts');
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const original = Buffer.from(first.buf);
+    first.buf.fill(0x78); // a caller scribbles over what it was given
+    const again = reader.bytes('src/util.ts');
+    expect(again.ok && Buffer.compare(again.buf, original) === 0).toBe(true);
+    expect(verifyClaim(reader, validClaims(dir, c).quote).ok).toBe(true);
+  });
+
+  it('the absence search covers a symlink by its stored target name, and does not follow it', () => {
+    const d = newRepo({ 'a.txt': 'x\n' });
+    const id = spawnGit(['hash-object', '-w', '--stdin'], { cwd: d, encoding: 'utf8', input: 'zz-link-target-zz' }).stdout.trim();
+    git(d, 'update-index', '--add', '--cacheinfo', `120000,${id},some-link`);
+    git(d, 'commit', '-qm', 'a symlink');
+    const cm = head(d);
+    const k = claim({ kind: 'absence', statement: 'No marker', evidence: [ev(d, cm, 'a.txt')], verifier: { kind: 'absence', pattern: { type: 'literal', text: 'zz-link-target-zz' } } });
+    const v = verifyClaim(new CommitReader(d, cm), k);
+    expect(v.ok).toBe(false);
+    expect(v.reason).toMatch(/some-link/);
   });
 });

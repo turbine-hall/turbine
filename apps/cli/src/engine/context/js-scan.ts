@@ -47,8 +47,8 @@ export type ModuleScan =
       unconfirmed: number;
       /** Lines of the `require()` calls counted in `unconfirmed`. */
       unconfirmedAt: number[];
-      /** Start lines of statements whose specifier is a string written with an escape (`'\\u0066oo'`): found, but not stated, so not silently dropped. */
-      escapedAt: number[];
+      /** Start lines of statements whose specifier is written with an escape or as a template literal (`'\\u0066oo'`): found, but not stated, so not silently dropped. */
+      unreadableAt: number[];
     }
   | { ok: false; reason: string };
 
@@ -124,12 +124,18 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
   let requireBound = false;
 
   /** A string literal written without escapes: its value is exactly the text between the quotes. */
-  const escapedAt: number[] = [];
+  const unreadableAt: number[] = [];
   /** `from` is where the statement that holds the string starts: an escaped specifier is recorded against that line. */
   const plainString = (n: TS.Node | undefined, from: number): TS.StringLiteral | undefined => {
-    if (!n || !ts.isStringLiteral(n)) return undefined;
+    if (!n) return undefined;
+    // `import(`pkg`)`: a template without substitutions names a module, but is not a string literal this scanner trusts.
+    if (ts.isNoSubstitutionTemplateLiteral(n)) {
+      unreadableAt.push(lineAt(from));
+      return undefined;
+    }
+    if (!ts.isStringLiteral(n)) return undefined;
     if (s.slice(startOf(n) + 1, n.end - 1) === n.text) return n;
-    escapedAt.push(lineAt(from));
+    unreadableAt.push(lineAt(from));
     return undefined;
   };
   const addImport = (kind: ImportKind, spec: TS.StringLiteral, from: number, to: number, viaCall = false) =>
@@ -183,7 +189,7 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
     if (ts.isExportDeclaration(n)) {
       const from = startOf(n);
       const spec = plainString(n.moduleSpecifier, from);
-      if (n.moduleSpecifier && !spec) return;
+      // An untrusted specifier withholds the import edge only: the names the statement exports are still read.
       if (spec) addImport('re-export', spec, from, spec.end);
       const clause = n.exportClause;
       if (!clause) return;
@@ -239,5 +245,5 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
       unconfirmedAt.push(imp.line);
     } else kept.push(imp);
   }
-  return { ok: true, imports: kept, exports, unconfirmed, unconfirmedAt, escapedAt };
+  return { ok: true, imports: kept, exports, unconfirmed, unconfirmedAt, unreadableAt };
 }

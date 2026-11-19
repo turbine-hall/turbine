@@ -41,8 +41,8 @@ export const SafeRepoPathSchema = z
   .min(1)
   .max(1024)
   .refine(
-    (p) => !p.startsWith('/') && !p.includes('\\') && !p.includes('\0') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..'),
-    'expected a repository-relative path without "..", "." or empty segments, and without a leading "/" or any backslash',
+    (p) => !p.startsWith('/') && !/^[A-Za-z]:/.test(p) && !p.includes('\\') && !p.includes('\0') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..'),
+    'expected a repository-relative path without "..", "." or empty segments, and without a leading "/", a drive letter or any backslash',
   );
 
 const LinesSchema = z

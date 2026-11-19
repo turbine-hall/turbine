@@ -214,6 +214,14 @@ export function readBlobs(repoRoot: string, blobIds: string[], expectedBytes = 0
  * Which of `paths` git reports as changed between two commits (A added, M modified, D deleted, T type change).
  * Renames are not followed, so a moved file shows as D and A. Throws when either commit cannot be read.
  */
+/** Whether `ancestor` is `descendant` or one of its ancestors. Throws when either is not a commit of the repository. */
+export function isAncestor(repoRoot: string, ancestor: string, descendant: string): boolean {
+  const r = run(repoRoot, ['merge-base', '--is-ancestor', ancestor, descendant]);
+  if (r.status === 0) return true;
+  if (r.status === 1) return false;
+  throw new Error(`git merge-base --is-ancestor failed: ${r.stderr || `exit ${r.status}`}`);
+}
+
 export function changedBetween(repoRoot: string, from: string, to: string, paths: string[]): Array<{ path: string; status: string }> {
   if (!paths.length) return [];
   const out = must(repoRoot, ['diff', '--name-status', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', from, to, '--', ...paths.map((p) => `:(literal)${p}`)]);

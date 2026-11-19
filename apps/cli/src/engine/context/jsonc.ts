@@ -42,8 +42,16 @@ export type JsoncOptions = {
 /** Significant digits of a JSON number token: the mantissa digits without leading or trailing zeros. */
 function significantDigits(token: string): number {
   const mantissa = token.replace(/^-/, '').replace(/[eE].*$/, '').replace('.', '');
-  return mantissa.replace(/^0+/, '').replace(/0+$/, '').length;
+  // Scans, not a regular expression: an unanchored `0+$` is quadratic on a long run of zeros inside the number.
+  let start = 0;
+  let end = mantissa.length;
+  while (start < end && mantissa.charCodeAt(start) === 48) start++;
+  while (end > start && mantissa.charCodeAt(end - 1) === 48) end--;
+  return end - start;
 }
+
+/** Below this a double is subnormal: it holds fewer digits than a normal one, and a nonzero literal can round to 0. */
+const MIN_NORMAL = 2.2250738585072014e-308;
 
 export function parseJsonc(input: string, opts: JsoncOptions = {}): Jsonc {
   const text = input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
@@ -184,7 +192,7 @@ export function parseJsonc(input: string, opts: JsoncOptions = {}): Jsonc {
     // 1e400 parses to Infinity, which is not a JSON value a manifest can meaningfully state: refuse it
     if (typeof n === 'number' && !Number.isFinite(n)) return fail('Number out of range', 'number');
     // A double holds any decimal of up to 15 significant digits, and any safe integer, exactly. Anything else may be rounded.
-    if (opts.exactNumbers && typeof n === 'number' && !(/^-?\d+$/.test(m[0]) ? Number.isSafeInteger(n) : significantDigits(m[0]) <= 15)) return new InexactNumber(m[0]);
+    if (opts.exactNumbers && typeof n === 'number' && !(/^-?\d+$/.test(m[0]) ? Number.isSafeInteger(n) : significantDigits(m[0]) <= 15 && (n === 0 ? significantDigits(m[0]) === 0 : Math.abs(n) >= MIN_NORMAL))) return new InexactNumber(m[0]);
     return n;
   };
 
