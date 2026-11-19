@@ -159,8 +159,9 @@ const MAX_RULE_SEGMENTS = 64;
  * skipped and counted; skipping a rule is the safe direction, because a skipped rule can only mean an owner is not
  * stated. A `**` segment between others matches zero or more directories (`docs/**\/x` owns `docs/x`).
  */
-export function parseCodeowners(textValue: string): { rules: CodeownersRule[]; skipped: number } {
+export function parseCodeowners(textValue: string): { rules: CodeownersRule[]; skipped: number; skippedLines: number[] } {
   const rules: CodeownersRule[] = [];
+  const skippedLines: number[] = [];
   let skipped = 0;
   textValue.split(/\r\n|\r|\n/).forEach((raw, i) => {
     const line = raw.replace(/(^|\s)#.*$/, '').trim();
@@ -169,6 +170,7 @@ export function parseCodeowners(textValue: string): { rules: CodeownersRule[]; s
     if (!pattern) return;
     if (/[[\]!\\]/.test(pattern) || pattern.startsWith('#') || pattern.length > MAX_RULE_CHARS || pattern.split('/').length > MAX_RULE_SEGMENTS) {
       skipped++;
+      skippedLines.push(i + 1);
       return;
     }
     const dirOnly = pattern.endsWith('/');
@@ -183,7 +185,7 @@ export function parseCodeowners(textValue: string): { rules: CodeownersRule[]; s
     if (!anchored) segments.unshift('**');
     rules.push({ line: i + 1, pattern, owners, segments, contents: dirOnly ? 'contents-only' : wildcardLast ? 'exact' : 'or-contents' });
   });
-  return { rules, skipped };
+  return { rules, skipped, skippedLines };
 }
 
 function ruleMatches(rule: CodeownersRule, path: string): boolean {
@@ -194,11 +196,14 @@ function ruleMatches(rule: CodeownersRule, path: string): boolean {
   return rule.contents === 'exact' ? whole : rule.contents === 'or-contents' ? whole || inside : inside;
 }
 
-/** The last matching rule wins. */
-export function codeownersFor(path: string, rules: CodeownersRule[]): CodeownersRule | undefined {
+/**
+ * The last matching rule wins. A rule that was skipped (syntax or size not modelled) AFTER the winning one could
+ * override it, and cannot be evaluated: the owner is then not stated rather than guessed.
+ */
+export function codeownersFor(path: string, rules: CodeownersRule[], skippedLines: number[] = []): CodeownersRule | undefined {
   let hit: CodeownersRule | undefined;
   for (const r of rules) if (ruleMatches(r, path)) hit = r;
-  return hit;
+  return hit && skippedLines.some((line) => line > hit!.line) ? undefined : hit;
 }
 
 function codeownersFile(files: Set<string>): string | undefined {
@@ -408,7 +413,7 @@ export function rankFiles(input: RankInput): { ranked: RelevantFile[]; limits: S
         ...(sharing ? { sharesWith: sharing } : {}),
       });
     }
-    const rule = owners ? codeownersFor(path, owners.rules) : undefined;
+    const rule = owners ? codeownersFor(path, owners.rules, owners.skippedLines) : undefined;
     if (coPath && rule && rule.owners.length) {
       add(path, { kind: 'codeowners', points: 0, file: coPath, line: rule.line, rule: `${rule.pattern} ${rule.owners.join(' ')}`, owners: rule.owners });
     }
@@ -563,8 +568,10 @@ export function verifyRelevantFiles(selected: RelevantFile[], input: VerifyInput
           // the file ranking uses, not one the reason names; the structured owners must be the rule's owners
           const active = codeownersFile(new Set(input.files.map((x) => x.path)));
           const t = active === r.file ? input.text(r.file) : undefined;
-          const rule = t === undefined ? undefined : codeownersFor(f.path, parseCodeowners(t).rules);
-          if (!rule || rule.line !== r.line || `${rule.pattern} ${rule.owners.join(' ')}` !== r.rule) problems.push(`${where}: ${r.file} line ${r.line} is not the rule that matches this file`);
+          const parsed = t === undefined ? undefined : parseCodeowners(t);
+          const rule = parsed ? codeownersFor(f.path, parsed.rules, parsed.skippedLines) : undefined;
+          if (r.points !== 0) problems.push(`${where}: ownership is shown, not scored, so its points must be 0 (not ${r.points})`);
+          else if (!rule || rule.line !== r.line || `${rule.pattern} ${rule.owners.join(' ')}` !== r.rule) problems.push(`${where}: ${r.file} line ${r.line} is not the rule that matches this file`);
           else if (JSON.stringify(rule.owners) !== JSON.stringify(r.owners)) problems.push(`${where}: the recorded owners are not the owners of ${r.file} line ${r.line}`);
           break;
         }

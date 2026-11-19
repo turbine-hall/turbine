@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { LINE_BUDGET, type Track } from './render.js';
 import { parseSpecMarkdown, type PacketPaths } from '../packet.js';
 import { lintContextFile, readContextFile } from '../context/task-render.js';
@@ -72,7 +72,14 @@ export function lintPacket(paths: PacketPaths, opts: { track: Track; requirement
     }
   }
   // CONTEXT.md is generated from the store; a hand edit to the generated part is reported (and overwritten).
-  if (existsSync(paths.context)) {
+  // `lstat`, not `existsSync`: a dangling symlink is an entry that exists, and it is reported, not skipped.
+  let present = true;
+  try {
+    lstatSync(paths.context);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') present = false;
+  }
+  if (present) {
     try {
       issues.push(...lintContextFile(readContextFile(paths.context)));
     } catch (e) {

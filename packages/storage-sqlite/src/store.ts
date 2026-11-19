@@ -415,6 +415,14 @@ export class WorkStore {
     return row ? this.parseSnapshotRow(row) : null;
   }
 
+  /** The snapshot most recently saved for this repository path AT this commit: a snapshot of another commit does not hide it. */
+  getLatestSnapshotAt(repoPath: string, commit: string): RepoSnapshot | null {
+    const row = this.db
+      .prepare(`SELECT hash, data FROM repo_snapshots WHERE repo_path = ? AND "commit" = ? ORDER BY rowid DESC LIMIT 1`)
+      .get(repoPath, commit) as { hash: string; data: string } | undefined;
+    return row ? this.parseSnapshotRow(row) : null;
+  }
+
   /** The snapshot most recently saved for this repository path. */
   getLatestSnapshotFor(repoPath: string): RepoSnapshot | null {
     const row = this.db

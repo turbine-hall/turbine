@@ -90,7 +90,6 @@ export function workspacesOf(snapshot: RepoSnapshot, hasRootManifest: boolean): 
 export function readTaskFiles(
   repoRoot: string,
   entries: TreeEntry[],
-  workspaces: WorkspacePackage[],
 ): { files: Array<{ path: string; size: number }>; text: (path: string) => string | undefined; notScanned: { tooLarge: number; overCap: number; metadataSkipped: number } } {
   const regular = entries.filter((e) => e.type === 'blob' && e.mode !== '120000' && !NODE_MODULES.test(e.path));
   const notScanned = { tooLarge: 0, overCap: 0, metadataSkipped: 0 };
@@ -104,20 +103,20 @@ export function readTaskFiles(
       bytes += e.size;
     }
   }
-  // Metadata: each workspace's package.json and tsconfig files (a config can extend a sibling such as
-  // tsconfig.base.json), and CODEOWNERS. One budget covers all of it; what it leaves out is counted, not dropped.
-  const dirs = new Set(workspaces.map((w) => w.dir));
+  // Metadata: every tracked package.json (the nearest one gives a file's module format, workspace or not) and
+  // tsconfig file (a config can extend one in any directory), and CODEOWNERS. One budget covers all of it, nearest
+  // the root first; what it leaves out is counted, not dropped.
   const isMetadata = (path: string): boolean => {
     if (CODEOWNERS_PATHS.has(path)) return true;
-    const slash = path.lastIndexOf('/');
-    const name = path.slice(slash + 1);
-    if (!dirs.has(slash < 0 ? '.' : path.slice(0, slash))) return false;
+    const name = path.slice(path.lastIndexOf('/') + 1);
     return name === 'package.json' || TSCONFIG_NAME.test(name);
   };
+  const depth = (path: string) => path.split('/').length;
+  const metadata = regular.filter((e) => isMetadata(e.path)).sort((a, b) => depth(a.path) - depth(b.path) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   const queued = new Set(toRead.map((e) => e.path));
   let metadataBytes = 0;
-  for (const e of regular) {
-    if (!isMetadata(e.path) || queued.has(e.path)) continue;
+  for (const e of metadata) {
+    if (queued.has(e.path)) continue;
     if (e.size > MAX_FILE_BYTES || metadataBytes + e.size > MAX_METADATA_BYTES) {
       notScanned.metadataSkipped++;
       continue;
@@ -174,7 +173,7 @@ export function buildTaskContext(
   const listing = listTreeDetailed(at.repoRoot, snapshot.commit);
   const hasRoot = listing.entries.some((e) => e.type === 'blob' && e.path === 'package.json');
   const workspaces = workspacesOf(snapshot, hasRoot);
-  const read = readTaskFiles(at.repoRoot, listing.entries, workspaces);
+  const read = readTaskFiles(at.repoRoot, listing.entries);
   const { ranked, limits } = rankFiles({ request: req.request, files: read.files, text: read.text, workspaces, notScanned: read.notScanned });
   const kept = applyBudget(ranked, req.budget, (f) => renderFileEntry(f).length);
   const selection: TaskContext = {
@@ -203,8 +202,7 @@ export type RefreshResult =
 /** The hash of the stored project snapshot, only when it was taken at this commit. */
 export function snapshotHashAt(store: WorkStore, projectRoot: string, commit: string): string | undefined {
   try {
-    const s = store.getLatestSnapshotFor(projectRoot);
-    return s && s.commit === commit ? s.hash : undefined;
+    return store.getLatestSnapshotAt(projectRoot, commit)?.hash;
   } catch {
     return undefined;
   }

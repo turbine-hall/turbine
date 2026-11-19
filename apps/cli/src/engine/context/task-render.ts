@@ -41,7 +41,8 @@ export function readContextFile(file: string): string {
       n += r;
     }
     if (n > MAX_CONTEXT_FILE_BYTES) throw new Error(`grew past the ${MAX_CONTEXT_FILE_BYTES} byte limit for a task context file while it was read`);
-    return buf.subarray(0, n).toString('utf8');
+    // fatal: a note in another encoding is an error, not text silently rewritten with replacement characters
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf.subarray(0, n));
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ELOOP') throw new Error('is not a regular file (a symlink or directory)');
     throw e;
@@ -161,7 +162,7 @@ export function renderContextBody(sel: TaskContext, o: BodyOptions): string {
     `  4. a test of a file of 1 or 2: it imports it 25, or the naming rule matches 20 (${TEST_PATH_RULE}; naming rule: ${TEST_NAMING_RULE});`,
     '  5. ownership: the package.json of the package that owns a file of 1 or 2: 10; a file in the same package as one of them: 5; CODEOWNERS is shown and adds nothing;',
     '  6. rare words of the request in the path (weakest, at most 4 points).',
-    '- An import is a statement read from a file at the commit, found by parsing the file with the TypeScript parser (comments, strings, regular expressions and JSX text are never read as code; a file with a syntax error states nothing). Relative paths and workspace package names are resolved; `tsconfig` path aliases, sub-path imports of workspace packages and run-time imports are not.',
+    '- An import is a statement read from a file at the commit, found by parsing the file with the TypeScript parser (comments, strings, regular expressions and JSX text are never read as code; a file with a syntax error states nothing). Relative paths and workspace package names are resolved; `tsconfig` path aliases, sub-path imports of workspace packages, and computed or otherwise unconfirmed specifiers are not.',
   );
   const l = sel.limits;
   out.push(

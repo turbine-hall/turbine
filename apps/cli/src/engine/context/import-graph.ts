@@ -204,7 +204,7 @@ export function makeResolver(files: Set<string>, text: (path: string) => string 
     }
 
     const tsconfig = `${pkg.dir === '.' ? '' : `${pkg.dir}/`}tsconfig.json`;
-    const build = loadBuildConfig(tsconfig, text);
+    const build = loadBuildConfig(tsconfig, text, (p) => files.has(p));
 
     const via = viaExports ? 'exports' : 'main';
     // Three passes, so a weaker kind of evidence never beats a stronger one that a later candidate has: every name
@@ -257,6 +257,9 @@ export function makeResolver(files: Set<string>, text: (path: string) => string 
       if (kind === 'require') return 'require';
       if (kind === 'import-type') return 'unknown';
       const ext = posix.extname(from);
+      // JavaScript runs as written: a native import() uses the `import` condition even from CommonJS. A TypeScript
+      // file may be compiled to require() instead, so only its own module format decides (below).
+      if (kind === 'dynamic' && (ext === '.js' || ext === '.jsx')) return 'import';
       if (ext === '.mjs' || ext === '.mts') return 'import';
       if (ext === '.cjs' || ext === '.cts') return kind === 'dynamic' ? 'import' : 'require';
       return packageType(from) === 'module' ? 'import' : 'unknown';

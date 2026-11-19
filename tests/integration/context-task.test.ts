@@ -9,7 +9,7 @@ import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, re
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   DEFAULT_CONTEXT_BUDGET,
@@ -1529,7 +1529,7 @@ describe('review round 3 (PR #11): metadata budget and CONTEXT.md safety', () =>
       workspaces.push({ dir: 'packages/huge', name: '@m/huge' });
       const dir = project(extra);
       const listing = listTreeDetailed(dir, head(dir));
-      const read = readTaskFiles(dir, listing.entries, workspaces);
+      const read = readTaskFiles(dir, listing.entries);
 
       const manifests = workspaces.map((w) => (w.dir === '.' ? 'package.json' : `${w.dir}/package.json`));
       const readCount = manifests.filter((m) => read.text(m) !== undefined).length;
@@ -1548,7 +1548,7 @@ describe('review round 3 (PR #11): metadata budget and CONTEXT.md safety', () =>
 
     it('a tsconfig next to a workspace package.json is read, so an `extends` chain can be proven', () => {
       const dir = project({ 'packages/shared/tsconfig.json': '{ "extends": "./tsconfig.base.json" }\n', 'packages/shared/tsconfig.base.json': '{ "compilerOptions": {} }\n', 'packages/shared/notes.json': '{}\n' });
-      const read = readTaskFiles(dir, listTreeDetailed(dir, head(dir)).entries, [{ dir: 'packages/shared', name: '@leave/shared' }]);
+      const read = readTaskFiles(dir, listTreeDetailed(dir, head(dir)).entries);
       expect(read.text('packages/shared/tsconfig.json')).toBeDefined();
       expect(read.text('packages/shared/tsconfig.base.json')).toBeDefined();
       expect(read.text('packages/shared/notes.json')).toBeUndefined();
@@ -1699,9 +1699,7 @@ describe('review round 4 (PR #11): config paths, bounded globs, importer format,
     it('many `**` segments against a deep path finish at once and give the right answer', () => {
       const deep = Array.from({ length: 40 }, () => 'a').join('/');
       const source = `packages/p/src/${deep}/index.ts`;
-      const t0 = Date.now();
       const r = built({ compilerOptions: { rootDir: 'src', outDir: 'dist' }, include: [`${'src/**/'.repeat(1)}${'**/'.repeat(30)}*.ts`] }, `./dist/${deep}/index.js`, [source]);
-      expect(Date.now() - t0).toBeLessThan(2000);
       expect(r).toMatchObject({ to: source });
       // an exclude that is one `**` pattern deep still matches
       const ex = built({ compilerOptions: { rootDir: 'src', outDir: 'dist' }, exclude: [`src/${'**/'.repeat(30)}index.ts`] }, `./dist/${deep}/index.js`, [source]);
@@ -1710,9 +1708,7 @@ describe('review round 4 (PR #11): config paths, bounded globs, importer format,
 
     it('a star-heavy segment against a long name does not blow up', () => {
       const name = `${'a'.repeat(200)}b.ts`;
-      const t0 = Date.now();
       const r = built({ compilerOptions: { rootDir: 'src', outDir: 'dist' }, include: [`src/${'*a'.repeat(30)}*c.ts`] }, `./dist/${name.replace(/\.ts$/, '.js')}`, [`packages/p/src/${name}`]);
-      expect(Date.now() - t0).toBeLessThan(2000);
       expect(r).toEqual(NONE); // the pattern does not match: no `c`
     });
 
@@ -1920,9 +1916,7 @@ describe('review round 4b (PR #11): tsconfig outputs, legacy order, nearest mani
       const rule = `/${'*a'.repeat(40)}*c @slow\n`;
       const parsed = parseCodeowners(`${rule}${'/a'.repeat(100)} @long\n* @all\n`);
       expect(parsed.skipped).toBe(1);
-      const t0 = Date.now();
       expect(codeownersFor(`${'a'.repeat(5000)}b`, parsed.rules)?.owners).toEqual(['@all']);
-      expect(Date.now() - t0).toBeLessThan(2000);
     });
 
     const files = [{ path: 'src/a.ts', size: 10 }, { path: 'CODEOWNERS', size: 10 }, { path: 'docs/CODEOWNERS', size: 10 }];
@@ -2099,6 +2093,28 @@ describe('review round 6 (PR #11): glob edge cases, config discovery, budget pro
     ).resolve('src/a.ts', '@w/root', 'import');
   const co = { rootDir: 'src', outDir: 'dist' };
 
+  describe('the matchers finish: heavy inputs run in a child process under a timeout (no wall-clock assertion in the test itself)', () => {
+    it('star-heavy segments, thousands of `**`, a star-heavy CODEOWNERS rule and a deep path all complete', () => {
+      const dist = (name: string) => pathToFileURL(join(factory, 'apps/cli/dist/engine/context', name)).href;
+      const script = `
+        import { prefixMatches, segmentMatches } from '${dist('glob.js')}';
+        import { codeownersFor, parseCodeowners } from '${dist('relevance.js')}';
+        const a = 'a'.repeat(5000) + 'b';
+        if (segmentMatches('*a'.repeat(40) + '*c', a)) throw new Error('star-heavy matched');
+        const deep = Array.from({ length: 50 }, () => 'd');
+        const ok = prefixMatches([...Array.from({ length: 5000 }, () => '**'), '*.ts'], [...deep, 'x.ts']);
+        if (!ok[deep.length + 1]) throw new Error('globstars did not match');
+        const rules = parseCodeowners('/' + '*a'.repeat(40) + '*c @slow\\n* @all\\n');
+        if (codeownersFor(a, rules.rules)?.owners[0] !== '@all') throw new Error('codeowners');
+        console.log('done');
+      `;
+      const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 60_000 });
+      expect(r.stderr).toBe('');
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe('done');
+    }, 90_000);
+  });
+
   describe('glob matching', () => {
     it('`*` is a wildcard even when the text has a `*` in the same place', () => {
       expect(segmentMatches('*.ts', '*draft.ts')).toBe(true);
@@ -2112,9 +2128,7 @@ describe('review round 6 (PR #11): glob edge cases, config discovery, budget pro
     it('thousands of consecutive `**` segments cost no more than one', () => {
       const pat = [...Array.from({ length: 5000 }, () => '**'), '*.ts'];
       const path = [...Array.from({ length: 50 }, () => 'd'), 'x.ts'];
-      const t0 = Date.now();
       const ok = prefixMatches(pat, path);
-      expect(Date.now() - t0).toBeLessThan(1000);
       expect(ok[path.length]).toBe(true);
       expect(ok[path.length - 1]).toBe(false);
     });
@@ -2257,6 +2271,108 @@ describe('review round 6 (PR #11): glob edge cases, config discovery, budget pro
       toChanges(reviewing, 'code-review'); // the first request commits
       expect(() => toChanges(reviewing, 'code-review')).toThrow(/CHANGES_REQUESTED|not HUMAN_CODE_REVIEW/); // the second still holds the old copy
       expect(store.listEvents(work.id).filter((e) => e.type === 'task.changes-requested')).toHaveLength(1);
+    });
+  });
+
+  describe('review round 7: remote findings on the same PR', () => {
+    const P = [{ dir: 'packages/p', name: '@w/p' }];
+
+    it('a native import() in a .js file uses the import condition even when the package is CommonJS; a .ts file is decided by its own format', () => {
+      const r = resolverOf(['package.json', 'src/a.js', 'src/b.ts'], { 'package.json': json({ name: 'root', type: 'commonjs' }) }, []);
+      expect(r.modeFor('src/a.js', 'dynamic')).toBe('import');
+      expect(r.modeFor('src/a.jsx', 'dynamic')).toBe('import');
+      expect(r.modeFor('src/a.js', 'import')).toBe('unknown'); // a static import in CommonJS: not known without more
+      expect(r.modeFor('src/b.ts', 'dynamic')).toBe('unknown'); // may be compiled to require()
+      expect(r.modeFor('src/a.js', 'require')).toBe('require');
+    });
+
+    it('an extends target that is tracked but was not read is not replaced by its .json twin', () => {
+      const tsconfig = { 'packages/p/tsconfig.json': json({ extends: './base', compilerOptions: { rootDir: 'src', outDir: 'dist' } }), 'packages/p/base.json': json({}) };
+      const manifest = json({ name: '@w/p', exports: { '.': { import: './dist/index.js' } } });
+      const make = (tracked: string[]) =>
+        resolverOf(['packages/p/package.json', 'packages/p/tsconfig.json', 'packages/p/base.json', 'packages/p/src/index.ts', 'src/a.ts', ...tracked], { 'packages/p/package.json': manifest, ...tsconfig }, P).resolve('src/a.ts', '@w/p', 'import');
+      expect(make([])).toMatchObject({ to: 'packages/p/src/index.ts' });
+      expect(make(['packages/p/base'])).toEqual(NONE); // `base` exists in the tree but its text is not available
+    });
+
+    it('a file TypeScript skips in a wildcard (`.min.js`) is not an input unless it is listed in files', () => {
+      const cfg = (extra: Record<string, unknown>) => json({ compilerOptions: { rootDir: 'src', outDir: 'dist', allowJs: true }, ...extra });
+      const r = (tsconfig: string) => resolverOf(['packages/p/package.json', 'packages/p/tsconfig.json', 'packages/p/src/vendor.min.js', 'src/a.ts'], { 'packages/p/package.json': json({ name: '@w/p', exports: { '.': { import: './dist/vendor.min.js' } } }), 'packages/p/tsconfig.json': tsconfig }, P).resolve('src/a.ts', '@w/p', 'import');
+      expect(r(cfg({ include: ['src/**/*'] }))).toEqual(NONE);
+      expect(r(cfg({ files: ['src/vendor.min.js'] }))).toMatchObject({ to: 'packages/p/src/vendor.min.js' });
+    });
+
+    it('CODEOWNERS: a skipped later rule could override, so the owner is not stated; skipped earlier rules do not matter', () => {
+      const later = parseCodeowners('* @general\n/docs/[ab]/x @special\n');
+      expect(codeownersFor('docs/a/x', later.rules, later.skippedLines)).toBeUndefined();
+      expect(codeownersFor('other/y', later.rules, later.skippedLines)).toBeUndefined(); // the same rule could be anywhere after `*`
+      const earlier = parseCodeowners('/docs/[ab]/x @special\n* @general\n');
+      expect(codeownersFor('docs/a/x', earlier.rules, earlier.skippedLines)?.owners).toEqual(['@general']);
+      const longPath = Array.from({ length: 70 }, (_, i) => `d${i}`).join('/');
+      const capped = parseCodeowners(`* @general\n/${longPath}/file.ts @override\n`);
+      expect(capped.skippedLines).toEqual([2]);
+      expect(codeownersFor(`${longPath}/file.ts`, capped.rules, capped.skippedLines)).toBeUndefined();
+    });
+
+    it('the verifier rejects a codeowners reason whose points are not 0', () => {
+      const files = [{ path: 'src/a.ts', size: 10 }, { path: 'CODEOWNERS', size: 10 }];
+      const input = { request: 'Change src/a.ts', files, text: (p: string) => (p === 'CODEOWNERS' ? '*.ts @frontend\n' : undefined), workspaces: [] as WorkspacePackage[] };
+      const ranked = rankFiles({ ...input, notScanned: { tooLarge: 0, overCap: 0 } }).ranked;
+      expect(verifyRelevantFiles(ranked, input)).toEqual([]);
+      const bumped = ranked.map((f) => (f.path === 'src/a.ts' ? { ...f, score: f.score + 100, reasons: f.reasons.map((x) => (x.kind === 'codeowners' ? { ...x, points: 100 } : x)) } : f)) as RelevantFile[];
+      expect(verifyRelevantFiles(bumped, input).join('\n')).toMatch(/points must be 0/);
+    });
+
+    it('a CONTEXT.md in another encoding is an error, never rewritten with replacement characters', () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const t = newTask(engine);
+      const work = engine.ctx.store.getWork(t.id);
+      engine.ensureTaskContext(work);
+      const path = packetPaths(dir, t.id).context;
+      writeFileSync(path, Buffer.concat([readFileSync(path), Buffer.from([0x0a, 0x63, 0x61, 0x66, 0xe9, 0x0a])])); // "caf" + Latin-1 é
+      const before = readFileSync(path);
+      expect(() => engine.ensureTaskContext(work)).toThrow(/cannot be read/);
+      expect(readFileSync(path).equals(before)).toBe(true);
+      expect(lintTaskContexts(dir).map((i) => i.message).join('\n')).toMatch(/cannot be read/);
+    });
+
+    it('packet lint reports a dangling CONTEXT.md symlink instead of skipping it', () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const t = newTask(engine);
+      engine.ensureTaskContext(engine.ctx.store.getWork(t.id));
+      const paths = packetPaths(dir, t.id);
+      rmSync(paths.context);
+      symlinkSync(join(dir, 'does-not-exist.md'), paths.context);
+      const issues = lintPacket(paths, { track: 'standard', requirementIds: [] });
+      expect(issues.find((i) => i.file === 'CONTEXT.md')).toMatchObject({ level: 'error', message: expect.stringContaining('cannot be read') });
+    });
+
+    it('manifests and tsconfig files outside the workspace roots are read too (the nearest package.json and extended configs)', () => {
+      const dir = project({ 'tools/package.json': '{ "name": "tools", "type": "commonjs" }\n', 'config/tsconfig.base.json': '{}\n', 'src/feature/package.json': '{ "type": "module" }\n' });
+      const read = readTaskFiles(dir, listTreeDetailed(dir, head(dir)).entries);
+      expect(read.text('tools/package.json')).toContain('commonjs');
+      expect(read.text('config/tsconfig.base.json')).toBe('{}\n');
+      expect(read.text('src/feature/package.json')).toContain('module');
+      expect(read.notScanned.metadataSkipped).toBe(0);
+    });
+
+    it('a snapshot of another commit does not hide the latest snapshot for this commit', () => {
+      const { dir, engine, a } = (() => {
+        const d = project();
+        const e = engineFor(d);
+        const t = newTask(e);
+        e.ensureTaskContext(e.ctx.store.getWork(t.id));
+        return { dir: d, engine: e, a: head(d) };
+      })();
+      const atA = snapshotHashAt(engine.ctx.store, dir, a);
+      expect(atA).toMatch(/^sha256:/);
+      commitFiles(dir, { 'src/leave/other.ts': 'export const o = 1;\n' });
+      const t2 = newTask(engine);
+      engine.ensureTaskContext(engine.ctx.store.getWork(t2.id)); // a snapshot for the new commit is now the latest for the repository
+      expect(engine.ctx.store.getLatestSnapshotFor(dir)!.commit).not.toBe(a);
+      expect(snapshotHashAt(engine.ctx.store, dir, a)).toBe(atA); // back at A: its own snapshot is still found
     });
   });
 

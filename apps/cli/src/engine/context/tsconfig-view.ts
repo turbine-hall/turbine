@@ -55,16 +55,16 @@ const pathIn = (dir: string, v: unknown): string => {
 };
 
 /** The merged options of a tsconfig and its relative `extends` chain; undefined when it is missing or cannot be read exactly. */
-export function loadBuildConfig(file: string, text: (path: string) => string | undefined): BuildConfig | undefined {
+export function loadBuildConfig(file: string, text: (path: string) => string | undefined, tracked: (path: string) => boolean = () => false): BuildConfig | undefined {
   try {
-    return load(file, text);
+    return load(file, text, tracked);
   } catch (e) {
     if (e instanceof Unproven) return undefined;
     throw e;
   }
 }
 
-function load(file: string, text: (path: string) => string | undefined): BuildConfig {
+function load(file: string, text: (path: string) => string | undefined, tracked: (path: string) => boolean): BuildConfig {
   const chain: Array<{ dir: string; data: Record<string, unknown> }> = [];
   const seen = new Set<string>();
   let cur: string | undefined = file;
@@ -88,6 +88,8 @@ function load(file: string, text: (path: string) => string | undefined): BuildCo
     if (typeof ext !== 'string' || !(ext.startsWith('./') || ext.startsWith('../'))) throw new Unproven();
     // TypeScript checks the exact path first and adds `.json` only when that file does not exist
     const exact = resolveIn(dir, ext);
+    // an exact file that is tracked but was not read (budget) is NOT replaced by `.json`: the mapping is unproven
+    if (!ext.endsWith('.json') && text(exact) === undefined && tracked(exact)) throw new Unproven();
     cur = ext.endsWith('.json') || text(exact) !== undefined ? exact : `${exact}.json`;
   }
 
@@ -149,6 +151,7 @@ function matchExclude(pattern: string, source: string): Tri {
 function isInput(cfg: BuildConfig, source: string): Tri {
   if (source.split('/').some((s) => s.startsWith('.'))) return 'unknown'; // wildcards skip hidden names; not modelled
   if (cfg.files?.includes(source)) return true;
+  if (/\.min\.jsx?$/.test(source)) return 'unknown'; // TypeScript skips `.min.js` names found by a wildcard; not modelled
   const base = posix.dirname(cfg.file);
   const include = cfg.include ?? (cfg.files ? [] : [posix.join(base, '**/*')]);
   // `outDir` and `declarationDir` are already repo-relative; only the unresolved defaults are joined to the config directory
