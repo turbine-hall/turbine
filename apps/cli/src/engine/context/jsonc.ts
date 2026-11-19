@@ -25,13 +25,25 @@ export class JsoncLimitError extends SyntaxError {
 }
 const TOKEN = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null/y;
 
+/** A number token whose value a double cannot hold exactly. Only produced under `exactNumbers`. */
+export class InexactNumber {
+  constructor(readonly text: string) {}
+}
+
 export type JsoncOptions = {
   /**
-   * An integer beyond 2^53 is read as a `bigint` of its exact digits instead of a rounded `number`. Off by default
-   * (every existing reader gets a `number`); the claim verifiers turn it on so a rounded value is never taken as the digits written.
+   * A number the reader would round (an integer beyond 2^53, or a token with more than 15 significant digits) is
+   * read as an `InexactNumber` carrying its text, not as a rounded `number`. Off by default (every existing reader
+   * gets a `number`); the claim verifiers turn it on so a rounded value is never taken as the digits written.
    */
-  exactIntegers?: boolean;
+  exactNumbers?: boolean;
 };
+
+/** Significant digits of a JSON number token: the mantissa digits without leading or trailing zeros. */
+function significantDigits(token: string): number {
+  const mantissa = token.replace(/^-/, '').replace(/[eE].*$/, '').replace('.', '');
+  return mantissa.replace(/^0+/, '').replace(/0+$/, '').length;
+}
 
 export function parseJsonc(input: string, opts: JsoncOptions = {}): Jsonc {
   const text = input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
@@ -171,7 +183,8 @@ export function parseJsonc(input: string, opts: JsoncOptions = {}): Jsonc {
     const n: unknown = JSON.parse(m[0]);
     // 1e400 parses to Infinity, which is not a JSON value a manifest can meaningfully state: refuse it
     if (typeof n === 'number' && !Number.isFinite(n)) return fail('Number out of range', 'number');
-    if (opts.exactIntegers && typeof n === 'number' && /^-?\d+$/.test(m[0]) && !Number.isSafeInteger(n)) return BigInt(m[0]);
+    // A double holds any decimal of up to 15 significant digits, and any safe integer, exactly. Anything else may be rounded.
+    if (opts.exactNumbers && typeof n === 'number' && !(/^-?\d+$/.test(m[0]) ? Number.isSafeInteger(n) : significantDigits(m[0]) <= 15)) return new InexactNumber(m[0]);
     return n;
   };
 

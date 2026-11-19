@@ -45,8 +45,10 @@ export type ModuleScan =
       exports: ScannedExport[];
       /** `require()` calls found but not stated, because `require` is bound in the file and may not be the loader. */
       unconfirmed: number;
-      /** Statements whose specifier is a string written with an escape (`'\\u0066oo'`): found, but not stated, so not silently dropped. */
-      escaped: number;
+      /** Lines of the `require()` calls counted in `unconfirmed`. */
+      unconfirmedAt: number[];
+      /** Start lines of statements whose specifier is a string written with an escape (`'\\u0066oo'`): found, but not stated, so not silently dropped. */
+      escapedAt: number[];
     }
   | { ok: false; reason: string };
 
@@ -122,11 +124,12 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
   let requireBound = false;
 
   /** A string literal written without escapes: its value is exactly the text between the quotes. */
-  let escaped = 0;
-  const plainString = (n: TS.Node | undefined): TS.StringLiteral | undefined => {
+  const escapedAt: number[] = [];
+  /** `from` is where the statement that holds the string starts: an escaped specifier is recorded against that line. */
+  const plainString = (n: TS.Node | undefined, from: number): TS.StringLiteral | undefined => {
     if (!n || !ts.isStringLiteral(n)) return undefined;
     if (s.slice(startOf(n) + 1, n.end - 1) === n.text) return n;
-    escaped++;
+    escapedAt.push(lineAt(from));
     return undefined;
   };
   const addImport = (kind: ImportKind, spec: TS.StringLiteral, from: number, to: number, viaCall = false) =>
@@ -164,7 +167,7 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
 
   const topLevel = (n: TS.Node) => {
     if (ts.isImportDeclaration(n)) {
-      const spec = plainString(n.moduleSpecifier);
+      const spec = plainString(n.moduleSpecifier, startOf(n));
       if (!spec) return;
       const kind: ImportKind = !n.importClause ? 'side-effect' : n.importClause.phaseModifier === ts.SyntaxKind.TypeKeyword ? 'import-type' : 'import';
       addImport(kind, spec, startOf(n), spec.end);
@@ -172,14 +175,14 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
     }
     if (ts.isImportEqualsDeclaration(n)) {
       if (ts.isExternalModuleReference(n.moduleReference)) {
-        const spec = plainString(n.moduleReference.expression);
+        const spec = plainString(n.moduleReference.expression, startOf(n));
         if (spec) addImport('require', spec, startOf(n), n.moduleReference.end);
       }
       return;
     }
     if (ts.isExportDeclaration(n)) {
       const from = startOf(n);
-      const spec = plainString(n.moduleSpecifier);
+      const spec = plainString(n.moduleSpecifier, from);
       if (n.moduleSpecifier && !spec) return;
       if (spec) addImport('re-export', spec, from, spec.end);
       const clause = n.exportClause;
@@ -213,10 +216,10 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
       const callee = n.expression;
       const arg = n.arguments[0];
       if (ts.isIdentifier(callee) && callee.text === 'require' && n.arguments.length === 1) {
-        const spec = plainString(arg);
+        const spec = plainString(arg, startOf(n));
         if (spec) addImport('require', spec, startOf(n), n.end, true);
       } else if (callee.kind === ts.SyntaxKind.ImportKeyword) {
-        const spec = plainString(arg);
+        const spec = plainString(arg, startOf(n));
         if (spec) addImport('dynamic', spec, startOf(n), n.end);
       }
     }
@@ -228,10 +231,13 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
   }
 
   let unconfirmed = 0;
+  const unconfirmedAt: number[] = [];
   const kept: ScannedImport[] = [];
   for (const { viaCall, ...imp } of imports) {
-    if (viaCall && requireBound) unconfirmed++;
-    else kept.push(imp);
+    if (viaCall && requireBound) {
+      unconfirmed++;
+      unconfirmedAt.push(imp.line);
+    } else kept.push(imp);
   }
-  return { ok: true, imports: kept, exports, unconfirmed, escaped };
+  return { ok: true, imports: kept, exports, unconfirmed, unconfirmedAt, escapedAt };
 }

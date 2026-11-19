@@ -17,6 +17,9 @@ import { DependencySectionSchema, GitObjectIdSchema, assertNoUnsafeKeys } from '
  * rendered from the verifier and evidence, never from the statement.
  */
 
+/** What one claim may occupy, as JSON. */
+export const MAX_CLAIM_BYTES = 128 * 1024;
+
 export const CLAIM_KINDS = ['exists', 'quote', 'imports', 'calls', 'config', 'dependency', 'command', 'absence'] as const;
 export const ClaimKindSchema = z.enum(CLAIM_KINDS);
 export type ClaimKind = z.infer<typeof ClaimKindSchema>;
@@ -75,7 +78,7 @@ export const ClaimEvidenceSchema = z
   });
 export type ClaimEvidence = z.infer<typeof ClaimEvidenceSchema>;
 
-const Identifier = z.string().regex(/^[A-Za-z_$][A-Za-z0-9_$]*$/, 'expected an identifier');
+const Identifier = z.string().max(256).regex(/^[A-Za-z_$][A-Za-z0-9_$]*$/, 'expected an identifier');
 const Printable = (min: number, max: number) =>
   z
     .string()
@@ -118,7 +121,7 @@ export const ClaimVerifierSchema = z.discriminatedUnion('kind', [
     .object({
       kind: z.literal('config'),
       path: SafeRepoPathSchema,
-      key: z.array(z.union([z.string(), z.number().int().min(0)])).min(1).max(32),
+      key: z.array(z.union([z.string().max(256), z.number().int().min(0)])).min(1).max(32),
       value: z.json().refine((v) => Buffer.byteLength(JSON.stringify(v), 'utf8') <= 65536, 'the expected value is over 64 KiB'),
     })
     .strict(),
@@ -184,6 +187,8 @@ export const ClaimSchema = z
   .strict()
   .superRefine((c, ctx) => {
     const issue = (message: string, path: Array<string | number> = []) => ctx.addIssue({ code: 'custom', message, path });
+    // Every field is bounded on its own; this is the budget for the claim as a whole, which is what is verified and stored.
+    if (Buffer.byteLength(JSON.stringify(c), 'utf8') > MAX_CLAIM_BYTES) issue(`the claim is over ${MAX_CLAIM_BYTES} bytes`);
     if (c.verifier.kind !== c.kind) issue(`the verifier is for "${c.verifier.kind}" but the claim is "${c.kind}"`, ['verifier', 'kind']);
     if (!EXHAUSTIVE_CLAIM_KINDS.includes(c.kind)) {
       const word = universalWordIn(c.statement);

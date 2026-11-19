@@ -4,7 +4,7 @@ import type { AbsencePattern, Claim, ClaimEvidence, ClaimVerifier } from '@turbi
 import { listTreeDetailed, readBlobs, resolveCommit } from './git-read.js';
 import type { TreeEntry, TreeListing } from './git-read.js';
 import { jsxFile, parseSource, scanModule } from './js-scan.js';
-import { JsoncLimitError, parseJsonc } from './jsonc.js';
+import { InexactNumber, JsoncLimitError, parseJsonc } from './jsonc.js';
 import type { LineRange } from './jsonc.js';
 
 /**
@@ -41,6 +41,7 @@ const MAX_SEARCH_FILE_BYTES = 32 * 1024 * 1024;
 const MAX_SEARCH_TOTAL_BYTES = 512 * 1024 * 1024;
 const SEARCH_BATCH_BYTES = 48 * 1024 * 1024;
 const MAX_REPORTED_MATCHES = 5;
+export const SYMLINK_MODE = '120000';
 /** What one reader keeps of the blobs it has read. */
 const MAX_CACHED_BYTES = 32 * 1024 * 1024;
 
@@ -53,7 +54,10 @@ const pass = (reason: string): VerifyResult => ({ ok: true, reason });
 
 /** Lines as the parsers here count them: LF, CRLF and a bare CR each end a line. A leading byte order mark is not text. */
 export function splitLines(text: string): string[] {
-  return (text.charCodeAt(0) === 0xfeff ? text.slice(1) : text).split(/\r\n|\r|\n/);
+  const lines = (text.charCodeAt(0) === 0xfeff ? text.slice(1) : text).split(/\r\n|\r|\n/);
+  // A line terminator ends a line; it does not start another. "x\n" is one line, "x\n\n" is two.
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  return lines;
 }
 
 type Text = { ok: true; text: string } | { ok: false; reason: string };
@@ -94,6 +98,8 @@ export class CommitReader {
     const entry = this.entry(path);
     if (!entry) return { ok: false, reason: `${path} is not tracked at commit ${this.commit.slice(0, 12)}` };
     if (entry.type !== 'blob') return { ok: false, reason: `${path} is a ${entry.type}, not a file` };
+    // git stores a symlink as a blob holding the link's target NAME. That is not the content of the file it points at.
+    if (entry.mode === SYMLINK_MODE) return { ok: false, reason: `${path} is a symbolic link; its blob is the link target, not file content` };
     if (entry.size > maxBytes) return { ok: false, reason: `${path} is ${entry.size} bytes, over the ${maxBytes}-byte limit for reading it` };
     let buf = this.blobs.get(entry.id);
     if (!buf) {
@@ -170,7 +176,7 @@ function readJson(reader: CommitReader, path: string): Parsed {
     }
   }
   try {
-    const j = parseJsonc(t.text, { exactIntegers: true });
+    const j = parseJsonc(t.text, { exactNumbers: true });
     return { ok: true, value: j.value, lines: (p) => j.lines(p) };
   } catch (e) {
     // A limit of this reader (nesting, a number out of range) does not say the file is wrong: nothing is decided.
@@ -208,12 +214,12 @@ export function jsonEqual(a: unknown, b: unknown): boolean {
   return ka.length === kb.length && ka.every((k) => own(b, k) && jsonEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
 }
 
-/** Whether a parsed value holds an exact (beyond 2^53) integer. Iterative. */
-function hasBigint(value: unknown): boolean {
+/** Whether a parsed value holds a number the reader could not read exactly. Iterative. */
+function hasInexact(value: unknown): boolean {
   const stack: unknown[] = [value];
   while (stack.length) {
     const v = stack.pop();
-    if (typeof v === 'bigint') return true;
+    if (v instanceof InexactNumber) return true;
     if (typeof v === 'object' && v !== null) for (const child of Object.values(v)) stack.push(child);
   }
   return false;
@@ -236,10 +242,13 @@ function verifyExists(reader: CommitReader, claim: Claim, v: Extract<ClaimVerifi
   return fail(elsewhere ? `${v.path} exports "${v.symbol}" at line ${elsewhere.line}, outside the cited lines` : `${v.path} has no top-level export named "${v.symbol}"`);
 }
 
-/** Statements the scanner found but could not state (a shadowed `require`, an escaped specifier): "no import" is not proven then. */
-function undecided(scan: { unconfirmed: number; escaped: number }, path: string): VerifyResult | undefined {
-  const n = scan.unconfirmed + scan.escaped;
-  return n ? unconfirmed(`${path} has ${n} import statement(s) that cannot be read exactly (a shadowed \`require\` or an escaped specifier), so a missing import is not proven`) : undefined;
+/**
+ * Statements the scanner found but could not state (a shadowed `require`, an escaped specifier). One that starts on a
+ * cited line might be the import the claim is about, so a miss is then not proven; one elsewhere cannot be.
+ */
+function undecided(scan: { unconfirmedAt: number[]; escapedAt: number[] }, path: string, cited: Array<{ start: number; end: number }>): VerifyResult | undefined {
+  const lines = [...scan.unconfirmedAt, ...scan.escapedAt].filter((l) => inLines(cited, l));
+  return lines.length ? unconfirmed(`${path} has ${lines.length} import statement(s) on the cited lines that cannot be read exactly (a shadowed \`require\` or an escaped specifier), so a missing import is not proven`) : undefined;
 }
 
 function verifyImports(reader: CommitReader, claim: Claim, v: Extract<ClaimVerifier, { kind: 'imports' }>): VerifyResult {
@@ -252,8 +261,8 @@ function verifyImports(reader: CommitReader, claim: Claim, v: Extract<ClaimVerif
   const matches = scan.imports.filter((i) => i.specifier === v.specifier);
   const hit = matches.find((i) => inLines(cited, i.line));
   if (hit) return pass(`${v.from} imports "${v.specifier}" (${hit.kind}) at line ${hit.line}`);
-  const hidden = undecided(scan, v.from);
-  if (hidden && !matches.length) return hidden;
+  const hidden = undecided(scan, v.from, cited);
+  if (hidden) return hidden;
   return fail(matches.length ? `${v.from} imports "${v.specifier}" at line ${matches.map((m) => m.line).join(', ')}, outside the cited lines` : `${v.from} does not import "${v.specifier}"`);
 }
 
@@ -267,8 +276,8 @@ function verifyUse(reader: CommitReader, claim: Claim, path: string, name: strin
   const uses = scan.imports.filter((i) => i.specifier === name || i.specifier.startsWith(`${name}/`));
   const hit = uses.find((i) => inLines(cited, i.line));
   if (hit) return pass(`${path} imports "${hit.specifier}" at line ${hit.line}`);
-  const hidden = undecided(scan, path);
-  if (hidden && !uses.length) return hidden;
+  const hidden = undecided(scan, path, cited);
+  if (hidden) return hidden;
   return fail(uses.length ? `${path} imports ${name} at line ${uses.map((m) => m.line).join(', ')}, outside the cited lines` : `${path} does not import ${name}`);
 }
 
@@ -314,8 +323,8 @@ function verifyMember(reader: CommitReader, claim: Claim, path: string, key: Rea
   if (!json.ok) return json.result;
   const at = valueAt(json.value, key);
   if (!at.found) return fail(`${path} has no ${what} at ${keyText(key)}`);
-  // An integer the reader would have rounded is held as its exact digits (a bigint); a claim cannot state those exactly.
-  if (hasBigint(at.value)) return unconfirmed(`${path} ${keyText(key)} holds an integer beyond 2^53, which a claim cannot state exactly`);
+  // A number the reader would have rounded is held as its text; a claim cannot state it exactly, so nothing is decided.
+  if (hasInexact(at.value)) return unconfirmed(`${path} ${keyText(key)} holds a number a double cannot hold exactly (an integer beyond 2^53, or more than 15 significant digits)`);
   if (!jsonEqual(at.value, expected)) return fail(`${path} ${keyText(key)} is ${JSON.stringify(at.value)}, not ${JSON.stringify(expected)}`);
   const range = json.lines([...key]);
   if (!range) return unconfirmed(`the lines of ${keyText(key)} in ${path} are unknown`);

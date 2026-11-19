@@ -32,8 +32,19 @@ afterAll(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
+/**
+ * The environment fixture git commands run in: no repository-selection variable (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, ...)
+ * from the process that runs the tests may point them at another checkout. GIT_CONFIG_GLOBAL is kept, for the tests that exercise it.
+ */
+function gitEnv(): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_') || k === 'GIT_CONFIG_GLOBAL'));
+}
+function spawnGit(args: string[], opts: { cwd: string; encoding: BufferEncoding; input?: string; maxBuffer?: number }) {
+  return spawnSync('git', args, { ...opts, env: gitEnv() });
+}
+
 function git(cwd: string, ...args: string[]): string {
-  const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
+  const r = spawnGit(args, { cwd, encoding: 'utf8' });
   if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${r.stderr}`);
   return r.stdout;
 }
@@ -93,6 +104,9 @@ function newRepo(files: Record<string, string | Buffer | null> = BASE): string {
   git(dir, 'config', 'core.hooksPath', noHooks);
   git(dir, 'config', 'core.autocrlf', 'false');
   git(dir, 'config', 'core.attributesFile', '/dev/null');
+  const noIgnores = join(noHooks, 'ignore');
+  writeFileSync(noIgnores, '');
+  git(dir, 'config', 'core.excludesFile', noIgnores);
   commitFiles(dir, files, 'base');
   return dir;
 }
@@ -292,7 +306,7 @@ describe('positive cases — every kind is published when its verifier proves it
     const d = newRepo({ 'a.ts': "import x from 'one';\r\nimport y from 'two';\rimport z from 'three';\r\nexport {};\r\n" });
     const cm = head(d);
     // The committed blob holds the CRLF and the bare CR as written (no line-ending conversion happened).
-    expect(spawnSync('git', ['cat-file', 'blob', `${cm}:a.ts`], { cwd: d, encoding: 'latin1' }).stdout).toBe("import x from 'one';\r\nimport y from 'two';\rimport z from 'three';\r\nexport {};\r\n");
+    expect(spawnGit(['cat-file', 'blob', `${cm}:a.ts`], { cwd: d, encoding: 'latin1' }).stdout).toBe("import x from 'one';\r\nimport y from 'two';\rimport z from 'three';\r\nexport {};\r\n");
     for (const [spec, line] of [['one', 1], ['two', 2], ['three', 3]] as const) {
       const v = verifyClaim(new CommitReader(d, cm), claim({ kind: 'imports', evidence: [ev(d, cm, 'a.ts', line)], verifier: { kind: 'imports', from: 'a.ts', specifier: spec } }));
       expect(v.ok, `${spec}: ${v.reason}`).toBe(true);
@@ -934,6 +948,8 @@ describe('review round 1 (PR #12): findings from the first CodeRabbit pass', () 
     const out = publishClaim(racing, dir, dir, input);
     expect(out.published).toBe(true);
     if (out.published) expect(out.claim.status).toBe('verified');
+    // The competing withdrawal did happen after the commit: the call returned what it stored, not what the row became.
+    expect(store.getClaim(dir, input.id as string)?.status).toBe('withdrawn');
   });
 
   describe('manifests are strict JSON; JSONC is only for the configuration files that allow it', () => {
@@ -1051,11 +1067,11 @@ describe('review round 1 (PR #12): findings from the first CodeRabbit pass', () 
 
   it('absence over a very large number of paths that share one blob is linear and reports every path', () => {
     const d = newRepo({ 'a.txt': 'x\n' });
-    const id = spawnSync('git', ['hash-object', '-w', '--stdin'], { cwd: d, input: 'needle-text\n', encoding: 'utf8' }).stdout.trim();
+    const id = spawnGit(['hash-object', '-w', '--stdin'], { cwd: d, input: 'needle-text\n', encoding: 'utf8' }).stdout.trim();
     const N = 150_000;
     const lines: string[] = [];
     for (let i = 0; i < N; i++) lines.push(`100644 ${id} 0\tmany/f${i}.txt`);
-    const r = spawnSync('git', ['update-index', '--add', '--index-info'], { cwd: d, input: `${lines.join('\n')}\n`, encoding: 'utf8', maxBuffer: 1 << 28 });
+    const r = spawnGit(['update-index', '--add', '--index-info'], { cwd: d, input: `${lines.join('\n')}\n`, encoding: 'utf8', maxBuffer: 1 << 28 });
     expect(r.status, r.stderr).toBe(0);
     git(d, 'commit', '-qm', 'many paths');
     const cm = head(d);
@@ -1201,14 +1217,25 @@ describe('review round 2 (PR #12): findings from the local CodeRabbit review', (
     }, 120_000);
   });
 
-  it('an integer beyond 2^53, which the JSON reader would round, is "unconfirmed"; ordinary integers verify', () => {
-    const d = newRepo({ 'n.json': '{"big": 9007199254740993, "ok": 42, "neg": -9007199254740993}\n' });
+  it('a number a double cannot hold exactly is "unconfirmed" in every spelling; exact numbers still verify', () => {
+    const text = [
+      '{"int": 9007199254740993, "neg": -9007199254740993, "frac": 9007199254740993.0, "exp": 9007199254740993e0,',
+      ' "sci": 9.007199254740993e15, "dec": 0.1000000000000000055511151231257827,',
+      ' "ok": 42, "nine": 9e2, "ratio": 1.5e3, "tenth": 0.1, "zero": 0.0, "max": 9007199254740991}',
+      '',
+    ].join('\n');
+    const d = newRepo({ 'n.json': text });
     const c = head(d);
-    const mk = (key: string, value: unknown) => claim({ kind: 'config', evidence: [ev(d, c, 'n.json', 1)], verifier: { kind: 'config', path: 'n.json', key: [key], value } });
-    // The rounded value of 9007199254740993 is 9007199254740992: it must not be taken as a match, nor as a mismatch.
-    expect(publishClaim(openStore(), d, d, mk('big', 9007199254740992))).toMatchObject({ published: false, unconfirmed: true });
-    expect(publishClaim(openStore(), d, d, mk('big', Number.MAX_SAFE_INTEGER + 2))).toMatchObject({ published: false, unconfirmed: true });
-    expect(publishClaim(openStore(), d, d, mk('ok', 42)).published).toBe(true);
+    const mk = (key: string, value: unknown) => claim({ kind: 'config', evidence: [ev(d, c, 'n.json', [1, 3])], verifier: { kind: 'config', path: 'n.json', key: [key], value } });
+    // 9007199254740993 rounds to 9007199254740992: that must not be taken as a match, nor as a mismatch.
+    for (const key of ['int', 'neg', 'frac', 'exp', 'sci', 'dec']) {
+      expect(publishClaim(openStore(), d, d, mk(key, 9007199254740992)), key).toMatchObject({ published: false, unconfirmed: true });
+    }
+    for (const [key, value] of [['ok', 42], ['nine', 900], ['ratio', 1500], ['tenth', 0.1], ['zero', 0], ['max', Number.MAX_SAFE_INTEGER]] as const) {
+      const out = publishClaim(openStore(), d, d, mk(key, value));
+      expect(out.published, `${key}: ${out.published ? '' : out.reason}`).toBe(true);
+    }
+    expect(publishClaim(openStore(), d, d, mk('ok', 43))).toMatchObject({ published: false, unconfirmed: false });
   });
 
   it('the expected-value limit is counted in UTF-8 bytes, not UTF-16 code units', () => {
@@ -1298,10 +1325,174 @@ describe('review round 2 (PR #12): findings from the local CodeRabbit review', (
     try {
       const d = newRepo({ 'a.txt': 'a\r\nb\r\n' });
       // And a global autocrlf=true did not turn the committed CRLF into LF.
-      expect(spawnSync('git', ['cat-file', 'blob', `${head(d)}:a.txt`], { cwd: d, encoding: 'latin1' }).stdout).toBe('a\r\nb\r\n');
+      expect(spawnGit(['cat-file', 'blob', `${head(d)}:a.txt`], { cwd: d, encoding: 'latin1' }).stdout).toBe('a\r\nb\r\n');
     } finally {
       if (before === undefined) delete process.env.GIT_CONFIG_GLOBAL;
       else process.env.GIT_CONFIG_GLOBAL = before;
     }
+  });
+});
+
+describe('review round 3 (PR #12): findings from the second local CodeRabbit review', () => {
+  const blobOf = (d: string, text: string) => spawnGit(['hash-object', '-w', '--stdin'], { cwd: d, encoding: 'utf8', input: text }).stdout.trim();
+
+  describe('a symlink is never read as the file it points at', () => {
+    it('a package.json that is a symlink whose target name is valid JSON proves nothing', () => {
+      const d = newRepo({ 'a.txt': 'x\n' });
+      const target = '{"scripts":{"build":"tsc"}}';
+      git(d, 'update-index', '--add', '--cacheinfo', `120000,${blobOf(d, target)},package.json`);
+      git(d, 'commit', '-qm', 'package.json as a symlink');
+      const c = head(d);
+      expect(git(d, 'ls-tree', c, 'package.json')).toMatch(/^120000 blob /);
+      const out = publishClaim(
+        openStore(),
+        d,
+        d,
+        claim({ kind: 'command', evidence: [ev(d, c, 'package.json', 1)], verifier: { kind: 'command', script: 'build', command: 'tsc' } }),
+      );
+      expect(out).toMatchObject({ published: false, unconfirmed: true });
+      if (!out.published) expect(out.reason).toMatch(/symbolic link/);
+      // A quote cited from a symlink is refused too, and a symlink still "exists".
+      const q = claim({ kind: 'quote', evidence: [ev(d, c, 'package.json', 1, target)], verifier: { kind: 'quote' } });
+      expect(publishClaim(openStore(), d, d, q)).toMatchObject({ published: false, unconfirmed: true });
+      const e = claim({ kind: 'exists', evidence: [ev(d, c, 'package.json')], verifier: { kind: 'exists', path: 'package.json' } });
+      expect(publishClaim(openStore(), d, d, e).published).toBe(true);
+    });
+
+    it('a regular file replaced by a symlink with the same blob id is rechecked on reverify', () => {
+      const text = '{"scripts":{"build":"tsc"}}';
+      const d = newRepo({ 'link.json': text });
+      const c1 = head(d);
+      const store = openStore();
+      // A config claim reads any .json file, so it can cite link.json.
+      const cfg = claim({ kind: 'config', evidence: [ev(d, c1, 'link.json', 1)], verifier: { kind: 'config', path: 'link.json', key: ['scripts', 'build'], value: 'tsc' } });
+      expect(publishClaim(store, d, d, cfg).published).toBe(true);
+      const attested = ClaimSchema.parse(claim({ kind: 'exists', evidence: [ev(d, c1, 'link.json')], verifier: { kind: 'exists', path: 'link.json' } }));
+      store.saveClaim({ repoPath: d, claim: attested, status: 'attested', reason: 'attested by a person' });
+      git(d, 'rm', '-q', '--cached', 'link.json');
+      git(d, 'update-index', '--add', '--cacheinfo', `120000,${blobOf(d, text)},link.json`);
+      git(d, 'commit', '-qm', 'turn it into a symlink');
+      const c2 = head(d);
+      expect(git(d, 'rev-parse', `${c1}:link.json`)).toBe(git(d, 'rev-parse', `${c2}:link.json`)); // the very same blob id
+      const r = reverifyOnCommit(store, d, d, c1, c2);
+      expect(r.withdrawn.map((w) => w.id).sort()).toEqual([cfg.id, attested.id].sort());
+    });
+  });
+
+  it('an unreadable import on a cited line keeps the claim unconfirmed even when a plain match is on another line', () => {
+    const d = newRepo({ 'm.ts': "import 'pkg';\nimport 'p\\u006bg';\n" });
+    const c = head(d);
+    const mk = (lines: Lines) => claim({ kind: 'imports', evidence: [ev(d, c, 'm.ts', lines)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } });
+    expect(publishClaim(openStore(), d, d, mk(1)).published).toBe(true); // the plain import on line 1 proves it
+    expect(publishClaim(openStore(), d, d, mk(2))).toMatchObject({ published: false, unconfirmed: true }); // the cited line may hold it
+    // Cited lines with no candidate at all are a definite miss.
+    const e = newRepo({ 'm.ts': "import 'pkg';\n\nexport {};\nimport 'p\\u006bg';\n" });
+    const ce = head(e);
+    const miss = claim({ kind: 'imports', evidence: [ev(e, ce, 'm.ts', 3)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } });
+    expect(publishClaim(openStore(), e, e, miss)).toMatchObject({ published: false, unconfirmed: false });
+  });
+
+  it('an oversized key, or an oversized claim, is refused by the schema and writes no row', () => {
+    const d = newRepo({ 'c.json': '{"a": 1}\n' });
+    const c = head(d);
+    const store = openStore();
+    const big = claim({ kind: 'config', evidence: [ev(d, c, 'c.json', 1)], verifier: { kind: 'config', path: 'c.json', key: ['k'.repeat(300_000)], value: 1 } });
+    const out = publishClaim(store, d, d, big);
+    expect(out).toMatchObject({ published: false, recorded: false });
+    expect(store.listClaims(d)).toEqual([]);
+    const sym = claim({ kind: 'exists', evidence: [ev(d, c, 'c.json', 1)], verifier: { kind: 'exists', path: 'c.json', symbol: 's'.repeat(300) } });
+    expect(ClaimSchema.safeParse(sym).success).toBe(false);
+    // Twenty 2 KB quotes stay within the claim budget; the budget is for the claim as a whole.
+    const many = claim({ kind: 'quote', evidence: Array.from({ length: 20 }, () => ev(d, c, 'c.json', 1, 'x'.repeat(2000))), verifier: { kind: 'quote' } });
+    expect(ClaimSchema.safeParse(many).success).toBe(true);
+  });
+
+  it('a reason that quotes a large value is clipped before it is stored', () => {
+    const d = newRepo({ 'c.json': '{"a": 1}\n' });
+    const c = head(d);
+    const store = openStore();
+    const value = 'v'.repeat(60_000);
+    const k = claim({ kind: 'config', evidence: [ev(d, c, 'c.json', 1)], verifier: { kind: 'config', path: 'c.json', key: ['a'], value } });
+    const out = publishClaim(store, d, d, k);
+    expect(out.published).toBe(false);
+    expect(store.getClaim(d, k.id as string)!.reason!.length).toBeLessThan(2200);
+  });
+
+  it('a final line terminator does not start another line', () => {
+    expect(splitLines('x\n')).toEqual(['x']);
+    expect(splitLines('x\n\n')).toEqual(['x', '']);
+    expect(splitLines('x\r\ny')).toEqual(['x', 'y']);
+    expect(splitLines('')).toEqual(['']);
+    const d = newRepo({ 'one.txt': 'x\n' });
+    const c = head(d);
+    const q = claim({ kind: 'quote', evidence: [ev(d, c, 'one.txt', [1, 2], 'x\n')], verifier: { kind: 'quote' } });
+    expect(ClaimSchema.safeParse(q).success).toBe(true); // two lines of quote, two lines cited
+    const out = publishClaim(openStore(), d, d, q);
+    expect(out.published).toBe(false);
+    if (!out.published) expect(out.reason).toMatch(/past the end/);
+  });
+
+  it('fixture repositories commit although the developer ignores *.ts globally', () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-claims-ignore-'));
+    dirs.push(root);
+    writeFileSync(join(root, 'ignore'), '*.ts\n*.json\n');
+    const globalConfig = join(root, 'gitconfig');
+    writeFileSync(globalConfig, `[core]\n\texcludesFile = ${join(root, 'ignore')}\n`);
+    const before = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      expect(() => newRepo()).not.toThrow();
+    } finally {
+      if (before === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = before;
+    }
+  });
+
+  it('fixture git commands never touch the repository named by an inherited GIT_DIR', () => {
+    const decoy = mkdtempSync(join(tmpdir(), 'turbine-claims-decoy-'));
+    dirs.push(decoy);
+    git(decoy, 'init', '-q');
+    const before = readFileSync(join(decoy, '.git', 'config'), 'utf8');
+    const saved = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE };
+    process.env.GIT_DIR = join(decoy, '.git');
+    process.env.GIT_WORK_TREE = decoy;
+    try {
+      const d = newRepo({ 'a.txt': 'a\n' });
+      expect(git(d, 'rev-parse', '--show-toplevel').trim().endsWith(d.split('/').pop()!)).toBe(true);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+    expect(readFileSync(join(decoy, '.git', 'config'), 'utf8')).toBe(before);
+    expect(spawnGit(['log', '--oneline'], { cwd: decoy, encoding: 'utf8' }).stdout.trim()).toBe(''); // no fixture commit landed in it
+  });
+
+  it('publish writes the verified row inside the transaction that also holds the verification', () => {
+    const dir = newRepo();
+    const c = head(dir);
+    const store = openStore();
+    let openWhileVerifying = false;
+    const spy = new Proxy(store, {
+      get(target, prop) {
+        if (prop === 'saveClaim') {
+          return (...a: Parameters<WorkStore['saveClaim']>) => {
+            // saveClaim is reached from inside publishClaim's transaction: a second BEGIN would fail here.
+            try {
+              target.db.exec('BEGIN IMMEDIATE');
+              target.db.exec('ROLLBACK');
+            } catch {
+              openWhileVerifying = true;
+            }
+            return target.saveClaim(...a);
+          };
+        }
+        const v = Reflect.get(target, prop) as unknown;
+        return typeof v === 'function' ? (v as (...x: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    expect(publishClaim(spy, dir, dir, validClaims(dir, c).quote!).published).toBe(true);
+    expect(openWhileVerifying).toBe(true);
   });
 });

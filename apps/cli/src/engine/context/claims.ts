@@ -2,7 +2,7 @@ import { ClaimSchema, PUBLISHED_CLAIM_STATUSES, claimCommit, parseClaimSafe } fr
 import type { Claim, StoredClaim } from '@turbine-hall/turbine-contracts';
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import { resolveCommit, treeIdOf } from './git-read.js';
-import { CommitReader, verifyClaim } from './verify.js';
+import { CommitReader, SYMLINK_MODE, verifyClaim } from './verify.js';
 
 /**
  * Publishing and re-verifying claims.
@@ -11,7 +11,14 @@ import { CommitReader, verifyClaim } from './verify.js';
  * against the git objects of the commit it names, in this process, immediately before it was stored. There is no
  * other path to the `verified` status: publication runs the verifier, and carrying a claim to a newer commit runs
  * it again (or proves the cited blobs did not change).
+ *
+ * The boundary of that guarantee: `WorkStore.saveClaim` is a trusted low-level API. It validates the schema and
+ * records whatever status it is given; it does not run a verifier. Only the functions in this file write `verified`,
+ * and a test fails if any other CLI source does. Code that calls the store directly must go through `publishClaim`.
  */
+
+/** A reason is stored with the claim: keep it short enough to read, whatever a verifier quoted into it. */
+const clip = (reason: string): string => (reason.length > 2000 ? `${reason.slice(0, 2000)}... (${reason.length - 2000} more characters)` : reason);
 
 export type PublishOutcome =
   | { published: true; claim: StoredClaim }
@@ -24,33 +31,37 @@ export type PublishOutcome =
       recorded: boolean;
     };
 
-/** Verify a claim at the commit it names and, only if the verifier proves it, store it as `verified`. */
+/**
+ * Verify a claim at the commit it names and, only if the verifier proves it, store it as `verified`.
+ * The verification and the write share one transaction: the verifier reads only immutable git objects, and no other
+ * writer (a `reverifyOnCommit` of the same claim) can move the row between "proven" and "stored".
+ */
 export function publishClaim(store: WorkStore, repoRoot: string, repoPath: string, input: unknown): PublishOutcome {
   // A `__proto__` key is refused before the schema runs (zod would drop it and change what the claim says); nothing is written.
   const parsed = parseClaimSafe(input);
-  if (!parsed.ok) return { published: false, reason: `the claim is not valid: ${parsed.reason}`, unconfirmed: false, recorded: false };
+  if (!parsed.ok) return { published: false, reason: `the claim is not valid: ${clip(parsed.reason)}`, unconfirmed: false, recorded: false };
   const claim = parsed.claim;
   const commit = claimCommit(claim);
-  let result: ReturnType<typeof verifyClaim>;
-  try {
-    result = verifyClaim(new CommitReader(repoRoot, commit), claim, 'pinned');
-  } catch (e) {
-    // A repository that cannot be read is not a false claim, and not a proven one either.
-    const reason = e instanceof Error ? e.message : String(e);
-    return reject(store, repoPath, claim, reason, true);
-  }
-  if (!result.ok) return reject(store, repoPath, claim, result.reason, result.unconfirmed === true);
-  // The row is read in the same transaction that wrote it: another process may withdraw it the moment this one commits.
-  const stored = store.transaction(() => {
-    store.saveClaim({ repoPath, claim, status: 'verified', reason: result.reason });
-    return store.getClaim(repoPath, claim.id)!;
+  return store.transaction((): PublishOutcome => {
+    let result: ReturnType<typeof verifyClaim>;
+    try {
+      result = verifyClaim(new CommitReader(repoRoot, commit), claim, 'pinned');
+    } catch (e) {
+      // A repository that cannot be read is not a false claim, and not a proven one either.
+      return reject(store, repoPath, claim, e instanceof Error ? e.message : String(e), true);
+    }
+    if (!result.ok) return reject(store, repoPath, claim, result.reason, result.unconfirmed === true);
+    store.saveClaim({ repoPath, claim, status: 'verified', reason: clip(result.reason) });
+    // Read in the same transaction that wrote it, so the result is what this call stored.
+    return { published: true, claim: store.getClaim(repoPath, claim.id)! };
   });
-  return { published: true, claim: stored };
 }
 
+/** Record a claim that was not proven. Runs inside the caller's transaction. */
 function reject(store: WorkStore, repoPath: string, claim: Claim, reason: string, unconfirmed: boolean): PublishOutcome {
-  const recorded = store.transaction(() => store.saveClaim({ repoPath, claim, status: 'rejected', reason }));
-  return { published: false, reason, unconfirmed, recorded };
+  const clipped = clip(reason);
+  const recorded = store.saveClaim({ repoPath, claim, status: 'rejected', reason: clipped });
+  return { published: false, reason: clipped, unconfirmed, recorded };
 }
 
 export type ReverifyResult = {
@@ -102,7 +113,8 @@ export function reverifyOnCommit(store: WorkStore, repoRoot: string, repoPath: s
       for (const e of c.claim.evidence) {
         const a = before.entry(e.path);
         const b = reader.entry(e.path);
-        if (!a || !b || a.id !== b.id || a.type !== b.type) changed.add(e.path);
+        // A regular file turned into a symlink keeps its blob id (the target name) but no longer has that content.
+        if (!a || !b || a.id !== b.id || a.type !== b.type || (a.mode === SYMLINK_MODE) !== (b.mode === SYMLINK_MODE)) changed.add(e.path);
       }
     }
     const sections = new Set<string>();
@@ -111,7 +123,8 @@ export function reverifyOnCommit(store: WorkStore, repoRoot: string, repoPath: s
       const { claim } = stored;
       const citedChanged = claim.evidence.some((e) => changed.has(e.path));
       const wholeTree = claim.kind === 'absence' && treeChanged;
-      const withdraw = (reason: string) => {
+      const withdraw = (full: string) => {
+        const reason = clip(full);
         store.withdrawClaim(repoPath, claim.id, `at ${next}: ${reason}`);
         store.appendEvent({ type: 'claim.withdrawn', payload: { repoPath, id: claim.id, section: claim.section, from: prev, to: next, reason } });
         result.withdrawn.push({ id: claim.id, section: claim.section, reason });
@@ -131,7 +144,7 @@ export function reverifyOnCommit(store: WorkStore, repoRoot: string, repoPath: s
         withdraw(v.reason);
         continue;
       }
-      store.saveClaim({ repoPath, claim: rebind(reader, claim), status: 'verified', reason: v.reason });
+      store.saveClaim({ repoPath, claim: rebind(reader, claim), status: 'verified', reason: clip(v.reason) });
       result.kept.push(claim.id);
     }
     result.sections = [...sections].sort();
