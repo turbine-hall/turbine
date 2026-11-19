@@ -15,6 +15,10 @@ import type { ImportKind } from '@turbine-hall/turbine-contracts';
  *     or import named `require` may shadow the loader). The calls left out for that reason are counted in
  *     `unconfirmed`, never silently dropped;
  *   - only a string literal without escapes is trusted as a specifier.
+ *
+ * The contract is the parser's: a SYNTAX error anywhere fails the file. Errors only the type checker reports
+ * (`export const x;`, a duplicate export name, a `const` without initialiser) are not detected, because they need a
+ * whole-program check; the file still parses to a tree, and every statement stated from it is at the line recorded.
  * A statement that is missed is a gap the document admits to; a statement that is stated can be found at the
  * recorded line.
  */

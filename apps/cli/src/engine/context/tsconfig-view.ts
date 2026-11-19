@@ -6,16 +6,19 @@ import { parseJsonc } from './jsonc.js';
  * (`./dist/index.js`) that is not tracked; the source it was built from may be, but only when the config really
  * emits that file from that source:
  *   - the entry config and the configs it `extends` (relative paths only) are read at the commit;
- *   - `noEmit`, `emitDeclarationOnly`, `declaration` / `composite`, `jsx` and `allowJs` decide which output kinds exist;
+ *   - `noEmit`, `emitDeclarationOnly`, `declaration` / `composite`, `declarationDir`, `jsx` and `allowJs` decide
+ *     which output files exist and where;
  *   - the source must be a compilation input: listed in `files`, or matched by `include` and not by `exclude`.
- * Anything that cannot be proven (an unreadable or non-relative `extends`, a glob syntax this does not model, a
- * hidden directory) leaves the mapping unconfirmed: no edge is stated.
+ * Anything that cannot be proven (an unreadable or non-relative `extends`, an absolute path, a path that leaves the
+ * repository, a glob syntax this does not model, a hidden directory) leaves the mapping unconfirmed: no edge is stated.
  */
 
 export type BuildConfig = {
   /** The tsconfig that was asked about (repo-relative). */
   file: string;
+  /** Repo-relative: already resolved against the config that wrote them. */
   outDir?: string;
+  declarationDir?: string;
   rootDir?: string;
   noEmit: boolean;
   emitDeclarationOnly: boolean;
@@ -31,41 +34,71 @@ export type BuildConfig = {
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const MAX_EXTENDS = 8;
+/** Work limits for glob matching: a pattern or a path beyond them is not matched, so the mapping is unconfirmed. */
+const MAX_PATTERN_CHARS = 512;
+const MAX_SEGMENTS = 64;
+
+class Unproven extends Error {}
+
+/** A path written in a config, resolved against that config's directory. Absolute paths and paths leaving the repository are refused. */
+function resolveIn(dir: string, value: string): string {
+  if (value === '' || value.startsWith('/') || value.startsWith('\\') || /^[A-Za-z]:/.test(value) || value.includes('\\')) throw new Unproven();
+  const joined = posix.join(dir, value);
+  if (joined === '..' || joined.startsWith('../')) throw new Unproven();
+  return joined;
+}
+
+const pathIn = (dir: string, v: unknown): string => {
+  if (typeof v !== 'string') throw new Unproven();
+  return resolveIn(dir, v);
+};
 
 /** The merged options of a tsconfig and its relative `extends` chain; undefined when it is missing or cannot be read exactly. */
 export function loadBuildConfig(file: string, text: (path: string) => string | undefined): BuildConfig | undefined {
+  try {
+    return load(file, text);
+  } catch (e) {
+    if (e instanceof Unproven) return undefined;
+    throw e;
+  }
+}
+
+function load(file: string, text: (path: string) => string | undefined): BuildConfig {
   const chain: Array<{ dir: string; data: Record<string, unknown> }> = [];
   const seen = new Set<string>();
   let cur: string | undefined = file;
   while (cur !== undefined) {
-    if (seen.has(cur) || chain.length >= MAX_EXTENDS) return undefined;
+    if (seen.has(cur) || chain.length >= MAX_EXTENDS) throw new Unproven();
     seen.add(cur);
     const raw = text(cur);
-    if (raw === undefined) return undefined;
+    if (raw === undefined) throw new Unproven();
     let data: unknown;
     try {
       data = parseJsonc(raw).value;
     } catch {
-      return undefined;
+      throw new Unproven();
     }
-    if (!isObj(data)) return undefined;
-    if (data.compilerOptions !== undefined && !isObj(data.compilerOptions)) return undefined;
+    if (!isObj(data)) throw new Unproven();
+    if (data.compilerOptions !== undefined && !isObj(data.compilerOptions)) throw new Unproven();
     const dir = posix.dirname(cur);
     chain.unshift({ dir, data });
     const ext: unknown = data.extends;
     if (ext === undefined) break;
-    if (typeof ext !== 'string' || !(ext.startsWith('./') || ext.startsWith('../'))) return undefined;
-    const next = posix.join(dir, ext.endsWith('.json') ? ext : `${ext}.json`);
-    if (next === '..' || next.startsWith('../')) return undefined;
-    cur = next;
+    if (typeof ext !== 'string' || !(ext.startsWith('./') || ext.startsWith('../'))) throw new Unproven();
+    cur = resolveIn(dir, ext.endsWith('.json') ? ext : `${ext}.json`);
   }
 
   const cfg: BuildConfig = { file, noEmit: false, emitDeclarationOnly: false, declaration: false, composite: false, allowJs: false };
-  const list = (v: unknown, dir: string): string[] | undefined => (Array.isArray(v) && v.every((x) => typeof x === 'string') ? (v as string[]).map((x) => posix.join(dir, x)) : undefined);
+  const list = (v: unknown, dir: string): string[] | undefined => {
+    if (v === undefined) return undefined;
+    if (!Array.isArray(v) || !v.every((x) => typeof x === 'string')) throw new Unproven();
+    return (v as string[]).map((x) => resolveIn(dir, x));
+  };
   for (const { dir, data } of chain) {
     const co = (data.compilerOptions ?? {}) as Record<string, unknown>;
-    if (typeof co.outDir === 'string') cfg.outDir = posix.join(dir, co.outDir);
-    if (typeof co.rootDir === 'string') cfg.rootDir = posix.join(dir, co.rootDir);
+    if (co.outDir !== undefined) cfg.outDir = pathIn(dir, co.outDir);
+    if (co.declarationDir !== undefined) cfg.declarationDir = pathIn(dir, co.declarationDir);
+    if (co.rootDir !== undefined) cfg.rootDir = pathIn(dir, co.rootDir);
     if (typeof co.noEmit === 'boolean') cfg.noEmit = co.noEmit;
     if (typeof co.emitDeclarationOnly === 'boolean') cfg.emitDeclarationOnly = co.emitDeclarationOnly;
     if (typeof co.declaration === 'boolean') cfg.declaration = co.declaration;
@@ -84,35 +117,74 @@ export function loadBuildConfig(file: string, text: (path: string) => string | u
 
 // ------------------------------------------------------------ globs (the syntax tsconfig documents)
 
-type Tri = true | false | 'unknown';
-
-const segmentRe = (seg: string): RegExp => new RegExp(`^${seg.replace(/[.+^$|\\]/g, '\\$&').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]')}$`);
-
-function segmentsMatch(pat: string[], path: string[]): boolean {
-  if (!pat.length) return !path.length;
-  if (pat[0] === '**') return segmentsMatch(pat.slice(1), path) || (path.length > 0 && segmentsMatch(pat, path.slice(1)));
-  if (!path.length) return false;
-  return segmentRe(pat[0]!).test(path[0]!) && segmentsMatch(pat.slice(1), path.slice(1));
+/** `*` and `?` inside one path segment, matched without recursion or regular expressions (linear in the text for one star). */
+function segmentMatches(pat: string, s: string): boolean {
+  let p = 0;
+  let i = 0;
+  let star = -1;
+  let mark = 0;
+  while (i < s.length) {
+    if (p < pat.length && (pat[p] === '?' || pat[p] === s[i])) {
+      p++;
+      i++;
+    } else if (p < pat.length && pat[p] === '*') {
+      star = p++;
+      mark = i;
+    } else if (star >= 0) {
+      p = star + 1;
+      i = ++mark;
+    } else return false;
+  }
+  while (p < pat.length && pat[p] === '*') p++;
+  return p === pat.length;
 }
 
-/** A pattern this module models: `*`, `?` and `**` segments only. */
-const modelled = (pattern: string): boolean => !/[[\]{}()!\\]/.test(pattern) && pattern.split('/').every((s) => s === '**' || !s.includes('**'));
+/**
+ * `out[n]` is true when the pattern matches exactly the first `n` path segments. A `**` segment consumes any number of
+ * segments. The pattern positions are advanced together, one path segment at a time: no recursion, and the work is
+ * (pattern segments × path segments).
+ */
+function prefixMatches(pat: string[], path: string[]): boolean[] {
+  const closure = (states: Set<number>): Set<number> => {
+    for (const i of [...states]) for (let j = i; pat[j] === '**'; j++) states.add(j + 1);
+    return states;
+  };
+  let states = closure(new Set([0]));
+  const out: boolean[] = [];
+  for (let k = 0; k <= path.length; k++) {
+    out.push(states.has(pat.length));
+    if (k === path.length) break;
+    const next = new Set<number>();
+    for (const i of states) {
+      if (i >= pat.length) continue;
+      if (pat[i] === '**') next.add(i);
+      else if (segmentMatches(pat[i]!, path[k]!)) next.add(i + 1);
+    }
+    states = closure(next);
+  }
+  return out;
+}
+
+type Tri = true | false | 'unknown';
+
+/** A pattern this module models: within the work limits, `*`, `?` and `**` segments only. */
+const modelled = (pattern: string): boolean =>
+  pattern.length <= MAX_PATTERN_CHARS && pattern.split('/').length <= MAX_SEGMENTS && !/[[\]{}()!\\]/.test(pattern) && pattern.split('/').every((s) => s === '**' || !s.includes('**'));
 
 function matchInclude(pattern: string, source: string): Tri {
-  if (!modelled(pattern)) return 'unknown';
+  const path = source.split('/');
+  if (!modelled(pattern) || path.length > MAX_SEGMENTS) return 'unknown';
   const segs = pattern.split('/');
   const last = segs[segs.length - 1]!;
   // a last segment with no wildcard and no extension names a directory
   if (!/[*?]/.test(last) && !last.includes('.')) segs.push('**', '*');
-  return segmentsMatch(segs, source.split('/'));
+  return prefixMatches(segs, path)[path.length]!;
 }
 
 function matchExclude(pattern: string, source: string): Tri {
-  if (!modelled(pattern)) return 'unknown';
-  const segs = pattern.split('/');
   const path = source.split('/');
-  for (let n = 1; n <= path.length; n++) if (segmentsMatch(segs, path.slice(0, n))) return true;
-  return false;
+  if (!modelled(pattern) || path.length > MAX_SEGMENTS) return 'unknown';
+  return prefixMatches(pattern.split('/'), path).some((ok, n) => n >= 1 && ok);
 }
 
 /** Whether the config compiles this source file. `true` only when it is proven. */
@@ -121,7 +193,8 @@ function isInput(cfg: BuildConfig, source: string): Tri {
   if (cfg.files?.includes(source)) return true;
   const base = posix.dirname(cfg.file);
   const include = cfg.include ?? (cfg.files ? [] : [posix.join(base, '**/*')]);
-  const exclude = cfg.exclude ?? ['node_modules', 'bower_components', 'jspm_packages', ...(cfg.outDir ? [cfg.outDir] : [])].map((p) => posix.join(base, p));
+  // `outDir` is already repo-relative; only the unresolved defaults are joined to the config directory
+  const exclude = cfg.exclude ?? [...['node_modules', 'bower_components', 'jspm_packages'].map((p) => posix.join(base, p)), ...(cfg.outDir ? [cfg.outDir] : [])];
   const inc = include.map((p) => matchInclude(p, source));
   if (!inc.includes(true)) return inc.includes('unknown') ? 'unknown' : false;
   const exc = exclude.map((p) => matchExclude(p, source));
@@ -155,22 +228,25 @@ function sourcesFor(cfg: BuildConfig, outExt: string): string[] {
 const OUT_EXT = /(\.d\.[cm]?ts|\.[cm]?jsx?)$/;
 
 /**
- * The tracked source a config compiles into `output`, with the proof, or undefined. Needs an explicit `outDir` and
- * `rootDir`, no `noEmit`, an output kind the options produce, and a source that is proven to be a compilation input.
+ * The tracked source a config compiles into `output`, with the proof, or undefined. Needs an explicit `rootDir` and an
+ * output directory (`outDir`, or `declarationDir` for declaration files), no `noEmit`, an output kind the options
+ * produce, and a source that is proven to be a compilation input.
  */
 export function sourceOfBuildOutput(cfg: BuildConfig, output: string, tracked: Set<string>): { source: string; how: string } | undefined {
-  const { outDir, rootDir } = cfg;
-  if (!outDir || !rootDir || cfg.noEmit) return undefined;
-  if (!output.startsWith(`${outDir}/`)) return undefined;
-  const rel = output.slice(outDir.length + 1);
-  const m = OUT_EXT.exec(rel);
+  const { rootDir } = cfg;
+  if (!rootDir || cfg.noEmit) return undefined;
+  const m = OUT_EXT.exec(output);
   if (!m) return undefined;
-  const stem = rel.slice(0, rel.length - m[0].length);
+  const declaration = m[0].startsWith('.d.');
+  // declaration files go to `declarationDir` when it is set; everything else goes to `outDir`
+  const outDir = declaration ? cfg.declarationDir ?? cfg.outDir : cfg.outDir;
+  if (!outDir || !output.startsWith(`${outDir}/`)) return undefined;
+  const stem = output.slice(outDir.length + 1, output.length - m[0].length);
   for (const ext of sourcesFor(cfg, m[0])) {
     const source = posix.join(rootDir, `${stem}${ext}`);
     if (!tracked.has(source)) continue;
     if (isInput(cfg, source) !== true) continue;
-    return { source, how: `${cfg.file} compiles rootDir "${rootDir}" into outDir "${outDir}" (noEmit is not set) and has ${source} as an input` };
+    return { source, how: `${cfg.file} compiles rootDir "${rootDir}" into ${declaration && cfg.declarationDir ? 'declarationDir' : 'outDir'} "${outDir}" (noEmit is not set) and has ${source} as an input` };
   }
   return undefined;
 }

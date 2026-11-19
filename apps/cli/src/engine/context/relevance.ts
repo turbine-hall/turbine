@@ -1,6 +1,6 @@
 import { posix } from 'node:path';
 import type { ContextBudget, ImportEdge, OmittedFile, Reason, RelevantFile, SelectionLimits } from '@turbine-hall/turbine-contracts';
-import { buildGraph, makeResolver, modeOf, SOURCE_EXT, type Graph, type WorkspacePackage } from './import-graph.js';
+import { buildGraph, makeResolver, SOURCE_EXT, type Graph, type WorkspacePackage } from './import-graph.js';
 import { jsxFile, scanModule } from './js-scan.js';
 import { pathWordMatches } from './path-words.js';
 
@@ -170,10 +170,19 @@ export function parseCodeowners(textValue: string): { rules: CodeownersRule[]; s
     const anchored = body.startsWith('/') || body.includes('/');
     body = body.replace(/^\//, '');
     const last = body.slice(body.lastIndexOf('/') + 1);
-    const re = body
-      .split('**')
-      .map((part) => part.replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]'))
-      .join('.*');
+    // Segment by segment: a `**` segment between others matches ZERO or more directories (`docs/**/x` owns `docs/x`).
+    const convert = (part: string) =>
+      part
+        .split('**')
+        .map((p) => p.replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]'))
+        .join('.*');
+    const segs = body.split('/');
+    const re = segs
+      .map((seg, k) => {
+        const end = k === segs.length - 1;
+        return seg === '**' ? (end ? '.*' : '(?:.*/)?') : `${convert(seg)}${end ? '' : '/'}`;
+      })
+      .join('');
     // A literal last segment may be a directory (its contents are owned too); a wildcard one is exact.
     const wildcardLast = /[*?]/.test(last);
     const tail = dirOnly || !wildcardLast ? '(?:/.*)?' : '';
@@ -479,7 +488,7 @@ export function verifyRelevantFiles(selected: RelevantFile[], input: VerifyInput
     if (!scan.ok) return (problems.push(`${where}: ${e.from} cannot be parsed (${scan.reason})`), false);
     const found = scan.imports.find((i) => i.line === e.line && i.specifier === e.specifier && i.kind === e.kind && i.statement === e.statement);
     if (!found) return (problems.push(`${where}: no such statement at ${e.from}:${e.line}`), false);
-    const r = resolver.resolve(e.from, e.specifier, modeOf(e.kind));
+    const r = resolver.resolve(e.from, e.specifier, resolver.modeFor(e.from, e.kind));
     if ('unresolved' in r || r.to !== e.to || r.resolution !== e.resolution) {
       problems.push(`${where}: "${e.specifier}" in ${e.from} does not resolve to ${e.to} by the stated rule`);
       return false;

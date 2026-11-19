@@ -25,10 +25,10 @@ export const MAX_CONTEXT_FILE_BYTES = 1024 * 1024;
 /**
  * The text of a CONTEXT.md: a regular file of at most `MAX_CONTEXT_FILE_BYTES`. Anything else throws with the reason
  * (a symlink or directory, too large, unreadable); a missing file throws ENOENT. The file is opened without following
- * a link and read at most one byte past the limit, so a file that grows after it was checked is still caught.
+ * a link and without blocking (a FIFO named CONTEXT.md is refused, not waited on), and read at most one byte past the limit, so a file that grows after it was checked is still caught.
  */
 export function readContextFile(file: string): string {
-  const fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  const fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
     const st = fstatSync(fd);
     if (!st.isFile()) throw new Error('is not a regular file (a symlink or directory)');

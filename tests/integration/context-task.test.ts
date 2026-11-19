@@ -26,14 +26,15 @@ import { Engine } from '../../apps/cli/src/engine/engine.js';
 import { packetPaths } from '../../apps/cli/src/engine/packet.js';
 import { computeNextStep } from '../../apps/cli/src/engine/next-step.js';
 import { scanModule } from '../../apps/cli/src/engine/context/js-scan.js';
-import { applyBudget, rankFiles, verifyRelevantFiles, type VerifyInput } from '../../apps/cli/src/engine/context/relevance.js';
-import { makeResolver, modeOf, type WorkspacePackage } from '../../apps/cli/src/engine/context/import-graph.js';
+import { applyBudget, codeownersFor, parseCodeowners, rankFiles, verifyRelevantFiles, type VerifyInput } from '../../apps/cli/src/engine/context/relevance.js';
+import { makeResolver, type WorkspacePackage } from '../../apps/cli/src/engine/context/import-graph.js';
 import { buildTaskContext, readTaskFiles } from '../../apps/cli/src/engine/context/task-context.js';
 import { listTreeDetailed } from '../../apps/cli/src/engine/context/git-read.js';
 import { lintPacket } from '../../apps/cli/src/engine/docs/lint.js';
 import {
   MAX_CONTEXT_FILE_BYTES,
   NOTES_LABEL,
+  readContextFile,
   lintContextFile,
   lintTaskContexts,
   parseContextFile,
@@ -986,6 +987,7 @@ describe('review follow-ups (PR #11): every hole a reviewer found stays closed',
       'src/a.ts',
     ];
     const texts: Record<string, string> = {
+      'package.json': json({ name: 'root', type: 'module' }), // src/a.ts is an ES module: its static imports use the `import` condition
       'packages/dual/package.json': manifest('@w/dual', { exports: { '.': { import: './esm.mjs', require: './cjs.cjs' } } }),
       'packages/same/package.json': manifest('@w/same', { exports: { import: './index.js', require: './index.js' } }),
       'packages/ordered/package.json': manifest('@w/ordered', { exports: { require: './c.cjs', default: './d.js', import: './i.mjs' } }),
@@ -1011,9 +1013,6 @@ describe('review follow-ups (PR #11): every hole a reviewer found stays closed',
       const r = resolver();
       expect(r.resolve('src/a.ts', '@w/dual', 'unknown')).toEqual({ unresolved: 'package' });
       expect(r.resolve('src/a.ts', '@w/same', 'unknown')).toMatchObject({ to: 'packages/same/index.js' });
-      expect(modeOf('require')).toBe('require');
-      expect(modeOf('import-type')).toBe('unknown');
-      for (const k of ['import', 'side-effect', 're-export', 'dynamic'] as const) expect(modeOf(k)).toBe('import');
     });
 
     it('conditions are tried in the order the manifest writes them; main is not used when exports exist', () => {
@@ -1254,8 +1253,8 @@ describe('review round 2 (PR #11): exports targets, JSX text, and the fallback r
     it('the statement mode decides (checked against the file the edge would state)', () => {
       const all = [...files, 'src/a.ts'];
       const r = resolverFor(all, manifests, workspaces);
-      expect(r.resolve('src/a.ts', '@w/nest', modeOf('import'))).toMatchObject({ to: 'packages/nest/esm.mjs' });
-      expect(r.resolve('src/a.ts', '@w/nest', modeOf('require'))).toMatchObject({ to: 'packages/nest/cjs.cjs' });
+      expect(r.resolve('src/a.ts', '@w/nest', r.modeFor('src/a.mts', 'import'))).toMatchObject({ to: 'packages/nest/esm.mjs' });
+      expect(r.resolve('src/a.ts', '@w/nest', r.modeFor('src/a.ts', 'require'))).toMatchObject({ to: 'packages/nest/cjs.cjs' });
     });
   });
 
@@ -1635,6 +1634,207 @@ describe('review round 3 (PR #11): metadata budget and CONTEXT.md safety', () =>
       engine.ensureTaskContext(work);
       expect(parseContextFile(readFileSync(path, 'utf8')).notes).toContain('finance team');
       expect(readdirSync(folder).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+    });
+  });
+});
+
+
+// =================================================================== review round 4 (PR #11): local CodeRabbit scan 2
+
+describe('review round 4 (PR #11): config paths, bounded globs, importer format, Node lookup order, CODEOWNERS, FIFO', () => {
+  const resolverOf = (files: string[], texts: Record<string, string>, workspaces: WorkspacePackage[]) => makeResolver(new Set(files), (p) => texts[p], workspaces);
+  const pkgManifest = (extra: Record<string, unknown>) => json({ name: '@w/p', version: '1.0.0', ...extra });
+  const P = [{ dir: 'packages/p', name: '@w/p' }];
+  const built = (tsconfig: unknown, entry: string, tracked: string[]) =>
+    resolverOf(
+      ['packages/p/package.json', 'packages/p/tsconfig.json', 'src/a.ts', ...tracked],
+      { 'packages/p/package.json': pkgManifest({ exports: { '.': { import: entry } } }), 'packages/p/tsconfig.json': typeof tsconfig === 'string' ? tsconfig : json(tsconfig) },
+      P,
+    ).resolve('src/a.ts', '@w/p', 'import');
+  const NONE = { unresolved: 'package' };
+
+  describe('tsconfig: the default exclude holds outDir exactly once, and config paths must stay inside the repository', () => {
+    it('a source inside the output directory is not an input (the default exclude covers outDir)', () => {
+      const cfg = { compilerOptions: { rootDir: 'lib', outDir: 'lib/a' } };
+      expect(built(cfg, './lib/a/a/b.js', ['packages/p/lib/a/b.ts'])).toEqual(NONE); // lib/a/b.ts is inside outDir lib/a
+      expect(built(cfg, './lib/a/b.js', ['packages/p/lib/b.ts'])).toMatchObject({ to: 'packages/p/lib/b.ts' }); // outside it: an input
+    });
+
+    it('absolute paths, backslashes and paths that leave the repository leave the mapping unconfirmed', () => {
+      for (const co of [
+        { rootDir: 'src', outDir: '/abs/dist' },
+        { rootDir: '/abs/src', outDir: 'dist' },
+        { rootDir: 'src', outDir: '../../../dist' },
+        { rootDir: 'src', outDir: 'C:\\dist' },
+        { rootDir: 'src', outDir: 'dist\\x' },
+      ]) {
+        expect(built({ compilerOptions: co }, './dist/index.js', ['packages/p/src/index.ts'])).toEqual(NONE);
+      }
+      const ok = { rootDir: 'src', outDir: 'dist' };
+      expect(built({ compilerOptions: ok, include: ['/etc/**/*'] }, './dist/index.js', ['packages/p/src/index.ts'])).toEqual(NONE);
+      expect(built({ compilerOptions: ok, files: ['../../../x.ts'] }, './dist/index.js', ['packages/p/src/index.ts'])).toEqual(NONE);
+      expect(built({ compilerOptions: ok, exclude: ['C:\\x'] }, './dist/index.js', ['packages/p/src/index.ts'])).toEqual(NONE);
+      expect(built({ compilerOptions: ok }, './dist/index.js', ['packages/p/src/index.ts'])).toMatchObject({ to: 'packages/p/src/index.ts' });
+    });
+
+    it('declarationDir decides where declaration files go; JavaScript output keeps outDir', () => {
+      const cfg = { compilerOptions: { rootDir: 'src', outDir: 'dist', declaration: true, declarationDir: 'types' } };
+      const src = ['packages/p/src/index.ts'];
+      expect(built(cfg, './types/index.d.ts', src)).toMatchObject({ to: 'packages/p/src/index.ts', resolution: expect.stringContaining('declarationDir') });
+      expect(built(cfg, './dist/index.d.ts', src)).toEqual(NONE); // declarations are not written to outDir
+      expect(built(cfg, './dist/index.js', src)).toMatchObject({ to: 'packages/p/src/index.ts' });
+      expect(built(cfg, './types/index.js', src)).toEqual(NONE);
+      // without declarationDir, declarations follow outDir
+      expect(built({ compilerOptions: { rootDir: 'src', outDir: 'dist', declaration: true } }, './dist/index.d.ts', src)).toMatchObject({ to: 'packages/p/src/index.ts' });
+    });
+  });
+
+  describe('glob matching is iterative and bounded', () => {
+    it('many `**` segments against a deep path finish at once and give the right answer', () => {
+      const deep = Array.from({ length: 40 }, () => 'a').join('/');
+      const source = `packages/p/src/${deep}/index.ts`;
+      const t0 = Date.now();
+      const r = built({ compilerOptions: { rootDir: 'src', outDir: 'dist' }, include: [`${'src/**/'.repeat(1)}${'**/'.repeat(30)}*.ts`] }, `./dist/${deep}/index.js`, [source]);
+      expect(Date.now() - t0).toBeLessThan(2000);
+      expect(r).toMatchObject({ to: source });
+      // an exclude that is one `**` pattern deep still matches
+      const ex = built({ compilerOptions: { rootDir: 'src', outDir: 'dist' }, exclude: [`src/${'**/'.repeat(30)}index.ts`] }, `./dist/${deep}/index.js`, [source]);
+      expect(ex).toEqual(NONE);
+    });
+
+    it('a star-heavy segment against a long name does not blow up', () => {
+      const name = `${'a'.repeat(200)}b.ts`;
+      const t0 = Date.now();
+      const r = built({ compilerOptions: { rootDir: 'src', outDir: 'dist' }, include: [`src/${'*a'.repeat(30)}*c.ts`] }, `./dist/${name.replace(/\.ts$/, '.js')}`, [`packages/p/src/${name}`]);
+      expect(Date.now() - t0).toBeLessThan(2000);
+      expect(r).toEqual(NONE); // the pattern does not match: no `c`
+    });
+
+    it('a pattern beyond the work limit is unconfirmed, never guessed', () => {
+      const long = Array.from({ length: 80 }, () => '**').join('/');
+      expect(built({ compilerOptions: { rootDir: 'src', outDir: 'dist' }, include: [`src/${long}/*.ts`] }, './dist/index.js', ['packages/p/src/index.ts'])).toEqual(NONE);
+    });
+  });
+
+  describe('the scanner contract: syntax errors fail the file; checker-only errors do not', () => {
+    it('a syntax error fails the file; `export const x;` (a checker-level error) parses and the statements stay at their lines', () => {
+      expect(scanModule("import a from './a';\nexport const = ;\n", { jsx: false }).ok).toBe(false);
+      const r = scanModule("import a from './a';\nexport const broken;\nimport b from './b';\n", { jsx: false });
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.imports.map((i) => [i.specifier, i.line])).toEqual([['./a', 1], ['./b', 3]]);
+    });
+  });
+
+  describe('a CONTEXT.md that is a FIFO is refused, not waited on', () => {
+    it.skipIf(process.platform === 'win32')('readContextFile returns an error at once for a named pipe', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'turbine-fifo-'));
+      dirs.push(dir);
+      const fifo = join(dir, 'CONTEXT.md');
+      expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
+      expect(() => readContextFile(fifo)).toThrow(/not a regular file/);
+    }, 5000);
+  });
+
+  describe('CODEOWNERS: a `**` between directories matches zero or more of them', () => {
+    const owner = (file: string, text: string) => codeownersFor(file, parseCodeowners(text).rules)?.owners.join(',');
+    const rules = '* @all\n/docs/**/README.md @docs\n**/logs @ops\n/a/**/b/**/c.txt @deep\n/src/** @src\n';
+
+    it('/docs/**/README.md owns docs/README.md and nested ones, and nothing else', () => {
+      expect(owner('docs/README.md', rules)).toBe('@docs');
+      expect(owner('docs/api/README.md', rules)).toBe('@docs');
+      expect(owner('docs/api/v2/README.md', rules)).toBe('@docs');
+      expect(owner('docsx/README.md', rules)).toBe('@all');
+      expect(owner('docs/README.txt', rules)).toBe('@all');
+    });
+
+    it('a leading **/ and several ** segments', () => {
+      expect(owner('logs', rules)).toBe('@ops');
+      expect(owner('x/y/logs', rules)).toBe('@ops');
+      expect(owner('a/b/c.txt', rules)).toBe('@deep');
+      expect(owner('a/q/b/r/s/c.txt', rules)).toBe('@deep');
+      expect(owner('a/q/c.txt', rules)).toBe('@all');
+      expect(owner('src/x/y.ts', rules)).toBe('@src');
+    });
+  });
+
+  describe('which module format an importing file has decides how it reaches a package', () => {
+    const files = ['package.json', 'packages/c/package.json', 'packages/c/src/x.ts', 'packages/d/package.json', 'packages/dual/package.json', 'packages/dual/esm.mjs', 'packages/dual/cjs.cjs', 'src/a.ts'];
+    const texts: Record<string, string> = {
+      'package.json': json({ name: 'root', type: 'module' }),
+      'packages/c/package.json': json({ name: '@w/c', type: 'commonjs' }),
+      'packages/d/package.json': json({ name: '@w/d' }),
+      'packages/dual/package.json': json({ name: '@w/dual', exports: { import: './esm.mjs', require: './cjs.cjs' } }),
+    };
+    const r = resolverOf(files, texts, [{ dir: 'packages/c', name: '@w/c' }, { dir: 'packages/d', name: '@w/d' }, { dir: 'packages/dual', name: '@w/dual' }]);
+
+    it('require() is CommonJS and a type-only import is not known, whatever the file', () => {
+      for (const f of ['src/a.ts', 'src/a.mts', 'src/a.cjs']) expect(r.modeFor(f, 'require')).toBe('require');
+      for (const f of ['src/a.ts', 'src/a.mts', 'src/a.cts']) expect(r.modeFor(f, 'import-type')).toBe('unknown');
+    });
+
+    it('the extension decides for .mjs/.mts (import) and .cjs/.cts (require; a dynamic import() stays import)', () => {
+      for (const k of ['import', 'side-effect', 're-export', 'dynamic'] as const) expect(r.modeFor('src/a.mts', k)).toBe('import');
+      for (const k of ['import', 'side-effect', 're-export'] as const) {
+        expect(r.modeFor('src/a.cts', k)).toBe('require');
+        expect(r.modeFor('src/a.cjs', k)).toBe('require');
+      }
+      expect(r.modeFor('src/a.cts', 'dynamic')).toBe('import');
+    });
+
+    it('otherwise the nearest "type" decides; without one the format is not known', () => {
+      expect(r.modeFor('src/a.ts', 'import')).toBe('import'); // root type: module
+      expect(r.modeFor('packages/c/src/x.ts', 'import')).toBe('unknown'); // nearest package says commonjs
+      expect(r.modeFor('packages/d/x.ts', 'import')).toBe('unknown'); // no "type"
+    });
+
+    it('so a static import in a .ts file of an untyped package reaches a dual package only when both modes agree', () => {
+      expect(r.resolve('packages/d/x.ts', '@w/dual', r.modeFor('packages/d/x.ts', 'import'))).toEqual(NONE);
+      expect(r.resolve('src/a.ts', '@w/dual', r.modeFor('src/a.ts', 'import'))).toMatchObject({ to: 'packages/dual/esm.mjs' });
+      expect(r.resolve('src/a.cts', '@w/dual', r.modeFor('src/a.cts', 'import'))).toMatchObject({ to: 'packages/dual/cjs.cjs' });
+    });
+  });
+
+  describe('a legacy entry is looked up in the order Node uses before TypeScript sources are tried', () => {
+    const entry = (files: string[], manifest: Record<string, unknown>, extra: Record<string, string> = {}) =>
+      resolverOf(['packages/p/package.json', 'src/a.ts', ...files], { 'packages/p/package.json': pkgManifest(manifest), ...extra }, P).resolve('src/a.ts', '@w/p', 'require');
+
+    it('a tracked index.js wins over index.ts', () => {
+      expect(entry(['packages/p/index.js', 'packages/p/index.ts'], {})).toMatchObject({ to: 'packages/p/index.js' });
+      expect(entry(['packages/p/lib.js', 'packages/p/lib.ts'], { main: 'lib.js' })).toMatchObject({ to: 'packages/p/lib.js' });
+    });
+
+    it('main is tried as written, then with .js, .json, .node, then as a directory index', () => {
+      expect(entry(['packages/p/lib', 'packages/p/lib.js'], { main: 'lib' })).toMatchObject({ to: 'packages/p/lib' });
+      expect(entry(['packages/p/lib.js', 'packages/p/lib/index.js'], { main: 'lib' })).toMatchObject({ to: 'packages/p/lib.js' });
+      expect(entry(['packages/p/lib/index.js'], { main: 'lib' })).toMatchObject({ to: 'packages/p/lib/index.js' });
+      expect(entry(['packages/p/lib.json'], { main: 'lib' })).toMatchObject({ to: 'packages/p/lib.json' });
+    });
+
+    it('then the package index; a TypeScript source only after Node\'s names and the build proof', () => {
+      expect(entry(['packages/p/index.js', 'packages/p/src/lib.ts'], { main: 'lib.js' })).toMatchObject({ to: 'packages/p/index.js' });
+      expect(entry(['packages/p/src/lib.ts'], { main: 'src/lib.js' })).toMatchObject({ to: 'packages/p/src/lib.ts' });
+      const cfg = { 'packages/p/tsconfig.json': json({ compilerOptions: { rootDir: 'src', outDir: 'dist' } }) };
+      expect(entry(['packages/p/src/index.ts', 'packages/p/tsconfig.json'], { main: 'dist/index.js' }, cfg)).toMatchObject({ to: 'packages/p/src/index.ts' });
+    });
+  });
+
+  describe('exports: an invalid CONFIGURATION is not passed over, an invalid target is', () => {
+    const pick = (exp: unknown, mode: 'import' | 'require' = 'import') =>
+      resolverOf(['packages/p/package.json', 'src/a.ts', 'packages/p/ok.js', 'packages/p/other.js'], { 'packages/p/package.json': pkgManifest({ exports: exp }) }, P).resolve('src/a.ts', '@w/p', mode);
+
+    it('an array-index key in a conditions object stops the array: no fallback to the next entry', () => {
+      expect(pick({ import: [{ '0': './other.js' }, './ok.js'] })).toEqual(NONE);
+      expect(pick({ import: [{ default: './other.js', '1': './x.js' }, './ok.js'] })).toEqual(NONE);
+      expect(pick({ import: ['./../bad.js', './ok.js'] })).toMatchObject({ to: 'packages/p/ok.js' }); // an invalid target IS passed over
+      expect(pick({ import: ['bad.js', './ok.js'] })).toMatchObject({ to: 'packages/p/ok.js' });
+      expect(pick({ import: ['./../bad.js'] })).toEqual(NONE);
+    });
+
+    it('only a canonical index below 2**32 - 1 is an index ("01" and 4294967295 are ordinary keys)', () => {
+      expect(pick({ '01': './other.js', default: './ok.js' })).toMatchObject({ to: 'packages/p/ok.js' });
+      expect(pick({ '4294967295': './other.js', default: './ok.js' })).toMatchObject({ to: 'packages/p/ok.js' });
+      expect(pick({ '4294967294': './other.js', default: './ok.js' })).toEqual(NONE);
+      expect(pick({ '7': './other.js', default: './ok.js' })).toEqual(NONE);
     });
   });
 });
