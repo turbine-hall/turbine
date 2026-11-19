@@ -155,4 +155,16 @@ CREATE INDEX IF NOT EXISTS idx_claims_repo_section ON claims(repo_path, section)
 CREATE INDEX IF NOT EXISTS idx_claims_repo_commit ON claims(repo_path, "commit");
 `,
   },
+  {
+    version: 5,
+    sql: `
+-- Layer 2: the commit the claims of a repository have been carried to. It only moves forward, and it survives the
+-- withdrawal of the last claim, so a later publication cannot reopen a commit the transitions have already passed.
+CREATE TABLE IF NOT EXISTS claim_frontier (
+  repo_path TEXT PRIMARY KEY,
+  "commit" TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`,
+  },
 ];

@@ -84,6 +84,26 @@ const tableCells = (l: string): number => l.trim().replace(/^\|/, '').replace(/(
 /** A GFM delimiter row: cells of dashes with optional colons, separated by pipes (a pipe is required: it is what makes a table). */
 const isTableDelimiter = (l: string): boolean => l.includes('|') && /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(l);
 
+/** Where GFM ends a table body: a blank line, or a line that starts another block. A line without pipes is still a (one-cell) row. */
+const BLOCK_START = /^\s{0,3}(?:#{1,6}(?:\s|$)|>|[-*+]\s|\d{1,9}[.)]\s|```|~~~)/;
+/** Every row of every table in `lines` whose cell count differs from its header's, and how many body rows were checked. */
+function tableProblems(lines: string[]): { problems: string[]; rows: number } {
+  const problems: string[] = [];
+  let rows = 0;
+  for (let i = 0; i + 1 < lines.length; i++) {
+    if (!isTableDelimiter(lines[i + 1]!)) continue;
+    const header = tableCells(lines[i]!);
+    if (tableCells(lines[i + 1]!) !== header) problems.push(`line ${i + 2}: delimiter row`);
+    let j = i + 2;
+    for (; j < lines.length && lines[j]!.trim() !== '' && !BLOCK_START.test(lines[j]!); j++) {
+      rows++;
+      if (tableCells(lines[j]!) !== header) problems.push(`line ${j + 1}: ${lines[j]!.slice(0, 60)}`);
+    }
+    i = j - 1;
+  }
+  return { problems, rows };
+}
+
 const json = (v: unknown) => `${JSON.stringify(v, null, 2)}\n`;
 
 const APP = [
@@ -116,7 +136,8 @@ function newRepo(files: Record<string, string | Buffer | null> = BASE): string {
   // An empty template: a developer's init.templateDir (hooks, info/attributes, ...) is not copied into the fixture.
   const emptyTemplate = mkdtempSync(join(tmpdir(), 'turbine-claims-template-'));
   dirs.push(emptyTemplate);
-  git(dir, 'init', '-q', `--template=${emptyTemplate}`);
+  // A fixed initial branch: a developer's init.defaultBranch must not decide the branch names a test creates.
+  git(dir, 'init', '-q', '-b', 'main', `--template=${emptyTemplate}`);
   git(dir, 'config', 'user.email', 'test@example.com');
   git(dir, 'config', 'user.name', 'Test');
   // A developer's global signing settings must not decide whether the fixture can commit.
@@ -708,7 +729,7 @@ describe('storage — migration v4 and the claim methods', () => {
   it('migration v4 creates the claims table (v3, work_claims, is untouched)', () => {
     const store = openStore();
     const versions = (store.db.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>).map((r) => r.version);
-    expect(versions).toEqual([1, 2, 3, 4]);
+    expect(versions).toEqual([1, 2, 3, 4, 5]); // v5 adds the claim frontier
     const cols = (store.db.prepare(`PRAGMA table_info(claims)`).all() as Array<{ name: string }>).map((x) => x.name);
     expect(cols).toEqual(['id', 'repo_path', 'section', 'commit', 'data', 'status', 'reason', 'created_at']);
     expect(store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='work_claims'`).all()).toHaveLength(1);
@@ -784,14 +805,14 @@ describe('storage — migration v4 and the claim methods', () => {
     expect(() => store.getClaim(dir, 'other')).toThrow(/actually has id/);
   });
 
-  it('source layout: the literal status "verified" is written only in engine/context/claims.ts (behaviour is tested below)', () => {
+  it('source layout: no other CLI source file writes the literal status "verified" (a check of literal source only; the behavioural tests cover the rest)', () => {
     const root = resolve(here, '../../apps/cli/src');
     const hits: string[] = [];
     const walk = (d: string) => {
       for (const e of readdirSync(d, { withFileTypes: true })) {
         const p = join(d, e.name);
         if (e.isDirectory()) walk(p);
-        else if (p.endsWith('.ts') && /status:\s*'verified'/.test(readFileSync(p, 'utf8'))) hits.push(p.slice(root.length + 1));
+        else if (p.endsWith('.ts') && /status\s*:\s*(['"`])verified\1/.test(readFileSync(p, 'utf8'))) hits.push(p.slice(root.length + 1));
       }
     };
     walk(root);
@@ -1138,29 +1159,25 @@ describe('review round 1 (PR #12): findings from the first CodeRabbit pass', () 
   });
 
   it('every row of a table in IMPLEMENTATION_STATUS.md has as many cells as its header (an unescaped "|" splits a cell)', () => {
-    const lines = readFileSync(resolve(here, '../../docs/IMPLEMENTATION_STATUS.md'), 'utf8').split('\n');
-    let checked = 0;
-    for (let i = 0; i + 1 < lines.length; i++) {
-      if (!lines[i]!.includes('|') || !isTableDelimiter(lines[i + 1]!)) continue;
-      const header = tableCells(lines[i]!);
-      expect(tableCells(lines[i + 1]!), `line ${i + 2}: delimiter row`).toBe(header);
-      for (let j = i + 2; j < lines.length && lines[j]!.trim() !== '' && lines[j]!.includes('|'); j++) {
-        expect(tableCells(lines[j]!), `line ${j + 1}: ${lines[j]!.slice(0, 60)}`).toBe(header);
-        checked++;
-      }
-    }
-    expect(checked).toBeGreaterThan(5);
+    const { problems, rows } = tableProblems(readFileSync(resolve(here, '../../docs/IMPLEMENTATION_STATUS.md'), 'utf8').split('\n'));
+    expect(problems).toEqual([]);
+    expect(rows).toBeGreaterThan(5);
   });
 
-  it('the table check reads a table written without leading pipes, and catches an extra cell in it', () => {
+  it('the table check follows GFM: rows without leading pipes, a pipe-free row inside a table, and where a table ends', () => {
     expect(isTableDelimiter('--- | ---')).toBe(true);
     expect(isTableDelimiter(':--|--:')).toBe(true);
     expect(isTableDelimiter('| --- | :---: |')).toBe(true);
     expect(isTableDelimiter('a | b')).toBe(false);
-    expect(tableCells('Layer | Status')).toBe(2);
-    expect(tableCells('a | b | c')).toBe(3); // the extra cell a leading-pipe-only check would never see
-    expect(tableCells('| a | b |')).toBe(2);
     expect(tableCells('| a \\| b | c |')).toBe(2); // an escaped pipe stays inside its cell
+    expect(tableProblems(['Layer | Status', '--- | ---', 'a | b', 'c | d']).problems).toEqual([]);
+    expect(tableProblems(['Layer | Status', '--- | ---', 'a | b | extra']).problems).toHaveLength(1); // no leading pipe: still seen
+    // A pipe-free row is a one-cell row, and the table goes on after it: the extra cell below it is still found.
+    const t = tableProblems(['| A | B |', '| - | - |', 'just text', '| x | y | z |', '', '| not | counted | here |']);
+    expect(t.rows).toBe(2);
+    expect(t.problems).toHaveLength(2);
+    // A heading or a list item ends the table.
+    expect(tableProblems(['| A | B |', '| - | - |', '| a | b |', '# Title', '| x | y | z |']).rows).toBe(1);
   });
 });
 
@@ -1509,6 +1526,9 @@ describe('review round 3 (PR #12): findings from the second local CodeRabbit rev
 });
 
 describe('review round 4 (PR #12): findings from the third local CodeRabbit review', () => {
+  const at4 = (dir: string, c: string, input: Record<string, unknown>) =>
+    ClaimSchema.parse({ ...input, evidence: (input.evidence as Array<Record<string, unknown>>).map((e) => ({ ...e, commit: c, blob: git(dir, 'rev-parse', `${c}:${e.path as string}`).trim() })) });
+
   it('a number token with a long run of zeros inside it is read in linear time (no backtracking)', () => {
     const token = `1.${'0'.repeat(200_000)}5`; // many interior zeros, then a nonzero digit
     const d = newRepo({ 'n.json': `{"n": ${token}, "ok": 1}\n` });
@@ -1583,7 +1603,7 @@ describe('review round 4 (PR #12): findings from the third local CodeRabbit revi
       expect(store.getClaim(dir, input.id as string)!.commit).toBe(c3);
     });
 
-    it('once withdrawn, the claim can be published at the older commit again', () => {
+    it('withdrawing a claim does not reopen the commit it was carried past; it can be published again at the frontier', () => {
       const dir = newRepo();
       const c1 = head(dir);
       const store = openStore();
@@ -1593,8 +1613,10 @@ describe('review round 4 (PR #12): findings from the third local CodeRabbit revi
       reverifyOnCommit(store, dir, dir, c1, c2); // the row is now carried at c2
       expect(publishClaim(store, dir, dir, input)).toMatchObject({ published: false, recorded: false }); // c1 is behind it
       store.withdrawClaim(dir, input.id as string, 'gone');
-      expect(publishClaim(store, dir, dir, input).published).toBe(true); // nothing published is ahead of c1 any more
-      expect(store.getClaim(dir, input.id as string)).toMatchObject({ status: 'verified', commit: c1 });
+      expect(publishClaim(store, dir, dir, input)).toMatchObject({ published: false, recorded: false }); // the frontier is still c2
+      const again = at4(dir, c2, input);
+      expect(publishClaim(store, dir, dir, again).published).toBe(true);
+      expect(store.getClaim(dir, input.id as string)).toMatchObject({ status: 'verified', commit: c2 });
     });
 
     it('a NEW claim is not published at a commit the published claims have already moved past', () => {
@@ -1809,5 +1831,170 @@ describe('review round 5 (PR #12): findings from the fourth local CodeRabbit rev
       publishClaim(openStore(), d, d, claim({ kind: 'config', evidence: [ev(d, c, path, 3)], verifier: { kind: 'config', path, key: ['a'], value: 1 } }));
     expect(cfg('tsconfig.base.json').published).toBe(true);
     expect(cfg('tsconfig-base.json').published).toBe(false); // strict JSON: the comment is a syntax error
+  });
+});
+
+describe('review round 6 (PR #12): findings from the fifth local CodeRabbit review', () => {
+  const at = (dir: string, c: string, input: Record<string, unknown>) =>
+    ClaimSchema.parse({ ...input, evidence: (input.evidence as Array<Record<string, unknown>>).map((e) => ({ ...e, commit: c, blob: git(dir, 'rev-parse', `${c}:${e.path as string}`).trim() })) });
+
+  describe('the claim frontier: published claims stay on one transition path', () => {
+    it('a claim published at a newer commit is refused until the earlier claims are carried to it', () => {
+      const dir = newRepo();
+      const c1 = head(dir);
+      const store = openStore();
+      const a = validClaims(dir, c1).quote!;
+      expect(publishClaim(store, dir, dir, a).published).toBe(true);
+      const c2 = commitFiles(dir, { 'README.md': 'x\n' });
+      const b = at(dir, c2, validClaims(dir, c2).imports!);
+      const out = publishClaim(store, dir, dir, b);
+      expect(out).toMatchObject({ published: false, recorded: false, unconfirmed: false });
+      if (!out.published) expect(out.reason).toMatch(/reverifyOnCommit/);
+      expect(store.getClaim(dir, b.id)).toBeNull();
+      // Carried, then accepted; and a later change to A's file is seen, because A travels with B.
+      reverifyOnCommit(store, dir, dir, c1, c2);
+      expect(publishClaim(store, dir, dir, b).published).toBe(true);
+      const c3 = commitFiles(dir, { 'src/util.ts': null });
+      const r = reverifyOnCommit(store, dir, dir, c2, c3);
+      expect(r.withdrawn.map((w) => w.id)).toContain(a.id);
+      expect(store.getClaim(dir, a.id as string)).toMatchObject({ status: 'withdrawn' });
+    });
+
+    it('the frontier survives the withdrawal of the last published claim, so an old commit cannot be reopened', () => {
+      const dir = newRepo();
+      const c1 = head(dir);
+      const store = openStore();
+      const a = validClaims(dir, c1).quote!;
+      publishClaim(store, dir, dir, a);
+      expect(store.getClaimFrontier(dir)).toBe(c1);
+      const c2 = commitFiles(dir, { 'src/util.ts': null });
+      expect(reverifyOnCommit(store, dir, dir, c1, c2).withdrawn).toHaveLength(1);
+      expect(store.listClaims(dir, { statuses: PUBLISHED_CLAIM_STATUSES })).toEqual([]);
+      expect(store.getClaimFrontier(dir)).toBe(c2);
+      const late = validClaims(dir, c1).imports!; // proven at c1, which the transitions have passed
+      const out = publishClaim(store, dir, dir, late);
+      expect(out).toMatchObject({ published: false, recorded: false, unconfirmed: false });
+      if (!out.published) expect(out.reason).toMatch(/already been carried/);
+      expect(store.getClaim(dir, late.id as string)).toBeNull();
+    });
+
+    it('a transition that carries no claim still moves the frontier, and never backwards', () => {
+      const dir = newRepo();
+      const c1 = head(dir);
+      const store = openStore();
+      const c2 = commitFiles(dir, { 'README.md': 'x\n' });
+      expect(store.getClaimFrontier(dir)).toBeNull();
+      reverifyOnCommit(store, dir, dir, c1, c2);
+      expect(store.getClaimFrontier(dir)).toBe(c2);
+      reverifyOnCommit(store, dir, dir, c2, c1); // a transition to an older commit leaves the frontier where it is
+      expect(store.getClaimFrontier(dir)).toBe(c2);
+    });
+
+    it('the store keeps one frontier per repository, validates it, and a failed publish does not move it', () => {
+      const dir = newRepo();
+      const c = head(dir);
+      const store = openStore();
+      expect(() => store.setClaimFrontier('', c)).toThrow(/non-empty/);
+      expect(() => store.setClaimFrontier(dir, 'main')).toThrow();
+      store.setClaimFrontier('/elsewhere', 'b'.repeat(40));
+      expect(store.getClaimFrontier(dir)).toBeNull();
+      const falseClaim = claim({ kind: 'imports', evidence: [ev(dir, c, 'src/app.ts', 2)], verifier: { kind: 'imports', from: 'src/app.ts', specifier: 'zzz' } });
+      expect(publishClaim(store, dir, dir, falseClaim).published).toBe(false);
+      expect(store.getClaimFrontier(dir)).toBeNull();
+      expect(publishClaim(store, dir, dir, validClaims(dir, c).quote!).published).toBe(true);
+      expect(store.getClaimFrontier(dir)).toBe(c);
+      expect(store.getClaimFrontier('/elsewhere')).toBe('b'.repeat(40));
+    });
+
+    it('migration v5 creates the frontier table', () => {
+      const store = openStore();
+      expect((store.db.prepare(`PRAGMA table_info(claim_frontier)`).all() as Array<{ name: string }>).map((x) => x.name)).toEqual(['repo_path', 'commit', 'updated_at']);
+    });
+  });
+
+  it('a clause that exports thousands of names is scanned in time that does not grow with the square of it', () => {
+    const names = Array.from({ length: 20_000 }, (_, i) => `name${i}`);
+    const d = newRepo({ 'barrel.ts': `export {\r\n${names.map((n) => `  ${n},`).join('\r\n')}\r\n};\r\n` });
+    const c = head(d);
+    const started = Date.now();
+    const out = publishClaim(openStore(), d, d, claim({ kind: 'exists', evidence: [ev(d, c, 'barrel.ts', [1, 20_002])], verifier: { kind: 'exists', path: 'barrel.ts', symbol: 'name19999' } }));
+    expect(out.published, out.published ? '' : out.reason).toBe(true);
+    expect(Date.now() - started).toBeLessThan(15_000);
+  }, 60_000);
+
+  it('export * as default declares a default export; export * as api stays a named export', () => {
+    const d = newRepo({ 'a.ts': "export * as default from './api.js';\n", 'b.ts': "export * as api from './api.js';\n" });
+    const c = head(d);
+    const ex = (path: string, symbol: string) =>
+      publishClaim(openStore(), d, d, claim({ kind: 'exists', evidence: [ev(d, c, path, 1)], verifier: { kind: 'exists', path, symbol } })).published;
+    expect(ex('a.ts', 'default')).toBe(true);
+    expect(ex('a.ts', 'api')).toBe(false);
+    expect(ex('b.ts', 'api')).toBe(true);
+    expect(ex('b.ts', 'default')).toBe(false);
+  });
+
+  it('the reader hands out frozen tree entries: a caller cannot change what later verification compares', () => {
+    const dir = newRepo();
+    const c = head(dir);
+    const reader = new CommitReader(dir, c);
+    const entry = reader.entry('src/util.ts')!;
+    expect(() => {
+      (entry as { id: string }).id = 'f'.repeat(40);
+    }).toThrow(TypeError);
+    expect(() => {
+      (reader.tree().entries as unknown[]).length = 0;
+    }).toThrow(TypeError);
+    expect(() => {
+      (reader.tree() as { undecodable: number }).undecodable = 9;
+    }).toThrow(TypeError);
+    expect(verifyClaim(reader, validClaims(dir, c).quote).ok).toBe(true);
+  });
+
+  describe('a specifier the scanner cannot evaluate is unconfirmed, not a missing import', () => {
+    const d = newRepo({
+      'm.ts': "export const a = () => import('./' + 'feature.js');\nexport const b = () => require(name);\nexport const c = () => import(loader());\nexport { x };\nconst x = 1;\nexport const d = () => import('./plain.js');\n",
+    });
+    const cm = head(d);
+    const imp = (specifier: string, line: number) =>
+      publishClaim(openStore(), d, d, claim({ kind: 'imports', evidence: [ev(d, cm, 'm.ts', line)], verifier: { kind: 'imports', from: 'm.ts', specifier } }));
+
+    it('import(<expression>) and require(<expression>) on a cited line', () => {
+      for (const line of [1, 2, 3]) expect(imp('./feature.js', line), `line ${line}`).toMatchObject({ published: false, unconfirmed: true });
+    });
+    it('a local `export { x }` has no specifier and records nothing', () => {
+      expect(imp('./feature.js', 4)).toMatchObject({ published: false, unconfirmed: false });
+    });
+    it('a literal import elsewhere is still an edge, and a plain miss is still a miss', () => {
+      expect(imp('./plain.js', 6).published).toBe(true);
+      expect(imp('./nowhere.js', 6)).toMatchObject({ published: false, unconfirmed: false });
+    });
+  });
+
+  it('a number is exact only if its TEXT states what a double holds: 1.0000000000000001e0 is not 1', () => {
+    const d = newRepo({ 'n.json': '{"a": 1.0000000000000001e0, "b": 1e0, "c": 12345678901234567e-2, "d": 1.5e23, "e": 1.25, "f": 9007199254740991}\n' });
+    const c = head(d);
+    const cfg = (key: string, value: unknown) =>
+      publishClaim(openStore(), d, d, claim({ kind: 'config', evidence: [ev(d, c, 'n.json', 1)], verifier: { kind: 'config', path: 'n.json', key: [key], value } }));
+    expect(cfg('a', 1)).toMatchObject({ published: false, unconfirmed: true });
+    expect(cfg('c', 123456789012345.67)).toMatchObject({ published: false, unconfirmed: true });
+    expect(cfg('d', 1.5e23)).toMatchObject({ published: false, unconfirmed: true });
+    expect(cfg('b', 1).published).toBe(true);
+    expect(cfg('e', 1.25).published).toBe(true);
+    expect(cfg('f', 9007199254740991).published).toBe(true);
+  });
+
+  it('the fixture repository starts on main whatever init.defaultBranch says', () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-claims-branch-'));
+    dirs.push(root);
+    const globalConfig = join(root, 'gitconfig');
+    writeFileSync(globalConfig, '[init]\n\tdefaultBranch = side\n');
+    const before = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      expect(git(newRepo(), 'rev-parse', '--abbrev-ref', 'HEAD').trim()).toBe('main');
+    } finally {
+      if (before === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = before;
+    }
   });
 });

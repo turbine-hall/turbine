@@ -24,6 +24,7 @@ import {
   EngineeringEvidenceContractSchema,
   EngineEventSchema,
   EvidenceSchema,
+  GitObjectIdSchema,
   RecoveryPlanSchema,
   RepoSnapshotSchema,
   RoleRunSchema,
@@ -494,6 +495,24 @@ export class WorkStore {
       .prepare(`UPDATE claims SET status = 'withdrawn', reason = ? WHERE repo_path = ? AND id = ? AND status <> 'withdrawn'`)
       .run(reason.trim(), repoPath, id);
     return Number(r.changes) === 1;
+  }
+
+  /** The commit this repository's claims have been carried to, or null before any claim was published or carried. */
+  getClaimFrontier(repoPath: string): string | null {
+    const row = this.db.prepare(`SELECT "commit" FROM claim_frontier WHERE repo_path = ?`).get(repoPath) as { commit: string } | undefined;
+    return row ? row.commit : null;
+  }
+
+  /** Record the commit the claims are carried to. Like `saveClaim`, a trusted write: only publishClaim / reverifyOnCommit move it. */
+  setClaimFrontier(repoPath: string, commit: string): void {
+    if (typeof repoPath !== 'string' || repoPath === '') throw new Error('a claim frontier is stored under a non-empty repository path');
+    const id = GitObjectIdSchema.parse(commit);
+    this.db
+      .prepare(
+        `INSERT INTO claim_frontier(repo_path, "commit", updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(repo_path) DO UPDATE SET "commit" = excluded."commit", updated_at = excluded.updated_at`,
+      )
+      .run(repoPath, id, now());
   }
 
   getClaim(repoPath: string, id: string): StoredClaim | null {

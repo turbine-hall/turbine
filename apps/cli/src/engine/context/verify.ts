@@ -2,7 +2,7 @@ import type * as TS from 'typescript';
 import { manifestPath, parseClaimSafe } from '@turbine-hall/turbine-contracts';
 import type { AbsencePattern, Claim, ClaimEvidence, ClaimVerifier } from '@turbine-hall/turbine-contracts';
 import { listTreeDetailed, readBlobs, resolveCommit } from './git-read.js';
-import type { TreeEntry, TreeListing } from './git-read.js';
+import type { TreeEntry } from './git-read.js';
 import { jsxFile, parseSource, scanModule } from './js-scan.js';
 import { InexactNumber, JsoncLimitError, parseJsonc } from './jsonc.js';
 import type { LineRange } from './jsonc.js';
@@ -60,13 +60,16 @@ export function splitLines(text: string): string[] {
   return lines;
 }
 
+/** A tree listing nobody can change. */
+export type FrozenListing = Readonly<{ entries: readonly Readonly<TreeEntry>[]; undecodable: number }>;
+
 type Text = { ok: true; text: string } | { ok: false; reason: string };
 
 /** One commit, read through git only. Trees and blobs are cached for the life of the reader. */
 export class CommitReader {
   readonly commit: string;
-  private listing: TreeListing | undefined;
-  private byPath: Map<string, TreeEntry> | undefined;
+  private listing: FrozenListing | undefined;
+  private byPath: Map<string, Readonly<TreeEntry>> | undefined;
   private readonly blobs = new Map<string, Buffer>();
   private cached = 0;
 
@@ -79,11 +82,18 @@ export class CommitReader {
     this.commit = commit;
   }
 
-  tree(): TreeListing {
-    return (this.listing ??= listTreeDetailed(this.repoRoot, this.commit));
+  /** The tracked files at this commit. Frozen: the reader's own copy is never handed out to be changed. */
+  tree(): FrozenListing {
+    if (!this.listing) {
+      const listing = listTreeDetailed(this.repoRoot, this.commit);
+      for (const e of listing.entries) Object.freeze(e);
+      Object.freeze(listing.entries);
+      this.listing = Object.freeze(listing);
+    }
+    return this.listing;
   }
 
-  entry(path: string): TreeEntry | undefined {
+  entry(path: string): Readonly<TreeEntry> | undefined {
     if (!this.byPath) this.byPath = new Map(this.tree().entries.map((e) => [e.path, e]));
     return this.byPath.get(path);
   }

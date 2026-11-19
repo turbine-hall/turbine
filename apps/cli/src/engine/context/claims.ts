@@ -51,35 +51,44 @@ export function publishClaim(store: WorkStore, repoRoot: string, repoPath: strin
       return reject(store, repoPath, claim, e instanceof Error ? e.message : String(e), true);
     }
     if (!result.ok) return reject(store, repoPath, claim, result.reason, result.unconfirmed === true);
-    // `reverifyOnCommit` carries only the rows stored at its `prev` commit. A claim stored at a commit that the published
-    // claims have already moved past (or on another line of history) would never be carried again, and would stay
-    // `verified` while its cited files change. So a publication is accepted only at a commit that every published
-    // claim of this repository is an ancestor of (or equal to). Once no claim is published, any commit is accepted.
-    const carriedAt = new Set(store.listClaims(repoPath, { statuses: PUBLISHED_CLAIM_STATUSES }).map((s) => s.commit));
-    carriedAt.delete(commit);
-    for (const other of carriedAt) {
-      let descends: boolean;
+    // `reverifyOnCommit` carries only the rows stored at its `prev` commit. A claim left behind by a newer publication
+    // (or stored at a commit the transitions have already passed) would never be checked again, and would stay
+    // `verified` while its cited files change. So a publication is accepted only on the repository's claim frontier:
+    //   - every OTHER published claim must already be at this commit (carry them first with `reverifyOnCommit`);
+    //   - and the commit must not be behind the frontier, which survives the withdrawal of the last claim.
+    const refuse = (reason: string, unconfirmed = false): PublishOutcome => ({ published: false, reason, unconfirmed, recorded: false });
+    const compare = (a: string, b: string): { ok: true; descends: boolean } | { ok: false; outcome: PublishOutcome } => {
       try {
-        descends = isAncestor(repoRoot, other, commit);
+        return { ok: true, descends: isAncestor(repoRoot, a, b) };
       } catch (e) {
         // A failed git check does not show that the commits are unrelated: nothing is stored, and the call can be retried.
-        return {
-          published: false,
-          reason: `could not compare commit ${commit} with commit ${other}, where claims are already published; try again (${e instanceof Error ? e.message : String(e)})`,
-          unconfirmed: true,
-          recorded: false,
-        };
+        return { ok: false, outcome: refuse(`could not compare commit ${a} with commit ${b}; try again (${e instanceof Error ? e.message : String(e)})`, true) };
       }
-      if (!descends) {
-        return {
-          published: false,
-          reason: `claims are already published at commit ${other}, which commit ${commit} does not descend from; publish at ${other} or a commit after it`,
-          unconfirmed: false,
-          recorded: false,
-        };
-      }
+    };
+    const leftBehind = new Set(
+      store
+        .listClaims(repoPath, { statuses: PUBLISHED_CLAIM_STATUSES })
+        .filter((s) => s.claim.id !== claim.id)
+        .map((s) => s.commit),
+    );
+    leftBehind.delete(commit);
+    for (const other of leftBehind) {
+      const c = compare(other, commit);
+      if (!c.ok) return c.outcome;
+      return refuse(
+        c.descends
+          ? `claims are published at commit ${other}, which is behind commit ${commit}; carry them to it with reverifyOnCommit first, so a later change to their files is still seen`
+          : `claims are published at commit ${other}, which commit ${commit} does not descend from; publish at ${other} or a commit after it`,
+      );
+    }
+    const frontier = store.getClaimFrontier(repoPath);
+    if (frontier && frontier !== commit) {
+      const c = compare(frontier, commit);
+      if (!c.ok) return c.outcome;
+      if (!c.descends) return refuse(`this repository's claims have already been carried to commit ${frontier}, which commit ${commit} does not descend from; publish at ${frontier} or a commit after it`);
     }
     store.saveClaim({ repoPath, claim, status: 'verified', reason: clip(result.reason) });
+    store.setClaimFrontier(repoPath, commit);
     // Read in the same transaction that wrote it, so the result is what this call stored.
     return { published: true, claim: store.getClaim(repoPath, claim.id)! };
   });
@@ -176,6 +185,9 @@ export function reverifyOnCommit(store: WorkStore, repoRoot: string, repoPath: s
       result.kept.push(claim.id);
     }
     result.sections = [...sections].sort();
+    // The frontier moves forward only, and also when the transition withdrew the last published claim.
+    const frontier = store.getClaimFrontier(repoPath);
+    if (!frontier || isAncestor(repoRoot, frontier, next)) store.setClaimFrontier(repoPath, next);
   });
   return result;
 }

@@ -53,6 +53,22 @@ function significantDigits(token: string): number {
 /** Below this a double is subnormal: it holds fewer digits than a normal one, and a nonzero literal can round to 0. */
 const MIN_NORMAL = 2.2250738585072014e-308;
 
+/**
+ * Whether the double `n` is exactly what the token `token` states. Decided from the TEXT as well as the rounded value:
+ * `1.0000000000000001e0` rounds to the integer 1, but states more digits than a double holds.
+ *   - zero: exact only if the token has no nonzero digit (`1e-400` underflows to 0);
+ *   - an integer value beyond 2^53 (`1e23`, `12345678901234567890`) is a rounding of the decimal;
+ *   - a token written as plain digits is exact only as a safe integer;
+ *   - otherwise up to 15 significant digits in the normal range round-trip.
+ */
+function numberIsExact(token: string, n: number): boolean {
+  const digits = significantDigits(token);
+  if (n === 0) return digits === 0;
+  if (Number.isInteger(n) && Math.abs(n) > Number.MAX_SAFE_INTEGER) return false;
+  if (/^-?\d+$/.test(token)) return Number.isSafeInteger(n);
+  return digits <= 15 && Math.abs(n) >= MIN_NORMAL;
+}
+
 export function parseJsonc(input: string, opts: JsoncOptions = {}): Jsonc {
   const text = input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
   // LF, CRLF and bare CR all end a line; CRLF counts once.
@@ -192,7 +208,7 @@ export function parseJsonc(input: string, opts: JsoncOptions = {}): Jsonc {
     // 1e400 parses to Infinity, which is not a JSON value a manifest can meaningfully state: refuse it
     if (typeof n === 'number' && !Number.isFinite(n)) return fail('Number out of range', 'number');
     // A double holds any decimal of up to 15 significant digits, and any safe integer, exactly. Anything else may be rounded.
-    if (opts.exactNumbers && typeof n === 'number' && !(/^-?\d+$/.test(m[0]) || (Number.isInteger(n) && n !== 0 && /[eE]/.test(m[0])) ? Number.isSafeInteger(n) : significantDigits(m[0]) <= 15 && (n === 0 ? significantDigits(m[0]) === 0 : Math.abs(n) >= MIN_NORMAL))) return new InexactNumber(m[0]);
+    if (opts.exactNumbers && typeof n === 'number' && !numberIsExact(m[0], n)) return new InexactNumber(m[0]);
     return n;
   };
 

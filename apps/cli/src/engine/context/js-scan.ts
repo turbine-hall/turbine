@@ -139,15 +139,20 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
       unreadableAt.push(lineAt(from));
       return undefined;
     }
-    if (!ts.isStringLiteral(n)) return undefined;
+    // A computed specifier (`import('./' + name)`) is a statement this scanner found but cannot state: record it, do not drop it.
+    if (!ts.isStringLiteral(n)) {
+      unreadableAt.push(lineAt(from));
+      return undefined;
+    }
     if (s.slice(startOf(n) + 1, n.end - 1) === n.text) return n;
     unreadableAt.push(lineAt(from));
     return undefined;
   };
   const addImport = (kind: ImportKind, spec: TS.StringLiteral, from: number, to: number, viaCall = false) =>
     imports.push({ specifier: spec.text, kind, line: lineAt(from), statement: text(from, to), ...(viaCall ? { viaCall: true as const } : {}) });
-  const addExport = (name: string, from: number, to: number) => exports.push({ name, line: lineAt(from), statement: text(from, to) });
-  const addDefault = (from: number, to: number) => defaultExports.push({ name: 'default', line: lineAt(from), statement: text(from, to) });
+  // `statement` is normalised by the caller, once per statement: a clause naming thousands of exports shares one.
+  const addExport = (name: string, line: number, statement: string) => exports.push({ name, line, statement });
+  const addDefault = (line: number, statement: string) => defaultExports.push({ name: 'default', line, statement });
 
   const modifiersOf = (n: TS.Node): readonly TS.Modifier[] => (ts.canHaveModifiers(n) ? (ts.getModifiers(n) ?? []) : []);
 
@@ -201,33 +206,36 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
       const clause = n.exportClause;
       if (!clause) return;
       if (ts.isNamespaceExport(clause)) {
-        addExport(clause.name.text, from, clause.name.end);
+        if (clause.name.text === 'default') addDefault(lineAt(from), text(from, clause.name.end));
+        else addExport(clause.name.text, lineAt(from), text(from, clause.name.end));
         return;
       }
+      const line = lineAt(from);
+      const statement = text(from, clause.end);
       for (const el of clause.elements) {
-        if (el.name.text === 'default') addDefault(from, clause.end);
-        else addExport(el.name.text, from, clause.end);
+        if (el.name.text === 'default') addDefault(line, statement);
+        else addExport(el.name.text, line, statement);
       }
       return;
     }
     if (ts.isExportAssignment(n)) {
-      if (!n.isExportEquals) addDefault(startOf(n), n.end);
+      if (!n.isExportEquals) addDefault(lineAt(startOf(n)), text(startOf(n), n.end));
       return;
     }
     const exportKeyword = modifiersOf(n).find((m) => m.kind === ts.SyntaxKind.ExportKeyword);
     const defaultKeyword = modifiersOf(n).find((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
     if (exportKeyword && defaultKeyword) {
-      addDefault(startOf(exportKeyword), defaultKeyword.end);
+      addDefault(lineAt(startOf(exportKeyword)), text(startOf(exportKeyword), defaultKeyword.end));
       return;
     }
     if (!exportKeyword) return;
     const from = startOf(exportKeyword);
     if (ts.isVariableStatement(n)) {
-      for (const d of n.declarationList.declarations) if (ts.isIdentifier(d.name)) addExport(d.name.text, from, d.name.end);
+      for (const d of n.declarationList.declarations) if (ts.isIdentifier(d.name)) addExport(d.name.text, lineAt(from), text(from, d.name.end));
     } else if (ts.isFunctionDeclaration(n) || ts.isClassDeclaration(n) || ts.isEnumDeclaration(n) || ts.isInterfaceDeclaration(n) || ts.isTypeAliasDeclaration(n)) {
-      if (n.name) addExport(n.name.text, from, n.name.end);
+      if (n.name) addExport(n.name.text, lineAt(from), text(from, n.name.end));
     } else if (ts.isModuleDeclaration(n) && ts.isIdentifier(n.name)) {
-      addExport(n.name.text, from, n.name.end);
+      addExport(n.name.text, lineAt(from), text(from, n.name.end));
     }
   };
 
