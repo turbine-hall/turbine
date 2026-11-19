@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { writeAtomic } from './context/render.js';
 
 /**
  * Task packet layout (Phase 3 document standard):
@@ -70,6 +71,12 @@ export function ensurePacketDir(projectRoot: string, workId: string): PacketPath
 export function writeFile(path: string, content: string): void {
   mkdirSync(join(path, '..'), { recursive: true });
   writeFileSync(path, content.replace(/\n+$/, '') + '\n', 'utf8');
+}
+
+/** Like `writeFile`, but a failure part-way leaves the previous file untouched (temp file, then rename). */
+export function writeFileAtomic(path: string, content: string): void {
+  mkdirSync(join(path, '..'), { recursive: true });
+  writeAtomic(path, content.replace(/\n+$/, '') + '\n');
 }
 
 export function readPacketFile(path: string): string | null {

@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { contentHashText, shortSnapshotId, type ImportEdge, type Reason, type RelevantFile, type TaskContext } from '@turbine-hall/turbine-contracts';
 import type { LintIssue } from '../docs/lint.js';
@@ -18,6 +18,37 @@ import { TEST_NAMING_RULE, TEST_PATH_RULE } from './relevance.js';
  * every render. Its content hash is in the begin marker, so a hand edit is found by `turbine lint` and
  * overwritten by the next render. Text is rendered FROM the structured reasons, never stored.
  */
+
+/** CONTEXT.md is generated text plus the agent's notes; a larger file (a pasted log) is not read into memory. */
+export const MAX_CONTEXT_FILE_BYTES = 1024 * 1024;
+
+/**
+ * The text of a CONTEXT.md: a regular file of at most `MAX_CONTEXT_FILE_BYTES`. Anything else throws with the reason
+ * (a symlink or directory, too large, unreadable); a missing file throws ENOENT. The file is opened without following
+ * a link and read at most one byte past the limit, so a file that grows after it was checked is still caught.
+ */
+export function readContextFile(file: string): string {
+  const fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new Error('is not a regular file (a symlink or directory)');
+    if (st.size > MAX_CONTEXT_FILE_BYTES) throw new Error(`is ${st.size} bytes, over the ${MAX_CONTEXT_FILE_BYTES} byte limit for a task context file`);
+    const buf = Buffer.alloc(MAX_CONTEXT_FILE_BYTES + 1);
+    let n = 0;
+    while (n < buf.length) {
+      const r = readSync(fd, buf, n, buf.length - n, null);
+      if (r === 0) break;
+      n += r;
+    }
+    if (n > MAX_CONTEXT_FILE_BYTES) throw new Error(`grew past the ${MAX_CONTEXT_FILE_BYTES} byte limit for a task context file while it was read`);
+    return buf.subarray(0, n).toString('utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ELOOP') throw new Error('is not a regular file (a symlink or directory)');
+    throw e;
+  } finally {
+    closeSync(fd);
+  }
+}
 
 export type Staleness = 'base-commit-changed' | 'snapshot-changed' | 'changes-requested' | 'budget-changed' | 'request-changed' | 'method-changed';
 
@@ -130,14 +161,16 @@ export function renderContextBody(sel: TaskContext, o: BodyOptions): string {
     `  4. a test of a file of 1 or 2: it imports it 25, or the naming rule matches 20 (${TEST_PATH_RULE}; naming rule: ${TEST_NAMING_RULE});`,
     '  5. ownership: the package.json of the package that owns a file of 1 or 2: 10; a file in the same package as one of them: 5; CODEOWNERS is shown and adds nothing;',
     '  6. rare words of the request in the path (weakest, at most 4 points).',
-    '- An import is a statement read from a file at the commit, found by a tokenizer that skips comments, strings and regular expressions. Relative paths and workspace package names are resolved; `tsconfig` path aliases, sub-path imports of workspace packages and run-time imports are not.',
+    '- An import is a statement read from a file at the commit, found by parsing the file with the TypeScript parser (comments, strings, regular expressions and JSX text are never read as code; a file with a syntax error states nothing). Relative paths and workspace package names are resolved; `tsconfig` path aliases, sub-path imports of workspace packages and run-time imports are not.',
   );
   const l = sel.limits;
   out.push(
     `- Read: ${l.sourceFilesScanned} of ${l.sourceFiles} source files` +
       `${l.notScannedTooLarge ? `; ${l.notScannedTooLarge} over the size limit for one file` : ''}` +
       `${l.notScannedOverCap ? `; ${l.notScannedOverCap} beyond the scan cap` : ''}` +
-      `${l.unreadableTotal ? `; ${l.unreadableTotal} could not be tokenised, so no import or export is stated for them${l.unreadable.length ? ` (${l.unreadable.slice(0, 5).map(code).join(', ')}${l.unreadableTotal > 5 ? ', …' : ''})` : ''}` : ''}.` +
+      `${l.metadataNotRead ? `; ${l.metadataNotRead} manifest, tsconfig or CODEOWNERS file(s) not read (size limit)` : ''}` +
+      `${l.statementsUnconfirmed ? `; ${l.statementsUnconfirmed} require() call(s) not stated because \`require\` is bound in the file` : ''}` +
+      `${l.unreadableTotal ? `; ${l.unreadableTotal} could not be parsed, so no import or export is stated for them${l.unreadable.length ? ` (${l.unreadable.slice(0, 5).map(code).join(', ')}${l.unreadableTotal > 5 ? ', …' : ''})` : ''}` : ''}.` +
       ` ${l.unresolvedRelative} relative and ${l.unresolvedPackage} workspace-package imports could not be resolved to a tracked file.`,
     `- ${l.seeds} file(s) were named by the request or export a symbol it mentions; hops and tests were taken from the best ${l.seedsUsedForHops}.${l.hopsTruncated ? ` ${l.hopsTruncated} hop file(s) beyond the per-file limit are not considered.` : ''}${l.testsTruncated ? ` ${l.testsTruncated} test(s) beyond the per-file limit are not considered.` : ''}`,
     l.codeowners
@@ -296,7 +329,14 @@ export function lintTaskContexts(projectRoot: string): LintIssue[] {
       issues.push({ level: 'error', file: name, message: 'is not a regular file (a symlink or directory)' });
       continue;
     }
-    issues.push(...lintContextFile(readFileSync(file, 'utf8'), name));
+    let raw: string;
+    try {
+      raw = readContextFile(file);
+    } catch (e) {
+      issues.push({ level: 'error', file: name, message: `cannot be read: ${(e as Error).message}` });
+      continue;
+    }
+    issues.push(...lintContextFile(raw, name));
   }
   return issues;
 }

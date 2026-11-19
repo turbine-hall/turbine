@@ -52,7 +52,7 @@ import { inspectRepo } from '@turbine-hall/turbine-adapter-git';
 import { hasUncommittedChanges, observeBranch } from './context/git-read.js';
 import { repoHead } from './context/understand.js';
 import { refreshTaskContext, requestHash, stalenessOf, type RefreshResult } from './context/task-context.js';
-import { parseContextFile, renderContextBody, renderContextFile, renderUnavailableFile, type Staleness } from './context/task-render.js';
+import { parseContextFile, readContextFile, renderContextBody, renderContextFile, renderUnavailableFile, type Staleness } from './context/task-render.js';
 import { analyze, type AnalysisFinding } from './docs/analyze.js';
 import { lintPacket, type LintIssue } from './docs/lint.js';
 import {
@@ -106,6 +106,7 @@ import {
   parseSpecMarkdown,
   readPacketFile,
   writeFile,
+  writeFileAtomic,
 } from './packet.js';
 
 function now(): string {
@@ -548,12 +549,14 @@ export class Engine {
   /** Writes CONTEXT.md (generated part from the store, agent notes kept) and evidence/context.json. */
   private writeTaskContext(work: WorkPackage, view: { selection?: TaskContext; stale?: Staleness[]; unavailable?: string }): void {
     const paths = packetPaths(this.ctx.projectRoot, work.id);
+    // The agent notes live only in CONTEXT.md. A missing file starts with empty notes; a file that cannot be read
+    // (unreadable, too large, a link) stops here with the document left as it is, never replaced by empty notes.
     let notes = '';
-    if (existsSync(paths.context)) {
-      try {
-        notes = parseContextFile(readFileSync(paths.context, 'utf8')).notes;
-      } catch {
-        notes = '';
+    try {
+      notes = parseContextFile(readContextFile(paths.context)).notes;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw err('E_CONTEXT_UNAVAILABLE', `CONTEXT.md of ${work.id} cannot be read (${(e as Error).message}), so it is left as it is and its agent notes are not replaced. Fix or move the file, then retry.`, { file: paths.context });
       }
     }
     if (view.selection) {
@@ -564,15 +567,15 @@ export class Engine {
         stale,
         projectLink: existsSync(paths.projectContext) ? relative(paths.dir, paths.projectContext) : undefined,
       });
-      writeFile(paths.context, renderContextFile(view.selection, body, notes));
-      writeFile(
+      writeFileAtomic(paths.context, renderContextFile(view.selection, body, notes));
+      writeFileAtomic(
         join(paths.evidenceDir, 'context.json'),
         `${JSON.stringify({ current: stale.length === 0, stale, selection: view.selection }, null, 2)}\n`,
       );
       return;
     }
-    writeFile(paths.context, renderUnavailableFile(work.title, work.id, view.unavailable ?? 'no selection has been built', notes));
-    writeFile(
+    writeFileAtomic(paths.context, renderUnavailableFile(work.title, work.id, view.unavailable ?? 'no selection has been built', notes));
+    writeFileAtomic(
       join(paths.evidenceDir, 'context.json'),
       `${JSON.stringify({ current: false, unavailable: view.unavailable ?? 'no selection has been built' }, null, 2)}\n`,
     );

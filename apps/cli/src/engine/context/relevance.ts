@@ -20,8 +20,11 @@ import { pathWordMatches } from './path-words.js';
  * re-derive from the blobs at the commit. A file with no reason is not listed.
  */
 
-/** Bump when the ranking rules change: stored selections of another version are rebuilt. */
-export const METHOD_VERSION = 1;
+/**
+ * Bump when the ranking rules change: stored selections of another version are rebuilt.
+ * 2: imports are read with the TypeScript parser; `exports` follows Node's selection; build output needs tsconfig proof.
+ */
+export const METHOD_VERSION = 2;
 
 const NAMED_EXACT = 100;
 const NAMED_SUFFIX = 90;
@@ -53,7 +56,7 @@ export type RankInput = {
   text: (path: string) => string | undefined;
   workspaces: WorkspacePackage[];
   /** How many source files were not read, and why. */
-  notScanned: { tooLarge: number; overCap: number };
+  notScanned: { tooLarge: number; overCap: number; metadataSkipped?: number };
 };
 
 const round1 = (n: number) => Math.round(n * 10) / 10;
@@ -203,6 +206,8 @@ function emptyLimits(input: RankInput, graph: Graph): SelectionLimits {
     notScannedOverCap: input.notScanned.overCap,
     unreadable: graph.unreadable.slice(0, 50),
     unreadableTotal: graph.unreadable.length,
+    metadataNotRead: input.notScanned.metadataSkipped ?? 0,
+    statementsUnconfirmed: graph.unconfirmed,
     unresolvedRelative: graph.unresolvedRelative,
     unresolvedPackage: graph.unresolvedPackage,
     seeds: 0,
@@ -471,7 +476,7 @@ export function verifyRelevantFiles(selected: RelevantFile[], input: VerifyInput
     const t = input.text(e.from);
     if (t === undefined) return (problems.push(`${where}: ${e.from} was not read`), false);
     const scan = scanModule(t, { jsx: jsxFile(e.from) });
-    if (!scan.ok) return (problems.push(`${where}: ${e.from} cannot be tokenised (${scan.reason})`), false);
+    if (!scan.ok) return (problems.push(`${where}: ${e.from} cannot be parsed (${scan.reason})`), false);
     const found = scan.imports.find((i) => i.line === e.line && i.specifier === e.specifier && i.kind === e.kind && i.statement === e.statement);
     if (!found) return (problems.push(`${where}: no such statement at ${e.from}:${e.line}`), false);
     const r = resolver.resolve(e.from, e.specifier, modeOf(e.kind));

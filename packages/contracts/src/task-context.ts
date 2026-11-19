@@ -155,9 +155,13 @@ export const SelectionLimitsSchema = z
     sourceFilesScanned: z.number().int().min(0),
     notScannedTooLarge: z.number().int().min(0),
     notScannedOverCap: z.number().int().min(0),
-    /** Source files whose text could not be tokenised exactly: no import or export is stated for them. */
+    /** Source files that could not be parsed exactly (a syntax error, or nested too deeply): no import or export is stated for them. */
     unreadable: z.array(z.string()).max(50),
     unreadableTotal: z.number().int().min(0),
+    /** Manifests, tsconfig files and CODEOWNERS that were not read (over the size limit or the metadata budget). */
+    metadataNotRead: z.number().int().min(0).default(0),
+    /** `require()` calls found but not stated, because `require` is bound in the file and may not be the loader. */
+    statementsUnconfirmed: z.number().int().min(0).default(0),
     unresolvedRelative: z.number().int().min(0),
     unresolvedPackage: z.number().int().min(0),
     seeds: z.number().int().min(0),

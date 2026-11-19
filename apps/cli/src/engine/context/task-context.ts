@@ -27,6 +27,9 @@ import { renderFileEntry, type Staleness } from './task-render.js';
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_SCAN_FILES = 4000;
 const MAX_SCAN_BYTES = 96 * 1024 * 1024;
+/** Manifests, tsconfig files and CODEOWNERS share one budget of their own, so many workspaces cannot exhaust memory. */
+const MAX_METADATA_BYTES = 16 * 1024 * 1024;
+const TSCONFIG_NAME = /^tsconfig(?:\.[^/]*)?\.json$/;
 const NODE_MODULES = /(^|\/)node_modules\//;
 const CODEOWNERS_PATHS = new Set(['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS']);
 
@@ -85,9 +88,9 @@ export function readTaskFiles(
   repoRoot: string,
   entries: TreeEntry[],
   workspaces: WorkspacePackage[],
-): { files: Array<{ path: string; size: number }>; text: (path: string) => string | undefined; notScanned: { tooLarge: number; overCap: number } } {
+): { files: Array<{ path: string; size: number }>; text: (path: string) => string | undefined; notScanned: { tooLarge: number; overCap: number; metadataSkipped: number } } {
   const regular = entries.filter((e) => e.type === 'blob' && e.mode !== '120000' && !NODE_MODULES.test(e.path));
-  const notScanned = { tooLarge: 0, overCap: 0 };
+  const notScanned = { tooLarge: 0, overCap: 0, metadataSkipped: 0 };
   const toRead: TreeEntry[] = [];
   let bytes = 0;
   for (const e of regular.filter((x) => SOURCE_EXT.test(x.path))) {
@@ -98,13 +101,28 @@ export function readTaskFiles(
       bytes += e.size;
     }
   }
-  const wanted = new Set<string>(CODEOWNERS_PATHS);
-  for (const w of workspaces) {
-    const prefix = w.dir === '.' ? '' : `${w.dir}/`;
-    wanted.add(`${prefix}package.json`);
-    wanted.add(`${prefix}tsconfig.json`);
+  // Metadata: each workspace's package.json and tsconfig files (a config can extend a sibling such as
+  // tsconfig.base.json), and CODEOWNERS. One budget covers all of it; what it leaves out is counted, not dropped.
+  const dirs = new Set(workspaces.map((w) => w.dir));
+  const isMetadata = (path: string): boolean => {
+    if (CODEOWNERS_PATHS.has(path)) return true;
+    const slash = path.lastIndexOf('/');
+    const name = path.slice(slash + 1);
+    if (!dirs.has(slash < 0 ? '.' : path.slice(0, slash))) return false;
+    return name === 'package.json' || TSCONFIG_NAME.test(name);
+  };
+  const queued = new Set(toRead.map((e) => e.path));
+  let metadataBytes = 0;
+  for (const e of regular) {
+    if (!isMetadata(e.path) || queued.has(e.path)) continue;
+    if (e.size > MAX_FILE_BYTES || metadataBytes + e.size > MAX_METADATA_BYTES) {
+      notScanned.metadataSkipped++;
+      continue;
+    }
+    metadataBytes += e.size;
+    toRead.push(e);
+    queued.add(e.path);
   }
-  for (const e of regular) if (wanted.has(e.path) && e.size <= MAX_FILE_BYTES && !toRead.includes(e)) toRead.push(e);
 
   const blobs = readBlobs(repoRoot, toRead.map((e) => e.id), toRead.reduce((n, e) => n + e.size, 0));
   const texts = new Map<string, string>();

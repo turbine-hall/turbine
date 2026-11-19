@@ -5,7 +5,7 @@
  * uncommitted file, a reason edited to say something false, a hand-edited generated block, a moved base
  * commit and a CHANGES_REQUESTED re-entry.
  */
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -28,8 +28,11 @@ import { computeNextStep } from '../../apps/cli/src/engine/next-step.js';
 import { scanModule } from '../../apps/cli/src/engine/context/js-scan.js';
 import { applyBudget, rankFiles, verifyRelevantFiles, type VerifyInput } from '../../apps/cli/src/engine/context/relevance.js';
 import { makeResolver, modeOf, type WorkspacePackage } from '../../apps/cli/src/engine/context/import-graph.js';
-import { buildTaskContext } from '../../apps/cli/src/engine/context/task-context.js';
+import { buildTaskContext, readTaskFiles } from '../../apps/cli/src/engine/context/task-context.js';
+import { listTreeDetailed } from '../../apps/cli/src/engine/context/git-read.js';
+import { lintPacket } from '../../apps/cli/src/engine/docs/lint.js';
 import {
+  MAX_CONTEXT_FILE_BYTES,
   NOTES_LABEL,
   lintContextFile,
   lintTaskContexts,
@@ -1273,8 +1276,11 @@ describe('review round 2 (PR #11): exports targets, JSX text, and the fallback r
       expect(imports("export const v = <div>{require('./real')}</div>;")).toEqual(['require:./real']);
     });
 
-    it('a `<` operator before a `/` is not a closing tag: the regular expression after it is read as one', () => {
-      expect(imports("import a from './a';\nexport const X = ({ x }: { x: string }) => <div>{x</div>/.source}</div>;\nimport b from './b';")).toEqual(['import:./a', 'import:./b']);
+    it('`x</div>/.source` in a .tsx file is a syntax error to TypeScript itself: the file states nothing, never a partial answer', () => {
+      const src = "import a from './a';\nexport const X = ({ x }: { x: string }) => <div>{x</div>/.source}</div>;\nimport b from './b';\n";
+      expect(scanModule(src, { jsx: true }).ok).toBe(false);
+      // written with a space, `<` is the operator and `/div>/` is a regular expression: both imports are found
+      expect(imports(src.replace('{x</div>/.source}', '{x < /div>/.source}'))).toEqual(['import:./a', 'import:./b']);
     });
 
     it('quotes and braces inside attribute values do not end the tag', () => {
@@ -1288,6 +1294,347 @@ describe('review round 2 (PR #11): exports targets, JSX text, and the fallback r
     it('a JSX shape that cannot be read exactly states nothing for the file', () => {
       expect(scanModule("export const v = <div>unterminated", { jsx: true }).ok).toBe(false);
       expect(scanModule("export const v = <div a=\"x></div>", { jsx: true }).ok).toBe(false);
+    });
+  });
+});
+
+// =================================================================== review round 3 (PR #11): local CodeRabbit scan
+
+describe('review round 3 (PR #11): the parser, Node exports rules, build-output proof, budgets and CONTEXT.md safety', () => {
+  const parsed = (src: string, jsx = true) => {
+    const r = scanModule(src, { jsx });
+    if (!r.ok) throw new Error(r.reason);
+    return r;
+  };
+  const specs = (src: string, jsx = true) => parsed(src, jsx).imports.map((i) => `${i.kind}:${i.specifier}`);
+
+  describe('the scanner is the TypeScript parser', () => {
+    it('a slash after an `if (...)` header starts a regular expression, not a division', () => {
+      const src = 'if (enabled) /require("pkg")/.test(value);\nimport b from \'./b\';\n';
+      expect(specs(src)).toEqual(['import:./b']);
+      expect(specs('const half = n / 2;\nconst r = (n) / 2;\nimport b from \'./b\';\n')).toEqual(['import:./b']);
+      expect(specs('while (more) /import x/.test(s);\nfor (;;) /require("q")/.exec(s);\nimport b from \'./b\';\n')).toEqual(['import:./b']);
+    });
+
+    it('a `require` that is bound in the file is not stated as the loader; the calls are counted, not dropped', () => {
+      const shadowed = parsed('function load(require) { return require("./helper.js"); }\nimport b from \'./b\';\n');
+      expect(shadowed.imports.map((i) => i.specifier)).toEqual(['./b']);
+      expect(shadowed.unconfirmed).toBe(1);
+      for (const src of ['const require = makeLoader();\nrequire("./x");', 'const { require } = ctx;\nrequire("./x");', 'import { require } from "mod";\nrequire("./x");', 'function require(p) { return p; }\nrequire("./x");']) {
+        const r = parsed(src);
+        expect(r.imports.filter((i) => i.kind === 'require'), src).toEqual([]);
+        expect(r.unconfirmed, src).toBe(1);
+      }
+    });
+
+    it('an ambient `declare const require` names the loader: calls are stated', () => {
+      const r = parsed('declare const require: (id: string) => unknown;\nconst x = require("./real");\n', false);
+      expect(r.imports.map((i) => i.specifier)).toEqual(['./real']);
+      expect(r.unconfirmed).toBe(0);
+    });
+
+    it('a property named require, and a call with a computed argument, are not imports', () => {
+      expect(parsed('loader.require("./a");\nrequire(name);\nrequire(`./t`);\n').imports).toEqual([]);
+    });
+
+    it('TSX generic arrows and component type arguments parse', () => {
+      const src = [
+        "import a from './a';",
+        'export const id = <T,>(x: T) => x;',
+        'export const bound = <T extends object>(x: T) => x;',
+        'export const view = () => <List<string> items={[]} />;',
+        "import b from './b';",
+      ].join('\n');
+      expect(specs(src)).toEqual(['import:./a', 'import:./b']);
+    });
+
+    it('mismatched JSX closing tags are a syntax error: nothing is stated', () => {
+      expect(scanModule("import a from './a';\nexport const v = <div>text</span>;\n").ok).toBe(false);
+    });
+
+    it('an unterminated string, comment or template, or any syntax error, states nothing', () => {
+      for (const src of ["import a from './a';\nconst s = 'x\n", "import a from './a';\n/* never closed", 'const t = `never closed', "import a from './a';\nconst = ;\n"]) {
+        expect(scanModule(src).ok, src).toBe(false);
+      }
+    });
+
+    it('a file nested too deeply to parse is a per-file failure: it does not throw', () => {
+      const parens = `${'('.repeat(60000)}1${')'.repeat(60000)};`;
+      const jsx = `${'<div>'.repeat(30000)}${'</div>'.repeat(30000)};`;
+      const arrays = `${'['.repeat(60000)}${']'.repeat(60000)};`;
+      for (const [name, src] of [['parens', parens], ['jsx', jsx], ['arrays', arrays]] as const) {
+        const r = scanModule(src);
+        expect(r.ok, name).toBe(false);
+      }
+      // and a ranking over such a file still completes, stating the file as unreadable
+      const out = rankFiles({
+        request: 'Change src/deep.ts',
+        files: [{ path: 'src/deep.ts', size: parens.length }, { path: 'src/ok.ts', size: 10 }],
+        text: (p) => (p === 'src/deep.ts' ? parens : 'export const ok = 1;\n'),
+        workspaces: [],
+        notScanned: { tooLarge: 0, overCap: 0 },
+      });
+      expect(out.limits.unreadable).toEqual(['src/deep.ts']);
+    });
+
+    it('reads every declarator of an exported const and an `export * as` name', () => {
+      const r = parsed("export const a = 1, b = 2;\nexport * as ns from './x';\nexport type { T } from './t';\n");
+      expect(r.exports.map((e) => e.name)).toEqual(['a', 'b', 'ns', 'T']);
+      expect(r.imports.map((i) => `${i.kind}:${i.specifier}`)).toEqual(['re-export:./x', 're-export:./t']);
+    });
+
+    it('imports and exports inside `declare module` are not top-level statements', () => {
+      const r = parsed("declare module 'x' {\n  import y from './inner';\n  export const z: number;\n}\nexport const real = 1;\n", false);
+      expect(r.imports).toEqual([]);
+      expect(r.exports.map((e) => e.name)).toEqual(['real']);
+    });
+  });
+
+  describe('exports follow Node (each case was checked against Node itself)', () => {
+    const manifest = (name: string, extra: Record<string, unknown>) => json({ name, version: '1.0.0', ...extra });
+    const one = (name: string, pj: Record<string, unknown>, files: string[]) => {
+      const dir = `packages/${name}`;
+      return makeResolver(new Set([...files.map((f) => `${dir}/${f}`), 'src/a.ts']), (p) => (p === `${dir}/package.json` ? manifest(`@w/${name}`, pj) : undefined), [{ dir, name: `@w/${name}` }]);
+    };
+    const at = (r: ReturnType<typeof makeResolver>, name: string, mode: 'import' | 'require') => r.resolve('src/a.ts', `@w/${name}`, mode);
+
+    it('a null entry in an array is passed over: the next entry is used; all null, or an empty array, blocks', () => {
+      const r = one('nullfirst', { exports: { '.': [null, './b.js'] } }, ['b.js']);
+      expect(at(r, 'nullfirst', 'import')).toMatchObject({ to: 'packages/nullfirst/b.js' });
+      expect(at(r, 'nullfirst', 'require')).toMatchObject({ to: 'packages/nullfirst/b.js' });
+      expect(at(one('allnull', { exports: { '.': [null] } }, ['b.js']), 'allnull', 'import')).toEqual({ unresolved: 'package' });
+      expect(at(one('emptyarr', { exports: [] }, ['b.js']), 'emptyarr', 'import')).toEqual({ unresolved: 'package' });
+    });
+
+    it('the node-addons condition applies', () => {
+      const r = one('addons', { exports: { 'node-addons': './addon.js', default: './d.js' } }, ['addon.js', 'd.js']);
+      expect(at(r, 'addons', 'import')).toMatchObject({ to: 'packages/addons/addon.js' });
+      expect(at(r, 'addons', 'require')).toMatchObject({ to: 'packages/addons/addon.js' });
+    });
+
+    it('module-sync depends on the Node version, so reaching it claims nothing', () => {
+      const r = one('modsync', { exports: { 'module-sync': './ms.js', default: './d.js' } }, ['ms.js', 'd.js']);
+      expect(at(r, 'modsync', 'import')).toEqual({ unresolved: 'package' });
+      expect(at(r, 'modsync', 'require')).toEqual({ unresolved: 'package' });
+      // after `default` it is never reached
+      const after = one('modsync2', { exports: { default: './d.js', 'module-sync': './ms.js' } }, ['ms.js', 'd.js']);
+      expect(at(after, 'modsync2', 'import')).toMatchObject({ to: 'packages/modsync2/d.js' });
+    });
+
+    it('"exports": null means no exports: the legacy main is used', () => {
+      const r = one('nullexp', { exports: null, main: 'm.js' }, ['m.js']);
+      expect(at(r, 'nullexp', 'import')).toMatchObject({ to: 'packages/nullexp/m.js' });
+      expect(at(r, 'nullexp', 'require')).toMatchObject({ to: 'packages/nullexp/m.js' });
+    });
+
+    it('a map that mixes sub-paths and conditions is invalid', () => {
+      const r = one('mixed', { exports: { '.': './a.js', import: './b.js' } }, ['a.js', 'b.js']);
+      expect(at(r, 'mixed', 'import')).toEqual({ unresolved: 'package' });
+      expect(at(r, 'mixed', 'require')).toEqual({ unresolved: 'package' });
+    });
+
+    it('without exports, main decides for both modes: `module` is a bundler field, not what Node loads', () => {
+      const r = one('legacy', { main: './server.cjs', module: './browser.mjs', types: './t.d.ts' }, ['server.cjs', 'browser.mjs', 't.d.ts']);
+      expect(at(r, 'legacy', 'require')).toMatchObject({ to: 'packages/legacy/server.cjs' });
+      expect(at(r, 'legacy', 'import')).toMatchObject({ to: 'packages/legacy/server.cjs' });
+      // only `module` or `types`, no main: Node falls back to index.js, which is absent here
+      expect(at(one('onlymodule', { module: './browser.mjs' }, ['browser.mjs']), 'onlymodule', 'import')).toEqual({ unresolved: 'package' });
+      expect(at(one('index', { module: './browser.mjs' }, ['index.js', 'browser.mjs']), 'index', 'require')).toMatchObject({ to: 'packages/index/index.js' });
+    });
+
+    it('a target is resolved as a file URL: escapes are decoded, and escaped separators, dot segments and queries are refused', () => {
+      const files = ['a b.js', 'a/b.js', 'x.js', 'q.js'];
+      expect(at(one('pct20', { exports: './a%20b.js' }, files), 'pct20', 'import')).toMatchObject({ to: 'packages/pct20/a b.js' });
+      expect(at(one('rawspace', { exports: './a b.js' }, files), 'rawspace', 'import')).toMatchObject({ to: 'packages/rawspace/a b.js' });
+      expect(at(one('dblslash', { exports: './a//b.js' }, files), 'dblslash', 'import')).toMatchObject({ to: 'packages/dblslash/a/b.js' });
+      for (const [name, target] of [['pct2f', './a%2fb.js'], ['dotdot', './lib/../x.js'], ['pctdots', './%2e%2e/x.js'], ['pctnm', './%6eode_modules/x.js'], ['query', './q.js?x=1'], ['dir', './a/'], ['star', './*.js']] as const) {
+        expect(at(one(name, { exports: target }, files), name, 'import'), target).toEqual({ unresolved: 'package' });
+      }
+    });
+  });
+
+  describe('a build-output entry maps to a source only when the config proves it emits it', () => {
+    const entryOf = (tsconfigs: Record<string, unknown>, extraFiles: string[], entry = './dist/index.js') => {
+      const manifests: Record<string, string> = { 'packages/p/package.json': json({ name: '@w/p', version: '1.0.0', exports: { '.': { import: entry } } }) };
+      for (const [path, v] of Object.entries(tsconfigs)) manifests[path] = typeof v === 'string' ? v : json(v);
+      const files = ['packages/p/package.json', 'src/a.ts', ...Object.keys(tsconfigs), ...extraFiles];
+      return makeResolver(new Set(files), (p) => manifests[p], [{ dir: 'packages/p', name: '@w/p' }]).resolve('src/a.ts', '@w/p', 'import');
+    };
+    const co = (extra: Record<string, unknown> = {}) => ({ compilerOptions: { outDir: 'dist', rootDir: 'src', ...extra } });
+    const src = ['packages/p/src/index.ts'];
+
+    it('the plain case is confirmed, with the proof in the resolution text', () => {
+      const r = entryOf({ 'packages/p/tsconfig.json': co() }, src);
+      expect(r).toMatchObject({ to: 'packages/p/src/index.ts', resolution: expect.stringContaining('noEmit is not set') });
+      expect(r).toMatchObject({ resolution: expect.stringContaining('has packages/p/src/index.ts as an input') });
+    });
+
+    it('noEmit, in the config or in the one it extends, proves nothing is emitted', () => {
+      expect(entryOf({ 'packages/p/tsconfig.json': co({ noEmit: true }) }, src)).toEqual({ unresolved: 'package' });
+      expect(entryOf({ 'packages/p/tsconfig.json': { extends: '../../tsconfig.base.json', ...co() }, 'tsconfig.base.json': { compilerOptions: { noEmit: true } } }, src)).toEqual({ unresolved: 'package' });
+      // a base that does not set it is read, and the mapping stands
+      expect(entryOf({ 'packages/p/tsconfig.json': { extends: '../../tsconfig.base.json', ...co() }, 'tsconfig.base.json': { compilerOptions: { strict: true } } }, src)).toMatchObject({ to: 'packages/p/src/index.ts' });
+    });
+
+    it('a config that cannot be read exactly leaves the mapping unconfirmed', () => {
+      expect(entryOf({ 'packages/p/tsconfig.json': { extends: '@tsconfig/node20/tsconfig.json', ...co() } }, src)).toEqual({ unresolved: 'package' });
+      expect(entryOf({ 'packages/p/tsconfig.json': { extends: '../../missing.json', ...co() } }, src)).toEqual({ unresolved: 'package' });
+      expect(entryOf({ 'packages/p/tsconfig.json': '{ not json' }, src)).toEqual({ unresolved: 'package' });
+    });
+
+    it('the source must be a compilation input: include, exclude and files are honoured', () => {
+      expect(entryOf({ 'packages/p/tsconfig.json': { ...co(), include: ['src/**/*.ts'] } }, src)).toMatchObject({ to: 'packages/p/src/index.ts' });
+      expect(entryOf({ 'packages/p/tsconfig.json': { ...co(), include: ['src'] } }, src)).toMatchObject({ to: 'packages/p/src/index.ts' });
+      expect(entryOf({ 'packages/p/tsconfig.json': { ...co(), include: ['lib/**/*'] } }, src)).toEqual({ unresolved: 'package' });
+      expect(entryOf({ 'packages/p/tsconfig.json': { ...co(), exclude: ['src/index.ts'] } }, src)).toEqual({ unresolved: 'package' });
+      expect(entryOf({ 'packages/p/tsconfig.json': { ...co(), exclude: ['**/*.ts'] } }, src)).toEqual({ unresolved: 'package' });
+      expect(entryOf({ 'packages/p/tsconfig.json': { ...co(), files: [] } }, src)).toEqual({ unresolved: 'package' });
+      expect(entryOf({ 'packages/p/tsconfig.json': { ...co(), files: ['src/index.ts'] } }, src)).toMatchObject({ to: 'packages/p/src/index.ts' });
+      // a glob this does not model is unconfirmed, not guessed
+      expect(entryOf({ 'packages/p/tsconfig.json': { ...co(), include: ['src/{a,index}.ts'] } }, src)).toEqual({ unresolved: 'package' });
+    });
+
+    it('the output kind must be one the options produce', () => {
+      expect(entryOf({ 'packages/p/tsconfig.json': co({ emitDeclarationOnly: true }) }, src)).toEqual({ unresolved: 'package' });
+      expect(entryOf({ 'packages/p/tsconfig.json': co() }, src, './dist/index.d.ts')).toEqual({ unresolved: 'package' });
+      expect(entryOf({ 'packages/p/tsconfig.json': co({ declaration: true }) }, src, './dist/index.d.ts')).toMatchObject({ to: 'packages/p/src/index.ts' });
+      // a .mjs build needs a .mts source: a .ts file does not emit .mjs
+      expect(entryOf({ 'packages/p/tsconfig.json': co() }, src, './dist/index.mjs')).toEqual({ unresolved: 'package' });
+      expect(entryOf({ 'packages/p/tsconfig.json': co() }, ['packages/p/src/index.mts'], './dist/index.mjs')).toMatchObject({ to: 'packages/p/src/index.mts' });
+    });
+
+    it('an exact tracked target stays confirmed without any config', () => {
+      expect(entryOf({}, ['packages/p/dist/index.js'])).toMatchObject({ to: 'packages/p/dist/index.js', resolution: expect.stringContaining('exact file') });
+    });
+  });
+});
+
+describe('review round 3 (PR #11): metadata budget and CONTEXT.md safety', () => {
+  describe('manifests and tsconfig files share one budget; what it leaves out is counted', () => {
+    const pad = (bytes: number) => `{"name":"x","version":"1.0.0","pad":"${'x'.repeat(bytes)}"}\n`;
+
+    it('files over the size limit, and files beyond the aggregate budget, are counted in the limits and the document', () => {
+      const extra: Record<string, string> = {};
+      const workspaces: WorkspacePackage[] = [{ dir: '.', name: 'leave-app' }];
+      for (let i = 0; i < 20; i++) {
+        extra[`packages/m${i}/package.json`] = pad(1_000_000);
+        workspaces.push({ dir: `packages/m${i}`, name: `@m/m${i}` });
+      }
+      extra['packages/huge/package.json'] = pad(2 * 1024 * 1024);
+      workspaces.push({ dir: 'packages/huge', name: '@m/huge' });
+      const dir = project(extra);
+      const listing = listTreeDetailed(dir, head(dir));
+      const read = readTaskFiles(dir, listing.entries, workspaces);
+
+      const manifests = workspaces.map((w) => (w.dir === '.' ? 'package.json' : `${w.dir}/package.json`));
+      const readCount = manifests.filter((m) => read.text(m) !== undefined).length;
+      const readBytes = manifests.reduce((n, m) => n + Buffer.byteLength(read.text(m) ?? ''), 0);
+      expect(readBytes).toBeLessThanOrEqual(16 * 1024 * 1024);
+      expect(read.text('packages/huge/package.json')).toBeUndefined();
+      // twenty files of about 1 MB do not all fit in 16 MiB, and the 2 MB one is over the per-file limit
+      expect(read.notScanned.metadataSkipped).toBe(manifests.length - readCount);
+      expect(read.notScanned.metadataSkipped).toBeGreaterThanOrEqual(5);
+
+      const ranked = rankFiles({ request: 'Change src/leave/export-csv.ts', files: read.files, text: read.text, workspaces, notScanned: read.notScanned });
+      expect(ranked.limits.metadataNotRead).toBe(read.notScanned.metadataSkipped);
+      const sel = { limits: ranked.limits } as TaskContext;
+      expect(renderContextBody({ ...sel, files: [], omitted: [], omittedTotal: 0, candidates: 0, budget: { maxFiles: 5, maxChars: 1000, source: 'default', roles: [] }, request: { hash: 'sha256:0', chars: 0 }, snapshot: { hash: 'sha256:0', commit: 'c' }, trigger: 'initial', changesCycle: 0, workId: 'w', schemaVersion: 1, methodVersion: 2 } as unknown as TaskContext, { title: 't', workId: 'w', stale: [] })).toContain(`${read.notScanned.metadataSkipped} manifest, tsconfig or CODEOWNERS file(s) not read (size limit)`);
+    });
+
+    it('a tsconfig next to a workspace package.json is read, so an `extends` chain can be proven', () => {
+      const dir = project({ 'packages/shared/tsconfig.json': '{ "extends": "./tsconfig.base.json" }\n', 'packages/shared/tsconfig.base.json': '{ "compilerOptions": {} }\n', 'packages/shared/notes.json': '{}\n' });
+      const read = readTaskFiles(dir, listTreeDetailed(dir, head(dir)).entries, [{ dir: 'packages/shared', name: '@leave/shared' }]);
+      expect(read.text('packages/shared/tsconfig.json')).toBeDefined();
+      expect(read.text('packages/shared/tsconfig.base.json')).toBeDefined();
+      expect(read.text('packages/shared/notes.json')).toBeUndefined();
+      expect(read.notScanned.metadataSkipped).toBe(0);
+    });
+  });
+
+  describe('CONTEXT.md is read within a bound, never replaced by empty notes, and replaced atomically', () => {
+    const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+    const prepared = () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const t = newTask(engine);
+      const work = engine.ctx.store.getWork(t.id);
+      engine.ensureTaskContext(work);
+      const path = packetPaths(dir, t.id).context;
+      return { dir, engine, work, path, id: t.id };
+    };
+    const NOTES = '\nThe real owner is the finance team. Do not touch the legacy exporter.\n';
+
+    it('a CONTEXT.md over the byte limit is reported by lint and not read: the engine stops and leaves it untouched', () => {
+      const { engine, work, path, dir, id } = prepared();
+      writeFileSync(path, `${readFileSync(path, 'utf8')}${NOTES}${'x'.repeat(MAX_CONTEXT_FILE_BYTES + 10)}\n`);
+      const before = readFileSync(path);
+      const issues = lintTaskContexts(dir);
+      expect(issues.map((i) => i.message).join('\n')).toMatch(/cannot be read: is \d+ bytes, over the \d+ byte limit/);
+      let thrown: unknown;
+      try {
+        engine.ensureTaskContext(work);
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toMatchObject({ code: 'E_CONTEXT_UNAVAILABLE' });
+      expect(readFileSync(path).equals(before)).toBe(true);
+      // the same file seen through the packet lint
+      const packet = lintPacket(packetPaths(dir, id), { track: 'standard', requirementIds: [] });
+      expect(packet.find((i) => i.file === 'CONTEXT.md')).toMatchObject({ level: 'error', message: expect.stringContaining('cannot be read') });
+    });
+
+    it.skipIf(isRoot)('a CONTEXT.md that exists but cannot be read keeps its agent notes: nothing is written', () => {
+      const { engine, work, path } = prepared();
+      writeFileSync(path, `${readFileSync(path, 'utf8')}${NOTES}`);
+      const before = readFileSync(path);
+      chmodSync(path, 0o000);
+      try {
+        expect(() => engine.ensureTaskContext(work)).toThrow(/cannot be read/);
+      } finally {
+        chmodSync(path, 0o644);
+      }
+      expect(readFileSync(path).equals(before)).toBe(true);
+      expect(parseContextFile(readFileSync(path, 'utf8')).notes).toContain('finance team');
+      // once it can be read again, the notes are carried into the new document
+      engine.ensureTaskContext(work);
+      expect(parseContextFile(readFileSync(path, 'utf8')).notes).toContain('finance team');
+    });
+
+    it('a CONTEXT.md that is a symlink is refused: the link target is not read or written', () => {
+      const { engine, work, path, dir } = prepared();
+      const decoy = join(dir, 'decoy.md');
+      writeFileSync(decoy, 'decoy\n');
+      rmSync(path);
+      symlinkSync(decoy, path);
+      expect(() => engine.ensureTaskContext(work)).toThrow(/cannot be read/);
+      expect(readFileSync(decoy, 'utf8')).toBe('decoy\n');
+    });
+
+    it('a missing CONTEXT.md starts with empty notes and is written', () => {
+      const { engine, work, path } = prepared();
+      rmSync(path);
+      engine.ensureTaskContext(work);
+      expect(existsSync(path)).toBe(true);
+      expect(parseContextFile(readFileSync(path, 'utf8')).notes).not.toContain('finance team');
+    });
+
+    it.skipIf(isRoot)('a write that fails leaves the previous CONTEXT.md and its notes in place (temp file, then rename)', () => {
+      const { engine, work, path } = prepared();
+      writeFileSync(path, `${readFileSync(path, 'utf8')}${NOTES}`);
+      const before = readFileSync(path);
+      const folder = dirname(path);
+      // the folder is read-only: a temp file cannot be created, so nothing may be published
+      chmodSync(folder, 0o555);
+      try {
+        expect(() => engine.ensureTaskContext(work)).toThrow();
+        expect(readFileSync(path).equals(before)).toBe(true);
+        expect(readdirSync(folder).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+      } finally {
+        chmodSync(folder, 0o755);
+      }
+      engine.ensureTaskContext(work);
+      expect(parseContextFile(readFileSync(path, 'utf8')).notes).toContain('finance team');
+      expect(readdirSync(folder).filter((f) => f.endsWith('.tmp'))).toEqual([]);
     });
   });
 });
