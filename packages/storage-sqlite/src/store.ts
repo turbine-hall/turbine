@@ -1,6 +1,8 @@
 import type {
   Artifact,
   ArtifactDependencyEdge,
+  Claim,
+  ClaimStatus,
   Decision,
   EecInvalidationEvent,
   EngineeringEvidenceContract,
@@ -9,11 +11,14 @@ import type {
   RecoveryPlan,
   RepoSnapshot,
   RoleRun,
+  StoredClaim,
   WorkPackage,
 } from '@turbine-hall/turbine-contracts';
 import {
   ArtifactDependencyEdgeSchema,
   ArtifactSchema,
+  ClaimSchema,
+  ClaimStatusSchema,
   DecisionSchema,
   EecInvalidationEventSchema,
   EngineeringEvidenceContractSchema,
@@ -22,7 +27,9 @@ import {
   RecoveryPlanSchema,
   RepoSnapshotSchema,
   RoleRunSchema,
+  StoredClaimSchema,
   assertNoUnsafeKeys,
+  claimCommit,
   WorkPackageSchema,
   createId,
   err,
@@ -31,6 +38,17 @@ import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import type { SqliteDb } from './db.js';
 import { openDatabase } from './db.js';
+
+type ClaimRow = {
+  id: string;
+  repo_path: string;
+  section: string;
+  commit: string;
+  data: string;
+  status: string;
+  reason: string | null;
+  created_at: string;
+};
 
 function now(): string {
   return new Date().toISOString();
@@ -440,6 +458,84 @@ export class WorkStore {
       throw new Error(`snapshot stored under ${row.hash} actually has hash ${parsed.hash} (the row was replaced or corrupted)`);
     }
     return parsed;
+  }
+
+  /**
+   * Store a claim under a status. This method only records: it does not decide whether a claim is true.
+   * `verified` must only ever be passed by code that has just run the claim's verifier against `claimCommit(claim)`
+   * (see publishClaim / reverifyOnCommit in the engine); the claim table is the brief's only source, so nothing else
+   * may write that status. A `rejected` record never replaces a claim that is already published: the published
+   * claim stays and false is returned. Otherwise the record is stored (replacing an older record of the same id).
+   */
+  saveClaim(input: { repoPath: string; claim: Claim; status: ClaimStatus; reason?: string }): boolean {
+    assertNoUnsafeKeys(input.claim);
+    const claim = ClaimSchema.parse(input.claim);
+    const status = ClaimStatusSchema.parse(input.status);
+    const reason = input.reason?.trim() || undefined;
+    if ((status === 'rejected' || status === 'withdrawn') && !reason) throw new Error(`a ${status} claim must record why`);
+    // One statement, so the "never replace a published claim with a rejection" rule cannot race another writer.
+    const written = this.db
+      .prepare(
+        `INSERT INTO claims(id, repo_path, section, "commit", data, status, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(repo_path, id) DO UPDATE SET section = excluded.section, "commit" = excluded."commit", data = excluded.data,
+           status = excluded.status, reason = excluded.reason, created_at = excluded.created_at
+         WHERE NOT (claims.status IN ('verified', 'attested') AND excluded.status = 'rejected')`,
+      )
+      .run(claim.id, input.repoPath, claim.section, claimCommit(claim), JSON.stringify(claim), status, reason ?? null, now());
+    return Number(written.changes) === 1;
+  }
+
+  /** Withdraw a published claim (or any claim not already withdrawn). The claim stays on record with the reason. */
+  withdrawClaim(repoPath: string, id: string, reason: string): boolean {
+    if (!reason.trim()) throw new Error('a withdrawn claim must record why');
+    const r = this.db
+      .prepare(`UPDATE claims SET status = 'withdrawn', reason = ? WHERE repo_path = ? AND id = ? AND status <> 'withdrawn'`)
+      .run(reason.trim(), repoPath, id);
+    return Number(r.changes) === 1;
+  }
+
+  getClaim(repoPath: string, id: string): StoredClaim | null {
+    const row = this.db.prepare(`SELECT * FROM claims WHERE repo_path = ? AND id = ?`).get(repoPath, id) as ClaimRow | undefined;
+    return row ? this.parseClaimRow(row) : null;
+  }
+
+  /** Claims of one repository, oldest first. `statuses` / `section` / `commit` narrow the list. */
+  listClaims(repoPath: string, filter: { statuses?: readonly ClaimStatus[]; section?: string; commit?: string } = {}): StoredClaim[] {
+    const where = ['repo_path = ?'];
+    const args: string[] = [repoPath];
+    if (filter.section !== undefined) {
+      where.push('section = ?');
+      args.push(filter.section);
+    }
+    if (filter.commit !== undefined) {
+      where.push('"commit" = ?');
+      args.push(filter.commit);
+    }
+    if (filter.statuses) {
+      // An empty list matches nothing; it must not fall back to "every status".
+      if (!filter.statuses.length) return [];
+      where.push(`status IN (${filter.statuses.map(() => '?').join(', ')})`);
+      args.push(...filter.statuses.map((s) => ClaimStatusSchema.parse(s)));
+    }
+    const rows = this.db.prepare(`SELECT * FROM claims WHERE ${where.join(' AND ')} ORDER BY rowid ASC`).all(...args) as ClaimRow[];
+    return rows.map((r) => this.parseClaimRow(r));
+  }
+
+  /** The schema proves the JSON is a valid claim; this proves it is the one the row is filed under. */
+  private parseClaimRow(row: ClaimRow): StoredClaim {
+    const raw: unknown = JSON.parse(row.data);
+    assertNoUnsafeKeys(raw);
+    const stored = StoredClaimSchema.parse({
+      repoPath: row.repo_path,
+      claim: raw,
+      section: row.section,
+      commit: row.commit,
+      status: row.status,
+      ...(row.reason === null ? {} : { reason: row.reason }),
+      createdAt: row.created_at,
+    });
+    if (stored.claim.id !== row.id) throw new Error(`claim stored under ${row.id} actually has id ${stored.claim.id} (the row was replaced or corrupted)`);
+    return stored;
   }
 
   /**

@@ -14,7 +14,7 @@ import { contentHash } from './ids.js';
  *   - the snapshot hash covers the whole body, so a hand-edited snapshot is rejected.
  */
 
-const GitObjectIdSchema = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/, 'expected a full git object id');
+export const GitObjectIdSchema = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/, 'expected a full git object id');
 
 /** Where a fact was read: a git object at a commit, plus the lines it was read from if known. */
 export const FactSourceSchema = z

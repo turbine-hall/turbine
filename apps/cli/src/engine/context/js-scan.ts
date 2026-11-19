@@ -57,7 +57,16 @@ export function jsxFile(path: string): boolean {
   return !/\.[cm]?ts$/.test(path);
 }
 
-export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }): ModuleScan {
+export type ParsedSource =
+  | { ok: true; ts: typeof TS; sf: TS.SourceFile; source: string; lineAt: (pos: number) => number }
+  | { ok: false; reason: string };
+
+/**
+ * Parse ONE source text with the TypeScript parser. Any syntax error, or a text too deeply nested to parse, is
+ * `{ ok: false }`: a partial parse is never handed on. `lineAt` maps a character offset to a 1-based line (LF, CRLF
+ * and bare CR all end a line).
+ */
+export function parseSource(input: string, opts: { jsx: boolean } = { jsx: true }): ParsedSource {
   const ts = loadTs();
   const s = input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
 
@@ -96,6 +105,13 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
     const d = diagnostics[0]!;
     return { ok: false, reason: `${ts.flattenDiagnosticMessageText(d.messageText, ' ')} near line ${lineAt(d.start)}` };
   }
+  return { ok: true, ts, sf, source: s, lineAt };
+}
+
+export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }): ModuleScan {
+  const parsed = parseSource(input, opts);
+  if (!parsed.ok) return parsed;
+  const { ts, sf, source: s, lineAt } = parsed;
 
   const text = (a: number, b: number) => s.slice(a, b).replace(/\r\n?/g, '\n');
   const startOf = (n: TS.Node) => n.getStart(sf);
