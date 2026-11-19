@@ -9,7 +9,8 @@ The plan is shown as a table; the engine checks that every requirement is covere
 - `steps[]` — `{ "id": "S1", "description", "requirementIds": ["FR-001"], "files": ["src/…"] }`
   - Every requirement ID must appear in at least one step. Every step links to at least one requirement
     (a step with none looks like scope creep).
-  - `files`: the files or folders you expect to change, from PROJECT_EVIDENCE related files when possible.
+  - `files`: the files or folders you expect to change, from the TASK_CONTEXT files (each has a stated reason) when possible.
+    TASK_CONTEXT is a selection, not a complete list: a file that is not in it may still need to change.
   - Use only repositories listed under REPOSITORIES IN SCOPE; prefix other-repo paths with `<repo>:`.
   - 3–8 steps for normal work; fewer for trivial changes.
 - `testPlan[]` — `{ "requirementId": "FR-001", "test": "what the test proves", "kind": "unit|api|e2e|manual" }`.

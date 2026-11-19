@@ -9,6 +9,7 @@ import { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import { err } from '@turbine-hall/turbine-contracts';
 import { formatOutcome, understandOnInit, understandProject } from './engine/context/understand.js';
 import { lintProjectContext } from './engine/context/render.js';
+import { lintTaskContexts } from './engine/context/task-render.js';
 import { Engine } from './engine/engine.js';
 import { initProject, openContext } from './engine/project.js';
 import { handleError, printResult } from './output.js';
@@ -83,7 +84,7 @@ program
 program
   .command('lint')
   .option('--json', 'JSON output')
-  .description('Check the generated project context (.turbine/context/) has not been edited by hand')
+  .description('Check the generated project context (.turbine/context/) and task CONTEXT.md files have not been edited by hand')
   .action((opts) => {
     try {
       // Lint only reads files: it finds the project from the caller's directory and does not open the store
@@ -91,7 +92,7 @@ program
       const cwd = callerCwd();
       const root = findProjectRoot(cwd);
       if (!root) throw err('E_INVALID_CONFIG', `No .turbine project found from ${cwd}. Run: turbine init --project .`);
-      const issues = lintProjectContext(root);
+      const issues = [...lintProjectContext(root), ...lintTaskContexts(root)];
       if (opts.json) printResult(issues, true);
       else if (!issues.length) process.stdout.write('Project context OK.\n');
       else for (const i of issues) process.stdout.write(`${i.level.toUpperCase().padEnd(7)} ${i.file}: ${i.message}\n`);

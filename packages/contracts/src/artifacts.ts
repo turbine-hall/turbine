@@ -13,6 +13,8 @@ export const ArtifactTypeSchema = z.enum([
   'test-report',
   'release-readiness',
   'execution-brief',
+  /** Repository context layer 3: the files relevant to one task, bound to a Layer 1 snapshot. */
+  'repo-context',
   'other',
 ]);
 export type ArtifactType = z.infer<typeof ArtifactTypeSchema>;

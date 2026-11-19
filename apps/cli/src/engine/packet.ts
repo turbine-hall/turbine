@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { writeAtomic } from './context/render.js';
 
 /**
  * Task packet layout (Phase 3 document standard):
@@ -8,6 +9,7 @@ import { join } from 'node:path';
  *     STATUS.md   — where the task is, who acts next, gate progress, blockers
  *     SPEC.md     — requirements, open questions, context, plan, test plan (humans edit requirements here)
  *     REVIEW.md   — what changed (git), traceability, AI review, checks, acceptance checklist
+ *     CONTEXT.md  — the files relevant to the task and why (generated from the store; "## Agent notes" kept)
  *     evidence/   — raw JSON and logs (never inlined in the documents above)
  *
  * The legacy keys (request, requirements, plan, …) are kept as aliases so callers that
@@ -18,6 +20,10 @@ export type PacketPaths = {
   status: string;
   spec: string;
   review: string;
+  /** CONTEXT.md: the files relevant to this task, each with a checkable reason (generated; notes kept). */
+  context: string;
+  /** The project facts the task context points to (`turbine understand`); shared by every task. */
+  projectContext: string;
   evidenceDir: string;
   legacyDir: string;
   // aliases
@@ -41,6 +47,8 @@ export function packetPaths(projectRoot: string, workId: string): PacketPaths {
     status,
     spec,
     review,
+    context: join(dir, 'CONTEXT.md'),
+    projectContext: join(projectRoot, '.turbine', 'context', 'PROJECT.md'),
     evidenceDir: join(dir, 'evidence'),
     legacyDir: join(dir, 'legacy'),
     request: spec,
@@ -63,6 +71,12 @@ export function ensurePacketDir(projectRoot: string, workId: string): PacketPath
 export function writeFile(path: string, content: string): void {
   mkdirSync(join(path, '..'), { recursive: true });
   writeFileSync(path, content.replace(/\n+$/, '') + '\n', 'utf8');
+}
+
+/** Like `writeFile`, but a failure part-way leaves the previous file untouched (temp file, then rename). */
+export function writeFileAtomic(path: string, content: string): void {
+  mkdirSync(join(path, '..'), { recursive: true });
+  writeAtomic(path, content.replace(/\n+$/, '') + '\n');
 }
 
 export function readPacketFile(path: string): string | null {

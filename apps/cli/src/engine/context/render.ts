@@ -262,7 +262,8 @@ function publish(staged: Array<{ file: string; tmp: string }>): void {
   }
 }
 
-function writeAtomic(file: string, content: string): void {
+/** Write a file by staging a complete temp file and renaming it into place; a failed write leaves the old file intact. */
+export function writeAtomic(file: string, content: string): void {
   publish([stage(file, content)]);
 }
 

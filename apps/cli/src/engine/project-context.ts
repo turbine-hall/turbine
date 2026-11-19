@@ -2,6 +2,7 @@ import { err, shortSnapshotId, type DependencyFact, type RepoSnapshot } from '@t
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import type { Fact } from './docs/normalize.js';
 import { hasUncommittedChanges, listTree, observeBranch } from './context/git-read.js';
+import { pathWordMatches } from './context/path-words.js';
 import { buildSnapshot } from './context/snapshot.js';
 import { brokenHeadError, buildOrThrow, ensureFreshSnapshot, publishFresh, repoHead, type RepoHead } from './context/understand.js';
 
@@ -35,31 +36,13 @@ const STACK: Array<[string, string]> = [
   ['tailwindcss', 'Tailwind CSS'], ['zod', 'Zod'], ['react-hook-form', 'React Hook Form'],
 ];
 const TEST_RUNNERS = ['vitest', 'jest', 'mocha', '@playwright/test', 'cypress'];
-const STOP = new Set(['the', 'and', 'for', 'with', 'from', 'that', 'this', 'into', 'add', 'update', 'make', 'user', 'users', 'can', 'should', 'when', 'will', 'new', 'all', 'not']);
 
 /**
- * Tracked files at the commit whose path mentions DISTINCTIVE words from the request (cap 12).
- * Words are weighted by rarity across the repo (IDF), so common words like "section" or
- * "content" do not pull in unrelated files.
+ * Tracked files at the commit whose path mentions DISTINCTIVE words from the request (cap 12). The rule is
+ * `pathWordMatches` (IDF weighting), the same one the task context uses as its weakest signal.
  */
 function relatedFiles(allFiles: string[], requestText: string): string[] {
-  const words = [...new Set(requestText.toLowerCase().match(/[a-z][a-z0-9-]{3,}/g) ?? [])].filter((w) => !STOP.has(w));
-  if (!words.length) return [];
-  const files = allFiles.filter((f) => f && !/(^|\/)(node_modules|dist|build|\.next|coverage|public)\//.test(f) && !/\.(lock|png|jpe?g|svg|ico|woff2?|gif|webp|mp4)$/.test(f));
-  if (!files.length) return [];
-  const lower = files.map((f) => f.toLowerCase());
-  const idf = new Map<string, number>();
-  for (const w of words) {
-    const df = lower.filter((f) => f.includes(w)).length;
-    // Ignore words that match nothing or are everywhere (>3% of files).
-    if (df > 0 && df / files.length <= 0.03) idf.set(w, Math.log(files.length / df));
-  }
-  const scored = files
-    .map((f, i) => ({ f, score: [...idf.entries()].filter(([w]) => lower[i]!.includes(w)).reduce((n, [, v]) => n + v, 0) }))
-    .filter((x) => x.score > 0)
-    .sort((a, b) => b.score - a.score || a.f.length - b.f.length);
-  const top = scored[0]?.score ?? 0;
-  return scored.filter((x) => x.score >= top * 0.5).slice(0, 12).map((x) => x.f);
+  return pathWordMatches(allFiles, requestText).slice(0, 12).map((x) => x.path);
 }
 
 /** Where a dependency fact came from: the manifest that declares it, plus the lockfile when it states an installed version. */
@@ -71,26 +54,26 @@ function describe(d: DependencyFact): string {
   return `${d.declared.spec} in ${d.declared.source.path}${d.installed ? `, installed ${d.installed.version} per ${d.installed.lockfile}` : ''}`;
 }
 
-/** Evidence from the snapshot (and live git state). Throws if the project facts cannot be made current. */
-export function collectProjectEvidence(projectRoot: string, requestText = '', opts: { store?: WorkStore } = {}): ProjectEvidence {
-  const facts: Fact[] = [];
-  const ev: ProjectEvidence = {
-    projectRoot,
-    collectedAt: new Date().toISOString(),
-    scripts: [],
-    stack: [],
-    relatedFiles: [],
-    facts,
-  };
+/** A snapshot with the commit and branch HEAD was observed at when it was read. */
+export type PinnedSnapshot = {
+  at: RepoHead;
+  snapshot: RepoSnapshot;
+  /** Where HEAD is now (branch undefined when detached or when branch and commit could not be observed together). */
+  observed: { commit: string; branch?: string };
+};
+
+/**
+ * The project snapshot, pinned to the commit HEAD is at. With a store the snapshot is kept in step with HEAD (a
+ * stale one is rebuilt, and published to `.turbine/context/`). If HEAD moves while this runs it is rebuilt once at
+ * the new HEAD; a second move, or any failure, throws `E_CONTEXT_UNAVAILABLE`: an old snapshot is never served.
+ * Returns the reason there is no snapshot when the project has no readable commit yet.
+ */
+export function pinSnapshot(projectRoot: string, opts: { store?: WorkStore } = {}): PinnedSnapshot | { error: 'not-a-repo' | 'no-commits' } {
   const at = repoHead(projectRoot);
   if ('error' in at) {
     // A HEAD that exists but is unreadable is a failure, not "no facts yet": stop instead of continuing blind.
     if (at.error === 'broken-head') throw brokenHeadError(at, projectRoot);
-    facts.push({
-      text: at.error === 'not-a-repo' ? 'Project is not a git repository' : 'Repository has no commits yet, so no project facts can be stated',
-      source: 'git',
-    });
-    return ev;
+    return { error: at.error };
   }
 
   // HEAD can move during this collection, and each move costs one rebuild. ONE budget covers the whole
@@ -154,6 +137,29 @@ export function collectProjectEvidence(projectRoot: string, requestText = '', op
       );
     }
   }
+  return { at, snapshot, observed: observed! };
+}
+
+/** Evidence from the snapshot (and live git state). Throws if the project facts cannot be made current. */
+export function collectProjectEvidence(projectRoot: string, requestText = '', opts: { store?: WorkStore } = {}): ProjectEvidence {
+  const facts: Fact[] = [];
+  const ev: ProjectEvidence = {
+    projectRoot,
+    collectedAt: new Date().toISOString(),
+    scripts: [],
+    stack: [],
+    relatedFiles: [],
+    facts,
+  };
+  const pinned = pinSnapshot(projectRoot, opts);
+  if ('error' in pinned) {
+    facts.push({
+      text: pinned.error === 'not-a-repo' ? 'Project is not a git repository' : 'Repository has no commits yet, so no project facts can be stated',
+      source: 'git',
+    });
+    return ev;
+  }
+  const { at, snapshot, observed } = pinned;
   ev.snapshot = { hash: snapshot.hash, commit: snapshot.commit };
 
   const dirty = hasUncommittedChanges(at.repoRoot);

@@ -1,6 +1,7 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { LINE_BUDGET, type Track } from './render.js';
 import { parseSpecMarkdown, type PacketPaths } from '../packet.js';
+import { lintContextFile, readContextFile } from '../context/task-render.js';
 
 /**
  * `turbine task lint` — structural checks on the packet documents. The engine generates them,
@@ -68,6 +69,21 @@ export function lintPacket(paths: PacketPaths, opts: { track: Track; requirement
       for (const id of opts.requirementIds) {
         if (!trace.includes(`| ${id} |`)) issues.push({ level: 'error', file: name, message: `requirement ${id} missing from traceability` });
       }
+    }
+  }
+  // CONTEXT.md is generated from the store; a hand edit to the generated part is reported (and overwritten).
+  // `lstat`, not `existsSync`: a dangling symlink is an entry that exists, and it is reported, not skipped.
+  let present = true;
+  try {
+    lstatSync(paths.context);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') present = false;
+  }
+  if (present) {
+    try {
+      issues.push(...lintContextFile(readContextFile(paths.context)));
+    } catch (e) {
+      issues.push({ level: 'error', file: 'CONTEXT.md', message: `cannot be read: ${(e as Error).message}` });
     }
   }
   return issues;

@@ -637,6 +637,26 @@ Detect Git root, branch, clean/dirty state, base commit, remote metadata, primar
 | AT-CTX-07 | Stale / failed rebuild | A task never uses a stale snapshot; a failed rebuild throws `E_CONTEXT_UNAVAILABLE` and the old snapshot is not used |
 | AT-CTX-08 | Generated files | `snapshot.json` and `PROJECT.md` carry the generated header and content hash; `turbine lint` flags hand edits |
 
+### 7.3B Repository context: task context (FR-CTX-03, layer 3 of #5)
+
+Each task gets `CONTEXT.md` next to STATUS/SPEC/REVIEW: a ranked, size-limited **selection** of the files that matter to that task's request. It is built by `apps/cli/src/engine/context/` (`relevance.ts`, `import-graph.ts`, `js-scan.ts`, `task-context.ts`, `task-render.ts`) with schemas in `packages/contracts/src/task-context.ts`, stored as a `repo-context` artifact bound to the Layer 1 snapshot hash, and rendered to `.turbine/tasks/<id>/CONTEXT.md` and `evidence/context.json`.
+
+- **Only committed text.** Files and contents come from the commit the project snapshot is pinned to; the working tree is never read, so an import that exists only in an uncommitted file cannot give a reason.
+- **No reason, no file.** Every listed file has at least one reason that is structured evidence, re-derivable from the blobs at the recorded commit: a resolved import edge (`file`, `line`, `statement`, `specifier`, target, resolution rule), a quote of the request with its offset, or a stated rule (test rule, package, CODEOWNERS line). The text shown is rendered from that evidence.
+- **Signals, strongest first:** paths/basenames named in the request; exported symbols the request mentions; one hop on the import graph (relative imports and workspace package names); related tests; owning package and CODEOWNERS; the path-word (IDF) match as the weakest signal.
+- **A selection, never a complete list.** The document states how files were chosen, what could not be read or resolved, and lists every file the size limit left out with its score. A role may declare `context_budget {maxFiles, maxChars}` (default 20 / 8000).
+- **Never stale.** `turbine task next`, `plan` and `execute` rebuild the selection first when the base commit, the project snapshot, the size limit or the request changed, or the task re-entered CHANGES_REQUESTED. A rebuild that cannot run is stated in the file; the old selection is not served. When the base commit changed, the diff against the previous selection is shown.
+- **Generated part vs agent notes.** The generated part is re-rendered from the store every time and carries a content hash; `turbine lint` and `turbine task lint` report a hand edit. `## Agent notes` is kept verbatim, labelled as unverified and never merged into the facts.
+- **Agents are told to read it.** In REQUIREMENTS_APPROVED, PLANNING, PLAN_APPROVED, IMPLEMENTING and CHANGES_REQUESTED, `turbine task next` lists PROJECT.md and CONTEXT.md and says to read them before planning/implementing.
+
+| ID | Scenario | Pass condition (test in `tests/integration/context-task.test.ts`) |
+|---|---|---|
+| AT-CTX-09 | Traceable reasons | Every listed file has a reason that re-derives from the commit's blobs (checked with plain git and `verifyRelevantFiles`); a falsified reason is rejected; an import only in an uncommitted file never appears |
+| AT-CTX-10 | Size limit | The role limit is respected; omitted files are listed with scores and why |
+| AT-CTX-11 | Staleness | A moved base commit or a CHANGES_REQUESTED re-entry makes `next` rebuild first; before that the file says STALE; a failed rebuild is stated, never papered over |
+| AT-CTX-12 | Notes and edits | Agent notes survive every re-render; a hand edit of the generated part is overwritten and reported by lint |
+| AT-CTX-13 | Agent instructions | `next` opens PROJECT.md and CONTEXT.md and tells agents to read them in the five states |
+
 ### 7.4 Test and CI adapters
 
 Execute explicitly configured allowlisted commands with bounded time/output in approved environment. Collect exit code, stdout/stderr artifact refs, env summary and tested commit. The command's *actual* exit code determines pass/fail. `ci.read` may read GitHub Actions / other CI if configured; don't invent PR/CI status when no provider exists.
@@ -1120,7 +1140,8 @@ Set operational hours, model/tool cost ceilings and explicit outcomes **before**
 - Ship changes as **small, reviewable PRs**: scaffolding; contracts/store; state/role policy; skills/models; planning/Jira; execution/review; SQA/acceptance.
 - Keep `docs/IMPLEMENTATION_STATUS.md` truthful with `planned / active / implemented / tested / blocked` per requirement. No claim that R1 exists simply because R0 CLI commands work.
 - The product remains exploratory until repeatable evidence of internal value and customer adoption exists.
-- **Repository context, layer 1 (FR-CTX-01, AT-CTX-01..08):** deterministic project facts at a commit, with a source for every fact, measured (not asserted) conventions, separate declared/installed versions and no stale snapshots. Layers 2 (project brief) and 3 (task context) are tracked in #7 and #8 and are not implemented.
+- **Repository context, layer 1 (FR-CTX-01, AT-CTX-01..08):** deterministic project facts at a commit, with a source for every fact, measured (not asserted) conventions, separate declared/installed versions and no stale snapshots. Layer 2 (project brief) is tracked in #7 and is not implemented.
+- **Repository context, layer 3 (FR-CTX-03, AT-CTX-09..13):** a per-task `CONTEXT.md` selection of files, every one with a reason that can be re-derived from the blobs at the recorded commit, a role size limit with the omitted files listed, rebuilt before `next` points to it, and agent notes kept apart from the generated facts.
 - **v0.5 baseline additions:** Core EEC (FR-WF-03A), typed lineage/invalidation/recovery (FR-WF-03B), failure/cost-aware role reassessment, CLI contract/impact/recovery commands, AT-021..AT-029 and AT-116..AT-123. These do not authorize building advanced semantic impact analysis, a new hosted platform or any future integration in R0/R1.
 
 ## 19. Verified reference shortlist (2026-11-11)

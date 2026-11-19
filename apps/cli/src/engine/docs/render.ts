@@ -55,6 +55,8 @@ export type PacketData = {
   trace: TraceRow[];
   analysis: AnalysisFinding[];
   evidenceFiles: string[];
+  /** CONTEXT.md exists for this task (the relevant files and why; a selection, not a complete list). */
+  contextFile?: boolean;
 };
 
 const esc = (t: string) => t.replace(/\|/g, '\\|').replace(/\n+/g, ' ');
@@ -177,6 +179,9 @@ export function renderStatus(d: PacketData): string {
     '',
     '- [SPEC.md](SPEC.md) — requirements, open questions, plan',
     '- [REVIEW.md](REVIEW.md) — what changed, traceability, AI review, checks, acceptance',
+    ...(d.contextFile
+      ? ['- [CONTEXT.md](CONTEXT.md) — files that may matter to this task, each with a checkable reason (a selection, not a complete list)']
+      : []),
     '- [evidence/](evidence/) — raw data and logs',
     `- [Glossary](${relative(packetPaths(d.projectRoot, d.work.id).dir, join(d.projectRoot, '.turbine', 'GLOSSARY.md'))}) — gate, worktree, change set, P0…`,
   );

@@ -211,6 +211,19 @@ export function readBlobs(repoRoot: string, blobIds: string[], expectedBytes = 0
 }
 
 /**
+ * Which of `paths` git reports as changed between two commits (A added, M modified, D deleted, T type change).
+ * Renames are not followed, so a moved file shows as D and A. Throws when either commit cannot be read.
+ */
+export function changedBetween(repoRoot: string, from: string, to: string, paths: string[]): Array<{ path: string; status: string }> {
+  if (!paths.length) return [];
+  const out = must(repoRoot, ['diff', '--name-status', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', from, to, '--', ...paths.map((p) => `:(literal)${p}`)]);
+  const parts = out.toString('utf8').split('\0').filter(Boolean);
+  const changed: Array<{ path: string; status: string }> = [];
+  for (let i = 0; i + 1 < parts.length; i += 2) changed.push({ status: parts[i]!, path: parts[i + 1]! });
+  return changed.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+
+/**
  * True when the main checkout has uncommitted changes (staged, unstaged or untracked), ignoring
  * Turbine's own `.turbine/` directory. Only used to say "uncommitted changes exist (not included)".
  */
