@@ -1,5 +1,6 @@
 import { posix } from 'node:path';
 import type { ContextBudget, ImportEdge, OmittedFile, Reason, RelevantFile, SelectionLimits } from '@turbine-hall/turbine-contracts';
+import { prefixMatches } from './glob.js';
 import { buildGraph, makeResolver, SOURCE_EXT, type Graph, type WorkspacePackage } from './import-graph.js';
 import { jsxFile, scanModule } from './js-scan.js';
 import { pathWordMatches } from './path-words.js';
@@ -146,12 +147,17 @@ function packageOf(path: string, packages: WorkspacePackage[], rootHasManifest: 
 
 const manifestPath = (dir: string) => (dir === '.' ? 'package.json' : `${dir}/package.json`);
 
-export type CodeownersRule = { line: number; pattern: string; owners: string[]; re: RegExp };
+/** One CODEOWNERS rule, as segments matched by `prefixMatches` (no regular expression, so no backtracking). */
+export type CodeownersRule = { line: number; pattern: string; owners: string[]; segments: string[]; contents: 'exact' | 'or-contents' | 'contents-only' };
+
+const MAX_RULE_CHARS = 512;
+const MAX_RULE_SEGMENTS = 64;
 
 /**
  * GitHub's CODEOWNERS rules for the subset that is matched exactly: `*`, `**`, `?`, a leading `/`, a trailing `/`.
- * A pattern using anything else (character classes, `!`, escapes) is skipped and counted; skipping a rule is the
- * safe direction, because a skipped rule can only mean an owner is not stated.
+ * A pattern using anything else (character classes, `!`, escapes) or longer than the matcher's work limit is
+ * skipped and counted; skipping a rule is the safe direction, because a skipped rule can only mean an owner is not
+ * stated. A `**` segment between others matches zero or more directories (`docs/**\/x` owns `docs/x`).
  */
 export function parseCodeowners(textValue: string): { rules: CodeownersRule[]; skipped: number } {
   const rules: CodeownersRule[] = [];
@@ -161,7 +167,7 @@ export function parseCodeowners(textValue: string): { rules: CodeownersRule[]; s
     if (!line) return;
     const [pattern, ...owners] = line.split(/\s+/);
     if (!pattern) return;
-    if (/[[\]!\\]/.test(pattern) || pattern.startsWith('#')) {
+    if (/[[\]!\\]/.test(pattern) || pattern.startsWith('#') || pattern.length > MAX_RULE_CHARS || pattern.split('/').length > MAX_RULE_SEGMENTS) {
       skipped++;
       return;
     }
@@ -169,32 +175,29 @@ export function parseCodeowners(textValue: string): { rules: CodeownersRule[]; s
     let body = pattern.replace(/\/+$/, '');
     const anchored = body.startsWith('/') || body.includes('/');
     body = body.replace(/^\//, '');
-    const last = body.slice(body.lastIndexOf('/') + 1);
-    // Segment by segment: a `**` segment between others matches ZERO or more directories (`docs/**/x` owns `docs/x`).
-    const convert = (part: string) =>
-      part
-        .split('**')
-        .map((p) => p.replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]'))
-        .join('.*');
-    const segs = body.split('/');
-    const re = segs
-      .map((seg, k) => {
-        const end = k === segs.length - 1;
-        return seg === '**' ? (end ? '.*' : '(?:.*/)?') : `${convert(seg)}${end ? '' : '/'}`;
-      })
-      .join('');
-    // A literal last segment may be a directory (its contents are owned too); a wildcard one is exact.
+    const segments = body.split('/');
+    const last = segments[segments.length - 1]!;
+    // a literal last segment may be a directory (its contents are owned too); a wildcard one is exact
     const wildcardLast = /[*?]/.test(last);
-    const tail = dirOnly || !wildcardLast ? '(?:/.*)?' : '';
-    rules.push({ line: i + 1, pattern, owners, re: new RegExp(`^${anchored ? '' : '(?:.*/)?'}${re}${dirOnly ? '/.*' : tail}$`) });
+    if (last === '**') segments.push('*'); // `a/**` owns what is inside a, not a itself
+    if (!anchored) segments.unshift('**');
+    rules.push({ line: i + 1, pattern, owners, segments, contents: dirOnly ? 'contents-only' : wildcardLast ? 'exact' : 'or-contents' });
   });
   return { rules, skipped };
+}
+
+function ruleMatches(rule: CodeownersRule, path: string): boolean {
+  const parts = path.split('/');
+  const ok = prefixMatches(rule.segments, parts);
+  const whole = ok[parts.length]!;
+  const inside = ok.some((v, n) => v && n >= 1 && n < parts.length);
+  return rule.contents === 'exact' ? whole : rule.contents === 'or-contents' ? whole || inside : inside;
 }
 
 /** The last matching rule wins. */
 export function codeownersFor(path: string, rules: CodeownersRule[]): CodeownersRule | undefined {
   let hit: CodeownersRule | undefined;
-  for (const r of rules) if (r.re.test(path)) hit = r;
+  for (const r of rules) if (ruleMatches(r, path)) hit = r;
   return hit;
 }
 
@@ -343,17 +346,20 @@ export function rankFiles(input: RankInput): { ranked: RelevantFile[]; limits: S
   const testFiles = paths.filter(isTestPath);
   const subjects = seeds.filter((s) => !isTestPath(s));
   for (const subject of subjects) {
-    let count = 0;
     const emitted = new Set<string>();
+    const admitted = new Set<string>();
+    const skipped = new Set<string>();
+    // The limit counts distinct test files: a second reason for a test already admitted does not use another slot.
     const tryAdd = (testPath: string, reason: Reason) => {
       const id = `${testPath}|${reason.kind === 'test-for' ? reason.rule : ''}`;
       if (emitted.has(id)) return;
-      if (count >= MAX_TESTS_PER_SUBJECT) {
-        limits.testsTruncated++;
+      if (!admitted.has(testPath) && admitted.size >= MAX_TESTS_PER_SUBJECT) {
+        if (!skipped.has(testPath)) limits.testsTruncated++;
+        skipped.add(testPath);
         return;
       }
       emitted.add(id);
-      count++;
+      admitted.add(testPath);
       add(testPath, reason);
     };
     for (const edge of distinctBy(graph.incoming.get(subject) ?? [], 'from')) {
@@ -554,9 +560,12 @@ export function verifyRelevantFiles(selected: RelevantFile[], input: VerifyInput
           break;
         }
         case 'codeowners': {
-          const t = input.text(r.file);
+          // the file ranking uses, not one the reason names; the structured owners must be the rule's owners
+          const active = codeownersFile(new Set(input.files.map((x) => x.path)));
+          const t = active === r.file ? input.text(r.file) : undefined;
           const rule = t === undefined ? undefined : codeownersFor(f.path, parseCodeowners(t).rules);
           if (!rule || rule.line !== r.line || `${rule.pattern} ${rule.owners.join(' ')}` !== r.rule) problems.push(`${where}: ${r.file} line ${r.line} is not the rule that matches this file`);
+          else if (JSON.stringify(rule.owners) !== JSON.stringify(r.owners)) problems.push(`${where}: the recorded owners are not the owners of ${r.file} line ${r.line}`);
           break;
         }
         case 'path-words': {

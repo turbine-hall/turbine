@@ -51,8 +51,8 @@ import { createJiraAdapter, issueToMarkdown, type JiraIssue } from '@turbine-hal
 import { inspectRepo } from '@turbine-hall/turbine-adapter-git';
 import { hasUncommittedChanges, observeBranch } from './context/git-read.js';
 import { repoHead } from './context/understand.js';
-import { refreshTaskContext, requestHash, stalenessOf, type RefreshResult } from './context/task-context.js';
-import { parseContextFile, readContextFile, renderContextBody, renderContextFile, renderUnavailableFile, type Staleness } from './context/task-render.js';
+import { refreshTaskContext, requestHash, snapshotHashAt, stalenessOf, type RefreshResult } from './context/task-context.js';
+import { MAX_CONTEXT_FILE_BYTES, parseContextFile, readContextFile, renderContextBody, renderContextFile, renderUnavailableFile, type Staleness } from './context/task-render.js';
 import { analyze, type AnalysisFinding } from './docs/analyze.js';
 import { lintPacket, type LintIssue } from './docs/lint.js';
 import {
@@ -463,10 +463,15 @@ export class Engine {
   /** Enters CHANGES_REQUESTED and records it: each entry starts a new review cycle with a fresh file selection. */
   private toChangesRequested(work: WorkPackage, cause: 'code-review' | 'verification-failed' | 'acceptance-failed'): WorkPackage {
     const next = transition(work, 'CHANGES_REQUESTED');
-    this.ctx.store.appendEvent({
-      workId: work.id,
-      type: 'task.changes-requested',
-      payload: { cause, fromState: work.currentState },
+    // The event and the state are saved together: a failed state write must not leave an event that would count as
+    // a review cycle, and a retried transition must add exactly one.
+    this.ctx.store.transaction(() => {
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'task.changes-requested',
+        payload: { cause, fromState: work.currentState },
+      });
+      this.ctx.store.saveWork(next);
     });
     return next;
   }
@@ -493,7 +498,10 @@ export class Engine {
   /** Why a stored selection is out of date for the checkout as it is now (empty = current). */
   private contextStaleness(work: WorkPackage, selection: TaskContext): Staleness[] {
     const head = repoHead(this.ctx.projectRoot);
-    return stalenessOf(selection, this.contextInputs(work, 'error' in head ? '' : head.head));
+    const commit = 'error' in head ? '' : head.head;
+    // The snapshot hash counts only when the stored snapshot belongs to this HEAD, as `refreshTaskContext` does.
+    const snapshotHash = commit ? snapshotHashAt(this.ctx.store, this.ctx.projectRoot, commit) : undefined;
+    return stalenessOf(selection, { ...this.contextInputs(work, commit), ...(snapshotHash ? { snapshotHash } : {}) });
   }
 
   /** Records a selection as the next `repo-context` artifact, pinned to the Layer 1 snapshot it was read at. */
@@ -546,39 +554,58 @@ export class Engine {
     return result;
   }
 
-  /** Writes CONTEXT.md (generated part from the store, agent notes kept) and evidence/context.json. */
+  /** The text of CONTEXT.md as it is on disk (undefined when it does not exist). Anything else that stops it being read stops the render. */
+  private readContextText(work: WorkPackage, file: string): string | undefined {
+    try {
+      return readContextFile(file);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw err('E_CONTEXT_UNAVAILABLE', `CONTEXT.md of ${work.id} cannot be read (${(e as Error).message}), so it is left as it is and its agent notes are not replaced. Fix or move the file, then retry.`, { file });
+    }
+  }
+
+  /**
+   * Writes evidence/context.json and CONTEXT.md (generated part from the store, agent notes kept).
+   *   - The agent notes live only in CONTEXT.md. A missing file starts with empty notes; a file that cannot be read
+   *     stops here with the document left as it is, never replaced by empty notes.
+   *   - The new document must fit the reader's byte limit, or it is not published (the old one stays).
+   *   - The file is read again right before publishing: if it changed since the notes were taken (an agent saved
+   *     notes meanwhile), the document is built again from the new notes instead of overwriting them.
+   *   - CONTEXT.md is published last. If the JSON cannot be written, the old CONTEXT.md still stands, and it is
+   *     never newer than the JSON beside it.
+   */
   private writeTaskContext(work: WorkPackage, view: { selection?: TaskContext; stale?: Staleness[]; unavailable?: string }): void {
     const paths = packetPaths(this.ctx.projectRoot, work.id);
-    // The agent notes live only in CONTEXT.md. A missing file starts with empty notes; a file that cannot be read
-    // (unreadable, too large, a link) stops here with the document left as it is, never replaced by empty notes.
-    let notes = '';
-    try {
-      notes = parseContextFile(readContextFile(paths.context)).notes;
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
-        throw err('E_CONTEXT_UNAVAILABLE', `CONTEXT.md of ${work.id} cannot be read (${(e as Error).message}), so it is left as it is and its agent notes are not replaced. Fix or move the file, then retry.`, { file: paths.context });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const raw = this.readContextText(work, paths.context);
+      const notes = raw === undefined ? '' : parseContextFile(raw).notes;
+      let file: string;
+      let evidence: string;
+      if (view.selection) {
+        const stale = view.stale ?? [];
+        const body = renderContextBody(view.selection, {
+          title: work.title,
+          workId: work.id,
+          stale,
+          projectLink: existsSync(paths.projectContext) ? relative(paths.dir, paths.projectContext) : undefined,
+        });
+        file = renderContextFile(view.selection, body, notes);
+        evidence = `${JSON.stringify({ current: stale.length === 0, stale, selection: view.selection }, null, 2)}\n`;
+      } else {
+        const reason = view.unavailable ?? 'no selection has been built';
+        file = renderUnavailableFile(work.title, work.id, reason, notes);
+        evidence = `${JSON.stringify({ current: false, unavailable: reason }, null, 2)}\n`;
       }
-    }
-    if (view.selection) {
-      const stale = view.stale ?? [];
-      const body = renderContextBody(view.selection, {
-        title: work.title,
-        workId: work.id,
-        stale,
-        projectLink: existsSync(paths.projectContext) ? relative(paths.dir, paths.projectContext) : undefined,
-      });
-      writeFileAtomic(paths.context, renderContextFile(view.selection, body, notes));
-      writeFileAtomic(
-        join(paths.evidenceDir, 'context.json'),
-        `${JSON.stringify({ current: stale.length === 0, stale, selection: view.selection }, null, 2)}\n`,
-      );
+      const bytes = Buffer.byteLength(file, 'utf8');
+      if (bytes > MAX_CONTEXT_FILE_BYTES) {
+        throw err('E_CONTEXT_UNAVAILABLE', `The new CONTEXT.md of ${work.id} would be ${bytes} bytes, over the ${MAX_CONTEXT_FILE_BYTES} byte limit the reader accepts, so the old file is kept. Shorten the agent notes, then retry.`, { file: paths.context });
+      }
+      if (this.readContextText(work, paths.context) !== raw) continue; // changed while rendering: start again from the new notes
+      writeFileAtomic(join(paths.evidenceDir, 'context.json'), evidence);
+      writeFileAtomic(paths.context, file);
       return;
     }
-    writeFileAtomic(paths.context, renderUnavailableFile(work.title, work.id, view.unavailable ?? 'no selection has been built', notes));
-    writeFileAtomic(
-      join(paths.evidenceDir, 'context.json'),
-      `${JSON.stringify({ current: false, unavailable: view.unavailable ?? 'no selection has been built' }, null, 2)}\n`,
-    );
+    throw err('E_CONTEXT_UNAVAILABLE', `CONTEXT.md of ${work.id} kept changing while it was rendered, so it was not replaced. Retry once nothing else is writing it.`, { file: paths.context });
   }
 
   /** The rendered selection for a model prompt. Never claims completeness, never hides what was left out. */
@@ -1887,8 +1914,15 @@ export class Engine {
     // here: if it no longer matches the checkout, the file says it is stale and why (`next` rebuilds it).
     const taskContext = this.latestTaskContext(work.id);
     if (taskContext) {
-      this.writeTaskContext(work, { selection: taskContext, stale: this.contextStaleness(work, taskContext) });
-      evidenceFiles.push('context.json');
+      try {
+        this.writeTaskContext(work, { selection: taskContext, stale: this.contextStaleness(work, taskContext) });
+        evidenceFiles.push('context.json');
+      } catch (e) {
+        // A transition that already happened must not look failed because CONTEXT.md could not be written: the
+        // file is left as it is, the failure is recorded, and `turbine lint` and `next` report it until it is fixed.
+        if ((e as { code?: string }).code !== 'E_CONTEXT_UNAVAILABLE') throw e;
+        this.ctx.store.appendEvent({ workId: work.id, type: 'context.render-failed', payload: { message: (e as Error).message.split('\n')[0] } });
+      }
     }
     const data: PacketData = {
       projectRoot: this.ctx.projectRoot,
@@ -2333,7 +2367,7 @@ export class Engine {
     } else {
       work = this.toChangesRequested(work, 'code-review');
     }
-    this.ctx.store.saveWork(work);
+    if (work.currentState !== 'CHANGES_REQUESTED') this.ctx.store.saveWork(work);
     this.render(work.id, action === 'approve'
           ? ['Human review approved. Next: turbine task sync <id> (runs verify)']
           : ['Changes requested — fix in the worktree, commit, then: turbine task sync <id>']);
@@ -2501,7 +2535,6 @@ export class Engine {
       work = this.reselectRoles(work, 'failure-informed', { failedChecks: failedRuns.map((r) => `${r.kind} ${r.command}`) });
       const roles = work.selectedRoles;
       work = this.toChangesRequested(work, 'verification-failed');
-      this.ctx.store.saveWork(work);
       this.render(work.id, [
           `Verification failed: ${failedRuns.map((r) => `${r.repo}: ${r.command}`).join('; ')} — see REVIEW.md → 4. Checks`,
           'Fix in the worktree, commit, then: turbine task sync <id>',
@@ -2590,7 +2623,6 @@ export class Engine {
 
     if (sqaNotes.result !== 'passed') {
       work = this.toChangesRequested(work, 'acceptance-failed');
-      this.ctx.store.saveWork(work);
       this.render(work.id, ['Acceptance failed — changes requested']);
       return { work, accepted: false };
     }

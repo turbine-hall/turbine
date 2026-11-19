@@ -197,6 +197,16 @@ export type RefreshResult =
   | { status: 'unavailable'; reason: string }
   | { status: 'current' | 'rebuilt'; selection: TaskContext };
 
+/** The hash of the stored project snapshot, only when it was taken at this commit. */
+export function snapshotHashAt(store: WorkStore, projectRoot: string, commit: string): string | undefined {
+  try {
+    const s = store.getLatestSnapshotFor(projectRoot);
+    return s && s.commit === commit ? s.hash : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Make the stored selection current. It is served unchanged only when nothing it depends on has moved (commit,
  * snapshot, size limit, request, CHANGES_REQUESTED re-entry, ranking rules); otherwise it is rebuilt, saved with
@@ -216,13 +226,7 @@ export function refreshTaskContext(args: {
   }
   let reasons: Staleness[] = [];
   if (args.previous) {
-    let stored: string | undefined;
-    try {
-      const s = args.store.getLatestSnapshotFor(args.projectRoot);
-      if (s && s.commit === head.head) stored = s.hash;
-    } catch {
-      stored = undefined;
-    }
+    const stored = snapshotHashAt(args.store, args.projectRoot, head.head);
     reasons = stalenessOf(args.previous, {
       commit: head.head,
       ...(stored ? { snapshotHash: stored } : {}),

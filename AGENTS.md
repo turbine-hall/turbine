@@ -42,7 +42,7 @@ These come from review findings on PR #9 (about 80 findings) and PR #11 (about 2
 7. **Publish atomically.** Write to a temporary file and rename it. Save store records inside the same critical section as the publish. Clean up on failure.
 8. **Locks:** remove a lock only if you still own it. Re-read the owner immediately before removing it. Clean up if writing the owner fails.
 9. **Never drop data silently.** If something is skipped, record why.
-10. **Implement the standard the spec states, not a convenient subset.** Examples: Node `exports` selection (first valid array target, no fallback on a missing file, nested conditions fall through to `default`, `null` blocks, targets start with `./`); JSON/JSONC edge cases (CR-only line endings, duplicate keys, non-finite numbers).
+10. **Implement the standard the spec states, not a convenient subset.** Examples: Node `exports` selection (first valid array target, no fallback on a missing file, nested conditions fall through to `default`, a direct `null` target blocks but inside an array it is passed over (`[null, "./index.js"]` selects `./index.js`), targets start with `./`); JSON/JSONC edge cases (CR-only line endings, duplicate keys, non-finite numbers).
 11. **Verify runtime behaviour when a rule depends on it.** Run the runtime (for example Node) on a small fixture instead of relying on memory.
 
 ## Testing

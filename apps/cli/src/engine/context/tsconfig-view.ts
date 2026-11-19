@@ -1,4 +1,5 @@
 import { posix } from 'node:path';
+import { prefixMatches } from './glob.js';
 import { parseJsonc } from './jsonc.js';
 
 /**
@@ -117,54 +118,6 @@ function load(file: string, text: (path: string) => string | undefined): BuildCo
 
 // ------------------------------------------------------------ globs (the syntax tsconfig documents)
 
-/** `*` and `?` inside one path segment, matched without recursion or regular expressions (linear in the text for one star). */
-function segmentMatches(pat: string, s: string): boolean {
-  let p = 0;
-  let i = 0;
-  let star = -1;
-  let mark = 0;
-  while (i < s.length) {
-    if (p < pat.length && (pat[p] === '?' || pat[p] === s[i])) {
-      p++;
-      i++;
-    } else if (p < pat.length && pat[p] === '*') {
-      star = p++;
-      mark = i;
-    } else if (star >= 0) {
-      p = star + 1;
-      i = ++mark;
-    } else return false;
-  }
-  while (p < pat.length && pat[p] === '*') p++;
-  return p === pat.length;
-}
-
-/**
- * `out[n]` is true when the pattern matches exactly the first `n` path segments. A `**` segment consumes any number of
- * segments. The pattern positions are advanced together, one path segment at a time: no recursion, and the work is
- * (pattern segments × path segments).
- */
-function prefixMatches(pat: string[], path: string[]): boolean[] {
-  const closure = (states: Set<number>): Set<number> => {
-    for (const i of [...states]) for (let j = i; pat[j] === '**'; j++) states.add(j + 1);
-    return states;
-  };
-  let states = closure(new Set([0]));
-  const out: boolean[] = [];
-  for (let k = 0; k <= path.length; k++) {
-    out.push(states.has(pat.length));
-    if (k === path.length) break;
-    const next = new Set<number>();
-    for (const i of states) {
-      if (i >= pat.length) continue;
-      if (pat[i] === '**') next.add(i);
-      else if (segmentMatches(pat[i]!, path[k]!)) next.add(i + 1);
-    }
-    states = closure(next);
-  }
-  return out;
-}
-
 type Tri = true | false | 'unknown';
 
 /** A pattern this module models: within the work limits, `*`, `?` and `**` segments only. */
@@ -193,8 +146,8 @@ function isInput(cfg: BuildConfig, source: string): Tri {
   if (cfg.files?.includes(source)) return true;
   const base = posix.dirname(cfg.file);
   const include = cfg.include ?? (cfg.files ? [] : [posix.join(base, '**/*')]);
-  // `outDir` is already repo-relative; only the unresolved defaults are joined to the config directory
-  const exclude = cfg.exclude ?? [...['node_modules', 'bower_components', 'jspm_packages'].map((p) => posix.join(base, p)), ...(cfg.outDir ? [cfg.outDir] : [])];
+  // `outDir` and `declarationDir` are already repo-relative; only the unresolved defaults are joined to the config directory
+  const exclude = cfg.exclude ?? [...['node_modules', 'bower_components', 'jspm_packages'].map((p) => posix.join(base, p)), ...(cfg.outDir ? [cfg.outDir] : []), ...(cfg.declarationDir ? [cfg.declarationDir] : [])];
   const inc = include.map((p) => matchInclude(p, source));
   if (!inc.includes(true)) return inc.includes('unknown') ? 'unknown' : false;
   const exc = exclude.map((p) => matchExclude(p, source));
@@ -213,9 +166,10 @@ function sourcesFor(cfg: BuildConfig, outExt: string): string[] {
     case '.d.cts':
       return cfg.declaration || cfg.composite ? ['.cts'] : [];
     case '.js':
-      return cfg.emitDeclarationOnly ? [] : ['.ts', ...(reactJsx ? ['.tsx'] : []), ...(cfg.allowJs ? ['.js', '.jsx'] : [])];
+      // a .jsx input becomes .js only when JSX is compiled; with "preserve" it is written as .jsx
+      return cfg.emitDeclarationOnly ? [] : ['.ts', ...(reactJsx ? ['.tsx'] : []), ...(cfg.allowJs ? ['.js', ...(reactJsx ? ['.jsx'] : [])] : [])];
     case '.jsx':
-      return cfg.emitDeclarationOnly || cfg.jsx !== 'preserve' ? [] : ['.tsx'];
+      return cfg.emitDeclarationOnly || cfg.jsx !== 'preserve' ? [] : ['.tsx', ...(cfg.allowJs ? ['.jsx'] : [])];
     case '.mjs':
       return cfg.emitDeclarationOnly ? [] : ['.mts', ...(cfg.allowJs ? ['.mjs'] : [])];
     case '.cjs':
@@ -245,6 +199,7 @@ export function sourceOfBuildOutput(cfg: BuildConfig, output: string, tracked: S
   for (const ext of sourcesFor(cfg, m[0])) {
     const source = posix.join(rootDir, `${stem}${ext}`);
     if (!tracked.has(source)) continue;
+    if (/\.d\.[cm]?ts$/.test(source)) continue; // TypeScript emits nothing from a declaration file
     if (isInput(cfg, source) !== true) continue;
     return { source, how: `${cfg.file} compiles rootDir "${rootDir}" into ${declaration && cfg.declarationDir ? 'declarationDir' : 'outDir'} "${outDir}" (noEmit is not set) and has ${source} as an input` };
   }

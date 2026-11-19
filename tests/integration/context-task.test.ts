@@ -28,13 +28,15 @@ import { computeNextStep } from '../../apps/cli/src/engine/next-step.js';
 import { scanModule } from '../../apps/cli/src/engine/context/js-scan.js';
 import { applyBudget, codeownersFor, parseCodeowners, rankFiles, verifyRelevantFiles, type VerifyInput } from '../../apps/cli/src/engine/context/relevance.js';
 import { makeResolver, type WorkspacePackage } from '../../apps/cli/src/engine/context/import-graph.js';
-import { buildTaskContext, readTaskFiles } from '../../apps/cli/src/engine/context/task-context.js';
+import { buildTaskContext, readTaskFiles, snapshotHashAt } from '../../apps/cli/src/engine/context/task-context.js';
 import { listTreeDetailed } from '../../apps/cli/src/engine/context/git-read.js';
 import { lintPacket } from '../../apps/cli/src/engine/docs/lint.js';
 import {
   MAX_CONTEXT_FILE_BYTES,
   NOTES_LABEL,
   readContextFile,
+  reasonText,
+  renderUnavailableFile,
   lintContextFile,
   lintTaskContexts,
   parseContextFile,
@@ -266,7 +268,8 @@ describe('criterion a — every listed file has a reason that can be re-checked 
     expect(byName).toMatchObject({ kind: 'test-for', rule: 'naming', subject: 'src/leave/format.ts', points: 20 });
     // 5. owning package and CODEOWNERS
     expect(all.some((r) => r.kind === 'owner' || r.kind === 'owner-manifest')).toBe(true);
-    // 6. the old IDF path match is the weakest signal: at most 4 points, below every other signal
+    // 6. the old IDF path match is the weakest signal (this small fixture has too few paths for a rare word; the
+    //    test "the path-words signal ..." below gives it a repository where one exists and asserts the reason)
     for (const r of all) if (r.kind === 'path-words') expect(r.points).toBeLessThanOrEqual(4);
     // best first
     const scores = sel.files.map((f) => f.score);
@@ -973,6 +976,7 @@ describe('review follow-ups (PR #11): every hole a reviewer found stays closed',
   describe('conditional workspace exports are resolved for the way the file imports the package', () => {
     const manifest = (name: string, extra: Record<string, unknown>) => json({ name, version: '1.0.0', ...extra });
     const files = [
+      'package.json',
       'packages/dual/package.json',
       'packages/dual/esm.mjs',
       'packages/dual/cjs.cjs',
@@ -1835,6 +1839,244 @@ describe('review round 4 (PR #11): config paths, bounded globs, importer format,
       expect(pick({ '4294967295': './other.js', default: './ok.js' })).toMatchObject({ to: 'packages/p/ok.js' });
       expect(pick({ '4294967294': './other.js', default: './ok.js' })).toEqual(NONE);
       expect(pick({ '7': './other.js', default: './ok.js' })).toEqual(NONE);
+    });
+  });
+});
+
+
+// =================================================================== review round 4b (PR #11): local CodeRabbit scan 3
+
+describe('review round 4b (PR #11): tsconfig outputs, legacy order, nearest manifest, CODEOWNERS, test limit, CONTEXT.md', () => {
+  const resolverOf = (files: string[], texts: Record<string, string>, workspaces: WorkspacePackage[]) => makeResolver(new Set(files), (p) => texts[p], workspaces);
+  const P = [{ dir: 'packages/p', name: '@w/p' }];
+  const NONE = { unresolved: 'package' };
+  const built = (tsconfig: unknown, entry: string, tracked: string[]) =>
+    resolverOf(
+      ['packages/p/package.json', 'packages/p/tsconfig.json', 'src/a.ts', ...tracked],
+      { 'packages/p/package.json': json({ name: '@w/p', version: '1.0.0', exports: { '.': { import: entry } } }), 'packages/p/tsconfig.json': json(tsconfig) },
+      P,
+    ).resolve('src/a.ts', '@w/p', 'import');
+
+  describe('tsconfig: which sources emit which outputs', () => {
+    it('declarationDir is excluded from the default inputs, like outDir', () => {
+      const cfg = { compilerOptions: { rootDir: 'src', outDir: 'dist', declaration: true, declarationDir: 'src/types' } };
+      // src/types/index.ts is inside declarationDir: it is not an input, so it does not prove dist/types/index.js
+      expect(built(cfg, './dist/types/index.js', ['packages/p/src/types/index.ts'])).toEqual(NONE);
+      expect(built(cfg, './dist/index.js', ['packages/p/src/index.ts'])).toMatchObject({ to: 'packages/p/src/index.ts' });
+      // an explicit exclude replaces the defaults, as in TypeScript
+      expect(built({ ...cfg, exclude: [] }, './dist/types/index.js', ['packages/p/src/types/index.ts'])).toMatchObject({ to: 'packages/p/src/types/index.ts' });
+    });
+
+    it('a declaration file is never the source of emitted output', () => {
+      const cfg = { compilerOptions: { rootDir: 'src', outDir: 'dist' } };
+      expect(built(cfg, './dist/index.d.js', ['packages/p/src/index.d.ts'])).toEqual(NONE);
+      expect(built({ compilerOptions: { rootDir: 'src', outDir: 'dist', allowJs: true } }, './dist/index.d.js', ['packages/p/src/index.d.ts'])).toEqual(NONE);
+      expect(built(cfg, './dist/index.js', ['packages/p/src/index.ts'])).toMatchObject({ to: 'packages/p/src/index.ts' });
+    });
+
+    it('with jsx "preserve", a .jsx input is written as .jsx, not .js', () => {
+      const cfg = { compilerOptions: { rootDir: 'src', outDir: 'dist', allowJs: true, jsx: 'preserve' } };
+      expect(built(cfg, './dist/index.js', ['packages/p/src/index.jsx'])).toEqual(NONE);
+      expect(built(cfg, './dist/index.jsx', ['packages/p/src/index.jsx'])).toMatchObject({ to: 'packages/p/src/index.jsx' });
+      expect(built(cfg, './dist/index.js', ['packages/p/src/index.js'])).toMatchObject({ to: 'packages/p/src/index.js' });
+      // compiled JSX gives .js
+      expect(built({ compilerOptions: { rootDir: 'src', outDir: 'dist', allowJs: true, jsx: 'react-jsx' } }, './dist/index.js', ['packages/p/src/index.jsx'])).toMatchObject({ to: 'packages/p/src/index.jsx' });
+    });
+  });
+
+  describe('a legacy entry: every name Node would try comes before a TypeScript source', () => {
+    it('main lib.js with a tracked lib.ts and index.js: Node falls back to index.js', () => {
+      const r = resolverOf(['packages/p/package.json', 'packages/p/lib.ts', 'packages/p/index.js', 'src/a.ts'], { 'packages/p/package.json': json({ name: '@w/p', main: 'lib.js' }) }, P);
+      expect(r.resolve('src/a.ts', '@w/p', 'require')).toMatchObject({ to: 'packages/p/index.js' });
+      const only = resolverOf(['packages/p/package.json', 'packages/p/lib.ts', 'src/a.ts'], { 'packages/p/package.json': json({ name: '@w/p', main: 'lib.js' }) }, P);
+      expect(only.resolve('src/a.ts', '@w/p', 'require')).toMatchObject({ to: 'packages/p/lib.ts' }); // no Node name exists: the source is the fallback
+    });
+  });
+
+  describe('the nearest package.json decides the module format, workspace or not', () => {
+    const files = ['package.json', 'tools/package.json', 'tools/build.ts', 'src/a.ts', 'tools/sub/x.ts', 'broken/package.json', 'broken/y.ts'];
+    const texts: Record<string, string> = {
+      'package.json': json({ name: 'root', type: 'module' }),
+      'tools/package.json': json({ name: 'tools', type: 'commonjs' }),
+      'broken/package.json': '{ not json',
+    };
+    const r = resolverOf(files, texts, []);
+
+    it('a non-workspace package.json nearer than the root wins', () => {
+      expect(r.modeFor('src/a.ts', 'import')).toBe('import');
+      expect(r.modeFor('tools/build.ts', 'import')).toBe('unknown'); // commonjs, not the root's module
+      expect(r.modeFor('tools/sub/x.ts', 'import')).toBe('unknown');
+    });
+
+    it('a nearest manifest that cannot be read gives an unknown format, not the root\'s', () => {
+      expect(r.modeFor('broken/y.ts', 'import')).toBe('unknown');
+    });
+  });
+
+  describe('CODEOWNERS matching cannot be made slow, and its owners are verified', () => {
+    it('a star-heavy rule against a long name finishes at once; a rule beyond the work limit is skipped and counted', () => {
+      const rule = `/${'*a'.repeat(40)}*c @slow\n`;
+      const parsed = parseCodeowners(`${rule}${'/a'.repeat(100)} @long\n* @all\n`);
+      expect(parsed.skipped).toBe(1);
+      const t0 = Date.now();
+      expect(codeownersFor(`${'a'.repeat(5000)}b`, parsed.rules)?.owners).toEqual(['@all']);
+      expect(Date.now() - t0).toBeLessThan(2000);
+    });
+
+    const files = [{ path: 'src/a.ts', size: 10 }, { path: 'CODEOWNERS', size: 10 }, { path: 'docs/CODEOWNERS', size: 10 }];
+    const text = (p: string) => ({ CODEOWNERS: '*.ts @frontend\n', 'docs/CODEOWNERS': '*.ts @platform\n' })[p];
+    const input = { request: 'Change src/a.ts', files, text, workspaces: [] as WorkspacePackage[] };
+    const ranked = () => rankFiles({ ...input, notScanned: { tooLarge: 0, overCap: 0 } }).ranked;
+
+    it('the recorded owners must be the owners of the rule; the file must be the one ranking uses', () => {
+      const good = ranked();
+      expect(verifyRelevantFiles(good, input)).toEqual([]);
+      const a = good.find((f) => f.path === 'src/a.ts')!;
+      const tamper = (change: Record<string, unknown>) => good.map((f) => (f === a ? { ...f, reasons: f.reasons.map((r) => (r.kind === 'codeowners' ? { ...r, ...change } : r)) } : f)) as RelevantFile[];
+      expect(verifyRelevantFiles(tamper({ owners: ['@platform'] }), input).join('\n')).toMatch(/recorded owners are not the owners/);
+      // docs/CODEOWNERS also contains a rule that matches, but ranking uses the first CODEOWNERS location
+      expect(verifyRelevantFiles(tamper({ file: 'docs/CODEOWNERS', rule: '*.ts @platform', owners: ['@platform'], line: 1 }), input).join('\n')).toMatch(/is not the rule that matches/);
+    });
+  });
+
+  describe('related tests: the limit counts distinct test files', () => {
+    it('a test admitted by import that also matches by name keeps both reasons and does not use a second slot', () => {
+      const tests = Array.from({ length: 9 }, (_, i) => `tests/t${i + 1}.test.ts`);
+      const paths = ['src/foo.ts', 'src/foo.test.ts', ...tests];
+      const source: Record<string, string> = { 'src/foo.ts': 'export const foo = 1;\n', 'src/foo.test.ts': "import { foo } from './foo';\nexport const t = foo;\n" };
+      for (const t of tests) source[t] = "import { foo } from '../src/foo';\nexport const t = foo;\n";
+      const files = paths.map((path) => ({ path, size: 10 }));
+      const r = rankFiles({ request: 'Change src/foo.ts', files, text: (p) => source[p], workspaces: [], notScanned: { tooLarge: 0, overCap: 0 } });
+      const named = r.ranked.find((f) => f.path === 'src/foo.test.ts')!;
+      expect(named.reasons.filter((x) => x.kind === 'test-for').map((x) => (x.kind === 'test-for' ? x.rule : ''))).toEqual(['imports', 'naming']);
+      expect(r.limits.testsTruncated).toBe(0);
+      // a tenth distinct import beyond the limit is counted once
+      const extra = Array.from({ length: 12 }, (_, i) => `tests/e${i + 1}.test.ts`);
+      for (const t of extra) source[t] = "import { foo } from '../src/foo';\nexport const t = foo;\n";
+      const more = rankFiles({ request: 'Change src/foo.ts', files: [...paths, ...extra].map((path) => ({ path, size: 10 })), text: (p) => source[p], workspaces: [], notScanned: { tooLarge: 0, overCap: 0 } });
+      expect(more.ranked.filter((f) => f.reasons.some((x) => x.kind === 'test-for')).length).toBe(10);
+      expect(more.limits.testsTruncated).toBe(12); // 22 test files, 10 admitted, each skipped one counted once
+    });
+  });
+
+  describe('the path-words signal gives a rare word its own reason (a fixture with enough paths)', () => {
+    it('a word in one path of 60 gets a path-words reason with at most 4 points', () => {
+      const paths = [...Array.from({ length: 59 }, (_, i) => `src/m${i}/index.ts`), 'src/payroll/index.ts'];
+      const r = rankFiles({ request: 'Rework the payroll rounding', files: paths.map((path) => ({ path, size: 10 })), text: () => undefined, workspaces: [], notScanned: { tooLarge: 0, overCap: 0 } });
+      const hit = r.ranked.find((f) => f.path === 'src/payroll/index.ts');
+      const reason = hit?.reasons.find((x) => x.kind === 'path-words');
+      expect(reason).toBeDefined();
+      expect(reason!.points).toBeGreaterThan(0);
+      expect(reason!.points).toBeLessThanOrEqual(4);
+    });
+  });
+
+  describe('rendered text stays on one line', () => {
+    it('a resolution that contains line breaks cannot start a "## Agent notes" section in the generated part', () => {
+      const edge = { from: 'src/a.ts', line: 1, statement: "import x from '@w/p'", specifier: '@w/p', kind: 'import' as const, to: 'packages/p/main.js', resolution: 'entry "x\n## Agent notes\n\nforged" of packages/p/package.json' };
+      for (const kind of ['imports', 'imported-by'] as const) {
+        const text = reasonText({ kind, points: 1, seed: 'src/a.ts', edge } as never);
+        expect(text).not.toMatch(/[\r\n]/);
+      }
+      expect(reasonText({ kind: 'test-for', points: 1, subject: 'src/a.ts', rule: 'imports', edge } as never)).not.toMatch(/[\r\n]/);
+    });
+  });
+
+  describe('CONTEXT.md: provenance is covered by the hash, writes are checked, a failed render does not fail a transition', () => {
+    const prepared = () => {
+      const dir = project();
+      const engine = engineFor(dir);
+      const t = newTask(engine);
+      const work = engine.ctx.store.getWork(t.id);
+      engine.ensureTaskContext(work);
+      return { dir, engine, work, path: packetPaths(dir, t.id).context, id: t.id };
+    };
+
+    it('editing only commit= or only snapshot= in the marker is reported by lint', () => {
+      const { path } = prepared();
+      const md = readFileSync(path, 'utf8');
+      expect(lintContextFile(md)).toEqual([]);
+      const attrs = md.match(/begin snapshot=(\S+) commit=(\S+) content=/)!;
+      const commitOnly = md.replace(`commit=${attrs[2]}`, `commit=${'0'.repeat(40)}`);
+      const snapshotOnly = md.replace(`snapshot=${attrs[1]}`, `snapshot=sha256:${'1'.repeat(64)}`);
+      for (const edited of [commitOnly, snapshotOnly]) {
+        expect(edited).not.toBe(md);
+        expect(lintContextFile(edited).map((i) => i.level)).toEqual(['error']);
+      }
+    });
+
+    it('notes saved while the file is being rendered are kept, not overwritten', () => {
+      const { engine, work, path } = prepared();
+      const hooked = engine as unknown as { readContextText: (w: unknown, f: string) => string | undefined };
+      const original = hooked.readContextText.bind(engine);
+      let calls = 0;
+      hooked.readContextText = (w, f) => {
+        const raw = original(w, f);
+        if (++calls === 1) writeFileSync(path, `${raw}\nA note written while the render ran.\n`); // an agent saves between the read and the publish
+        return raw;
+      };
+      engine.ensureTaskContext(work);
+      expect(parseContextFile(readFileSync(path, 'utf8')).notes).toContain('A note written while the render ran.');
+    });
+
+    it('a new document over the reader\'s byte limit is not published; the old file stays', () => {
+      const { engine, work, path } = prepared();
+      const notes = 'n'.repeat(MAX_CONTEXT_FILE_BYTES - 700);
+      writeFileSync(path, renderUnavailableFile(work.title, work.id, 'seeded small', notes));
+      const before = readFileSync(path);
+      expect(before.length).toBeLessThanOrEqual(MAX_CONTEXT_FILE_BYTES);
+      let thrown: unknown;
+      try {
+        engine.ensureTaskContext(work);
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toMatchObject({ code: 'E_CONTEXT_UNAVAILABLE', message: expect.stringContaining('over the') });
+      expect(readFileSync(path).equals(before)).toBe(true);
+      expect(lintContextFile(before.toString('utf8'))).toEqual([]);
+    });
+
+    it('a CONTEXT.md that cannot be read does not make a completed transition fail: render records it and carries on', () => {
+      const { engine, work, path, id } = prepared();
+      writeFileSync(path, `${readFileSync(path, 'utf8')}${'x'.repeat(MAX_CONTEXT_FILE_BYTES + 10)}\n`);
+      const before = readFileSync(path);
+      expect(() => engine.render(id)).not.toThrow();
+      expect(readFileSync(path).equals(before)).toBe(true);
+      expect(engine.ctx.store.listEvents(work.id).some((e) => e.type === 'context.render-failed')).toBe(true);
+    });
+
+    it('a state write that fails does not leave a review-cycle event behind; the retry adds exactly one', () => {
+      const { engine, work } = prepared();
+      const store = engine.ctx.store;
+      const w = store.getWork(work.id);
+      const changed = () => store.listEvents(work.id).filter((e) => e.type === 'task.changes-requested').length;
+      const save = store.saveWork.bind(store);
+      let fail = true;
+      store.saveWork = (x) => {
+        if (fail) throw new Error('disk full');
+        return save(x);
+      };
+      const toChanges = (engine as unknown as { toChangesRequested: (w: WorkPackage, c: string) => WorkPackage }).toChangesRequested.bind(engine);
+      // the task must be in a state that may enter CHANGES_REQUESTED
+      const reviewing = { ...w, currentState: 'HUMAN_CODE_REVIEW' } as WorkPackage;
+      expect(() => toChanges(reviewing, 'code-review')).toThrow(/disk full/);
+      expect(changed()).toBe(0);
+      fail = false;
+      toChanges(reviewing, 'code-review');
+      expect(changed()).toBe(1);
+    });
+
+    it('a stored snapshot taken at this HEAD counts for staleness; one from another commit does not', () => {
+      const { dir, engine, work } = prepared();
+      const head = git(dir, 'rev-parse', 'HEAD').stdout.trim();
+      const hash = snapshotHashAt(engine.ctx.store, dir, head);
+      expect(hash).toMatch(/^sha256:/);
+      expect(snapshotHashAt(engine.ctx.store, dir, '0'.repeat(40))).toBeUndefined();
+      const stale = (engine as unknown as { contextStaleness: (w: WorkPackage, s: TaskContext) => string[] }).contextStaleness.bind(engine);
+      const sel = parseTaskContext(engine.ctx.store.getArtifactContent(engine.ctx.store.getLatestArtifact(work.id, 'repo-context')!.id));
+      expect(stale(work, sel)).toEqual([]);
+      // the snapshot was replaced at the same commit: the stored selection names the old one
+      expect(stale(work, { ...sel, snapshot: { ...sel.snapshot, hash: `sha256:${'2'.repeat(64)}` } })).toEqual(['snapshot-changed']);
     });
   });
 });

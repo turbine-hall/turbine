@@ -207,38 +207,49 @@ export function makeResolver(files: Set<string>, text: (path: string) => string 
     const build = loadBuildConfig(tsconfig, text);
 
     const via = viaExports ? 'exports' : 'main';
-    for (const { target, path, suffixes, tsProbe } of candidates) {
+    // Three passes, so a weaker kind of evidence never beats a stronger one that a later candidate has: every name
+    // Node would try, then build output proven by the tsconfig, then a TypeScript source for a `.js` name.
+    for (const { target, path, suffixes } of candidates) {
       for (const suffix of suffixes) {
         if (files.has(`${path}${suffix}`)) return { to: `${path}${suffix}`, how: `entry "${target}" of ${manifest} (${via}: ${suffix === '' ? 'exact file' : `Node adds "${suffix}"`})` };
       }
+    }
+    for (const { target, path } of candidates) {
       const built = build ? sourceOfBuildOutput(build, path, files) : undefined;
       if (built) return { to: built.source, how: `entry "${target}" of ${manifest} is build output: ${built.how}, so its source is ${built.source}` };
+    }
+    for (const { target, path, tsProbe } of candidates) {
       const probed = tsProbe ? probe(path, files) : undefined;
       if (probed) return { to: probed.path, how: `entry "${target}" of ${manifest} (${via}: ${probed.how})` };
     }
     return undefined;
   };
 
-  /** `"type"` of the nearest workspace manifest above a file, falling back to the root manifest. */
+  /** `"type"` of the nearest tracked package.json above a file, workspace or not. A manifest that cannot be read gives no type. */
   const typeCache = new Map<string, 'module' | 'commonjs' | undefined>();
   const packageType = (from: string): 'module' | 'commonjs' | undefined => {
-    let best: WorkspacePackage | undefined;
-    for (const w of workspaces) if (w.dir !== '.' && from.startsWith(`${w.dir}/`) && (!best || w.dir.length > best.dir.length)) best = w;
-    const dir = best?.dir ?? '.';
-    if (!typeCache.has(dir)) {
-      let type: 'module' | 'commonjs' | undefined;
-      const raw = text(dir === '.' ? 'package.json' : `${dir}/package.json`);
-      if (raw !== undefined) {
-        try {
-          const v = parseJsonc(raw).value;
-          if (isObj(v) && (v.type === 'module' || v.type === 'commonjs')) type = v.type;
-        } catch {
-          type = undefined;
+    let dir = posix.dirname(from);
+    for (;;) {
+      const manifest = dir === '.' ? 'package.json' : `${dir}/package.json`;
+      if (files.has(manifest)) {
+        if (!typeCache.has(manifest)) {
+          let type: 'module' | 'commonjs' | undefined;
+          const raw = text(manifest);
+          if (raw !== undefined) {
+            try {
+              const v = parseJsonc(raw).value;
+              if (isObj(v) && (v.type === 'module' || v.type === 'commonjs')) type = v.type;
+            } catch {
+              type = undefined;
+            }
+          }
+          typeCache.set(manifest, type);
         }
+        return typeCache.get(manifest); // the nearest manifest decides, even when it says nothing
       }
-      typeCache.set(dir, type);
+      if (dir === '.' || dir === '/') return undefined;
+      dir = posix.dirname(dir);
     }
-    return typeCache.get(dir);
   };
 
   return {
