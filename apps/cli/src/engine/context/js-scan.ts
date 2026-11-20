@@ -211,6 +211,8 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
         const spec = plainString(n.moduleReference.expression, startOf(n));
         if (spec) addImport('require', spec, startOf(n), n.moduleReference.end);
       }
+      // `export import fs = require('node:fs')` and `export import x = Ns.Member` also export the alias.
+      if (modifiersOf(n).some((m) => m.kind === ts.SyntaxKind.ExportKeyword)) addExport(n.name.text, lineAt(startOf(n)), text(startOf(n), n.end));
       return;
     }
     if (ts.isExportDeclaration(n)) {

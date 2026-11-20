@@ -216,12 +216,17 @@ export function readBlobs(repoRoot: string, blobIds: string[], expectedBytes = 0
  */
 /** Whether `ancestor` is `descendant` or one of its ancestors. Throws when either is not a commit of the repository. */
 export function isAncestor(repoRoot: string, ancestor: string, descendant: string): boolean {
+  // Shallow state is read before AND after: a "no" is settled only if the history was complete for the whole query.
+  const full = (): boolean => {
+    const shallow = run(repoRoot, ['rev-parse', '--is-shallow-repository']);
+    return shallow.status === 0 && String(shallow.stdout).trim() === 'false';
+  };
+  const completeBefore = full();
   const r = run(repoRoot, ['merge-base', '--is-ancestor', ancestor, descendant]);
   if (r.status === 0) return true;
   if (r.status === 1) {
     // In a shallow repository git stops at the boundary and ignores the parent link behind it: "no" is then not a settled answer.
-    const shallow = run(repoRoot, ['rev-parse', '--is-shallow-repository']);
-    if (shallow.status !== 0 || String(shallow.stdout).trim() !== 'false') {
+    if (!completeBefore || !full()) {
       throw new Error('the history of this repository is shallow (or could not be checked), so it is not known whether the commits are related; fetch the full history and try again');
     }
     return false;

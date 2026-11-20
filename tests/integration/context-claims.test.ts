@@ -85,8 +85,17 @@ const tableCells = (l: string): number => l.trim().replace(/^\|/, '').replace(/(
 /** A GFM delimiter row: cells of dashes with optional colons, separated by pipes (a pipe is required: it is what makes a table). */
 const isTableDelimiter = (l: string): boolean => l.includes('|') && /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(l);
 
-/** Where GFM ends a table body: a blank line, or a line that starts another block. A line without pipes is still a (one-cell) row. */
-const BLOCK_START = /^\s{0,3}(?:#{1,6}(?:\s|$)|>|[-*+]\s|\d{1,9}[.)]\s|```|~~~|([-*_])(?:\s*\1){2,}\s*$)/;
+/** GFM HTML blocks of types 1 to 6 (type 7 cannot interrupt a paragraph, so it cannot end a table either). */
+const HTML_BLOCK_TAGS = 'address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul';
+/**
+ * Where GFM ends a table body: a blank line, or a line that starts a block which can interrupt a paragraph: an ATX heading,
+ * a block quote, a fence, a thematic break, an HTML block (types 1 to 6), a bullet item that is not empty, or an ordered item
+ * that is not empty and starts at 1. A line without pipes, or an ordered item such as "2.", is still a row.
+ */
+const BLOCK_START = new RegExp(
+  `^\\s{0,3}(?:#{1,6}(?:\\s|$)|>|[-*+]\\s+\\S|1[.)]\\s+\\S|\`\`\`|~~~|([-*_])(?:\\s*\\1){2,}\\s*$|<(?:!--|\\?|![A-Za-z]|!\\[CDATA\\[|(?:script|pre|style|textarea)(?:\\s|>|$)|/?(?:${HTML_BLOCK_TAGS})(?:\\s|/?>|$)))`,
+  'i',
+);
 /** Every row of every table in `lines` whose cell count differs from its header's, and how many body rows were checked. */
 function tableProblems(lines: string[]): { problems: string[]; rows: number } {
   const problems: string[] = [];
@@ -1194,6 +1203,8 @@ describe('review round 1 (PR #12): findings from the first CodeRabbit pass', () 
     expect(t.problems).toHaveLength(2);
     // A heading or a list item ends the table.
     expect(tableProblems(['| A | B |', '| - | - |', '| a | b |', '# Title', '| x | y | z |']).rows).toBe(1);
+    expect(tableProblems(['| A | B |', '| - | - |', '| a | b |', '- item', '| x | y | z |']).rows).toBe(1);
+    expect(tableProblems(['| A | B |', '| - | - |', '| a | b |', '1. item', '| x | y | z |']).rows).toBe(1);
   });
 });
 
@@ -2122,6 +2133,20 @@ describe('review round 7 (PR #12): findings from the sixth local CodeRabbit revi
     });
   });
 
+  it('GFM list and HTML interruptions: "2." stays a row, "1." and a bullet end the table, an HTML block ends it', () => {
+    // An ordered item that does not start at 1 cannot interrupt a paragraph: it is a table row, and its extra cell is found.
+    const t = tableProblems(['| A | B |', '| - | - |', '| a | b |', '2. extra | cell | third']);
+    expect(t.rows).toBe(2);
+    expect(t.problems).toHaveLength(1);
+    // An empty list item does not interrupt either.
+    expect(tableProblems(['| A | B |', '| - | - |', '-', '| x | y | z |']).rows).toBe(2);
+    for (const html of ['<!-- note -->', '<div>', '<script>', '<pre>', '<?php', '<!DOCTYPE html>', '</section>', '<table>']) {
+      expect(tableProblems(['| A | B |', '| - | - |', '| a | b |', html, '| x | y | z |']).rows, html).toBe(1);
+    }
+    // An inline tag at the start of a row is not a block: the row is checked.
+    expect(tableProblems(['| A | B |', '| - | - |', '| a | b |', '<span>x</span> | y | z']).problems).toHaveLength(1);
+  });
+
   it('the table check ends a table at a thematic break, and a fence closes only on a valid closing line', () => {
     for (const br of ['***', '---', '___', '- - -', '* * *']) expect(tableProblems(['| A | B |', '| - | - |', '| a | b |', br, 'text']).rows, br).toBe(1);
     // A pipe-free body row is still a row.
@@ -2194,8 +2219,9 @@ describe('review round 8 (PR #12): findings from the seventh local CodeRabbit re
       dirs.push(dst);
       git(dst, 'init', '-q', '-b', 'main');
       git(dst, 'remote', 'add', 'origin', `file://${src}`);
-      git(dst, 'fetch', '-q', '--depth', '1', 'origin', c3);
-      git(dst, 'fetch', '-q', '--depth', '1', 'origin', c1);
+      // The fixture's own fetches allow the local file transport, whatever protocol.file.allow the developer has set.
+      git(dst, '-c', 'protocol.file.allow=always', 'fetch', '-q', '--depth', '1', 'origin', c3);
+      git(dst, '-c', 'protocol.file.allow=always', 'fetch', '-q', '--depth', '1', 'origin', c1);
       return { src, dst, c1, c3 };
     }
     it('isAncestor throws in a shallow repository instead of answering false; a full repository answers', () => {
@@ -2250,5 +2276,90 @@ describe('review round 8 (PR #12): findings from the seventh local CodeRabbit re
     expect(() => assertClaimBudget(wideObject)).toThrow(/more than 20000 values/);
     expect(() => assertClaimBudget({ a: [1, 2, { b: 'text' }] })).not.toThrow();
     expect(() => assertClaimBudget({ k: 'x'.repeat(128 * 1024 + 1) })).toThrow(/characters of text/);
+  });
+});
+
+describe('review round 9 (PR #12): findings from the eighth local CodeRabbit review', () => {
+  it('publishClaim refuses, without writing, if HEAD moves while the claim is being verified', () => {
+    const dir = newRepo();
+    const c = head(dir);
+    const store = openStore();
+    hooks.onVerify = () => {
+      commitFiles(dir, { 'moved.txt': 'x\n' }); // another process commits while verification runs
+    };
+    let out;
+    try {
+      out = publishClaim(store, dir, dir, validClaims(dir, c).quote!);
+    } finally {
+      hooks.onVerify = undefined;
+    }
+    expect(out).toMatchObject({ published: false, unconfirmed: true, recorded: false });
+    if (!out.published) expect(out.reason).toMatch(/HEAD moved/);
+    expect(store.listClaims(dir)).toEqual([]);
+    expect(store.getClaimFrontier(dir)).toBeNull();
+    // With HEAD stable, the same claim (an explicit older pin) is published.
+    expect(publishClaim(store, dir, dir, validClaims(dir, c).quote!).published).toBe(true);
+  });
+
+  it('a config key path never walks into the reader\'s inexact-number marker', () => {
+    const d = newRepo({ 'n.json': '{"limit": 9007199254740993}\n' });
+    const c = head(d);
+    const cfg = (key: string[], value: unknown) =>
+      publishClaim(openStore(), d, d, claim({ kind: 'config', evidence: [ev(d, c, 'n.json', 1)], verifier: { kind: 'config', path: 'n.json', key, value } }));
+    const into = cfg(['limit', 'text'], '9007199254740993');
+    expect(into).toMatchObject({ published: false, unconfirmed: false });
+    if (!into.published) expect(into.reason).toMatch(/has no/);
+    expect(cfg(['limit'], 9007199254740992)).toMatchObject({ published: false, unconfirmed: true });
+  });
+
+  it('export import aliases are exports', () => {
+    const d = newRepo({ 'x.ts': "export import fs = require('node:fs');\nexport import member = Ns.Member;\nimport plain = require('node:path');\nexport const k = 1;\n" });
+    const c = head(d);
+    const ex = (symbol: string, line: number) =>
+      publishClaim(openStore(), d, d, claim({ kind: 'exists', evidence: [ev(d, c, 'x.ts', line)], verifier: { kind: 'exists', path: 'x.ts', symbol } })).published;
+    expect(ex('fs', 1)).toBe(true);
+    expect(ex('member', 2)).toBe(true);
+    expect(ex('plain', 3)).toBe(false); // not exported
+    expect(ex('k', 4)).toBe(true);
+    // The require edge of the exported alias is still an import.
+    expect(publishClaim(openStore(), d, d, claim({ kind: 'imports', evidence: [ev(d, c, 'x.ts', 1)], verifier: { kind: 'imports', from: 'x.ts', specifier: 'node:fs' } })).published).toBe(true);
+  });
+
+  it('a claim reason is bounded on write and on read, and an oversized stored reason is an invalid row', () => {
+    const dir = repoOnce();
+    const store = openStore();
+    const input = structuredClone(validClaims(dir, headOnce()).quote!) as Record<string, unknown>;
+    const parsed = ClaimSchema.parse(input);
+    expect(() => store.saveClaim({ repoPath: dir, claim: parsed, status: 'rejected', reason: 'x'.repeat(65 * 1024) })).toThrow(/over 65536 bytes/);
+    expect(() => store.saveClaim({ repoPath: dir, claim: parsed, status: 'rejected', reason: '€'.repeat(22_000) })).toThrow(/over 65536 bytes/); // 66,000 bytes
+    expect(store.saveClaim({ repoPath: dir, claim: parsed, status: 'verified', reason: 'proof' })).toBe(true);
+    expect(() => store.withdrawClaim(dir, parsed.id, 'y'.repeat(70_000))).toThrow(/over 65536 bytes/);
+    expect(store.getClaim(dir, parsed.id)).toMatchObject({ status: 'verified', reason: 'proof' });
+    store.db.prepare('UPDATE claims SET reason = ? WHERE id = ?').run('€'.repeat(22_000), parsed.id);
+    expect(() => store.getClaim(dir, parsed.id)).toThrow(/reason of more than 65536 bytes/);
+    expect(() => store.listClaims(dir)).toThrow(/reason of more than 65536 bytes/);
+    store.db.prepare('UPDATE claims SET reason = NULL WHERE id = ?').run(parsed.id);
+    expect(store.getClaim(dir, parsed.id)).toMatchObject({ status: 'verified' }); // a missing reason is not an oversized one
+  });
+
+  it('the fixture shallow clone fetches with the file transport allowed even when the developer forbids it', () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-claims-proto-'));
+    dirs.push(root);
+    const globalConfig = join(root, 'gitconfig');
+    writeFileSync(globalConfig, '[protocol "file"]\n\tallow = never\n');
+    const before = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      const src = newRepo();
+      const dst = mkdtempSync(join(tmpdir(), 'turbine-claims-proto-dst-'));
+      dirs.push(dst);
+      git(dst, 'init', '-q', '-b', 'main');
+      git(dst, 'remote', 'add', 'origin', `file://${src}`);
+      expect(() => git(dst, 'fetch', '-q', '--depth', '1', 'origin', head(src))).toThrow(); // the developer's setting applies by default
+      expect(() => git(dst, '-c', 'protocol.file.allow=always', 'fetch', '-q', '--depth', '1', 'origin', head(src))).not.toThrow();
+    } finally {
+      if (before === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = before;
+    }
   });
 });

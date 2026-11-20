@@ -214,7 +214,8 @@ function valueAt(root: unknown, key: ReadonlyArray<string | number>): { found: t
       if (!Array.isArray(cur) || k >= cur.length) return { found: false };
       cur = cur[k];
     } else {
-      if (typeof cur !== 'object' || cur === null || Array.isArray(cur) || !own(cur, k)) return { found: false };
+      // The reader's marker for a number it would have rounded is a number in the JSON, not an object with members.
+      if (typeof cur !== 'object' || cur === null || cur instanceof InexactNumber || Array.isArray(cur) || !own(cur, k)) return { found: false };
       cur = (cur as Record<string, unknown>)[k];
     }
   }

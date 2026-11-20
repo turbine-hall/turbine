@@ -19,6 +19,8 @@ import { DependencySectionSchema, GitObjectIdSchema, assertNoUnsafeKeys } from '
 
 /** What one claim may occupy, as JSON. */
 export const MAX_CLAIM_BYTES = 128 * 1024;
+/** What the reason stored with a claim may occupy, in UTF-8 bytes. The engine clips far below this. */
+export const MAX_CLAIM_REASON_BYTES = 64 * 1024;
 /** How deep, and how many values, a claim may have: checked before any recursive validation runs. */
 const MAX_CLAIM_DEPTH = 64;
 const MAX_CLAIM_NODES = 20_000;

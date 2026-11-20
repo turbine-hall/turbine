@@ -1,7 +1,7 @@
 import { ClaimSchema, PUBLISHED_CLAIM_STATUSES, claimCommit, parseClaimSafe } from '@turbine-hall/turbine-contracts';
 import type { Claim, StoredClaim } from '@turbine-hall/turbine-contracts';
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
-import { isAncestor, resolveCommit, treeIdOf } from './git-read.js';
+import { headState, isAncestor, resolveCommit, treeIdOf } from './git-read.js';
 import { CommitReader, SYMLINK_MODE, verifyClaim } from './verify.js';
 
 /**
@@ -43,6 +43,8 @@ export function publishClaim(store: WorkStore, repoRoot: string, repoPath: strin
   const claim = parsed.claim;
   const commit = claimCommit(claim);
   return store.transaction((): PublishOutcome => {
+    // HEAD is read before the verification and again before the write: a commit made meanwhile is a retryable refusal.
+    const headBefore = JSON.stringify(headState(repoRoot));
     let result: ReturnType<typeof verifyClaim>;
     try {
       result = verifyClaim(new CommitReader(repoRoot, commit), claim, 'pinned');
@@ -87,6 +89,7 @@ export function publishClaim(store: WorkStore, repoRoot: string, repoPath: strin
       if (!c.ok) return c.outcome;
       if (!c.descends) return refuse(`this repository's claims have already been carried to commit ${frontier}, which commit ${commit} does not descend from; publish at ${frontier} or a commit after it`);
     }
+    if (JSON.stringify(headState(repoRoot)) !== headBefore) return refuse('HEAD moved while the claim was being verified; nothing was stored, try again', true);
     store.saveClaim({ repoPath, claim, status: 'verified', reason: clip(result.reason) });
     store.setClaimFrontier(repoPath, commit);
     // Read in the same transaction that wrote it, so the result is what this call stored.

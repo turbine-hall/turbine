@@ -20,6 +20,7 @@ import {
   ClaimSchema,
   ClaimStatusSchema,
   MAX_CLAIM_BYTES,
+  MAX_CLAIM_REASON_BYTES,
   assertClaimBudget,
   DecisionSchema,
   EecInvalidationEventSchema,
@@ -46,7 +47,11 @@ import { openDatabase } from './db.js';
  * The claim columns, with the payload measured in BYTES inside SQLite: a payload over the limit comes back as NULL, so an
  * oversized or damaged row is never read into memory by this process.
  */
-const CLAIM_COLUMNS = `id, repo_path, section, "commit", CASE WHEN length(CAST(data AS BLOB)) > ${MAX_CLAIM_BYTES} THEN NULL ELSE data END AS data, status, reason, created_at`;
+// `octet_length` (SQLite 3.43+, bundled with Node 22.5 and later) reads the stored size without loading the value.
+const CLAIM_COLUMNS = `id, repo_path, section, "commit",
+  CASE WHEN octet_length(data) > ${MAX_CLAIM_BYTES} THEN NULL ELSE data END AS data, status,
+  CASE WHEN octet_length(reason) > ${MAX_CLAIM_REASON_BYTES} THEN NULL ELSE reason END AS reason,
+  coalesce(octet_length(reason) > ${MAX_CLAIM_REASON_BYTES}, 0) AS reason_oversized, created_at`;
 
 type ClaimRow = {
   id: string;
@@ -56,6 +61,7 @@ type ClaimRow = {
   data: string | null;
   status: string;
   reason: string | null;
+  reason_oversized: number;
   created_at: string;
 };
 
@@ -484,6 +490,7 @@ export class WorkStore {
     const claim = ClaimSchema.parse(input.claim);
     const status = ClaimStatusSchema.parse(input.status);
     const reason = input.reason?.trim() || undefined;
+    if (reason !== undefined && Buffer.byteLength(reason, 'utf8') > MAX_CLAIM_REASON_BYTES) throw new Error(`a claim reason is over ${MAX_CLAIM_REASON_BYTES} bytes`);
     if ((status === 'rejected' || status === 'withdrawn') && !reason) throw new Error(`a ${status} claim must record why`);
     // One statement, so the "never replace a published claim with a rejection" rule cannot race another writer.
     const written = this.db
@@ -500,6 +507,7 @@ export class WorkStore {
   /** Withdraw a published claim (or any claim not already withdrawn). The claim stays on record with the reason. */
   withdrawClaim(repoPath: string, id: string, reason: string): boolean {
     if (!reason.trim()) throw new Error('a withdrawn claim must record why');
+    if (Buffer.byteLength(reason.trim(), 'utf8') > MAX_CLAIM_REASON_BYTES) throw new Error(`a claim reason is over ${MAX_CLAIM_REASON_BYTES} bytes`);
     const r = this.db
       .prepare(`UPDATE claims SET status = 'withdrawn', reason = ? WHERE repo_path = ? AND id = ? AND status <> 'withdrawn'`)
       .run(reason.trim(), repoPath, id);
@@ -555,6 +563,8 @@ export class WorkStore {
   private parseClaimRow(row: ClaimRow): StoredClaim {
     // The size was measured in bytes by SQLite, and an oversized payload was not returned at all.
     if (row.data === null) throw new Error(`claim ${row.id} is stored with more than ${MAX_CLAIM_BYTES} bytes of data`);
+    // An over-budget reason is an invalid row, not a missing reason.
+    if (row.reason_oversized) throw new Error(`claim ${row.id} is stored with a reason of more than ${MAX_CLAIM_REASON_BYTES} bytes`);
     const raw: unknown = JSON.parse(row.data);
     // The budget walk is iterative and stops at a fixed depth; the unsafe-key walk below recurses, so it only sees what fits.
     assertClaimBudget(raw);
