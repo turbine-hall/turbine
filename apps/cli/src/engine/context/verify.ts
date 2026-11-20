@@ -54,7 +54,9 @@ const pass = (reason: string): VerifyResult => ({ ok: true, reason });
 
 /** Lines as the parsers here count them: LF, CRLF and a bare CR each end a line. A leading byte order mark is not text. */
 export function splitLines(text: string): string[] {
-  const lines = (text.charCodeAt(0) === 0xfeff ? text.slice(1) : text).split(/\r\n|\r|\n/);
+  const body = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  if (body === '') return []; // an empty file has no lines: line 1 of it does not exist
+  const lines = body.split(/\r\n|\r|\n/);
   // A line terminator ends a line; it does not start another. "x\n" is one line, "x\n\n" is two.
   if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
   return lines;

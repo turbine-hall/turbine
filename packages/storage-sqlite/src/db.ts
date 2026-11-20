@@ -8,6 +8,12 @@ export type SqliteDb = DatabaseSync;
 export function openDatabase(dbPath: string): SqliteDb {
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
+  // `octet_length` and the size limits are measured in UTF-8 bytes: a database in another text encoding is refused.
+  const encoding = (db.prepare('PRAGMA encoding').get() as { encoding: string }).encoding;
+  if (encoding !== 'UTF-8') {
+    db.close();
+    throw new Error(`the database ${dbPath} uses the ${encoding} text encoding; only UTF-8 is supported`);
+  }
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA foreign_keys = ON;');
   migrate(db);

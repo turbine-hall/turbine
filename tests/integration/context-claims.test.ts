@@ -5,6 +5,7 @@
  * the commit it names. The PLANTED FALSE CLAIMS suite must be rejected 100%; every verifier also has positive cases.
  */
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -115,7 +116,8 @@ function tableProblems(lines: string[]): { problems: string[]; rows: number } {
     }
   }
   for (let i = 0; i + 1 < lines.length; i++) {
-    if (fenced[i] || fenced[i + 1] || !isTableDelimiter(lines[i + 1]!)) continue;
+    // A header and a delimiter indented four spaces or more (or by a tab) are indented code, not a table.
+    if (fenced[i] || fenced[i + 1] || !/^ {0,3}\S/.test(lines[i]!) || !/^ {0,3}\S/.test(lines[i + 1]!) || !isTableDelimiter(lines[i + 1]!)) continue;
     const header = tableCells(lines[i]!);
     if (tableCells(lines[i + 1]!) !== header) problems.push(`line ${i + 2}: delimiter row`);
     let j = i + 2;
@@ -171,6 +173,7 @@ function newRepo(files: Record<string, string | Buffer | null> = BASE): string {
   dirs.push(noHooks);
   git(dir, 'config', 'core.hooksPath', noHooks);
   git(dir, 'config', 'core.autocrlf', 'false');
+  git(dir, 'config', 'core.ignoreStat', 'false'); // a global assume-unchanged setting would hide the fixture's uncommitted edits
   git(dir, 'config', 'core.attributesFile', '/dev/null');
   const noIgnores = join(noHooks, 'ignore');
   writeFileSync(noIgnores, '');
@@ -1504,7 +1507,7 @@ describe('review round 3 (PR #12): findings from the second local CodeRabbit rev
     expect(splitLines('x\n')).toEqual(['x']);
     expect(splitLines('x\n\n')).toEqual(['x', '']);
     expect(splitLines('x\r\ny')).toEqual(['x', 'y']);
-    expect(splitLines('')).toEqual(['']);
+    expect(splitLines('')).toEqual([]); // an empty file has no lines
     const d = newRepo({ 'one.txt': 'x\n' });
     const c = head(d);
     const q = claim({ kind: 'quote', evidence: [ev(d, c, 'one.txt', [1, 2], 'x\n')], verifier: { kind: 'quote' } });
@@ -1913,7 +1916,7 @@ describe('review round 6 (PR #12): findings from the fifth local CodeRabbit revi
       expect(store.getClaimFrontier(dir)).toBeNull();
       reverifyOnCommit(store, dir, dir, c1, c2);
       expect(store.getClaimFrontier(dir)).toBe(c2);
-      reverifyOnCommit(store, dir, dir, c2, c1); // a transition to an older commit leaves the frontier where it is
+      expect(() => reverifyOnCommit(store, dir, dir, c2, c1)).toThrow(/does not descend/); // never backwards
       expect(store.getClaimFrontier(dir)).toBe(c2);
     });
 
@@ -2155,6 +2158,10 @@ describe('review round 7 (PR #12): findings from the sixth local CodeRabbit revi
     expect(tableProblems(['~~~~', '~~~', '| A | B |', '| - | - |', 'literal', '~~~~']).problems).toEqual([]);
     expect(tableProblems(['```', '``` still code', '| A | B |', '| - | - |', 'literal', '```']).problems).toEqual([]);
     expect(tableProblems(['```', '~~~', '| A | B |', '| - | - |', 'literal', '```']).problems).toEqual([]);
+    // Indented code is not a table.
+    expect(tableProblems(['    | A | B |', '    | - | - |', '    literal']).problems).toEqual([]);
+    expect(tableProblems(['\t| A | B |', '\t| - | - |', '\tliteral']).problems).toEqual([]);
+    expect(tableProblems(['   | A | B |', '   | - | - |', 'literal']).rows).toBe(1); // three spaces is still a table
     // After a valid close, the next table is checked again.
     expect(tableProblems(['```', 'x', '```', '| A | B |', '| - | - |', 'oops']).problems).toHaveLength(1);
   });
@@ -2361,5 +2368,78 @@ describe('review round 9 (PR #12): findings from the eighth local CodeRabbit rev
       if (before === undefined) delete process.env.GIT_CONFIG_GLOBAL;
       else process.env.GIT_CONFIG_GLOBAL = before;
     }
+  });
+});
+
+describe('review round 10 (PR #12): findings from the ninth local CodeRabbit review', () => {
+  it('a diverged transition does not repin or withdraw anything, and writes no event', () => {
+    const dir = newRepo();
+    const a = head(dir);
+    const store = openStore();
+    const input = validClaims(dir, a).quote!;
+    publishClaim(store, dir, dir, input);
+    const b = commitFiles(dir, { 'README.md': 'x\n' });
+    reverifyOnCommit(store, dir, dir, a, b);
+    git(dir, 'checkout', '-q', '-b', 'other', a);
+    const other = commitFiles(dir, { 'src/util.ts': null }); // would withdraw the claim
+    const before = JSON.stringify(store.listClaims(dir));
+    const eventsBefore = JSON.stringify(store.db.prepare('SELECT * FROM events').all());
+    expect(() => reverifyOnCommit(store, dir, dir, b, other)).toThrow(/does not descend/);
+    expect(JSON.stringify(store.listClaims(dir))).toBe(before);
+    expect(JSON.stringify(store.db.prepare('SELECT * FROM events').all())).toBe(eventsBefore);
+    expect(store.getClaimFrontier(dir)).toBe(b);
+    expect(store.getClaim(dir, input.id as string)).toMatchObject({ status: 'verified', commit: b });
+  });
+
+  it('an empty file has no lines: a citation of line 1 of it is refused, and a lone line terminator is one empty line', () => {
+    expect(splitLines('')).toEqual([]);
+    expect(splitLines('\ufeff')).toEqual([]);
+    expect(splitLines('\n')).toEqual(['']);
+    expect(splitLines('\r\n')).toEqual(['']);
+    expect(splitLines('x\n')).toEqual(['x']);
+    const d = newRepo({ 'empty.txt': '', 'nl.txt': '\n' });
+    const c = head(d);
+    const cite = (path: string) =>
+      publishClaim(openStore(), d, d, claim({ kind: 'exists', evidence: [ev(d, c, path, 1)], verifier: { kind: 'exists', path } }));
+    expect(cite('empty.txt')).toMatchObject({ published: false });
+    expect(cite('nl.txt').published).toBe(true);
+  });
+
+  it('the store refuses a database in another text encoding, and accepts a UTF-8 one', () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-claims-utf16-'));
+    dirs.push(root);
+    const path = join(root, 'engine.db');
+    const raw = new DatabaseSync(path);
+    raw.exec("PRAGMA encoding = 'UTF-16le'; CREATE TABLE t (x TEXT); INSERT INTO t VALUES ('a');");
+    raw.close();
+    expect(() => new WorkStore(path)).toThrow(/UTF-16le text encoding; only UTF-8/);
+    const ok = new WorkStore(join(root, 'ok.db'));
+    stores.push(ok);
+    expect((ok.db.prepare('PRAGMA encoding').get() as { encoding: string }).encoding).toBe('UTF-8');
+  });
+
+  it('the fixture repository sets core.ignoreStat to false whatever the developer has globally', () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-claims-stat-'));
+    dirs.push(root);
+    const globalConfig = join(root, 'gitconfig');
+    writeFileSync(globalConfig, '[core]\n\tignoreStat = true\n');
+    const before = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      const d = newRepo();
+      expect(git(d, 'config', '--get', 'core.ignoreStat').trim()).toBe('false');
+      writeFileSync(join(d, 'src', 'app.ts'), '// edited\n');
+      expect(git(d, 'status', '--porcelain')).toContain('src/app.ts'); // the edit is seen, not skipped as assume-unchanged
+    } finally {
+      if (before === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = before;
+    }
+  });
+
+  it('the status document states the star, numeric and transition rules', () => {
+    const doc = readFileSync(resolve(here, '../../docs/IMPLEMENTATION_STATUS.md'), 'utf8');
+    expect(doc).toContain('a `default` miss stays a definite failure');
+    expect(doc).toContain('round-trips through a double');
+    expect(doc).toContain('`next` must descend from `prev`');
   });
 });

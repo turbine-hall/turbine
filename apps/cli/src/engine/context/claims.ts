@@ -155,6 +155,9 @@ export function reverifyOnCommit(store: WorkStore, repoRoot: string, repoPath: s
     if (frontier && frontier !== prev) {
       throw new Error(`the claims of this repository are at commit ${frontier}, not ${prev}; carry them from ${frontier} (the transition from ${prev} to ${next} is stale)`);
     }
+    // A transition moves forward along one line of history: a commit that does not descend from `prev` would repin claims
+    // while the frontier (which only moves forward) stayed behind. Refused before any row is written.
+    if (!isAncestor(repoRoot, prev, next)) throw new Error(`commit ${next} does not descend from ${prev}; claims are carried forward along one line of history`);
     const claims = store.listClaims(repoPath, { statuses: PUBLISHED_CLAIM_STATUSES, commit: prev });
     // Compared by what the tree holds (object id and type), not by `git diff`: a mode-only change does not change the
     // blob, and a diff over thousands of cited paths would overflow the command line.
