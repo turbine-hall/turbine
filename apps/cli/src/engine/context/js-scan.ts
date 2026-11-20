@@ -154,6 +154,18 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
   const addExport = (name: string, line: number, statement: string) => exports.push({ name, line, statement });
   const addDefault = (line: number, statement: string) => defaultExports.push({ name: 'default', line, statement });
 
+  /** The identifiers a declaration name binds, through object and array patterns (an explicit stack: a pattern can nest deeply). */
+  const boundNames = (name: TS.BindingName): string[] => {
+    const out: string[] = [];
+    const todo: TS.BindingName[] = [name];
+    while (todo.length) {
+      const b = todo.pop()!;
+      if (ts.isIdentifier(b)) out.push(b.text);
+      else for (const el of b.elements) if (ts.isBindingElement(el)) todo.push(el.name);
+    }
+    return out.reverse();
+  };
+
   const modifiersOf = (n: TS.Node): readonly TS.Modifier[] => (ts.canHaveModifiers(n) ? (ts.getModifiers(n) ?? []) : []);
 
   /** Whether this node declares a binding named `require` that is not an ambient declaration of the loader itself. */
@@ -231,7 +243,14 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
     if (!exportKeyword) return;
     const from = startOf(exportKeyword);
     if (ts.isVariableStatement(n)) {
-      for (const d of n.declarationList.declarations) if (ts.isIdentifier(d.name)) addExport(d.name.text, lineAt(from), text(from, d.name.end));
+      for (const d of n.declarationList.declarations) {
+        // `export const { start: run, ...rest } = api` exports `run` and `rest`: the names the pattern binds, not its property names.
+        const names = boundNames(d.name);
+        if (!names.length) continue;
+        const line = lineAt(from);
+        const statement = text(from, d.name.end);
+        for (const name of names) addExport(name, line, statement);
+      }
     } else if (ts.isFunctionDeclaration(n) || ts.isClassDeclaration(n) || ts.isEnumDeclaration(n) || ts.isInterfaceDeclaration(n) || ts.isTypeAliasDeclaration(n)) {
       if (n.name) addExport(n.name.text, lineAt(from), text(from, n.name.end));
     } else if (ts.isModuleDeclaration(n) && ts.isIdentifier(n.name)) {

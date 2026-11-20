@@ -19,6 +19,32 @@ import { DependencySectionSchema, GitObjectIdSchema, assertNoUnsafeKeys } from '
 
 /** What one claim may occupy, as JSON. */
 export const MAX_CLAIM_BYTES = 128 * 1024;
+/** How deep, and how many values, a claim may have: checked before any recursive validation runs. */
+const MAX_CLAIM_DEPTH = 64;
+const MAX_CLAIM_NODES = 20_000;
+
+/**
+ * A bounded walk over an untrusted claim, run before the schema (which recurses and serialises). It refuses a claim that is
+ * too deep, has too many values, or holds more text than a stored claim may (a string's length in UTF-16 units never exceeds
+ * its UTF-8 byte length, so a claim that fits is never refused here). The exact serialised-size check stays in the schema.
+ */
+export function assertClaimBudget(raw: unknown): void {
+  let nodes = 0;
+  let text = 0;
+  const stack: Array<{ v: unknown; depth: number }> = [{ v: raw, depth: 0 }];
+  while (stack.length) {
+    const { v, depth } = stack.pop()!;
+    if (++nodes > MAX_CLAIM_NODES) throw new Error(`the claim has more than ${MAX_CLAIM_NODES} values`);
+    if (typeof v === 'string') {
+      text += v.length;
+    } else if (typeof v === 'object' && v !== null) {
+      if (depth >= MAX_CLAIM_DEPTH) throw new Error(`the claim is nested deeper than ${MAX_CLAIM_DEPTH} levels`);
+      const children = Array.isArray(v) ? v : Object.entries(v).flatMap(([k, c]) => ((text += k.length), [c]));
+      for (const c of children) stack.push({ v: c, depth: depth + 1 });
+    }
+    if (text > MAX_CLAIM_BYTES) throw new Error(`the claim holds more than ${MAX_CLAIM_BYTES} characters of text`);
+  }
+}
 
 export const CLAIM_KINDS = ['exists', 'quote', 'imports', 'calls', 'config', 'dependency', 'command', 'absence'] as const;
 export const ClaimKindSchema = z.enum(CLAIM_KINDS);
@@ -241,6 +267,7 @@ export type ClaimParse = { ok: true; claim: Claim } | { ok: false; reason: strin
  */
 export function parseClaimSafe(raw: unknown): ClaimParse {
   try {
+    assertClaimBudget(raw);
     assertNoUnsafeKeys(raw);
     const r = ClaimSchema.safeParse(raw);
     if (r.success) return { ok: true, claim: r.data };

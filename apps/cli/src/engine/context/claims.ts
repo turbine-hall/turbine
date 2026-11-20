@@ -141,6 +141,12 @@ export function reverifyOnCommit(store: WorkStore, repoRoot: string, repoPath: s
   const treeChanged = treeIdOf(repoRoot, prev) !== treeIdOf(repoRoot, next);
 
   store.transaction(() => {
+    // The transition must start where the claims are: a stale caller (carrying A to C when they are already at B) would
+    // find no claims at A, move the frontier to C and leave the claims behind. It is refused so the caller can start from B.
+    const frontier = store.getClaimFrontier(repoPath);
+    if (frontier && frontier !== prev) {
+      throw new Error(`the claims of this repository are at commit ${frontier}, not ${prev}; carry them from ${frontier} (the transition from ${prev} to ${next} is stale)`);
+    }
     const claims = store.listClaims(repoPath, { statuses: PUBLISHED_CLAIM_STATUSES, commit: prev });
     // Compared by what the tree holds (object id and type), not by `git diff`: a mode-only change does not change the
     // blob, and a diff over thousands of cited paths would overflow the command line.
@@ -186,7 +192,6 @@ export function reverifyOnCommit(store: WorkStore, repoRoot: string, repoPath: s
     }
     result.sections = [...sections].sort();
     // The frontier moves forward only, and also when the transition withdrew the last published claim.
-    const frontier = store.getClaimFrontier(repoPath);
     if (!frontier || isAncestor(repoRoot, frontier, next)) store.setClaimFrontier(repoPath, next);
   });
   return result;

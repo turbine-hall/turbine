@@ -305,7 +305,7 @@ function verifyCalls(reader: CommitReader, claim: Claim, v: Extract<ClaimVerifie
   const parsed = parseSource(t.text, { jsx: jsxFile(v.path) });
   if (!parsed.ok) return unconfirmed(`${v.path} cannot be parsed: ${parsed.reason}`);
   const { ts, sf, lineAt } = parsed;
-  /** `a`, `a.b.c`, `this.x`: the dotted name written at the call. Anything computed has no name. A loop, not recursion: a chain can be tens of thousands of segments long. */
+  /** `a`, `a.b.c`, `this.x`, `super.x`: the dotted name written at the call. Anything computed has no name. A loop, not recursion: a chain can be tens of thousands of segments long. */
   const nameOf = (n: TS.Expression): string | undefined => {
     const parts: string[] = [];
     let cur: TS.Expression = n;
@@ -315,6 +315,7 @@ function verifyCalls(reader: CommitReader, claim: Claim, v: Extract<ClaimVerifie
     }
     if (ts.isIdentifier(cur)) parts.push(cur.text);
     else if (cur.kind === ts.SyntaxKind.ThisKeyword) parts.push('this');
+    else if (cur.kind === ts.SyntaxKind.SuperKeyword) parts.push('super'); // `super.run()`; `super[key]()` is computed and has no name
     else return undefined;
     return parts.reverse().join('.');
   };

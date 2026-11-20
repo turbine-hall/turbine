@@ -19,6 +19,8 @@ import {
   ArtifactSchema,
   ClaimSchema,
   ClaimStatusSchema,
+  MAX_CLAIM_BYTES,
+  assertClaimBudget,
   DecisionSchema,
   EecInvalidationEventSchema,
   EngineeringEvidenceContractSchema,
@@ -471,6 +473,7 @@ export class WorkStore {
   saveClaim(input: { repoPath: string; claim: Claim; status: ClaimStatus; reason?: string }): boolean {
     // A row under an empty path could be written but never read back (the stored-claim schema needs a path).
     if (typeof input.repoPath !== 'string' || input.repoPath === '') throw new Error('a claim is stored under a non-empty repository path');
+    assertClaimBudget(input.claim);
     assertNoUnsafeKeys(input.claim);
     const claim = ClaimSchema.parse(input.claim);
     const status = ClaimStatusSchema.parse(input.status);
@@ -544,6 +547,8 @@ export class WorkStore {
 
   /** The schema proves the JSON is a valid claim; this proves it is the one the row is filed under. */
   private parseClaimRow(row: ClaimRow): StoredClaim {
+    // Bounded before it is parsed: a stored claim is never larger than the limit (a string's length never exceeds its byte length).
+    if (row.data.length > MAX_CLAIM_BYTES) throw new Error(`claim ${row.id} is stored with more than ${MAX_CLAIM_BYTES} bytes of data`);
     const raw: unknown = JSON.parse(row.data);
     assertNoUnsafeKeys(raw);
     const stored = StoredClaimSchema.parse({

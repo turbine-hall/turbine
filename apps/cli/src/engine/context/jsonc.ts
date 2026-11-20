@@ -54,19 +54,40 @@ function significantDigits(token: string): number {
 const MIN_NORMAL = 2.2250738585072014e-308;
 
 /**
- * Whether the double `n` is exactly what the token `token` states. Decided from the TEXT as well as the rounded value:
- * `1.0000000000000001e0` rounds to the integer 1, but states more digits than a double holds.
+ * The value a number token states as `digits x 10^exp`: the mantissa digits without leading or trailing zeros (trailing
+ * zeros move into the exponent), so `1000000000000001.0`, `1000000000000001` and `10000000000000010e-1` all give the same pair.
+ */
+function decimalOf(token: string): { digits: string; exp: number } {
+  const body = token.replace(/^-/, '');
+  const e = body.search(/[eE]/);
+  const mantissa = e < 0 ? body : body.slice(0, e);
+  const dot = mantissa.indexOf('.');
+  const fraction = dot < 0 ? 0 : mantissa.length - dot - 1;
+  const all = mantissa.replace('.', '');
+  let start = 0;
+  let end = all.length;
+  // Scans, not a regular expression: an unanchored `0+$` is quadratic on a long run of zeros inside the number.
+  while (start < end && all.charCodeAt(start) === 48) start++;
+  while (end > start && all.charCodeAt(end - 1) === 48) end--;
+  const exponent = e < 0 ? 0 : Number(body.slice(e + 1));
+  return { digits: all.slice(start, end), exp: exponent - fraction + (all.length - end) };
+}
+
+/**
+ * Whether the double `n` is exactly what the token `token` states. Decided from the TEXT, not from the rounded value
+ * (`1.0000000000000001e0` rounds to the integer 1, but states more digits than a double holds):
  *   - zero: exact only if the token has no nonzero digit (`1e-400` underflows to 0);
- *   - an integer value beyond 2^53 (`1e23`, `12345678901234567890`) is a rounding of the decimal;
- *   - a token written as plain digits is exact only as a safe integer;
- *   - otherwise up to 15 significant digits in the normal range round-trip.
+ *   - a whole number (`1e3`, `1000000000000001.0`, `12345`) is exact only if it is a safe integer, however it is spelled;
+ *   - a fraction is exact if it has at most 15 significant digits and is in the normal range, where a double round-trips it.
  */
 function numberIsExact(token: string, n: number): boolean {
-  const digits = significantDigits(token);
-  if (n === 0) return digits === 0;
-  if (Number.isInteger(n) && Math.abs(n) > Number.MAX_SAFE_INTEGER) return false;
-  if (/^-?\d+$/.test(token)) return Number.isSafeInteger(n);
-  return digits <= 15 && Math.abs(n) >= MIN_NORMAL;
+  if (n === 0) return significantDigits(token) === 0;
+  const { digits, exp } = decimalOf(token);
+  if (exp >= 0) {
+    if (digits.length + exp > 16) return false; // beyond 2^53 whatever the digits
+    return BigInt(digits) * 10n ** BigInt(exp) <= BigInt(Number.MAX_SAFE_INTEGER);
+  }
+  return digits.length <= 15 && Math.abs(n) >= MIN_NORMAL;
 }
 
 export function parseJsonc(input: string, opts: JsoncOptions = {}): Jsonc {

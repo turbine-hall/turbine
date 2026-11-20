@@ -90,12 +90,25 @@ const BLOCK_START = /^\s{0,3}(?:#{1,6}(?:\s|$)|>|[-*+]\s|\d{1,9}[.)]\s|```|~~~)/
 function tableProblems(lines: string[]): { problems: string[]; rows: number } {
   const problems: string[] = [];
   let rows = 0;
+  // Lines inside a fenced code block are literal text, not a table: find them first.
+  const fenced: boolean[] = [];
+  let fence: string | undefined;
+  for (const l of lines) {
+    const m = /^\s{0,3}(`{3,}|~{3,})/.exec(l);
+    if (fence === undefined && m) {
+      fence = m[1]![0]!;
+      fenced.push(true);
+    } else if (fence !== undefined && m && m[1]![0] === fence) {
+      fence = undefined;
+      fenced.push(true);
+    } else fenced.push(fence !== undefined);
+  }
   for (let i = 0; i + 1 < lines.length; i++) {
-    if (!isTableDelimiter(lines[i + 1]!)) continue;
+    if (fenced[i] || fenced[i + 1] || !isTableDelimiter(lines[i + 1]!)) continue;
     const header = tableCells(lines[i]!);
     if (tableCells(lines[i + 1]!) !== header) problems.push(`line ${i + 2}: delimiter row`);
     let j = i + 2;
-    for (; j < lines.length && lines[j]!.trim() !== '' && !BLOCK_START.test(lines[j]!); j++) {
+    for (; j < lines.length && !fenced[j] && lines[j]!.trim() !== '' && !BLOCK_START.test(lines[j]!); j++) {
       rows++;
       if (tableCells(lines[j]!) !== header) problems.push(`line ${j + 1}: ${lines[j]!.slice(0, 60)}`);
     }
@@ -950,8 +963,9 @@ describe('criterion 4 — changing a cited file so a claim becomes false removes
     const c2 = commitFiles(dir, { 'src/util.ts': 'export {};\n' });
     reverifyOnCommit(store, dir, dir, c1, c2);
     expect(store.getClaim(dir, other.id)).toMatchObject({ status: 'rejected', reason: 'earlier failure', commit: c1 });
-    // A second run from c1 finds nothing published at c1 any more.
-    expect(reverifyOnCommit(store, dir, dir, c1, c2)).toMatchObject({ kept: [], withdrawn: [], sections: [] });
+    // A second run from c1 is a stale transition (the claims were carried to c2 already): refused, nothing changes.
+    expect(() => reverifyOnCommit(store, dir, dir, c1, c2)).toThrow(/stale/);
+    expect(store.getClaimFrontier(dir)).toBe(c2);
     expect(store.getClaim(dir, id)!.status).toBe('withdrawn');
   });
 
@@ -1643,7 +1657,7 @@ describe('review round 4 (PR #12): findings from the third local CodeRabbit revi
       const store = openStore();
       git(dir, 'checkout', '-q', '-b', 'side');
       const side = commitFiles(dir, { 'side.txt': 's\n' });
-      git(dir, 'checkout', '-q', '-');
+      git(dir, 'checkout', '-q', 'main');
       const main = commitFiles(dir, { 'main.txt': 'm\n' });
       expect(publishClaim(store, dir, dir, validClaims(dir, main).quote!).published).toBe(true);
       const out = publishClaim(store, dir, dir, validClaims(dir, side).imports!);
@@ -1996,5 +2010,115 @@ describe('review round 6 (PR #12): findings from the fifth local CodeRabbit revi
       if (before === undefined) delete process.env.GIT_CONFIG_GLOBAL;
       else process.env.GIT_CONFIG_GLOBAL = before;
     }
+  });
+});
+
+let onceRepo: string | undefined;
+const repoOnce = (): string => (onceRepo ??= newRepo());
+const newRepoOnce = repoOnce;
+const headOnce = (): string => head(repoOnce());
+
+describe('review round 7 (PR #12): findings from the sixth local CodeRabbit review', () => {
+  it('a stale transition (A to C when the claims are already at B) is refused and moves nothing; B to C then works', () => {
+    const dir = newRepo();
+    const a = head(dir);
+    const store = openStore();
+    const claimA = validClaims(dir, a).quote!;
+    expect(publishClaim(store, dir, dir, claimA).published).toBe(true);
+    const b = commitFiles(dir, { 'README.md': 'x\n' });
+    reverifyOnCommit(store, dir, dir, a, b);
+    const c = commitFiles(dir, { 'src/util.ts': null });
+    expect(() => reverifyOnCommit(store, dir, dir, a, c)).toThrow(/stale/);
+    expect(store.getClaimFrontier(dir)).toBe(b); // not moved
+    expect(store.getClaim(dir, claimA.id as string)).toMatchObject({ status: 'verified', commit: b }); // not touched
+    const r = reverifyOnCommit(store, dir, dir, b, c);
+    expect(r.withdrawn.map((w) => w.id)).toEqual([claimA.id]);
+    expect(store.getClaimFrontier(dir)).toBe(c);
+    // With no published rows left, the next transition from the frontier still works.
+    const d = commitFiles(dir, { 'README.md': 'y\n' });
+    expect(reverifyOnCommit(store, dir, dir, c, d)).toMatchObject({ kept: [], withdrawn: [] });
+    expect(() => reverifyOnCommit(store, dir, dir, b, d)).toThrow(/stale/);
+  });
+
+  it('super.run() is a dotted call named "super.run"; super[key]() has no name', () => {
+    const d = newRepo({ 'k.ts': "class A { run() {} }\nclass B extends A {\n  go() {\n    super.run();\n    super[key]();\n  }\n}\n" });
+    const c = head(d);
+    const call = (callee: string, line: number) =>
+      publishClaim(openStore(), d, d, claim({ kind: 'calls', evidence: [ev(d, c, 'k.ts', line)], verifier: { kind: 'calls', path: 'k.ts', callee } }));
+    expect(call('super.run', 4).published).toBe(true);
+    expect(call('super.run', 5).published).toBe(false); // the computed call is not super.run
+    expect(call('super.key', 5).published).toBe(false);
+    expect(call('run', 4).published).toBe(false); // the dotted name is the whole name
+  });
+
+  it('exported destructuring declarations export the bound names, not the property names', () => {
+    const d = newRepo({ 'x.ts': 'export const { start: run, stop, nested: { deep }, ...rest } = api;\nexport const [first, , [second]] = list;\nexport const plain = 1;\n' });
+    const c = head(d);
+    const ex = (symbol: string, line: number) =>
+      publishClaim(openStore(), d, d, claim({ kind: 'exists', evidence: [ev(d, c, 'x.ts', line)], verifier: { kind: 'exists', path: 'x.ts', symbol } })).published;
+    for (const name of ['run', 'stop', 'deep', 'rest']) expect(ex(name, 1), name).toBe(true);
+    for (const name of ['first', 'second']) expect(ex(name, 2), name).toBe(true);
+    expect(ex('plain', 3)).toBe(true);
+    for (const name of ['start', 'nested']) expect(ex(name, 1), name).toBe(false); // property names are not exports
+    expect(ex('run', 2)).toBe(false);
+  });
+
+  it('a safe integer is exact however it is spelled; a rounded token stays unconfirmed', () => {
+    const d = newRepo({ 'n.json': '{"a": 1000000000000001, "b": 1000000000000001.0, "c": 10000000000000010e-1, "d": 1.0000000000000001, "e": 9007199254740993.0, "f": 100000000000000000e-1, "g": 0.10, "h": 1.5e1}\n' });
+    const c = head(d);
+    const cfg = (key: string, value: unknown) =>
+      publishClaim(openStore(), d, d, claim({ kind: 'config', evidence: [ev(d, c, 'n.json', 1)], verifier: { kind: 'config', path: 'n.json', key: [key], value } }));
+    for (const key of ['a', 'b', 'c']) expect(cfg(key, 1000000000000001).published, key).toBe(true);
+    expect(cfg('d', 1)).toMatchObject({ published: false, unconfirmed: true });
+    expect(cfg('e', Number.MAX_SAFE_INTEGER + 2)).toMatchObject({ published: false, unconfirmed: true }); // beyond 2^53
+    expect(cfg('f', 10000000000000000)).toMatchObject({ published: false, unconfirmed: true }); // 1e16 is beyond 2^53
+    expect(cfg('g', 0.1).published).toBe(true);
+    expect(cfg('h', 15).published).toBe(true);
+    // The same value in the file keeps the same answer on re-verification (no withdrawal from respelling).
+    const store = openStore();
+    const first = claim({ kind: 'config', evidence: [ev(d, c, 'n.json', 1)], verifier: { kind: 'config', path: 'n.json', key: ['a'], value: 1000000000000001 } });
+    publishClaim(store, d, d, first);
+    const c2 = commitFiles(d, { 'n.json': '{"a": 1000000000000001.0, "b": 1}\n' });
+    expect(reverifyOnCommit(store, d, d, c, c2).kept).toEqual([first.id]);
+  });
+
+  describe('a claim is bounded before any recursive validation runs', () => {
+    const base = () => structuredClone(validClaims(newRepoOnce(), headOnce()).config!) as Record<string, any>;
+    function nested(depth: number): unknown {
+      let v: unknown = 1;
+      for (let i = 0; i < depth; i++) v = { a: v };
+      return v;
+    }
+    it('too deep, too many values, or too much text is refused with a reason, quickly, and writes nothing', () => {
+      const store = openStore();
+      const deep = base();
+      deep.verifier.value = nested(500);
+      const wide = base();
+      wide.verifier.value = Array.from({ length: 30_000 }, (_, i) => i);
+      const text = base();
+      text.verifier.value = { big: 'x'.repeat(200 * 1024) };
+      for (const [name, input] of [['deep', deep], ['wide', wide], ['text', text]] as const) {
+        const started = Date.now();
+        const out = publishClaim(store, repoOnce(), repoOnce(), input);
+        expect(out, name).toMatchObject({ published: false, recorded: false });
+        if (!out.published) expect(out.reason, name).toMatch(/nested deeper|more than 20000 values|characters of text/);
+        expect(Date.now() - started, name).toBeLessThan(2_000);
+      }
+      expect(store.listClaims(repoOnce())).toEqual([]);
+      expect(() => store.saveClaim({ repoPath: repoOnce(), claim: deep as never, status: 'verified', reason: 'x' })).toThrow(/nested deeper/);
+    });
+    it('a claim within the bounds is untouched by the budget, and a stored row over the limit is refused unread', () => {
+      const store = openStore();
+      const ok = base();
+      expect(publishClaim(store, repoOnce(), repoOnce(), ok).published).toBe(true);
+      store.db.prepare('UPDATE claims SET data = ? WHERE id = ?').run(`{"pad":"${'x'.repeat(129 * 1024)}"}`, ok.id);
+      expect(() => store.getClaim(repoOnce(), ok.id)).toThrow(/more than \d+ bytes of data/);
+    });
+  });
+
+  it('the divergent-branch test names main explicitly, and the table check ignores fenced code', () => {
+    expect(tableProblems(['```', '| A | B |', '| --- | --- |', 'literal text', '```']).problems).toEqual([]);
+    expect(tableProblems(['~~~md', '| A | B |', '| --- | --- |', 'literal text', '~~~', '| A | B |', '| - | - |', 'oops']).problems).toHaveLength(1); // the same rows outside a fence
+    expect(tableProblems(['text', '```', '| A | B |', '| --- | --- |', '| a | b | c |', '```', '', '| X |', '| - |', '| y |']).rows).toBe(1);
   });
 });
