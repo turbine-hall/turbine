@@ -31,18 +31,32 @@ const MAX_CLAIM_NODES = 20_000;
 export function assertClaimBudget(raw: unknown): void {
   let nodes = 0;
   let text = 0;
-  const stack: Array<{ v: unknown; depth: number }> = [{ v: raw, depth: 0 }];
-  while (stack.length) {
-    const { v, depth } = stack.pop()!;
+  // Every value is counted as it is QUEUED, so a very wide array or object is refused after MAX_CLAIM_NODES children, not after all of them.
+  const visit = (v: unknown, depth: number, containers: Array<{ v: object; depth: number }>): void => {
     if (++nodes > MAX_CLAIM_NODES) throw new Error(`the claim has more than ${MAX_CLAIM_NODES} values`);
     if (typeof v === 'string') {
       text += v.length;
+      if (text > MAX_CLAIM_BYTES) throw new Error(`the claim holds more than ${MAX_CLAIM_BYTES} characters of text`);
     } else if (typeof v === 'object' && v !== null) {
       if (depth >= MAX_CLAIM_DEPTH) throw new Error(`the claim is nested deeper than ${MAX_CLAIM_DEPTH} levels`);
-      const children = Array.isArray(v) ? v : Object.entries(v).flatMap(([k, c]) => ((text += k.length), [c]));
-      for (const c of children) stack.push({ v: c, depth: depth + 1 });
+      containers.push({ v, depth });
     }
-    if (text > MAX_CLAIM_BYTES) throw new Error(`the claim holds more than ${MAX_CLAIM_BYTES} characters of text`);
+  };
+  const containers: Array<{ v: object; depth: number }> = [];
+  visit(raw, 0, containers);
+  while (containers.length) {
+    const { v, depth } = containers.pop()!;
+    if (Array.isArray(v)) {
+      for (let i = 0; i < v.length; i++) visit(v[i], depth + 1, containers);
+    } else {
+      // `for in` with an own-property test: no list of all the keys or entries is built first.
+      for (const k in v) {
+        if (!Object.prototype.hasOwnProperty.call(v, k)) continue;
+        text += k.length;
+        if (text > MAX_CLAIM_BYTES) throw new Error(`the claim holds more than ${MAX_CLAIM_BYTES} characters of text`);
+        visit((v as Record<string, unknown>)[k], depth + 1, containers);
+      }
+    }
   }
 }
 
@@ -254,6 +268,7 @@ export function claimCommit(claim: Claim): string {
 
 /** Parse untrusted claim JSON: a `__proto__` key is refused before the schema sees it. Throws on a bad claim. */
 export function parseClaim(raw: unknown): Claim {
+  assertClaimBudget(raw);
   assertNoUnsafeKeys(raw);
   return ClaimSchema.parse(raw);
 }

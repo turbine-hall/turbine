@@ -10,9 +10,10 @@ import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { ClaimSchema, PUBLISHED_CLAIM_STATUSES, UNIVERSAL_WORDS, claimCommit, parseClaim, universalWordIn } from '../../packages/contracts/dist/index.js';
+import { ClaimSchema, PUBLISHED_CLAIM_STATUSES, assertClaimBudget, UNIVERSAL_WORDS, claimCommit, parseClaim, universalWordIn } from '../../packages/contracts/dist/index.js';
 import { WorkStore } from '../../packages/storage-sqlite/dist/index.js';
 import { publishClaim, reverifyOnCommit } from '../../apps/cli/src/engine/context/claims.js';
+import { isAncestor } from '../../apps/cli/src/engine/context/git-read.js';
 import { CommitReader, jsonEqual, splitLines, verifyClaim } from '../../apps/cli/src/engine/context/verify.js';
 
 // publishClaim calls the verifier through this module: a test can observe the moment it runs (and change nothing else).
@@ -85,23 +86,24 @@ const tableCells = (l: string): number => l.trim().replace(/^\|/, '').replace(/(
 const isTableDelimiter = (l: string): boolean => l.includes('|') && /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(l);
 
 /** Where GFM ends a table body: a blank line, or a line that starts another block. A line without pipes is still a (one-cell) row. */
-const BLOCK_START = /^\s{0,3}(?:#{1,6}(?:\s|$)|>|[-*+]\s|\d{1,9}[.)]\s|```|~~~)/;
+const BLOCK_START = /^\s{0,3}(?:#{1,6}(?:\s|$)|>|[-*+]\s|\d{1,9}[.)]\s|```|~~~|([-*_])(?:\s*\1){2,}\s*$)/;
 /** Every row of every table in `lines` whose cell count differs from its header's, and how many body rows were checked. */
 function tableProblems(lines: string[]): { problems: string[]; rows: number } {
   const problems: string[] = [];
   let rows = 0;
-  // Lines inside a fenced code block are literal text, not a table: find them first.
+  // Lines inside a fenced code block are literal text, not a table. A fence closes only on a line of the same marker, at
+  // least as long as the opening one, with nothing after it but spaces (CommonMark / GFM).
   const fenced: boolean[] = [];
-  let fence: string | undefined;
+  let open: { marker: string; length: number } | undefined;
   for (const l of lines) {
-    const m = /^\s{0,3}(`{3,}|~{3,})/.exec(l);
-    if (fence === undefined && m) {
-      fence = m[1]![0]!;
+    const m = /^\s{0,3}(`{3,}|~{3,})(.*)$/.exec(l);
+    if (!open) {
+      if (m && !(m[1]![0] === '`' && m[2]!.includes('`'))) open = { marker: m[1]![0]!, length: m[1]!.length };
+      fenced.push(open !== undefined);
+    } else {
       fenced.push(true);
-    } else if (fence !== undefined && m && m[1]![0] === fence) {
-      fence = undefined;
-      fenced.push(true);
-    } else fenced.push(fence !== undefined);
+      if (m && m[1]![0] === open.marker && m[1]!.length >= open.length && m[2]!.trim() === '') open = undefined;
+    }
   }
   for (let i = 0; i + 1 < lines.length; i++) {
     if (fenced[i] || fenced[i + 1] || !isTableDelimiter(lines[i + 1]!)) continue;
@@ -2113,12 +2115,140 @@ describe('review round 7 (PR #12): findings from the sixth local CodeRabbit revi
       expect(publishClaim(store, repoOnce(), repoOnce(), ok).published).toBe(true);
       store.db.prepare('UPDATE claims SET data = ? WHERE id = ?').run(`{"pad":"${'x'.repeat(129 * 1024)}"}`, ok.id);
       expect(() => store.getClaim(repoOnce(), ok.id)).toThrow(/more than \d+ bytes of data/);
+      // Measured in BYTES: 45,000 euro signs are 45,000 UTF-16 units but 135,000 bytes. The listing is refused too.
+      store.db.prepare('UPDATE claims SET data = ? WHERE id = ?').run(`{"pad":"${'€'.repeat(45_000)}"}`, ok.id);
+      expect(() => store.getClaim(repoOnce(), ok.id)).toThrow(/more than \d+ bytes of data/);
+      expect(() => store.listClaims(repoOnce())).toThrow(/more than \d+ bytes of data/);
     });
+  });
+
+  it('the table check ends a table at a thematic break, and a fence closes only on a valid closing line', () => {
+    for (const br of ['***', '---', '___', '- - -', '* * *']) expect(tableProblems(['| A | B |', '| - | - |', '| a | b |', br, 'text']).rows, br).toBe(1);
+    // A pipe-free body row is still a row.
+    expect(tableProblems(['| A | B |', '| - | - |', 'plain', '| a | b |']).rows).toBe(2);
+    // A shorter or different marker, or a marker followed by text, does not close the fence: the rows inside stay literal.
+    expect(tableProblems(['~~~~', '~~~', '| A | B |', '| - | - |', 'literal', '~~~~']).problems).toEqual([]);
+    expect(tableProblems(['```', '``` still code', '| A | B |', '| - | - |', 'literal', '```']).problems).toEqual([]);
+    expect(tableProblems(['```', '~~~', '| A | B |', '| - | - |', 'literal', '```']).problems).toEqual([]);
+    // After a valid close, the next table is checked again.
+    expect(tableProblems(['```', 'x', '```', '| A | B |', '| - | - |', 'oops']).problems).toHaveLength(1);
   });
 
   it('the divergent-branch test names main explicitly, and the table check ignores fenced code', () => {
     expect(tableProblems(['```', '| A | B |', '| --- | --- |', 'literal text', '```']).problems).toEqual([]);
     expect(tableProblems(['~~~md', '| A | B |', '| --- | --- |', 'literal text', '~~~', '| A | B |', '| - | - |', 'oops']).problems).toHaveLength(1); // the same rows outside a fence
     expect(tableProblems(['text', '```', '| A | B |', '| --- | --- |', '| a | b | c |', '```', '', '| X |', '| - |', '| y |']).rows).toBe(1);
+  });
+});
+
+describe('review round 8 (PR #12): findings from the seventh local CodeRabbit review', () => {
+  it('a no-op transition is checked against the frontier too: A to A is stale when the claims are at B', () => {
+    const dir = newRepo();
+    const a = head(dir);
+    const store = openStore();
+    publishClaim(store, dir, dir, validClaims(dir, a).quote!);
+    const b = commitFiles(dir, { 'README.md': 'x\n' });
+    reverifyOnCommit(store, dir, dir, a, b);
+    expect(() => reverifyOnCommit(store, dir, dir, a, a)).toThrow(/stale/);
+    expect(reverifyOnCommit(store, dir, dir, b, b)).toMatchObject({ kept: [], withdrawn: [], sections: [] }); // at the frontier: empty success
+  });
+
+  it('a clause with thousands of destructured declarations shares one statement excerpt (no quadratic copy)', () => {
+    const decls = Array.from({ length: 30_000 }, (_, i) => `{ a${i} } = x${i}`);
+    const d = newRepo({ 'big.ts': `export const ${decls.join(',\r\n  ')};\r\n` });
+    const c = head(d);
+    const started = Date.now();
+    const out = publishClaim(openStore(), d, d, claim({ kind: 'exists', evidence: [ev(d, c, 'big.ts', [1, 30_000])], verifier: { kind: 'exists', path: 'big.ts', symbol: 'a29999' } }));
+    expect(out.published, out.published ? '' : out.reason).toBe(true);
+    expect(Date.now() - started).toBeLessThan(15_000);
+  }, 60_000);
+
+  describe('a missing export is not proven when an export * could supply it', () => {
+    const d = newRepo({
+      'api.ts': "export * from './impl.js';\nexport const direct = 1;\nexport * as ns from './ns.js';\n",
+      'plain.ts': 'export const only = 1;\n',
+    });
+    const c = head(d);
+    const ex = (path: string, symbol: string, line: number) =>
+      publishClaim(openStore(), d, d, claim({ kind: 'exists', evidence: [ev(d, c, path, line)], verifier: { kind: 'exists', path, symbol } }));
+    it('unconfirmed for a name the star re-export may supply', () => {
+      expect(ex('api.ts', 'run', 1)).toMatchObject({ published: false, unconfirmed: true });
+    });
+    it('an explicit match stays verifiable, a namespace re-export is a named export, default is never re-exported by a star', () => {
+      expect(ex('api.ts', 'direct', 2).published).toBe(true);
+      expect(ex('api.ts', 'ns', 3).published).toBe(true);
+      expect(ex('api.ts', 'default', 1)).toMatchObject({ published: false, unconfirmed: false });
+    });
+    it('a file without a star re-export still gets a definite miss', () => {
+      expect(ex('plain.ts', 'missing', 1)).toMatchObject({ published: false, unconfirmed: false });
+    });
+  });
+
+  describe('a shallow history gives no settled "not an ancestor"', () => {
+    function shallowClone() {
+      const src = newRepo();
+      const c1 = head(src);
+      commitFiles(src, { 'a.txt': '1\n' });
+      const c3 = commitFiles(src, { 'b.txt': '2\n' });
+      const dst = mkdtempSync(join(tmpdir(), 'turbine-claims-shallow-'));
+      dirs.push(dst);
+      git(dst, 'init', '-q', '-b', 'main');
+      git(dst, 'remote', 'add', 'origin', `file://${src}`);
+      git(dst, 'fetch', '-q', '--depth', '1', 'origin', c3);
+      git(dst, 'fetch', '-q', '--depth', '1', 'origin', c1);
+      return { src, dst, c1, c3 };
+    }
+    it('isAncestor throws in a shallow repository instead of answering false; a full repository answers', () => {
+      const { src, dst, c1, c3 } = shallowClone();
+      expect(git(dst, 'rev-parse', '--is-shallow-repository').trim()).toBe('true');
+      expect(() => isAncestor(dst, c1, c3)).toThrow(/shallow/);
+      expect(isAncestor(dst, c1, c1)).toBe(true); // a positive answer is settled whatever the depth
+      expect(isAncestor(src, c1, c3)).toBe(true);
+      expect(isAncestor(src, c3, c1)).toBe(false);
+    });
+    it('publishClaim refuses with an unconfirmed, retryable reason, not "does not descend"', () => {
+      const { dst, c1, c3 } = shallowClone();
+      const store = openStore();
+      const first = claim({ kind: 'exists', evidence: [ev(dst, c1, 'docs/notes.md')], verifier: { kind: 'exists', path: 'docs/notes.md' } });
+      expect(publishClaim(store, dst, dst, first).published).toBe(true);
+      const second = claim({ kind: 'exists', evidence: [ev(dst, c3, 'docs/notes.md')], verifier: { kind: 'exists', path: 'docs/notes.md' } });
+      const out = publishClaim(store, dst, dst, second);
+      expect(out).toMatchObject({ published: false, unconfirmed: true, recorded: false });
+      if (!out.published) expect(out.reason).not.toMatch(/does not descend/);
+    });
+  });
+
+  it('the stored-row budget runs before the unsafe-key walk: a deeply nested row is a clear error, not a stack overflow', () => {
+    const dir = repoOnce();
+    const store = openStore();
+    const ok = structuredClone(validClaims(dir, headOnce()).quote!) as Record<string, unknown>;
+    expect(publishClaim(store, dir, dir, ok).published).toBe(true);
+    store.db.prepare('UPDATE claims SET data = ? WHERE id = ?').run(`${'['.repeat(40_000)}${']'.repeat(40_000)}`, ok.id);
+    expect(() => store.getClaim(dir, ok.id as string)).toThrow(/nested deeper/);
+    expect(() => store.listClaims(dir)).toThrow(/nested deeper/);
+  });
+
+  it('parseClaim applies the budget first: deep input is a budget error, not a RangeError', () => {
+    let deep: unknown = 1;
+    for (let i = 0; i < 100_000; i++) deep = [deep];
+    let error: unknown;
+    try {
+      parseClaim(deep);
+    } catch (e) {
+      error = e;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(RangeError);
+    expect((error as Error).message).toMatch(/nested deeper/);
+  });
+
+  it('the budget counts values as they are queued: a very wide array or object is refused without walking all of it', () => {
+    const sparse = new Array<number>(2 ** 32 - 1); // four billion holes: a walk that queued them all would never finish
+    expect(() => assertClaimBudget({ value: sparse })).toThrow(/more than 20000 values/);
+    const wideObject: Record<string, number> = {};
+    for (let i = 0; i < 25_000; i++) wideObject[`k${i}`] = i;
+    expect(() => assertClaimBudget(wideObject)).toThrow(/more than 20000 values/);
+    expect(() => assertClaimBudget({ a: [1, 2, { b: 'text' }] })).not.toThrow();
+    expect(() => assertClaimBudget({ k: 'x'.repeat(128 * 1024 + 1) })).toThrow(/characters of text/);
   });
 });

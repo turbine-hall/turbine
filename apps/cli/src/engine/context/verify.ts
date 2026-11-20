@@ -257,6 +257,10 @@ function verifyExists(reader: CommitReader, claim: Claim, v: Extract<ClaimVerifi
   const hit = exported.find((x) => x.name === v.symbol && inLines(cited, x.line));
   if (hit) return pass(`${v.path} exports "${v.symbol}" at line ${hit.line}`);
   const elsewhere = exported.find((x) => x.name === v.symbol);
+  // `export * from './impl.js'` re-exports names this scan does not list (never `default`): a miss may be one of them.
+  if (!elsewhere && v.symbol !== 'default' && scan.starReexports > 0) {
+    return unconfirmed(`${v.path} has ${scan.starReexports} \`export * from\` statement(s), which may re-export "${v.symbol}"; its names are not listed, so a missing export is not proven`);
+  }
   return fail(elsewhere ? `${v.path} exports "${v.symbol}" at line ${elsewhere.line}, outside the cited lines` : `${v.path} has no top-level export named "${v.symbol}"`);
 }
 

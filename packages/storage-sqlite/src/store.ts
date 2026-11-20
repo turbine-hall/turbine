@@ -42,12 +42,18 @@ import { spawnSync } from 'node:child_process';
 import type { SqliteDb } from './db.js';
 import { openDatabase } from './db.js';
 
+/**
+ * The claim columns, with the payload measured in BYTES inside SQLite: a payload over the limit comes back as NULL, so an
+ * oversized or damaged row is never read into memory by this process.
+ */
+const CLAIM_COLUMNS = `id, repo_path, section, "commit", CASE WHEN length(CAST(data AS BLOB)) > ${MAX_CLAIM_BYTES} THEN NULL ELSE data END AS data, status, reason, created_at`;
+
 type ClaimRow = {
   id: string;
   repo_path: string;
   section: string;
   commit: string;
-  data: string;
+  data: string | null;
   status: string;
   reason: string | null;
   created_at: string;
@@ -519,7 +525,7 @@ export class WorkStore {
   }
 
   getClaim(repoPath: string, id: string): StoredClaim | null {
-    const row = this.db.prepare(`SELECT * FROM claims WHERE repo_path = ? AND id = ?`).get(repoPath, id) as ClaimRow | undefined;
+    const row = this.db.prepare(`SELECT ${CLAIM_COLUMNS} FROM claims WHERE repo_path = ? AND id = ?`).get(repoPath, id) as ClaimRow | undefined;
     return row ? this.parseClaimRow(row) : null;
   }
 
@@ -541,15 +547,17 @@ export class WorkStore {
       where.push(`status IN (${filter.statuses.map(() => '?').join(', ')})`);
       args.push(...filter.statuses.map((s) => ClaimStatusSchema.parse(s)));
     }
-    const rows = this.db.prepare(`SELECT * FROM claims WHERE ${where.join(' AND ')} ORDER BY rowid ASC`).all(...args) as ClaimRow[];
+    const rows = this.db.prepare(`SELECT ${CLAIM_COLUMNS} FROM claims WHERE ${where.join(' AND ')} ORDER BY rowid ASC`).all(...args) as ClaimRow[];
     return rows.map((r) => this.parseClaimRow(r));
   }
 
   /** The schema proves the JSON is a valid claim; this proves it is the one the row is filed under. */
   private parseClaimRow(row: ClaimRow): StoredClaim {
-    // Bounded before it is parsed: a stored claim is never larger than the limit (a string's length never exceeds its byte length).
-    if (row.data.length > MAX_CLAIM_BYTES) throw new Error(`claim ${row.id} is stored with more than ${MAX_CLAIM_BYTES} bytes of data`);
+    // The size was measured in bytes by SQLite, and an oversized payload was not returned at all.
+    if (row.data === null) throw new Error(`claim ${row.id} is stored with more than ${MAX_CLAIM_BYTES} bytes of data`);
     const raw: unknown = JSON.parse(row.data);
+    // The budget walk is iterative and stops at a fixed depth; the unsafe-key walk below recurses, so it only sees what fits.
+    assertClaimBudget(raw);
     assertNoUnsafeKeys(raw);
     const stored = StoredClaimSchema.parse({
       repoPath: row.repo_path,

@@ -137,7 +137,12 @@ export function reverifyOnCommit(store: WorkStore, repoRoot: string, repoPath: s
   if (resolveCommit(repoRoot, prev) !== prev) throw new Error(`${prev} is not a commit of this repository (a full commit id is required)`);
   const reader = new CommitReader(repoRoot, next);
   const result: ReverifyResult = { from: prev, to: next, kept: [], withdrawn: [], sections: [] };
-  if (prev === next) return result;
+  if (prev === next) {
+    // A no-op at the frontier is an empty success; at any other commit it is as stale as a real transition.
+    const at = store.getClaimFrontier(repoPath);
+    if (at && at !== prev) throw new Error(`the claims of this repository are at commit ${at}, not ${prev}; carry them from ${at} (the transition from ${prev} to ${next} is stale)`);
+    return result;
+  }
   const treeChanged = treeIdOf(repoRoot, prev) !== treeIdOf(repoRoot, next);
 
   store.transaction(() => {

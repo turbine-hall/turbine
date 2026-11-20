@@ -218,7 +218,14 @@ export function readBlobs(repoRoot: string, blobIds: string[], expectedBytes = 0
 export function isAncestor(repoRoot: string, ancestor: string, descendant: string): boolean {
   const r = run(repoRoot, ['merge-base', '--is-ancestor', ancestor, descendant]);
   if (r.status === 0) return true;
-  if (r.status === 1) return false;
+  if (r.status === 1) {
+    // In a shallow repository git stops at the boundary and ignores the parent link behind it: "no" is then not a settled answer.
+    const shallow = run(repoRoot, ['rev-parse', '--is-shallow-repository']);
+    if (shallow.status !== 0 || String(shallow.stdout).trim() !== 'false') {
+      throw new Error('the history of this repository is shallow (or could not be checked), so it is not known whether the commits are related; fetch the full history and try again');
+    }
+    return false;
+  }
   throw new Error(`git merge-base --is-ancestor failed: ${r.stderr || `exit ${r.status}`}`);
 }
 

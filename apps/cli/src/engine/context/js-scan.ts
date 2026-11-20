@@ -45,6 +45,8 @@ export type ModuleScan =
       exports: ScannedExport[];
       /** The default export (`export default …`, `export { x as default }`), named "default". Kept apart from `exports`, which the import graph reads as named exports. */
       defaultExports: ScannedExport[];
+      /** How many `export * from '…'` statements the file has: they re-export names this scan does not list. */
+      starReexports: number;
       /** `require()` calls found but not stated, because `require` is bound in the file and may not be the loader. */
       unconfirmed: number;
       /** Lines of the `require()` calls counted in `unconfirmed`. */
@@ -124,6 +126,7 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
   const imports: Array<ScannedImport & { viaCall?: true }> = [];
   const exports: ScannedExport[] = [];
   const defaultExports: ScannedExport[] = [];
+  let starReexports = 0;
   let requireBound = false;
 
   /** A string literal written without escapes: its value is exactly the text between the quotes. */
@@ -216,7 +219,10 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
       // An untrusted specifier withholds the import edge only: the names the statement exports are still read.
       if (spec) addImport('re-export', spec, from, spec.end);
       const clause = n.exportClause;
-      if (!clause) return;
+      if (!clause) {
+        if (n.moduleSpecifier) starReexports++;
+        return;
+      }
       if (ts.isNamespaceExport(clause)) {
         if (clause.name.text === 'default') addDefault(lineAt(from), text(from, clause.name.end));
         else addExport(clause.name.text, lineAt(from), text(from, clause.name.end));
@@ -243,13 +249,15 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
     if (!exportKeyword) return;
     const from = startOf(exportKeyword);
     if (ts.isVariableStatement(n)) {
+      // One excerpt for the whole statement, shared by every name it binds: a statement with thousands of declarations is not copied per name.
+      const line = lineAt(from);
+      let excerpt: string | undefined;
+      const statement = (): string => (excerpt ??= text(from, n.declarationList.end));
       for (const d of n.declarationList.declarations) {
         // `export const { start: run, ...rest } = api` exports `run` and `rest`: the names the pattern binds, not its property names.
         const names = boundNames(d.name);
         if (!names.length) continue;
-        const line = lineAt(from);
-        const statement = text(from, d.name.end);
-        for (const name of names) addExport(name, line, statement);
+        for (const name of names) addExport(name, line, statement());
       }
     } else if (ts.isFunctionDeclaration(n) || ts.isClassDeclaration(n) || ts.isEnumDeclaration(n) || ts.isInterfaceDeclaration(n) || ts.isTypeAliasDeclaration(n)) {
       if (n.name) addExport(n.name.text, lineAt(from), text(from, n.name.end));
@@ -291,5 +299,5 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
       unconfirmedAt.push(imp.line);
     } else kept.push(imp);
   }
-  return { ok: true, imports: kept, exports, defaultExports, unconfirmed, unconfirmedAt, unreadableAt };
+  return { ok: true, imports: kept, exports, defaultExports, starReexports, unconfirmed, unconfirmedAt, unreadableAt };
 }
