@@ -18,7 +18,11 @@ import { CommitReader, SYMLINK_MODE, verifyClaim } from './verify.js';
  */
 
 /** A reason is stored with the claim: keep it short enough to read, whatever a verifier quoted into it. */
-const clip = (reason: string): string => (reason.length > 2000 ? `${reason.slice(0, 2000)}... (${reason.length - 2000} more characters)` : reason);
+const clip = (reason: string): string => {
+  // SQLite TEXT on Node is read as a C string: a NUL would truncate the reason on read, so it is escaped before storage.
+  const safe = reason.replace(/\0/g, '\\0');
+  return safe.length > 2000 ? `${safe.slice(0, 2000)}... (${safe.length - 2000} more characters)` : safe;
+};
 
 export type PublishOutcome =
   | { published: true; claim: StoredClaim }
@@ -71,11 +75,10 @@ export function publishClaim(store: WorkStore, repoRoot: string, repoPath: strin
         return { ok: false, outcome: refuse(`could not compare commit ${a} with commit ${b}; try again (${e instanceof Error ? e.message : String(e)})`, true) };
       }
     };
-    // Metadata only: the payloads of every published claim are not loaded just to compare their commits.
-    const leftBehind = new Set(store.listPublishedClaimCommits(repoPath));
+    // Metadata only: exclude THIS claim by id before taking distinct commits, so replacing the sole claim at A with one
+    // at B is allowed, but a sibling still published at A is not hidden by that exclusion.
+    const leftBehind = new Set(store.listPublishedClaimCommits(repoPath, { exceptId: claim.id }));
     leftBehind.delete(commit);
-    const currentPin = store.getClaim(repoPath, claim.id);
-    if (currentPin && PUBLISHED_CLAIM_STATUSES.includes(currentPin.status)) leftBehind.delete(currentPin.commit);
     for (const other of leftBehind) {
       const c = compare(other, commit);
       if (!c.ok) return c.outcome;

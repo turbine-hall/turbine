@@ -52,25 +52,30 @@ const MAX_CLAIM_SECTION_BYTES = 1024;
 const MAX_CLAIM_ID_BYTES = 256;
 const MAX_CLAIM_CREATED_AT_BYTES = 64;
 /** Metadata columns are size-capped in SQL the same way as `data` and `reason`. */
-const CLAIM_COLUMNS = `id, repo_path, section, "commit",
+const CLAIM_COLUMNS = `
+  CASE WHEN octet_length(id) > ${MAX_CLAIM_ID_BYTES} THEN NULL ELSE id END AS id,
+  CASE WHEN octet_length(repo_path) > ${MAX_CLAIM_BYTES} THEN NULL ELSE repo_path END AS repo_path,
+  CASE WHEN octet_length(section) > ${MAX_CLAIM_SECTION_BYTES} THEN NULL ELSE section END AS section,
+  CASE WHEN octet_length("commit") IN (40, 64) THEN "commit" ELSE NULL END AS "commit",
   CASE WHEN octet_length(data) > ${MAX_CLAIM_BYTES} THEN NULL ELSE data END AS data, status,
   CASE WHEN octet_length(reason) > ${MAX_CLAIM_REASON_BYTES} THEN NULL ELSE reason END AS reason,
   coalesce(octet_length(reason) > ${MAX_CLAIM_REASON_BYTES}, 0) AS reason_oversized,
   CASE WHEN octet_length(section) > ${MAX_CLAIM_SECTION_BYTES} OR octet_length(id) > ${MAX_CLAIM_ID_BYTES}
-    OR octet_length("commit") <> 40 OR octet_length(created_at) > ${MAX_CLAIM_CREATED_AT_BYTES}
-    OR octet_length(repo_path) > ${MAX_CLAIM_BYTES} THEN 1 ELSE 0 END AS meta_oversized, created_at`;
+    OR octet_length("commit") NOT IN (40, 64) OR octet_length(created_at) > ${MAX_CLAIM_CREATED_AT_BYTES}
+    OR octet_length(repo_path) > ${MAX_CLAIM_BYTES} THEN 1 ELSE 0 END AS meta_oversized,
+  CASE WHEN octet_length(created_at) > ${MAX_CLAIM_CREATED_AT_BYTES} THEN NULL ELSE created_at END AS created_at`;
 
 type ClaimRow = {
-  id: string;
-  repo_path: string;
-  section: string;
-  commit: string;
+  id: string | null;
+  repo_path: string | null;
+  section: string | null;
+  commit: string | null;
   data: string | null;
   status: string;
   reason: string | null;
   reason_oversized: number;
   meta_oversized: number;
-  created_at: string;
+  created_at: string | null;
 };
 
 function now(): string {
@@ -493,6 +498,7 @@ export class WorkStore {
   saveClaim(input: { repoPath: string; claim: Claim; status: ClaimStatus; reason?: string }): boolean {
     // A row under an empty path could be written but never read back (the stored-claim schema needs a path).
     if (typeof input.repoPath !== 'string' || input.repoPath === '') throw new Error('a claim is stored under a non-empty repository path');
+    if (Buffer.byteLength(input.repoPath, 'utf8') > MAX_CLAIM_BYTES) throw new Error(`a claim repository path is over ${MAX_CLAIM_BYTES} bytes`);
     assertClaimBudget(input.claim);
     assertNoUnsafeKeys(input.claim);
     const claim = ClaimSchema.parse(input.claim);
@@ -531,25 +537,35 @@ export class WorkStore {
   getClaimFrontier(repoPath: string): string | null {
     const row = this.db
       .prepare(
-        `SELECT CASE WHEN octet_length("commit") = 40 THEN "commit" ELSE NULL END AS "commit" FROM claim_frontier WHERE repo_path = ?`,
+        `SELECT CASE WHEN octet_length("commit") IN (40, 64) THEN "commit" ELSE NULL END AS "commit" FROM claim_frontier WHERE repo_path = ?`,
       )
       .get(repoPath) as { commit: string | null } | undefined;
     if (!row) return null;
-    if (row.commit === null) throw new Error(`claim frontier for ${repoPath} is stored with a commit id that is not 40 hex characters`);
+    if (row.commit === null) throw new Error(`claim frontier for ${repoPath} is stored with a commit id that is not a full object id`);
     return GitObjectIdSchema.parse(row.commit);
   }
 
   /**
    * The distinct commits at which this repository has published claims. Metadata only: the claim payloads are not read.
    * Used by the engine to refuse a transition that would move the frontier past an unchecked published claim.
+   * `exceptId` omits one claim (the one being replaced) so a sole claim can move forward without hiding a sibling.
    */
-  listPublishedClaimCommits(repoPath: string): string[] {
-    const rows = this.db
-      .prepare(
-        `SELECT DISTINCT "commit" FROM claims WHERE repo_path = ? AND status IN ('verified', 'attested') ORDER BY "commit"`,
-      )
-      .all(repoPath) as Array<{ commit: string }>;
-    return rows.map((r) => GitObjectIdSchema.parse(r.commit));
+  listPublishedClaimCommits(repoPath: string, opts: { exceptId?: string } = {}): string[] {
+    const rows = (
+      opts.exceptId === undefined
+        ? this.db.prepare(
+            `SELECT DISTINCT CASE WHEN octet_length("commit") IN (40, 64) THEN "commit" ELSE NULL END AS "commit"
+             FROM claims WHERE repo_path = ? AND status IN ('verified', 'attested') ORDER BY 1`,
+          ).all(repoPath)
+        : this.db.prepare(
+            `SELECT DISTINCT CASE WHEN octet_length("commit") IN (40, 64) THEN "commit" ELSE NULL END AS "commit"
+             FROM claims WHERE repo_path = ? AND status IN ('verified', 'attested') AND id <> ? ORDER BY 1`,
+          ).all(repoPath, opts.exceptId)
+    ) as Array<{ commit: string | null }>;
+    return rows.map((r) => {
+      if (r.commit === null) throw new Error(`a published claim in ${repoPath} is stored with a commit id that is not a full object id`);
+      return GitObjectIdSchema.parse(r.commit);
+    });
   }
 
   /** Record the commit the claims are carried to. Like `saveClaim`, a trusted write: only publishClaim / reverifyOnCommit move it. */
@@ -597,7 +613,9 @@ export class WorkStore {
     // The size was measured in bytes by SQLite, and an oversized payload was not returned at all.
     if (row.data === null) throw new Error(`claim ${row.id} is stored with more than ${MAX_CLAIM_BYTES} bytes of data`);
     // An over-budget reason is an invalid row, not a missing reason.
-    if (row.meta_oversized) throw new Error(`claim ${row.id} is stored with metadata over its size limit`);
+    if (row.meta_oversized || row.id === null || row.repo_path === null || row.section === null || row.commit === null || row.created_at === null) {
+      throw new Error(`claim ${row.id ?? '(unknown)'} is stored with metadata over its size limit`);
+    }
     if (row.reason_oversized) throw new Error(`claim ${row.id} is stored with a reason of more than ${MAX_CLAIM_REASON_BYTES} bytes`);
     const raw: unknown = JSON.parse(row.data);
     // The budget walk is iterative and stops at a fixed depth; the unsafe-key walk below recurses, so it only sees what fits.

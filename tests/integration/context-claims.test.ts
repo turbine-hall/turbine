@@ -112,6 +112,16 @@ function tableProblems(lines: string[]): { problems: string[]; rows: number } {
       if (htmlClose.test(l)) htmlClose = undefined;
       continue;
     }
+    if (!open && htmlClose === undefined && /<!--/.test(l) && !/-->/.test(l.slice(l.indexOf('<!--') + 4))) {
+      htmlClose = /-->/;
+      fenced.push(true);
+      continue;
+    }
+    if (!open && htmlClose === undefined && /<!--/.test(l) && !/-->/.test(l.slice(l.indexOf('<!--') + 4))) {
+      htmlClose = /-->/;
+      fenced.push(true);
+      continue;
+    }
     const htmlOpen = /^\s{0,3}<(script|pre|style|textarea)(?:\s|>|$)/i.exec(l);
     if (!open && htmlOpen) {
       htmlClose = new RegExp(`</${htmlOpen[1]}>`, 'i');
@@ -176,7 +186,8 @@ function newRepo(files: Record<string, string | Buffer | null> = BASE): string {
   const emptyTemplate = mkdtempSync(join(tmpdir(), 'turbine-claims-template-'));
   dirs.push(emptyTemplate);
   // A fixed initial branch: a developer's init.defaultBranch must not decide the branch names a test creates.
-  git(dir, 'init', '-q', '-b', 'main', `--template=${emptyTemplate}`);
+  // Pin SHA-1: a developer's init.defaultObjectFormat=sha256 would otherwise produce 64-character ids in every fixture.
+  git(dir, 'init', '-q', '-b', 'main', '--object-format=sha1', `--template=${emptyTemplate}`);
   git(dir, 'config', 'user.email', 'test@example.com');
   git(dir, 'config', 'user.name', 'Test');
   // A developer's global signing settings must not decide whether the fixture can commit.
@@ -2237,7 +2248,7 @@ describe('review round 8 (PR #12): findings from the seventh local CodeRabbit re
       const c3 = commitFiles(src, { 'b.txt': '2\n' });
       const dst = mkdtempSync(join(tmpdir(), 'turbine-claims-shallow-'));
       dirs.push(dst);
-      git(dst, 'init', '-q', '-b', 'main');
+      git(dst, 'init', '-q', '-b', 'main', '--object-format=sha1');
       git(dst, 'remote', 'add', 'origin', `file://${src}`);
       // The fixture's own fetches allow the local file transport, whatever protocol.file.allow the developer has set.
       git(dst, '-c', 'protocol.file.allow=always', 'fetch', '-q', '--depth', '1', 'origin', c3);
@@ -2373,7 +2384,7 @@ describe('review round 9 (PR #12): findings from the eighth local CodeRabbit rev
       const src = newRepo();
       const dst = mkdtempSync(join(tmpdir(), 'turbine-claims-proto-dst-'));
       dirs.push(dst);
-      git(dst, 'init', '-q', '-b', 'main');
+      git(dst, 'init', '-q', '-b', 'main', '--object-format=sha1');
       git(dst, 'remote', 'add', 'origin', `file://${src}`);
       expect(() => git(dst, 'fetch', '-q', '--depth', '1', 'origin', head(src))).toThrow(); // the developer's setting applies by default
       expect(() => git(dst, '-c', 'protocol.file.allow=always', 'fetch', '-q', '--depth', '1', 'origin', head(src))).not.toThrow();
@@ -2561,12 +2572,156 @@ describe('review round 11 (PR #12): findings from the tenth local CodeRabbit rev
       const c3 = commitFiles(src, { 'b.txt': '2\n' });
       const dst = mkdtempSync(join(tmpdir(), 'turbine-claims-shallow2-'));
       dirs.push(dst);
-      git(dst, 'init', '-q', '-b', 'main');
+      git(dst, 'init', '-q', '-b', 'main', '--object-format=sha1');
       git(dst, 'remote', 'add', 'origin', `file://${src}`);
       git(dst, '-c', 'protocol.file.allow=always', 'fetch', '-q', '--depth', '1', 'origin', c3);
       git(dst, '-c', 'protocol.file.allow=always', 'fetch', '-q', '--depth', '1', 'origin', c1);
       expect(git(dst, 'cat-file', '-t', c1).trim()).toBe('commit');
       expect(git(dst, 'cat-file', '-t', c3).trim()).toBe('commit');
+    } finally {
+      if (before === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = before;
+    }
+  });
+});
+
+describe('review round 12 (PR #12): findings from the eleventh local CodeRabbit review', () => {
+  it('replacing one claim at A with the same id at B does not hide a sibling still published at A', () => {
+    const dir = newRepo();
+    const a = head(dir);
+    const store = openStore();
+    const x = validClaims(dir, a).quote!;
+    const y = validClaims(dir, a).imports!;
+    expect(publishClaim(store, dir, dir, x).published).toBe(true);
+    expect(publishClaim(store, dir, dir, y).published).toBe(true);
+    const b = commitFiles(dir, { 'README.md': 'x\n' });
+    const xAtB = ClaimSchema.parse({ ...x, evidence: (x.evidence as Array<Record<string, unknown>>).map((e) => ({ ...e, commit: b, blob: git(dir, 'rev-parse', `${b}:${e.path as string}`).trim() })) });
+    const out = publishClaim(store, dir, dir, xAtB);
+    expect(out).toMatchObject({ published: false, recorded: false });
+    if (!out.published) expect(out.reason).toMatch(/reverifyOnCommit/);
+    expect(store.getClaim(dir, y.id as string)).toMatchObject({ status: 'verified', commit: a });
+    expect(store.getClaimFrontier(dir)).toBe(a);
+    // The sole claim can move once its sibling is carried.
+    reverifyOnCommit(store, dir, dir, a, b);
+    expect(publishClaim(store, dir, dir, xAtB).published).toBe(true);
+  });
+
+  it('a verifier reason that quotes a key containing NUL is stored, with the NUL escaped', () => {
+    const d = newRepo({ 'n.json': '{"a": 1}\n' });
+    const c = head(d);
+    const out = publishClaim(openStore(), d, d, claim({ kind: 'config', evidence: [ev(d, c, 'n.json', 1)], verifier: { kind: 'config', path: 'n.json', key: ['a\u0000b'], value: 1 } }));
+    expect(out).toMatchObject({ published: false, recorded: true });
+    if (!out.published) expect(out.reason).not.toMatch(/\0/);
+  });
+
+  it('module-scope loops and switches may break and continue; a return still fails the file', () => {
+    const ok = newRepo({ 'm.ts': "import 'pkg';\nfor (const x of []) { if (x) continue; break; }\nswitch (0) { case 0: break; }\nlabel: for (;;) { break label; }\n" });
+    const bad = newRepo({ 'm.ts': "import 'pkg';\nfor (const x of []) { return; }\n" });
+    const cOk = head(ok);
+    const cBad = head(bad);
+    expect(publishClaim(openStore(), ok, ok, claim({ kind: 'imports', evidence: [ev(ok, cOk, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } })).published).toBe(true);
+    expect(publishClaim(openStore(), bad, bad, claim({ kind: 'imports', evidence: [ev(bad, cBad, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } }))).toMatchObject({ published: false, unconfirmed: true });
+  });
+
+  it('a repository path over the read limit is refused on write, and both 40 and 64-hex object ids round-trip', () => {
+    const store = openStore();
+    const dir = repoOnce();
+    const c = headOnce();
+    const claim = ClaimSchema.parse(validClaims(dir, c).quote!);
+    expect(() => store.saveClaim({ repoPath: 'x'.repeat(128 * 1024 + 1), claim, status: 'verified', reason: 'x' })).toThrow(/over .* bytes/);
+    store.setClaimFrontier(dir, 'a'.repeat(64));
+    expect(store.getClaimFrontier(dir)).toBe('a'.repeat(64));
+    const long = ClaimSchema.parse({ ...claim, id: 'sha256-pin', evidence: [{ ...(claim.evidence[0] as object), commit: 'b'.repeat(64), blob: 'c'.repeat(64) }] });
+    expect(store.saveClaim({ repoPath: dir, claim: long, status: 'verified', reason: 'x' })).toBe(true);
+    expect(store.getClaim(dir, 'sha256-pin')).toMatchObject({ commit: 'b'.repeat(64) });
+  });
+
+  it('a table inside an HTML comment is not linted', () => {
+    expect(tableProblems(['<!--', '| A | B |', '| - | - |', 'short', '-->']).problems).toEqual([]);
+    expect(tableProblems(['| A | B |', '| - | - |', 'short']).problems).toHaveLength(1);
+  });
+
+  it('fixture repositories pin SHA-1 whatever init.defaultObjectFormat says', () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-claims-sha-'));
+    dirs.push(root);
+    const globalConfig = join(root, 'gitconfig');
+    writeFileSync(globalConfig, '[init]\n\tdefaultObjectFormat = sha256\n');
+    const before = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      expect(head(newRepo())).toHaveLength(40);
+    } finally {
+      if (before === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = before;
+    }
+  });
+});
+
+describe('review round 12 (PR #12): findings from the eleventh local CodeRabbit review', () => {
+  it('replacing one claim at A with the same id at B does not hide a sibling still published at A', () => {
+    const dir = newRepo();
+    const a = head(dir);
+    const store = openStore();
+    const x = validClaims(dir, a).quote!;
+    const y = validClaims(dir, a).imports!;
+    expect(publishClaim(store, dir, dir, x).published).toBe(true);
+    expect(publishClaim(store, dir, dir, y).published).toBe(true);
+    const b = commitFiles(dir, { 'README.md': 'x\n' });
+    const xAtB = ClaimSchema.parse({ ...x, evidence: (x.evidence as Array<Record<string, unknown>>).map((e) => ({ ...e, commit: b, blob: git(dir, 'rev-parse', `${b}:${e.path as string}`).trim() })) });
+    const out = publishClaim(store, dir, dir, xAtB);
+    expect(out).toMatchObject({ published: false, recorded: false });
+    if (!out.published) expect(out.reason).toMatch(/reverifyOnCommit/);
+    expect(store.getClaim(dir, y.id as string)).toMatchObject({ status: 'verified', commit: a });
+    expect(store.getClaimFrontier(dir)).toBe(a);
+    // The sole claim can move once its sibling is carried.
+    reverifyOnCommit(store, dir, dir, a, b);
+    expect(publishClaim(store, dir, dir, xAtB).published).toBe(true);
+  });
+
+  it('a verifier reason that quotes a key containing NUL is stored, with the NUL escaped', () => {
+    const d = newRepo({ 'n.json': '{"a": 1}\n' });
+    const c = head(d);
+    const out = publishClaim(openStore(), d, d, claim({ kind: 'config', evidence: [ev(d, c, 'n.json', 1)], verifier: { kind: 'config', path: 'n.json', key: ['a\u0000b'], value: 1 } }));
+    expect(out).toMatchObject({ published: false, recorded: true });
+    if (!out.published) expect(out.reason).not.toMatch(/\0/);
+  });
+
+  it('module-scope loops and switches may break and continue; a return still fails the file', () => {
+    const ok = newRepo({ 'm.ts': "import 'pkg';\nfor (const x of []) { if (x) continue; break; }\nswitch (0) { case 0: break; }\nlabel: for (;;) { break label; }\n" });
+    const bad = newRepo({ 'm.ts': "import 'pkg';\nfor (const x of []) { return; }\n" });
+    const cOk = head(ok);
+    const cBad = head(bad);
+    expect(publishClaim(openStore(), ok, ok, claim({ kind: 'imports', evidence: [ev(ok, cOk, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } })).published).toBe(true);
+    expect(publishClaim(openStore(), bad, bad, claim({ kind: 'imports', evidence: [ev(bad, cBad, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } }))).toMatchObject({ published: false, unconfirmed: true });
+  });
+
+  it('a repository path over the read limit is refused on write, and both 40 and 64-hex object ids round-trip', () => {
+    const store = openStore();
+    const dir = repoOnce();
+    const c = headOnce();
+    const claim = ClaimSchema.parse(validClaims(dir, c).quote!);
+    expect(() => store.saveClaim({ repoPath: 'x'.repeat(128 * 1024 + 1), claim, status: 'verified', reason: 'x' })).toThrow(/over .* bytes/);
+    store.setClaimFrontier(dir, 'a'.repeat(64));
+    expect(store.getClaimFrontier(dir)).toBe('a'.repeat(64));
+    const long = ClaimSchema.parse({ ...claim, id: 'sha256-pin', evidence: [{ ...(claim.evidence[0] as object), commit: 'b'.repeat(64), blob: 'c'.repeat(64) }] });
+    expect(store.saveClaim({ repoPath: dir, claim: long, status: 'verified', reason: 'x' })).toBe(true);
+    expect(store.getClaim(dir, 'sha256-pin')).toMatchObject({ commit: 'b'.repeat(64) });
+  });
+
+  it('a table inside an HTML comment is not linted', () => {
+    expect(tableProblems(['<!--', '| A | B |', '| - | - |', 'short', '-->']).problems).toEqual([]);
+    expect(tableProblems(['| A | B |', '| - | - |', 'short']).problems).toHaveLength(1);
+  });
+
+  it('fixture repositories pin SHA-1 whatever init.defaultObjectFormat says', () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-claims-sha-'));
+    dirs.push(root);
+    const globalConfig = join(root, 'gitconfig');
+    writeFileSync(globalConfig, '[init]\n\tdefaultObjectFormat = sha256\n');
+    const before = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      expect(head(newRepo())).toHaveLength(40);
     } finally {
       if (before === undefined) delete process.env.GIT_CONFIG_GLOBAL;
       else process.env.GIT_CONFIG_GLOBAL = before;

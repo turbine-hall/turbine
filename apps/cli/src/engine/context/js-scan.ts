@@ -113,18 +113,27 @@ export function parseSource(input: string, opts: { jsx: boolean } = { jsx: true 
     const d = diagnostics[0]!;
     return { ok: false, reason: `${ts.flattenDiagnosticMessageText(d.messageText, ' ')} near line ${lineAt(d.start)}` };
   }
-  // A top-level `return` / `break` / `continue` is a grammatical error TypeScript's parseDiagnostics do not report:
-  // the tree still parses, but the file is not a valid module, so nothing is stated from it. Function bodies are skipped.
-  // An explicit stack: a property-access chain of tens of thousands of segments must not overflow the call stack here.
-  let illegal: TS.Node | undefined;
-  const todo: Array<{ n: TS.Node; inFunction: boolean }> = [{ n: sf, inFunction: false }];
+  // Control-flow errors the binder reports that parseDiagnostics omit: a `return` outside a function, or a `break` /
+  // `continue` that is not enclosed by a valid target. An explicit stack: deep ASTs must not overflow the call stack.
+  type Ctx = { inFunction: boolean; loops: number; switches: number; labels: ReadonlySet<string>; loopLabels: ReadonlySet<string> };
+  let illegal: { node: TS.Node; why: string } | undefined;
+  const todo: Array<{ n: TS.Node; ctx: Ctx }> = [{ n: sf, ctx: { inFunction: false, loops: 0, switches: 0, labels: new Set(), loopLabels: new Set() } }];
   while (todo.length && !illegal) {
-    const { n, inFunction } = todo.pop()!;
-    if (!inFunction && (ts.isReturnStatement(n) || ts.isBreakStatement(n) || ts.isContinueStatement(n))) {
-      illegal = n;
-      break;
+    const { n, ctx } = todo.pop()!;
+    if (ts.isReturnStatement(n) && !ctx.inFunction) illegal = { node: n, why: 'a top-level return is not valid in a module' };
+    else if (ts.isBreakStatement(n) || ts.isContinueStatement(n)) {
+      const label = n.label?.text;
+      const isContinue = ts.isContinueStatement(n);
+      if (label === undefined) {
+        if (isContinue ? ctx.loops === 0 : ctx.loops === 0 && ctx.switches === 0) {
+          illegal = { node: n, why: `a ${isContinue ? 'continue' : 'break'} outside a ${isContinue ? 'loop' : 'loop or switch'} is not valid` };
+        }
+      } else if (isContinue ? !ctx.loopLabels.has(label) : !ctx.labels.has(label)) {
+        illegal = { node: n, why: `a ${isContinue ? 'continue' : 'break'} to label "${label}" has no matching enclosing ${isContinue ? 'loop' : 'target'}` };
+      }
     }
-    const enter =
+    if (illegal) break;
+    const enterFn =
       ts.isFunctionDeclaration(n) ||
       ts.isFunctionExpression(n) ||
       ts.isArrowFunction(n) ||
@@ -132,17 +141,30 @@ export function parseSource(input: string, opts: { jsx: boolean } = { jsx: true 
       ts.isConstructorDeclaration(n) ||
       ts.isGetAccessorDeclaration(n) ||
       ts.isSetAccessorDeclaration(n);
-    const next = inFunction || enter;
+    const isLoop = ts.isForStatement(n) || ts.isForInStatement(n) || ts.isForOfStatement(n) || ts.isWhileStatement(n) || ts.isDoStatement(n);
+    const isSwitch = ts.isSwitchStatement(n);
+    let next: Ctx = {
+      inFunction: ctx.inFunction || enterFn,
+      loops: ctx.loops + (isLoop ? 1 : 0),
+      switches: ctx.switches + (isSwitch ? 1 : 0),
+      labels: ctx.labels,
+      loopLabels: ctx.loopLabels,
+    };
+    if (ts.isLabeledStatement(n)) {
+      const labels = new Set(ctx.labels);
+      labels.add(n.label.text);
+      const loopLabels = new Set(ctx.loopLabels);
+      const body = n.statement;
+      if (ts.isForStatement(body) || ts.isForInStatement(body) || ts.isForOfStatement(body) || ts.isWhileStatement(body) || ts.isDoStatement(body)) loopLabels.add(n.label.text);
+      next = { ...next, labels, loopLabels };
+    }
     const children: TS.Node[] = [];
     ts.forEachChild(n, (c) => {
       children.push(c);
     });
-    for (let i = children.length - 1; i >= 0; i--) todo.push({ n: children[i]!, inFunction: next });
+    for (let i = children.length - 1; i >= 0; i--) todo.push({ n: children[i]!, ctx: next });
   }
-  if (illegal) {
-    const kind = ts.isReturnStatement(illegal) ? 'return' : ts.isBreakStatement(illegal) ? 'break' : 'continue';
-    return { ok: false, reason: `a top-level ${kind} is not valid in a module near line ${lineAt(illegal.getStart(sf))}` };
-  }
+  if (illegal) return { ok: false, reason: `${illegal.why} near line ${lineAt(illegal.node.getStart(sf))}` };
   return { ok: true, ts, sf, source: s, lineAt };
 }
 
