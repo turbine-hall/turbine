@@ -216,6 +216,14 @@ export function readBlobs(repoRoot: string, blobIds: string[], expectedBytes = 0
  */
 /** Whether `ancestor` is `descendant` or one of its ancestors. Throws when either is not a commit of the repository. */
 export function isAncestor(repoRoot: string, ancestor: string, descendant: string): boolean {
+  // Grafts rewrite parent links without changing the stored commits: a comparison that used them would not be a fact of the repository.
+  const grafts = run(repoRoot, ['rev-parse', '--git-path', 'info/grafts']);
+  if (grafts.status === 0) {
+    const path = String(grafts.stdout).trim();
+    if (path && existsSync(resolve(repoRoot, path))) {
+      throw new Error('this repository has info/grafts; ancestry cannot be settled from the stored parent links until the grafts are removed');
+    }
+  }
   // Shallow state is read before AND after: a "no" is settled only if the history was complete for the whole query.
   const full = (): boolean => {
     const shallow = run(repoRoot, ['rev-parse', '--is-shallow-repository']);

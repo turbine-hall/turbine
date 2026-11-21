@@ -113,6 +113,27 @@ export function parseSource(input: string, opts: { jsx: boolean } = { jsx: true 
     const d = diagnostics[0]!;
     return { ok: false, reason: `${ts.flattenDiagnosticMessageText(d.messageText, ' ')} near line ${lineAt(d.start)}` };
   }
+  // A top-level `return` / `break` / `continue` is a grammatical error TypeScript's parseDiagnostics do not report:
+  // the tree still parses, but the file is not a valid module, so nothing is stated from it. Function bodies are skipped.
+  const illegal: TS.Node[] = [];
+  const walk = (n: TS.Node, inFunction: boolean): void => {
+    if (!inFunction && (ts.isReturnStatement(n) || ts.isBreakStatement(n) || ts.isContinueStatement(n))) illegal.push(n);
+    const enter =
+      ts.isFunctionDeclaration(n) ||
+      ts.isFunctionExpression(n) ||
+      ts.isArrowFunction(n) ||
+      ts.isMethodDeclaration(n) ||
+      ts.isConstructorDeclaration(n) ||
+      ts.isGetAccessorDeclaration(n) ||
+      ts.isSetAccessorDeclaration(n);
+    ts.forEachChild(n, (c) => walk(c, inFunction || enter));
+  };
+  walk(sf, false);
+  if (illegal.length) {
+    const n = illegal[0]!;
+    const kind = ts.isReturnStatement(n) ? 'return' : ts.isBreakStatement(n) ? 'break' : 'continue';
+    return { ok: false, reason: `a top-level ${kind} is not valid in a module near line ${lineAt(n.getStart(sf))}` };
+  }
   return { ok: true, ts, sf, source: s, lineAt };
 }
 
@@ -275,7 +296,8 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
     if (n.parent === sf) topLevel(n);
     if (bindsRequire(n)) requireBound = true;
     if (ts.isCallExpression(n)) {
-      const callee = n.expression;
+      let callee: TS.Expression = n.expression;
+      while (ts.isParenthesizedExpression(callee)) callee = callee.expression;
       const arg = n.arguments[0];
       if (ts.isIdentifier(callee) && callee.text === 'require' && n.arguments.length === 1) {
         const spec = plainString(arg, startOf(n));

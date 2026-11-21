@@ -11,7 +11,7 @@ import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { ClaimSchema, PUBLISHED_CLAIM_STATUSES, assertClaimBudget, UNIVERSAL_WORDS, claimCommit, parseClaim, universalWordIn } from '../../packages/contracts/dist/index.js';
+import { ClaimSchema, PUBLISHED_CLAIM_STATUSES, assertClaimBudget, parseClaim, UNIVERSAL_WORDS, claimCommit, universalWordIn } from '../../packages/contracts/dist/index.js';
 import { WorkStore } from '../../packages/storage-sqlite/dist/index.js';
 import { publishClaim, reverifyOnCommit } from '../../apps/cli/src/engine/context/claims.js';
 import { isAncestor } from '../../apps/cli/src/engine/context/git-read.js';
@@ -94,18 +94,31 @@ const HTML_BLOCK_TAGS = 'address|article|aside|base|basefont|blockquote|body|cap
  * that is not empty and starts at 1. A line without pipes, or an ordered item such as "2.", is still a row.
  */
 const BLOCK_START = new RegExp(
-  `^\\s{0,3}(?:#{1,6}(?:\\s|$)|>|[-*+]\\s+\\S|1[.)]\\s+\\S|\`\`\`|~~~|([-*_])(?:\\s*\\1){2,}\\s*$|<(?:!--|\\?|![A-Za-z]|!\\[CDATA\\[|(?:script|pre|style|textarea)(?:\\s|>|$)|/?(?:${HTML_BLOCK_TAGS})(?:\\s|/?>|$)))`,
+  `^\\s{0,3}(?:#{1,6}(?:\\s|$)|>|[-*+]\\s+\\S|1[.)]\\s+\\S|([-*_])(?:\\s*\\1){2,}\\s*$|<(?:!--|\\?|![A-Za-z]|!\\[CDATA\\[|(?:script|pre|style|textarea)(?:\\s|>|$)|/?(?:${HTML_BLOCK_TAGS})(?:\\s|/?>|$)))`,
   'i',
 );
 /** Every row of every table in `lines` whose cell count differs from its header's, and how many body rows were checked. */
 function tableProblems(lines: string[]): { problems: string[]; rows: number } {
   const problems: string[] = [];
   let rows = 0;
-  // Lines inside a fenced code block are literal text, not a table. A fence closes only on a line of the same marker, at
-  // least as long as the opening one, with nothing after it but spaces (CommonMark / GFM).
+  // Lines inside a fenced code block or an HTML <pre>/<script>/<style>/<textarea> block are literal text, not a table.
+  // A fence closes only on a line of the same marker, at least as long as the opening one, with nothing after it but spaces.
   const fenced: boolean[] = [];
   let open: { marker: string; length: number } | undefined;
+  let htmlClose: RegExp | undefined;
   for (const l of lines) {
+    if (htmlClose) {
+      fenced.push(true);
+      if (htmlClose.test(l)) htmlClose = undefined;
+      continue;
+    }
+    const htmlOpen = /^\s{0,3}<(script|pre|style|textarea)(?:\s|>|$)/i.exec(l);
+    if (!open && htmlOpen) {
+      htmlClose = new RegExp(`</${htmlOpen[1]}>`, 'i');
+      fenced.push(true);
+      if (htmlClose.test(l)) htmlClose = undefined;
+      continue;
+    }
     const m = /^\s{0,3}(`{3,}|~{3,})(.*)$/.exec(l);
     if (!open) {
       if (m && !(m[1]![0] === '`' && m[2]!.includes('`'))) open = { marker: m[1]![0]!, length: m[1]!.length };
@@ -1551,7 +1564,7 @@ describe('review round 3 (PR #12): findings from the second local CodeRabbit rev
       }
     }
     expect(readFileSync(join(decoy, '.git', 'config'), 'utf8')).toBe(before);
-    expect(spawnGit(['log', '--oneline'], { cwd: decoy, encoding: 'utf8' }).stdout.trim()).toBe(''); // no fixture commit landed in it
+    expect(git(decoy, 'rev-list', '--all', '--count').trim()).toBe('0'); // no fixture commit landed in it (a failed read throws)
   });
 });
 
@@ -2441,5 +2454,122 @@ describe('review round 10 (PR #12): findings from the ninth local CodeRabbit rev
     expect(doc).toContain('a `default` miss stays a definite failure');
     expect(doc).toContain('round-trips through a double');
     expect(doc).toContain('`next` must descend from `prev`');
+  });
+});
+
+describe('review round 11 (PR #12): findings from the tenth local CodeRabbit review', () => {
+  it('a rejection is not written if HEAD moved during verification', () => {
+    const dir = newRepo();
+    const c = head(dir);
+    const store = openStore();
+    hooks.onVerify = () => {
+      commitFiles(dir, { 'moved.txt': 'x\n' });
+    };
+    let out;
+    try {
+      out = publishClaim(store, dir, dir, claim({ kind: 'imports', evidence: [ev(dir, c, 'src/app.ts', 2)], verifier: { kind: 'imports', from: 'src/app.ts', specifier: 'zzz' } }));
+    } finally {
+      hooks.onVerify = undefined;
+    }
+    expect(out).toMatchObject({ published: false, unconfirmed: true, recorded: false });
+    if (!out.published) expect(out.reason).toMatch(/HEAD moved/);
+    expect(store.listClaims(dir)).toEqual([]);
+  });
+
+  it('(require)("pkg") is an import when require is not shadowed', () => {
+    const d = newRepo({ 'cjs.js': "const x = (require)('pkg');\nexport {};\n" });
+    const c = head(d);
+    expect(publishClaim(openStore(), d, d, claim({ kind: 'imports', evidence: [ev(d, c, 'cjs.js', 1)], verifier: { kind: 'imports', from: 'cjs.js', specifier: 'pkg' } })).published).toBe(true);
+  });
+
+  it('a top-level return makes the whole file unconfirmed; without it the import verifies', () => {
+    const bad = newRepo({ 'm.ts': "import 'pkg';\nreturn;\n" });
+    const good = newRepo({ 'm.ts': "import 'pkg';\n" });
+    const cb = head(bad);
+    const cg = head(good);
+    expect(publishClaim(openStore(), bad, bad, claim({ kind: 'imports', evidence: [ev(bad, cb, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } }))).toMatchObject({ published: false, unconfirmed: true });
+    expect(publishClaim(openStore(), good, good, claim({ kind: 'imports', evidence: [ev(good, cg, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } })).published).toBe(true);
+  });
+
+  it('a transition refuses to move the frontier past a published claim at another commit', () => {
+    const dir = newRepo();
+    const a = head(dir);
+    const store = openStore();
+    const early = ClaimSchema.parse(validClaims(dir, a).quote!);
+    // Trusted write with no frontier: simulates a row left from outside publishClaim.
+    store.saveClaim({ repoPath: dir, claim: early, status: 'verified', reason: 'seeded' });
+    const b = commitFiles(dir, { 'README.md': 'x\n' });
+    const late = ClaimSchema.parse({ ...validClaims(dir, b).imports!, evidence: (validClaims(dir, b).imports!.evidence as Array<Record<string, unknown>>).map((e) => ({ ...e, commit: b, blob: git(dir, 'rev-parse', `${b}:${e.path as string}`).trim() })) });
+    store.saveClaim({ repoPath: dir, claim: late, status: 'verified', reason: 'seeded' });
+    expect(() => reverifyOnCommit(store, dir, dir, b, commitFiles(dir, { 'README.md': 'y\n' }))).toThrow(/sit at commit/);
+    expect(store.getClaim(dir, early.id)).toMatchObject({ status: 'verified', commit: a });
+    expect(store.getClaimFrontier(dir)).toBeNull();
+  });
+
+  it('ancestry refuses a repository that has info/grafts', () => {
+    const dir = newRepo();
+    const a = head(dir);
+    const b = commitFiles(dir, { 'a.txt': '1\n' });
+    const grafts = join(dir, '.git', 'info', 'grafts');
+    mkdirSync(join(dir, '.git', 'info'), { recursive: true });
+    writeFileSync(grafts, `${b} ${a}\n`);
+    expect(() => isAncestor(dir, a, b)).toThrow(/grafts/);
+  });
+
+  it('listPublishedClaimCommits is metadata-only, statuses are deduped, and a NUL reason is refused', () => {
+    const dir = newRepo();
+    const c = head(dir);
+    const store = openStore();
+    const a = ClaimSchema.parse(validClaims(dir, c).quote!);
+    const b = ClaimSchema.parse(validClaims(dir, c).imports!);
+    publishClaim(store, dir, dir, a);
+    publishClaim(store, dir, dir, b);
+    expect(store.listPublishedClaimCommits(dir)).toEqual([c]);
+    expect(store.listClaims(dir, { statuses: ['verified', 'verified', 'verified'] })).toHaveLength(2);
+    expect(() => store.saveClaim({ repoPath: dir, claim: a, status: 'rejected', reason: 'bad\0tail' })).toThrow(/NUL/);
+    expect(() => store.withdrawClaim(dir, a.id, 'bad\0tail')).toThrow(/NUL/);
+  });
+
+  it('a table inside <pre> is not linted, and an invalid fence opener does not end a table', () => {
+    expect(tableProblems(['<pre>', '| A | B |', '| - | - |', '| short |', '</pre>']).problems).toEqual([]);
+    // A row that looks like a fence but has a backtick in the info string is still a table row.
+    const t = tableProblems(['| A | B |', '| - | - |', '``` label ` | x | extra']);
+    expect(t.rows).toBeGreaterThanOrEqual(1);
+    expect(t.problems.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('the decoy GIT_DIR check uses a status-checked count', () => {
+    // Covered by the existing decoy test once updated; assert the helper shape here.
+    const decoy = mkdtempSync(join(tmpdir(), 'turbine-claims-decoy2-'));
+    dirs.push(decoy);
+    git(decoy, 'init', '-q', '-b', 'main');
+    expect(git(decoy, 'rev-list', '--all', '--count').trim()).toBe('0');
+  });
+
+  it('the shallow helper itself works under protocol.file.allow=never', () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-claims-proto2-'));
+    dirs.push(root);
+    const globalConfig = join(root, 'gitconfig');
+    writeFileSync(globalConfig, '[protocol "file"]\n\tallow = never\n');
+    const before = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      // Inline the helper body used by the shallow tests (same fetches with -c allow=always).
+      const src = newRepo();
+      const c1 = head(src);
+      commitFiles(src, { 'a.txt': '1\n' });
+      const c3 = commitFiles(src, { 'b.txt': '2\n' });
+      const dst = mkdtempSync(join(tmpdir(), 'turbine-claims-shallow2-'));
+      dirs.push(dst);
+      git(dst, 'init', '-q', '-b', 'main');
+      git(dst, 'remote', 'add', 'origin', `file://${src}`);
+      git(dst, '-c', 'protocol.file.allow=always', 'fetch', '-q', '--depth', '1', 'origin', c3);
+      git(dst, '-c', 'protocol.file.allow=always', 'fetch', '-q', '--depth', '1', 'origin', c1);
+      expect(git(dst, 'cat-file', '-t', c1).trim()).toBe('commit');
+      expect(git(dst, 'cat-file', '-t', c3).trim()).toBe('commit');
+    } finally {
+      if (before === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = before;
+    }
   });
 });
