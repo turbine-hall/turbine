@@ -135,4 +135,36 @@ CREATE TABLE IF NOT EXISTS work_claims (
 );
 `,
   },
+  {
+    version: 4,
+    sql: `
+-- Layer 2 claims. "data" is the claim (statement, evidence, verifier); the status says whether it may be published.
+CREATE TABLE IF NOT EXISTS claims (
+  id TEXT NOT NULL,
+  repo_path TEXT NOT NULL,
+  section TEXT NOT NULL,
+  "commit" TEXT NOT NULL,
+  data TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('verified', 'rejected', 'withdrawn', 'attested')),
+  reason TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (repo_path, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_claims_repo_section ON claims(repo_path, section);
+CREATE INDEX IF NOT EXISTS idx_claims_repo_commit ON claims(repo_path, "commit");
+`,
+  },
+  {
+    version: 5,
+    sql: `
+-- Layer 2: the commit the claims of a repository have been carried to. It only moves forward, and it survives the
+-- withdrawal of the last claim, so a later publication cannot reopen a commit the transitions have already passed.
+CREATE TABLE IF NOT EXISTS claim_frontier (
+  repo_path TEXT PRIMARY KEY,
+  "commit" TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`,
+  },
 ];

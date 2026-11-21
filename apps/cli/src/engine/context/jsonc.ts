@@ -12,9 +12,85 @@ export type Jsonc = {
 };
 
 const MAX_DEPTH = 128;
+
+/** The text may be valid JSON, but this reader will not go further: the answer is "not decided", not "invalid". */
+export class JsoncLimitError extends SyntaxError {
+  constructor(
+    message: string,
+    readonly limit: 'depth' | 'number',
+  ) {
+    super(message);
+    this.name = 'JsoncLimitError';
+  }
+}
 const TOKEN = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null/y;
 
-export function parseJsonc(input: string): Jsonc {
+/** A number token whose value a double cannot hold exactly. Only produced under `exactNumbers`. */
+export class InexactNumber {
+  constructor(readonly text: string) {}
+}
+
+export type JsoncOptions = {
+  /**
+   * A number the reader would round (an integer beyond 2^53, or a token with more than 15 significant digits) is
+   * read as an `InexactNumber` carrying its text, not as a rounded `number`. Off by default (every existing reader
+   * gets a `number`); the claim verifiers turn it on so a rounded value is never taken as the digits written.
+   */
+  exactNumbers?: boolean;
+};
+
+/** Significant digits of a JSON number token: the mantissa digits without leading or trailing zeros. */
+function significantDigits(token: string): number {
+  const mantissa = token.replace(/^-/, '').replace(/[eE].*$/, '').replace('.', '');
+  // Scans, not a regular expression: an unanchored `0+$` is quadratic on a long run of zeros inside the number.
+  let start = 0;
+  let end = mantissa.length;
+  while (start < end && mantissa.charCodeAt(start) === 48) start++;
+  while (end > start && mantissa.charCodeAt(end - 1) === 48) end--;
+  return end - start;
+}
+
+/** Below this a double is subnormal: it holds fewer digits than a normal one, and a nonzero literal can round to 0. */
+const MIN_NORMAL = 2.2250738585072014e-308;
+
+/**
+ * The value a number token states as `digits x 10^exp`: the mantissa digits without leading or trailing zeros (trailing
+ * zeros move into the exponent), so `1000000000000001.0`, `1000000000000001` and `10000000000000010e-1` all give the same pair.
+ */
+function decimalOf(token: string): { digits: string; exp: number } {
+  const body = token.replace(/^-/, '');
+  const e = body.search(/[eE]/);
+  const mantissa = e < 0 ? body : body.slice(0, e);
+  const dot = mantissa.indexOf('.');
+  const fraction = dot < 0 ? 0 : mantissa.length - dot - 1;
+  const all = mantissa.replace('.', '');
+  let start = 0;
+  let end = all.length;
+  // Scans, not a regular expression: an unanchored `0+$` is quadratic on a long run of zeros inside the number.
+  while (start < end && all.charCodeAt(start) === 48) start++;
+  while (end > start && all.charCodeAt(end - 1) === 48) end--;
+  const exponent = e < 0 ? 0 : Number(body.slice(e + 1));
+  return { digits: all.slice(start, end), exp: exponent - fraction + (all.length - end) };
+}
+
+/**
+ * Whether the double `n` is exactly what the token `token` states. Decided from the TEXT, not from the rounded value
+ * (`1.0000000000000001e0` rounds to the integer 1, but states more digits than a double holds):
+ *   - zero: exact only if the token has no nonzero digit (`1e-400` underflows to 0);
+ *   - a whole number (`1e3`, `1000000000000001.0`, `12345`) is exact only if it is a safe integer, however it is spelled;
+ *   - a fraction is exact if it has at most 15 significant digits and is in the normal range, where a double round-trips it.
+ */
+function numberIsExact(token: string, n: number): boolean {
+  if (n === 0) return significantDigits(token) === 0;
+  const { digits, exp } = decimalOf(token);
+  if (exp >= 0) {
+    if (digits.length + exp > 16) return false; // beyond 2^53 whatever the digits
+    return BigInt(digits) * 10n ** BigInt(exp) <= BigInt(Number.MAX_SAFE_INTEGER);
+  }
+  return digits.length <= 15 && Math.abs(n) >= MIN_NORMAL;
+}
+
+export function parseJsonc(input: string, opts: JsoncOptions = {}): Jsonc {
   const text = input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
   // LF, CRLF and bare CR all end a line; CRLF counts once.
   const lineStarts = [0];
@@ -66,8 +142,9 @@ export function parseJsonc(input: string): Jsonc {
   };
   let i = 0;
 
-  const fail = (msg: string): never => {
-    throw new SyntaxError(`${msg} at line ${lineOf(Math.min(i, text.length))}`);
+  const fail = (msg: string, limit?: 'depth' | 'number'): never => {
+    const message = `${msg} at line ${lineOf(Math.min(i, text.length))}`;
+    throw limit ? new JsoncLimitError(message, limit) : new SyntaxError(message);
   };
   const skip = () => {
     for (;;) {
@@ -95,7 +172,7 @@ export function parseJsonc(input: string): Jsonc {
     return JSON.parse(text.slice(start, i)) as string;
   };
   const value = (path: Array<string | number>): unknown => {
-    if (path.length > MAX_DEPTH) fail('Nested too deeply');
+    if (path.length > MAX_DEPTH) fail('Nested too deeply', 'depth');
     skip();
     const c = text[i];
     if (c === '{') {
@@ -150,7 +227,9 @@ export function parseJsonc(input: string): Jsonc {
     i += m[0].length;
     const n: unknown = JSON.parse(m[0]);
     // 1e400 parses to Infinity, which is not a JSON value a manifest can meaningfully state: refuse it
-    if (typeof n === 'number' && !Number.isFinite(n)) return fail('Number out of range');
+    if (typeof n === 'number' && !Number.isFinite(n)) return fail('Number out of range', 'number');
+    // A double holds any decimal of up to 15 significant digits, and any safe integer, exactly. Anything else may be rounded.
+    if (opts.exactNumbers && typeof n === 'number' && !numberIsExact(m[0], n)) return new InexactNumber(m[0]);
     return n;
   };
 

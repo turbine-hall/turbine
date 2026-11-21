@@ -6,3 +6,4 @@ export * from './errors.js';
 export * from './config.js';
 export * from './context.js';
 export * from './task-context.js';
+export * from './claims.js';
