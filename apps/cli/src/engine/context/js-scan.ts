@@ -115,9 +115,15 @@ export function parseSource(input: string, opts: { jsx: boolean } = { jsx: true 
   }
   // A top-level `return` / `break` / `continue` is a grammatical error TypeScript's parseDiagnostics do not report:
   // the tree still parses, but the file is not a valid module, so nothing is stated from it. Function bodies are skipped.
-  const illegal: TS.Node[] = [];
-  const walk = (n: TS.Node, inFunction: boolean): void => {
-    if (!inFunction && (ts.isReturnStatement(n) || ts.isBreakStatement(n) || ts.isContinueStatement(n))) illegal.push(n);
+  // An explicit stack: a property-access chain of tens of thousands of segments must not overflow the call stack here.
+  let illegal: TS.Node | undefined;
+  const todo: Array<{ n: TS.Node; inFunction: boolean }> = [{ n: sf, inFunction: false }];
+  while (todo.length && !illegal) {
+    const { n, inFunction } = todo.pop()!;
+    if (!inFunction && (ts.isReturnStatement(n) || ts.isBreakStatement(n) || ts.isContinueStatement(n))) {
+      illegal = n;
+      break;
+    }
     const enter =
       ts.isFunctionDeclaration(n) ||
       ts.isFunctionExpression(n) ||
@@ -126,13 +132,16 @@ export function parseSource(input: string, opts: { jsx: boolean } = { jsx: true 
       ts.isConstructorDeclaration(n) ||
       ts.isGetAccessorDeclaration(n) ||
       ts.isSetAccessorDeclaration(n);
-    ts.forEachChild(n, (c) => walk(c, inFunction || enter));
-  };
-  walk(sf, false);
-  if (illegal.length) {
-    const n = illegal[0]!;
-    const kind = ts.isReturnStatement(n) ? 'return' : ts.isBreakStatement(n) ? 'break' : 'continue';
-    return { ok: false, reason: `a top-level ${kind} is not valid in a module near line ${lineAt(n.getStart(sf))}` };
+    const next = inFunction || enter;
+    const children: TS.Node[] = [];
+    ts.forEachChild(n, (c) => {
+      children.push(c);
+    });
+    for (let i = children.length - 1; i >= 0; i--) todo.push({ n: children[i]!, inFunction: next });
+  }
+  if (illegal) {
+    const kind = ts.isReturnStatement(illegal) ? 'return' : ts.isBreakStatement(illegal) ? 'break' : 'continue';
+    return { ok: false, reason: `a top-level ${kind} is not valid in a module near line ${lineAt(illegal.getStart(sf))}` };
   }
   return { ok: true, ts, sf, source: s, lineAt };
 }
