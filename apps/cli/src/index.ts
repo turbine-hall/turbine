@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, opendirSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createJiraAdapter } from '@turbine-hall/turbine-adapter-jira';
 import { assertTransition, listFrameworks, loadRoles } from '@turbine-hall/turbine-core';
@@ -286,54 +286,60 @@ knowledgeCmd
           budgetHit = `bundle exceeds max depth ${MAX_BUNDLE_DEPTH}`;
           return;
         }
-        let names: string[];
+        let dirHandle;
         try {
-          names = readdirSync(abs);
+          dirHandle = opendirSync(abs);
         } catch (e) {
           budgetHit = `cannot read ${rel || '.'}: ${(e as Error).message}`;
           return;
         }
-        for (const name of names) {
-          if (budgetHit) return;
-          if (name.startsWith('.')) continue;
-          visited += 1;
-          if (visited > MAX_BUNDLE_FILES) {
-            budgetHit = `bundle has more than ${MAX_BUNDLE_FILES} entries`;
-            return;
-          }
-          const child = join(abs, name);
-          const childRel = rel ? `${rel}/${name}` : name;
-          let st;
-          try {
-            st = lstatSync(child);
-          } catch (e) {
-            rows.push({ path: childRel, trust: `unreadable:${(e as Error).message}` });
-            continue;
-          }
-          if (st.isDirectory()) walk(child, childRel, depth + 1);
-          else if (st.isFile() && name.endsWith('.md') && name !== 'index.md' && name !== 'log.md' && name !== 'README.md') {
-            if (concept && childRel !== concept && !childRel.endsWith(`/${concept}`)) continue;
-            let text: string;
+        try {
+          for (let ent = dirHandle.readSync(); ent !== null; ent = dirHandle.readSync()) {
+            if (budgetHit) return;
+            // Count every scanned entry (including hidden) so the budget bounds enumeration work.
+            visited += 1;
+            if (visited > MAX_BUNDLE_FILES) {
+              budgetHit = `bundle has more than ${MAX_BUNDLE_FILES} entries`;
+              return;
+            }
+            const name = ent.name;
+            if (name.startsWith('.')) continue;
+            const child = join(abs, name);
+            const childRel = rel ? `${rel}/${name}` : name;
+            let st;
             try {
-              const body = readBoundedUtf8(child, MAX_BUNDLE_FILE_BYTES);
-              if (body === undefined) continue;
-              text = body;
+              st = lstatSync(child);
             } catch (e) {
               rows.push({ path: childRel, trust: `unreadable:${(e as Error).message}` });
               continue;
             }
-            const split = splitFrontmatter(text);
-            if (!split.ok || typeof split.data.type !== 'string') continue;
-            rows.push({
-              path: childRel,
-              type: split.data.type,
-              title: typeof split.data.title === 'string' ? split.data.title : undefined,
-              trust: okfTrustTier({
-                generated: split.data.generated as { by?: string; at?: string } | undefined,
-                verified: split.data.verified,
-              }),
-            });
+            if (st.isDirectory()) walk(child, childRel, depth + 1);
+            else if (st.isFile() && name.endsWith('.md') && name !== 'index.md' && name !== 'log.md' && name !== 'README.md') {
+              if (concept && childRel !== concept && !childRel.endsWith(`/${concept}`)) continue;
+              let text: string;
+              try {
+                const body = readBoundedUtf8(child, MAX_BUNDLE_FILE_BYTES);
+                if (body === undefined) continue;
+                text = body;
+              } catch (e) {
+                rows.push({ path: childRel, trust: `unreadable:${(e as Error).message}` });
+                continue;
+              }
+              const split = splitFrontmatter(text);
+              if (!split.ok || typeof split.data.type !== 'string') continue;
+              rows.push({
+                path: childRel,
+                type: split.data.type,
+                title: typeof split.data.title === 'string' ? split.data.title : undefined,
+                trust: okfTrustTier({
+                  generated: split.data.generated as { by?: string; at?: string } | undefined,
+                  verified: split.data.verified,
+                }),
+              });
+            }
           }
+        } finally {
+          dirHandle.closeSync();
         }
       };
       walk(dir, '', 0);

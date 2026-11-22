@@ -262,6 +262,19 @@ describe('AC: same commit → byte-identical / no writes; new commit → rebuild
     expect(readFileSync(knowledgePaths(dir).index, 'utf8')).toBe(before);
   });
 
+  it('a UTC-date-only log change does not force republish', async () => {
+    const dir = newRepo();
+    const store = openStore();
+    await understand(dir, store);
+    const logPath = knowledgePaths(dir).log;
+    const beforeLog = readFileSync(logPath, 'utf8');
+    // Simulate crossing UTC midnight: only the calendar heading differs from what a fresh render would emit.
+    writeFileSync(logPath, beforeLog.replace(/^## \d{4}-\d{2}-\d{2}/m, '## 1999-01-01'));
+    const again = await understand(dir, store);
+    expect(again.knowledge?.unchanged).toBe(true);
+    expect(readFileSync(logPath, 'utf8')).toMatch(/^## 1999-01-01/m);
+  });
+
   it('a new commit rebuilds and appends a log entry', async () => {
     const dir = newRepo();
     const store = openStore();

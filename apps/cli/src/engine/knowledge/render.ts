@@ -65,7 +65,7 @@ function yamlScalar(value: string): string {
     value !== value.trim() ||
     shouldQuoteOkfString(value) ||
     /[:#{}[\],&*?|>!%@`]/.test(value) ||
-    value.includes('\n') ||
+    /[\n\r\u0000-\u001f\u007f]/.test(value) ||
     value.includes("'") ||
     value.includes('"') ||
     /^[-?]/.test(value)

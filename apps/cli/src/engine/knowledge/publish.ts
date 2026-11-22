@@ -302,6 +302,8 @@ function recoverInterruptedSwap(projectRoot: string): void {
 function bundleOnDiskMatches(dir: string, files: BundleFiles): boolean {
   if (!existsSync(dir)) return false;
   for (const [rel, body] of files) {
+    // Match bundleContentHash: log.md may change with the UTC calendar day even when inputs are identical.
+    if (rel === 'log.md') continue;
     const abs = join(dir, rel);
     if (!existsSync(abs)) return false;
     try {
