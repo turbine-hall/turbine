@@ -5,6 +5,7 @@ import {
   PUBLISHED_CLAIM_STATUSES,
   briefConfirmToken,
   claimsHashOf,
+  contentHashText,
   parseClaimSafe,
   type BriefState,
   type Claim,
@@ -19,8 +20,16 @@ import { ensureDefaultMock, getModel } from '@turbine-hall/turbine-models';
 import { publishClaim, reverifyOnCommit } from './claims.js';
 import { listTree, resolveCommit } from './git-read.js';
 import { CommitReader } from './verify.js';
-import { parseClaimIdsFromSection, readBriefMarker, writeBriefFiles, briefPaths } from './brief-render.js';
-import { contextPaths } from './render.js';
+import {
+  briefPaths,
+  parseClaimIdsFromSection,
+  readBriefMarker,
+  renderBriefProjectBody,
+  renderClaimBullet,
+  renderSectionBody,
+  writeBriefFiles,
+} from './brief-render.js';
+import { contextPaths, HeadMovedError } from './render.js';
 import { existsSync } from 'node:fs';
 
 export type BriefConfig = {
@@ -123,6 +132,73 @@ export type EnsureBriefResult = {
 };
 
 /**
+ * Carry published brief claims to HEAD and rewrite brief pages when anything was withdrawn.
+ * Deterministic: no model calls. Used by task next / task start so agents never see stale verified text.
+ */
+export function syncBriefClaimsToHead(input: {
+  store: WorkStore;
+  projectRoot: string;
+  repoRoot: string;
+  repoPath: string;
+  sections: string[];
+}): { commit: string; rewritten: boolean; withdrawn: number } {
+  const commit = resolveCommit(input.repoRoot, 'HEAD');
+  if (!commit) return { commit: '', rewritten: false, withdrawn: 0 };
+
+  let withdrawn = 0;
+  const frontier = input.store.getClaimFrontier(input.repoPath);
+  if (frontier && frontier !== commit) {
+    const r = reverifyOnCommit(input.store, input.repoRoot, input.repoPath, frontier, commit);
+    withdrawn = r.withdrawn.length;
+  }
+
+  const published = input.store.listClaims(input.repoPath, { statuses: [...PUBLISHED_CLAIM_STATUSES] });
+  const claimsHash = claimsHashOf(published);
+  const prev = input.store.getBriefState(input.repoPath);
+  if (!prev && published.length === 0) return { commit, rewritten: false, withdrawn };
+
+  const stillApproved = prev?.approvedHash === claimsHash ? prev : null;
+  const state: BriefState = {
+    repoPath: input.repoPath,
+    commit,
+    claimsHash,
+    approvedHash: stillApproved?.approvedHash ?? null,
+    approvedBy: stillApproved?.approvedBy ?? null,
+    approvedAt: stillApproved?.approvedAt ?? null,
+    sampleCap: prev?.sampleCap ?? 40,
+    samplePaths: prev?.samplePaths ?? [],
+    updatedAt: new Date().toISOString(),
+  };
+
+  const projectPath = contextPaths(input.projectRoot).project;
+  const existingProject = existsSync(projectPath) ? readFileSync(projectPath, 'utf8') : undefined;
+  const marker = existingProject ? readBriefMarker(existingProject) : undefined;
+  const bySection = new Map<string, StoredClaim[]>();
+  for (const s of input.sections) bySection.set(s, []);
+  for (const c of published) {
+    const list = bySection.get(c.claim.section);
+    if (list) list.push(c);
+  }
+  const expectedProjectBody = renderBriefProjectBody(input.sections, bySection, state);
+  const filesCurrent =
+    marker?.commit === commit &&
+    marker?.claims === claimsHash &&
+    marker?.content === contentHashText(expectedProjectBody) &&
+    input.sections.every((s) => {
+      const file = briefPaths(input.projectRoot).section(s);
+      if (!existsSync(file)) return false;
+      return readFileSync(file, 'utf8') === renderSectionBody(s, bySection.get(s) ?? [], state);
+    });
+
+  const unchanged = withdrawn === 0 && prev?.commit === commit && prev?.claimsHash === claimsHash && filesCurrent;
+  if (unchanged) return { commit, rewritten: false, withdrawn: 0 };
+
+  input.store.saveBriefState(state);
+  writeBriefFiles(input.projectRoot, input.sections, published, state, existingProject);
+  return { commit, rewritten: true, withdrawn };
+}
+
+/**
  * After Layer 1 is fresh at HEAD: re-verify when the frontier moved, draft only sections that need it,
  * render brief files. No model calls when the published set is already current and no section needs redraft.
  */
@@ -152,11 +228,17 @@ export async function ensureBrief(input: {
 
   const published = () => input.store.listClaims(input.repoPath, { statuses: [...PUBLISHED_CLAIM_STATUSES], commit });
   const existing = published();
-  const hasAnyPublished = existing.length > 0 || input.store.getBriefState(input.repoPath) !== null;
+  const prevState = input.store.getBriefState(input.repoPath);
 
   const needDraft = new Set<string>();
-  if (!hasAnyPublished) {
+  // No brief_state yet (first draft or interrupted before save): finish every configured section.
+  if (prevState === null) {
     for (const s of sections) needDraft.add(s);
+  } else {
+    // A newly configured section has no page yet — draft it without re-drafting completed empty sections.
+    for (const s of sections) {
+      if (!existsSync(briefPaths(input.projectRoot).section(s))) needDraft.add(s);
+    }
   }
   for (const s of sectionsReverified) {
     if (sections.includes(s)) needDraft.add(s);
@@ -164,7 +246,7 @@ export async function ensureBrief(input: {
   for (const s of input.forceSections ?? []) {
     if (sections.includes(s)) needDraft.add(s);
   }
-  // Apply human edits: claim markers removed from a section file → withdraw those claims and redraft.
+  // Apply human edits: missing markers or mutated assertion text → withdraw and redraft.
   const editWithdrawn = applyHumanSectionEdits(input.store, input.projectRoot, input.repoPath, sections, existing);
   for (const s of editWithdrawn) needDraft.add(s);
 
@@ -172,7 +254,7 @@ export async function ensureBrief(input: {
   let publishedCount = 0;
   let rejectedCount = 0;
   const sectionsDrafted: string[] = [];
-  let samplePaths: string[] = input.store.getBriefState(input.repoPath)?.samplePaths ?? [];
+  let samplePaths: string[] = prevState?.samplePaths ?? [];
   const sampleCap = input.config.sampleFileCap;
 
   if (needDraft.size) {
@@ -180,6 +262,8 @@ export async function ensureBrief(input: {
     samplePaths = samples.map((s) => s.path);
     ensureDefaultMock();
     const model = input.model ?? getModel('mock-default');
+    // Collect every proposal before publishing so a mid-run model failure leaves no partial draft.
+    const batches: Array<{ section: string; proposals: unknown[] }> = [];
     for (const section of sections.filter((s) => needDraft.has(s))) {
       modelCalls++;
       sectionsDrafted.push(section);
@@ -191,8 +275,20 @@ export async function ensureBrief(input: {
         snapshot: input.snapshot,
         samples,
       });
+      batches.push({ section, proposals });
+    }
+
+    const headAfterPropose = resolveCommit(input.repoRoot, 'HEAD');
+    if (!headAfterPropose || headAfterPropose !== commit) {
+      throw new HeadMovedError('HEAD changed while the project brief was being drafted; nothing was published. Run again.');
+    }
+    const frontierNow = input.store.getClaimFrontier(input.repoPath);
+    if (frontierNow && frontierNow !== commit) {
+      throw new HeadMovedError('Claim frontier moved while the project brief was being drafted; nothing was published. Run again.');
+    }
+
+    for (const { section, proposals } of batches) {
       for (const raw of proposals) {
-        // Force section + commit/blob alignment when the model is close but not exact.
         const normalized = normalizeProposal(raw, section, commit, samples);
         const out = publishClaim(input.store, input.repoRoot, input.repoPath, normalized);
         if (out.published) publishedCount++;
@@ -201,6 +297,13 @@ export async function ensureBrief(input: {
     }
   }
 
+  // Publication boundary: refuse a stale HEAD before saving and rendering.
+  const headAtPublish = resolveCommit(input.repoRoot, 'HEAD');
+  if (!headAtPublish || headAtPublish !== commit) {
+    throw new HeadMovedError('HEAD changed before the project brief was published; nothing was saved. Run again.');
+  }
+
+  // Final claim-set read immediately before persist/render (do not reuse a value computed earlier).
   const finalClaims = published();
   const claimsHash = claimsHashOf(finalClaims);
   const prev = input.store.getBriefState(input.repoPath);
@@ -220,10 +323,22 @@ export async function ensureBrief(input: {
   const projectPath = contextPaths(input.projectRoot).project;
   const existingProject = existsSync(projectPath) ? readFileSync(projectPath, 'utf8') : undefined;
   const marker = existingProject ? readBriefMarker(existingProject) : undefined;
+  const bySection = new Map<string, StoredClaim[]>();
+  for (const s of sections) bySection.set(s, []);
+  for (const c of finalClaims) {
+    const list = bySection.get(c.claim.section);
+    if (list) list.push(c);
+  }
+  const expectedProjectBody = renderBriefProjectBody(sections, bySection, state);
   const filesCurrent =
     marker?.commit === commit &&
     marker?.claims === claimsHash &&
-    sections.every((s) => existsSync(briefPaths(input.projectRoot).section(s)));
+    marker?.content === contentHashText(expectedProjectBody) &&
+    sections.every((s) => {
+      const file = briefPaths(input.projectRoot).section(s);
+      if (!existsSync(file)) return false;
+      return readFileSync(file, 'utf8') === renderSectionBody(s, bySection.get(s) ?? [], state);
+    });
   const unchanged =
     modelCalls === 0 &&
     sectionsDrafted.length === 0 &&
@@ -232,11 +347,18 @@ export async function ensureBrief(input: {
     prev?.claimsHash === claimsHash &&
     filesCurrent;
 
+  // Recheck once more immediately before write; a concurrent withdraw must not be sealed as current.
+  const claimsAtWrite = published();
+  const hashAtWrite = claimsHashOf(claimsAtWrite);
+  if (hashAtWrite !== claimsHash) {
+    throw new HeadMovedError('Published claims changed before the project brief was written; nothing was sealed. Run again.');
+  }
+
   if (!unchanged) {
     input.store.saveBriefState(state);
   }
 
-  const written = unchanged ? [] : writeBriefFiles(input.projectRoot, sections, finalClaims, state, existingProject);
+  const written = unchanged ? [] : writeBriefFiles(input.projectRoot, sections, claimsAtWrite, state, existingProject);
 
   return {
     commit,
@@ -275,7 +397,22 @@ function normalizeProposal(
   return o;
 }
 
-/** Withdraw published claims whose markers a human removed from the section markdown. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** True when the section file still contains the exact rendered claim block (markers + assertion). */
+function claimBlockIntact(body: string, stored: StoredClaim): boolean {
+  const id = stored.claim.id;
+  const re = new RegExp(
+    `<!-- claim id=${escapeRegExp(id)} kind=[^\\n]*-->\\r?\\n[\\s\\S]*?\\r?\\n<!-- /claim id=${escapeRegExp(id)} -->`,
+  );
+  const m = body.match(re);
+  if (!m) return false;
+  return m[0].replace(/\r\n/g, '\n') === renderClaimBullet(stored).replace(/\r\n/g, '\n');
+}
+
+/** Withdraw published claims whose markers a human removed, or whose assertion text no longer matches. */
 function applyHumanSectionEdits(
   store: WorkStore,
   projectRoot: string,
@@ -297,10 +434,14 @@ function applyHumanSectionEdits(
     const inSection = published.filter((p) => p.claim.section === section && (PUBLISHED_CLAIM_STATUSES as readonly string[]).includes(p.status));
     if (!inSection.length) continue;
     const keep = new Set(parseClaimIdsFromSection(body));
-    // A section cleared of every claim marker (or missing some) withdraws the removed published claims.
     for (const c of inSection) {
       if (!keep.has(c.claim.id)) {
         store.withdrawClaim(repoPath, c.claim.id, 'removed by human edit of the brief section markdown');
+        if (!withdrawnSections.includes(section)) withdrawnSections.push(section);
+        continue;
+      }
+      if (!claimBlockIntact(body, c)) {
+        store.withdrawClaim(repoPath, c.claim.id, 'human edit changed the claim assertion text; claim must be verified again');
         if (!withdrawnSections.includes(section)) withdrawnSections.push(section);
       }
     }

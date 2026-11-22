@@ -188,8 +188,10 @@ contextCmd
         const reviewer = await askReviewer(ctx.projectRoot);
         const claim = attestClaim({
           store: ctx.store,
+          projectRoot: ctx.projectRoot,
           repoRoot: repoToplevel(ctx.projectRoot) ?? ctx.projectRoot,
           repoPath: ctx.projectRoot,
+          sections: briefConfigOf(ctx.config).sections,
           raw,
           reviewer,
           presence: HUMAN_PRESENCE,

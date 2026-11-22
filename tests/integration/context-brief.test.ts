@@ -195,6 +195,23 @@ describe('AC: human edit that breaks a claim is rejected (markers removed → wi
     const o2 = await understandProjectWithBrief(store, dir, { factoryRoot: factoryRoot(), config: defaultCfg() });
     expect(o2.brief!.sectionsDrafted).toContain('architecture');
   });
+
+  it('keeping the marker but changing the assertion text withdraws the claim', async () => {
+    const dir = newRepo();
+    const store = openStore();
+    await understandProjectWithBrief(store, dir, { factoryRoot: factoryRoot(), config: defaultCfg() });
+    const file = briefPaths(dir).section('architecture');
+    const before = readFileSync(file, 'utf8');
+    const ids = parseClaimIdsFromSection(before);
+    expect(ids.length).toBeGreaterThan(0);
+    const edited = before.replace(/- .+? _\[verified\]_/, '- Totally different unsupported assertion _[verified]_');
+    expect(edited).not.toBe(before);
+    writeFileSync(file, edited);
+    const o2 = await understandProjectWithBrief(store, dir, { factoryRoot: factoryRoot(), config: defaultCfg() });
+    expect(o2.brief!.sectionsDrafted).toContain('architecture');
+    const body = readFileSync(file, 'utf8');
+    expect(body).not.toMatch(/Totally different unsupported assertion/);
+  });
 });
 
 describe('AC: unchanged commit triggers no model call', () => {
@@ -227,6 +244,25 @@ describe('AC: task next points agents to the brief labelled verified claims at s
     expect(sec?.brief_sections).toEqual(['security']);
     expect(briefSectionsFor([sec!])).toEqual(['security']);
   });
+
+  it('computeNextStep openFiles include the role brief section and playbook cites verified claims at', async () => {
+    const { computeNextStep } = await import('../../apps/cli/src/engine/next-step.js');
+    const dir = newRepo();
+    const store = openStore();
+    const o = await understandProjectWithBrief(store, dir, { factoryRoot: factoryRoot(), config: defaultCfg() });
+    const sha8 = o.snapshot.commit.slice(0, 8);
+    const roles = loadRoles(factoryRoot());
+    const sec = roles.find((r) => r.id === 'security-reviewer')!;
+    const work = {
+      id: 'work_brief_next',
+      currentState: 'PLANNING' as const,
+      selectedRoles: [{ id: sec.id, version: sec.version }],
+    };
+    const step = computeNextStep({ projectRoot: dir, work: work as never, defaultBaseBranch: 'staging' });
+    expect(step.openFiles).toContain(briefPaths(dir).section('security'));
+    expect(step.agentPlaybook.join('\n')).toMatch(/verified claims at/i);
+    expect(readFileSync(briefPaths(dir).section('security'), 'utf8')).toMatch(new RegExp(`verified claims at \`${sha8}\``, 'i'));
+  });
 });
 
 describe('human gates', () => {
@@ -236,16 +272,18 @@ describe('human gates', () => {
     expect(isHumanOnlyCommand('turbine context show')).toBe(false);
   });
 
-  it('attest stores human-attested label and never verified', () => {
+  it('attest stores human-attested label and never verified', async () => {
     const dir = newRepo();
     const store = openStore();
-    understandProject(store, dir);
+    await understandProjectWithBrief(store, dir, { factoryRoot: factoryRoot(), config: defaultCfg() });
     const c = git(dir, 'rev-parse', 'HEAD').trim();
     const blob = git(dir, 'rev-parse', 'HEAD:README.md').trim();
     const claim = attestClaim({
       store,
+      projectRoot: dir,
       repoRoot: dir,
       repoPath: dir,
+      sections: briefConfigOf(defaultCfg()).sections,
       reviewer: 'Alice',
       presence: 'tty-hash-confirmation',
       raw: {
@@ -260,6 +298,37 @@ describe('human gates', () => {
     const row = store.getClaim(dir, claim.id)!;
     expect(row.status).toBe('attested');
     expect(row.reason).toMatch(/Human-attested \(by Alice/);
+    const section = readFileSync(briefPaths(dir).section('architecture'), 'utf8');
+    expect(section).toMatch(/claim id=intent-1/);
+    expect(section).toMatch(/Human-attested/);
+  });
+
+  it('attest survives the next understand without being withdrawn as a human removal', async () => {
+    const dir = newRepo();
+    const store = openStore();
+    await understandProjectWithBrief(store, dir, { factoryRoot: factoryRoot(), config: defaultCfg() });
+    const c = git(dir, 'rev-parse', 'HEAD').trim();
+    const blob = git(dir, 'rev-parse', 'HEAD:README.md').trim();
+    attestClaim({
+      store,
+      projectRoot: dir,
+      repoRoot: dir,
+      repoPath: dir,
+      sections: briefConfigOf(defaultCfg()).sections,
+      reviewer: 'Alice',
+      presence: 'tty-hash-confirmation',
+      raw: {
+        id: 'intent-keep',
+        section: 'architecture',
+        statement: 'Intent that must survive refresh',
+        kind: 'exists',
+        evidence: [{ path: 'README.md', commit: c, blob }],
+        verifier: { kind: 'exists', path: 'README.md' },
+      },
+    });
+    const again = await understandProjectWithBrief(store, dir, { factoryRoot: factoryRoot(), config: defaultCfg() });
+    expect(again.brief!.modelCalls).toBe(0);
+    expect(store.getClaim(dir, 'intent-keep')?.status).toBe('attested');
   });
 });
 

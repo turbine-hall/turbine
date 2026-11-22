@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   PUBLISHED_CLAIM_STATUSES,
@@ -176,6 +176,15 @@ export function writeBriefFiles(
     written.push(file);
   }
 
+  // Retire section files no longer in the configured brief so agents cannot pick up stale verified pages.
+  if (existsSync(paths.dir)) {
+    const keep = new Set(sections.map((s) => `${s}.md`));
+    for (const name of readdirSync(paths.dir)) {
+      if (!name.endsWith('.md') || keep.has(name)) continue;
+      unlinkSync(join(paths.dir, name));
+    }
+  }
+
   const projectPath = contextPaths(projectRoot).project;
   const body = renderBriefProjectBody(sections, bySection, state);
   const marker = `<!-- turbine:brief begin commit=${state.commit} claims=${state.claimsHash} content=${contentHashText(body)} -->`;
@@ -183,14 +192,15 @@ export function writeBriefFiles(
   const text = existingProject ?? readFileSync(projectPath, 'utf8');
   const eol = text.includes('\r\n') ? '\r\n' : '\n';
   const block = `${marker}\n${body}\n<!-- turbine:brief end -->`.split('\n').join(eol);
+  const begins = (text.match(BRIEF_BEGIN_ANY) ?? []).length;
+  const ends = (text.match(BRIEF_END_ANY) ?? []).length;
   let next: string;
-  if (BRIEF_SECTION.test(text)) {
-    const begins = (text.match(BRIEF_BEGIN_ANY) ?? []).length;
-    const ends = (text.match(BRIEF_END_ANY) ?? []).length;
-    if (begins !== 1 || ends !== 1) throw new Error('.turbine/context/PROJECT.md has a damaged brief section; restore the turbine:brief markers');
+  if (begins === 0 && ends === 0) {
+    next = `${text.replace(/\r?\n*$/, eol)}${eol}${block}${eol}`;
+  } else if (begins === 1 && ends === 1 && BRIEF_SECTION.test(text)) {
     next = text.replace(BRIEF_SECTION, () => block);
   } else {
-    next = `${text.replace(/\r?\n*$/, eol)}${eol}${block}${eol}`;
+    throw new Error('.turbine/context/PROJECT.md has a damaged brief section; restore the turbine:brief markers');
   }
   writeAtomic(projectPath, next);
   written.push(projectPath);

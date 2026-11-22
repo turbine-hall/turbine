@@ -49,7 +49,8 @@ import type { ModelAdapter } from '@turbine-hall/turbine-models';
 import { ToolBroker } from '@turbine-hall/turbine-tools';
 import { createJiraAdapter, issueToMarkdown, type JiraIssue } from '@turbine-hall/turbine-adapter-jira';
 import { inspectRepo } from '@turbine-hall/turbine-adapter-git';
-import { hasUncommittedChanges, observeBranch } from './context/git-read.js';
+import { hasUncommittedChanges, observeBranch, repoToplevel } from './context/git-read.js';
+import { briefConfigOf, syncBriefClaimsToHead } from './context/brief.js';
 import { repoHead } from './context/understand.js';
 import { refreshTaskContext, requestHash, snapshotHashAt, stalenessOf, type RefreshResult } from './context/task-context.js';
 import { MAX_CONTEXT_FILE_BYTES, parseContextFile, readContextFile, renderContextBody, renderContextFile, renderUnavailableFile, type Staleness } from './context/task-render.js';
@@ -1629,6 +1630,7 @@ export class Engine {
     // commit moved or the task re-entered CHANGES_REQUESTED. If the rebuild cannot run, the file says so;
     // the old selection is never left in place as if it were current.
     if (CONTEXT_READING_STATES.has(work.currentState)) {
+      this.syncBriefForHandoff();
       try {
         this.ensureTaskContext(work);
       } catch (e) {
@@ -1640,6 +1642,22 @@ export class Engine {
       work,
       defaultBaseBranch: baseBranch,
     });
+  }
+
+  /** Deterministic brief reverify + rewrite (no model calls) so task handoffs never expose withdrawn claims. */
+  private syncBriefForHandoff(): void {
+    const repoRoot = repoToplevel(this.ctx.projectRoot) ?? this.ctx.projectRoot;
+    try {
+      syncBriefClaimsToHead({
+        store: this.ctx.store,
+        projectRoot: this.ctx.projectRoot,
+        repoRoot,
+        repoPath: this.ctx.projectRoot,
+        sections: briefConfigOf(this.ctx.config).sections,
+      });
+    } catch {
+      // Brief sync failure must not block task next; understand remains the recovery path.
+    }
   }
 
   async execute(idOrAlias: string): Promise<{
@@ -1669,6 +1687,7 @@ export class Engine {
     // Rebuilt when the base commit moved or this is a new CHANGES_REQUESTED cycle, before anything points at it.
     // It runs before the task leaves PLAN_APPROVED / CHANGES_REQUESTED and before any worktree exists, so a
     // failure here (an unreadable repository, an unwritable packet folder) leaves the task retryable.
+    this.syncBriefForHandoff();
     const taskContext = this.ensureTaskContext(work);
 
     work = transition(work, 'IMPLEMENTING');
