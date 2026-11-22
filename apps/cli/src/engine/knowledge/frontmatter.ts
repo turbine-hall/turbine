@@ -11,8 +11,13 @@ export type SplitFrontmatter =
  * CR-only line endings are accepted (normalised for the YAML block).
  */
 export function splitFrontmatter(text: string, maxDepth = MAX_BUNDLE_YAML_DEPTH): SplitFrontmatter {
+  // Drop one leading UTF-8 BOM so BOM+`---` still parses (matches upstream validate.py).
+  const withoutBom = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
   // Normalise CR-only to LF for line splitting; keep content otherwise.
-  const normalised = text.includes('\r') && !text.includes('\n') ? text.replace(/\r/g, '\n') : text.replace(/\r\n/g, '\n');
+  const normalised =
+    withoutBom.includes('\r') && !withoutBom.includes('\n')
+      ? withoutBom.replace(/\r/g, '\n')
+      : withoutBom.replace(/\r\n/g, '\n');
   const lines = normalised.split('\n');
   if (!lines.length || lines[0] !== '---') {
     return { ok: false, reason: 'frontmatter is absent (file must start with ---)', body: normalised };
@@ -70,10 +75,12 @@ function assertYamlDepth(node: unknown, max: number, depth: number): void {
   }
 }
 
-/** Quote string scalars that look like numbers/booleans when writing YAML (OKF §4). */
+/** Quote string scalars that look like numbers/booleans when writing YAML (OKF §4 / YAML 1.2 core). */
 export function shouldQuoteOkfString(value: string): boolean {
-  if (/^(true|false|null|yes|no|on|off)$/i.test(value)) return true;
-  if (/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(value)) return true;
+  if (/^(true|false|null|yes|no|on|off|~)$/i.test(value)) return true;
+  // integers (decimal, hex, octal), floats (incl. leading +, .5, 1.), special floats
+  if (/^[+-]?(0x[0-9a-fA-F]+|0o[0-7]+|\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/.test(value)) return true;
+  if (/^[+-]?\.(inf|Inf|INF|nan|NaN|NAN)$/.test(value)) return true;
   if (/^\d{4}-\d{2}-\d{2}/.test(value)) return true;
   return false;
 }

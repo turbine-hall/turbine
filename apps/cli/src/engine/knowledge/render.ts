@@ -47,16 +47,29 @@ const oneLine = (t: string) => t.replace(/\s*[\r\n\u2028\u2029]+\s*/g, ' ');
 function generatedAtFor(previousAt: string | undefined, contentChanged: boolean, nowIso?: string): string {
   if (!contentChanged && previousAt) return previousAt;
   const now = nowIso ?? new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-  if (previousAt && previousAt >= now) {
-    // Keep chronology: a rewrite must not look older than the prior generation.
+  if (previousAt) {
     const prevMs = Date.parse(previousAt);
-    if (Number.isFinite(prevMs)) return new Date(prevMs + 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const nowMs = Date.parse(now);
+    // Compare as instants (not lexicographic strings) so offsets cannot invert chronology.
+    if (Number.isFinite(prevMs) && Number.isFinite(nowMs) && prevMs >= nowMs) {
+      return new Date(prevMs + 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    }
   }
   return now;
 }
 
 function yamlScalar(value: string): string {
-  if (shouldQuoteOkfString(value) || /[:#{}[\],&*?|>!%@`]/.test(value) || value.includes('\n') || value.includes("'")) {
+  // Quote anything that is not a safe YAML 1.2 plain scalar (leading `-` is a sequence indicator).
+  if (
+    value === '' ||
+    value !== value.trim() ||
+    shouldQuoteOkfString(value) ||
+    /[:#{}[\],&*?|>!%@`]/.test(value) ||
+    value.includes('\n') ||
+    value.includes("'") ||
+    value.includes('"') ||
+    /^[-?]/.test(value)
+  ) {
     return JSON.stringify(value);
   }
   return value;
@@ -172,38 +185,8 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
     'x-turbine-commit': commit,
   };
   if (input.license) indexFm.license = input.license;
-  const indexBody = [
-    '# Project knowledge',
-    '',
-    `Bundle for commit \`${commit.slice(0, 12)}\`. Start here, then open concepts under the folders listed below.`,
-    '',
-    '# Project',
-    '',
-    `* [Overview](project/overview.md) - project summary and facts`,
-    '',
-    '# Structure',
-    '',
-    `* [Layout](structure/layout.md) - repository layout`,
-    `* [Packages](structure/packages/) - workspace packages`,
-    '',
-    '# Commands',
-    '',
-    `* [Commands](commands/) - scripts and toolchain commands`,
-    '',
-    '# Conventions',
-    '',
-    `* [Conventions](conventions/) - confirmed conventions only`,
-    '',
-    '# Open questions',
-    '',
-    `* [Open questions](open-questions/) - unconfirmed items`,
-    '',
-    '# Brief',
-    '',
-    `* [Brief](brief/) - verified claim sections`,
-    '',
-  ].join('\n');
-  files.set('index.md', `${emitFrontmatter(indexFm)}\n${indexBody}`);
+  // Index body is finalized after concepts are rendered so links match paths that exist.
+  files.set('index.md', ''); // placeholder; rewritten at end
 
   // --- README.md (no type) ---
   files.set(
@@ -333,8 +316,10 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
     } catch {
       continue; // unsafe name skipped — never invent a path
     }
-    const entries = snapshot.facts.filter((f) => f.category === 'entry-point' && f.source.path.startsWith(pkg.source.path.replace(/package\.json$/, '') || ''));
     const pkgDir = String((pkg.data as { dir?: string } | undefined)?.dir ?? '.');
+    const entries = snapshot.facts.filter(
+      (f) => f.category === 'entry-point' && String((f.data as { dir?: string } | undefined)?.dir ?? '.') === pkgDir,
+    );
     const scripts = snapshot.facts.filter(
       (f) => f.category === 'script' && String((f.data as { dir?: string } | undefined)?.dir ?? '.') === pkgDir,
     );
@@ -524,9 +509,9 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
       bullets.push(`- ${oneLine(renderClaimLine(sc))} _[${label}]_[^${sid}]`);
       defs.push(citeFootnote(sid, `${e.path}@${e.blob.slice(0, 8)}`));
     }
-    // Concept-level human review only when the whole section is covered (approved brief, or every claim attested).
-    const allAttested = sectionClaims.length > 0 && sectionClaims.every((c) => c.status === 'attested');
-    const humanVerified = approved || allAttested;
+    // Concept-level human review only from brief approval that covers the full rendered concept.
+    // Per-claim attestation stays on the bullet labels; do not promote allAttested to whole-concept verified.by.
+    const humanVerified = approved && Boolean(brief?.approvedBy);
     const body = [
       '# Claims',
       '',
@@ -535,14 +520,7 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
       ...[...new Set(defs)],
       '',
     ].join('\n');
-    let humanId: string | undefined;
-    if (humanVerified) {
-      if (brief?.approvedBy) humanId = okfHumanActor(brief.approvedBy);
-      else {
-        const fromReason = sectionClaims.find((c) => c.status === 'attested')?.reason?.match(/by ([^,]+)/)?.[1]?.trim();
-        if (fromReason) humanId = okfHumanActor(fromReason);
-      }
-    }
+    const humanId = humanVerified && brief?.approvedBy ? okfHumanActor(brief.approvedBy) : undefined;
     files.set(
       path,
       conceptFile({
@@ -562,7 +540,7 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
         verified: sectionClaims.length > 0,
         humanVerified,
         humanId,
-        verifiedAt: humanVerified ? brief?.approvedAt ?? undefined : undefined,
+        // verified.at must be >= generated.at (OKF §5.3); use the render timestamp, not a prior approval time.
         status: approved ? 'stable' : 'draft',
         previous: input.previousFiles?.get(path),
         allowEmptySources: true,
@@ -571,7 +549,7 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
   }
 
   // --- log.md ---
-  const today = utcDateFromCommit(commit);
+  const today = utcDateToday();
   const prev = (input.previousLogBody ?? '').replace(/^\s*# Directory Update Log\s*/i, '').trimStart();
   const prevWithoutToday = stripLogDay(prev, today, commit);
   const alreadyLogged = new Set<string>();
@@ -615,6 +593,39 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
   }
   files.set('log.md', combined.replace(/\n+$/, '\n'));
 
+  // Finalize index.md from paths that were actually rendered.
+  const has = (prefix: string) => [...files.keys()].some((p) => p === prefix || p.startsWith(`${prefix}/`));
+  const indexBody = [
+    '# Project knowledge',
+    '',
+    `Bundle for commit \`${commit.slice(0, 12)}\`. Start here, then open concepts under the folders listed below.`,
+    '',
+    '# Project',
+    '',
+    `* [Overview](project/overview.md) - project summary and facts`,
+    '',
+    '# Structure',
+    '',
+    `* [Layout](structure/layout.md) - repository layout`,
+    ...(has('structure/packages') ? [`* [Packages](structure/packages/) - workspace packages`] : []),
+    '',
+    '# Commands',
+    '',
+    ...(has('commands') ? [`* [Commands](commands/) - scripts and toolchain commands`] : ['* _No commands recorded._']),
+    '',
+    '# Conventions',
+    '',
+    ...(has('conventions') ? [`* [Conventions](conventions/) - confirmed conventions only`] : ['* _No conventions recorded._']),
+    '',
+    '# Open questions',
+    '',
+    ...(has('open-questions') ? [`* [Open questions](open-questions/) - unconfirmed items`] : ['* _No open questions._']),
+    '',
+    ...(has('brief')
+      ? ['# Brief', '', `* [Brief](brief/) - verified claim sections`, '']
+      : []),
+  ].join('\n');
+  files.set('index.md', `${emitFrontmatter(indexFm)}\n${indexBody}`);
 
   return files;
 }
@@ -712,8 +723,13 @@ function uniqueDefs(sources: SourceAcc[]): string[] {
 
 function extractGeneratedAt(file?: string): string | undefined {
   if (!file) return undefined;
-  const m = file.match(/generated:\s*\{[^}]*\bat:\s*"([^"]+)"/);
-  return m?.[1];
+  const split = splitFrontmatter(file);
+  if (!split.ok) return undefined;
+  const g = split.data.generated;
+  if (g && typeof g === 'object' && g !== null && typeof (g as { at?: unknown }).at === 'string') {
+    return (g as { at: string }).at;
+  }
+  return undefined;
 }
 
 function extractTitle(file?: string): string | undefined {
@@ -731,11 +747,8 @@ function extractBody(file?: string): string | undefined {
 }
 
 
-function utcDateFromCommit(commit: string): string {
-  // Stable date from commit id so same commit → same log heading.
-  const n = Number.parseInt(commit.slice(0, 8), 16);
-  const day = (n % 28) + 1;
-  return `2020-01-${String(day).padStart(2, '0')}`;
+function utcDateToday(): string {
+  return new Date().toISOString().slice(0, 10);
 }
 
 function stripLogDay(prev: string, day: string, commit: string): string {

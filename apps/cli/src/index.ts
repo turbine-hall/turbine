@@ -16,7 +16,13 @@ import { approveBrief, attestClaim } from './engine/context/brief-approve.js';
 import { renderClaimBullet } from './engine/context/brief-render.js';
 import { validateBundle, lintKnowledgeBundle } from './engine/knowledge/validate.js';
 import { exportKnowledgeBundle, lintKnowledgeHandEdits } from './engine/knowledge/publish.js';
-import { knowledgePaths, readBoundedUtf8, MAX_BUNDLE_FILE_BYTES } from './engine/knowledge/paths.js';
+import {
+  knowledgePaths,
+  readBoundedUtf8,
+  MAX_BUNDLE_DEPTH,
+  MAX_BUNDLE_FILE_BYTES,
+  MAX_BUNDLE_FILES,
+} from './engine/knowledge/paths.js';
 import { splitFrontmatter } from './engine/knowledge/frontmatter.js';
 import { Engine } from './engine/engine.js';
 import { initProject, openContext } from './engine/project.js';
@@ -272,13 +278,39 @@ knowledgeCmd
       const dir = knowledgePaths(root).dir;
       if (!existsSync(dir)) throw err('E_NOT_FOUND', 'No knowledge bundle; run: turbine understand');
       const rows: Array<{ path: string; type?: string; title?: string; trust: string }> = [];
-      const walk = (abs: string, rel: string) => {
-        for (const name of readdirSync(abs)) {
+      let visited = 0;
+      let budgetHit: string | undefined;
+      const walk = (abs: string, rel: string, depth: number) => {
+        if (budgetHit) return;
+        if (depth > MAX_BUNDLE_DEPTH) {
+          budgetHit = `bundle exceeds max depth ${MAX_BUNDLE_DEPTH}`;
+          return;
+        }
+        let names: string[];
+        try {
+          names = readdirSync(abs);
+        } catch (e) {
+          budgetHit = `cannot read ${rel || '.'}: ${(e as Error).message}`;
+          return;
+        }
+        for (const name of names) {
+          if (budgetHit) return;
           if (name.startsWith('.')) continue;
+          visited += 1;
+          if (visited > MAX_BUNDLE_FILES) {
+            budgetHit = `bundle has more than ${MAX_BUNDLE_FILES} entries`;
+            return;
+          }
           const child = join(abs, name);
           const childRel = rel ? `${rel}/${name}` : name;
-          const st = lstatSync(child);
-          if (st.isDirectory()) walk(child, childRel);
+          let st;
+          try {
+            st = lstatSync(child);
+          } catch (e) {
+            rows.push({ path: childRel, trust: `unreadable:${(e as Error).message}` });
+            continue;
+          }
+          if (st.isDirectory()) walk(child, childRel, depth + 1);
           else if (st.isFile() && name.endsWith('.md') && name !== 'index.md' && name !== 'log.md' && name !== 'README.md') {
             if (concept && childRel !== concept && !childRel.endsWith(`/${concept}`)) continue;
             let text: string;
@@ -304,7 +336,8 @@ knowledgeCmd
           }
         }
       };
-      walk(dir, '');
+      walk(dir, '', 0);
+      if (budgetHit) throw err('E_CONTEXT_UNAVAILABLE', budgetHit);
       rows.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
       if (opts.json) printResult(rows, true);
       else {
@@ -331,8 +364,17 @@ program
         ...lintProjectContext(root),
         ...lintTaskContexts(root),
         ...lintKnowledgeBundle(root),
-        ...lintKnowledgeHandEdits(root),
       ];
+      try {
+        issues.push(...lintKnowledgeHandEdits(root));
+      } catch (e) {
+        // A hand-edit check failure must not discard the other lint diagnostics.
+        issues.push({
+          level: 'error',
+          file: 'knowledge/',
+          message: `hand-edit check failed: ${(e as Error).message}`,
+        });
+      }
       if (opts.json) printResult(issues, true);
       else if (!issues.length) process.stdout.write('Project context OK.\n');
       else for (const i of issues) process.stdout.write(`${i.level.toUpperCase().padEnd(7)} ${i.file}: ${i.message}\n`);

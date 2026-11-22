@@ -22,6 +22,10 @@ export const MAX_BUNDLE_FILE_BYTES = 512 * 1024;
 export const MAX_BUNDLE_YAML_DEPTH = 32;
 /** Max files/entries walked under a bundle root during validation. */
 export const MAX_BUNDLE_FILES = 2000;
+/** Max directory depth under a bundle root (bundle root = depth 0). */
+export const MAX_BUNDLE_DEPTH = 32;
+/** Aggregate byte budget when reading an existing bundle for merge / hand-edit checks. */
+export const MAX_BUNDLE_TOTAL_BYTES = 32 * 1024 * 1024;
 /** Marker JSON budget. */
 export const MAX_MARKER_BYTES = 64 * 1024;
 /** Keep rendered log.md under the per-file budget with headroom. */
@@ -44,8 +48,14 @@ export function readBoundedUtf8(abs: string, budget = MAX_BUNDLE_FILE_BYTES): st
     const st = fstatSync(fd);
     if (!st.isFile()) throw new Error(`not a regular file: ${abs}`);
     if (st.size > budget) throw new Error(`file-too-large:${st.size}`);
-    const buf = Buffer.alloc(Math.min(st.size + 1, budget + 1));
-    const n = readSync(fd, buf, 0, buf.length, 0);
+    // Read up to budget+1 regardless of the earlier size so a file that grows mid-read is still caught.
+    const buf = Buffer.alloc(budget + 1);
+    let n = 0;
+    while (n < buf.length) {
+      const got = readSync(fd, buf, n, buf.length - n, n);
+      if (got === 0) break;
+      n += got;
+    }
     if (n > budget) throw new Error(`file-too-large:${n}`);
     return buf.subarray(0, n).toString('utf8');
   } finally {

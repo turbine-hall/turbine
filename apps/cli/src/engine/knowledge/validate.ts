@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, opendirSync, realpathSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import {
   OKF_VERSION,
@@ -17,10 +17,9 @@ import {
 } from '@turbine-hall/turbine-contracts';
 import type { LintIssue } from '../docs/lint.js';
 import { splitFrontmatter } from './frontmatter.js';
-import { MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_FILES, knowledgePaths, readBoundedUtf8 } from './paths.js';
+import { MAX_BUNDLE_DEPTH, MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_FILES, knowledgePaths, readBoundedUtf8 } from './paths.js';
 
 const FOOTNOTE_REF = /\[\^([^\]\s]+)\]/g;
-const FOOTNOTE_DEF = /^\[\^([^\]\s]+)\]:/gm;
 const HEADING = /^(#{1,6})\s+(.*?)\s*#*\s*$/;
 const RESERVED = new Set(['index.md', 'log.md']);
 
@@ -62,7 +61,12 @@ export function validateBundle(dir: string): KnowledgeIssue[] {
   const indexCommit = readIndexCommit(rootReal, issues);
   const seenConceptPaths = new Set<string>();
   for (const rel of [...files].sort()) {
-    if (RESERVED.has(rel.split('/').pop()!)) continue;
+    const base = rel.split('/').pop()!;
+    if (RESERVED.has(base)) {
+      // Nested reserved names are not concepts; still enforce OKF §8/§9 rules (E004/E006).
+      if (rel.includes('/')) validateNestedReserved(rootReal, rel, base, issues);
+      continue;
+    }
     if (rel === 'README.md') {
       validateReadme(rootReal, rel, issues);
       continue;
@@ -127,38 +131,91 @@ function listBundleFiles(root: string, issues: KnowledgeIssue[]): Set<string> {
     }
     return true;
   };
-  const walk = (abs: string, relBase: string) => {
+  const walk = (abs: string, relBase: string, depth: number) => {
     if (overflow) return;
-    let entries: string[];
+    if (depth > MAX_BUNDLE_DEPTH) {
+      overflow = true;
+      issues.push({
+        level: 'error',
+        file: relBase || '.',
+        message: `bundle exceeds max depth ${MAX_BUNDLE_DEPTH}`,
+        code: 'too-deep',
+      });
+      return;
+    }
+    let dir;
     try {
-      entries = readdirSync(abs);
+      dir = opendirSync(abs);
     } catch (e) {
       issues.push({ level: 'error', file: relBase || '.', message: `cannot read directory (${(e as Error).message})`, code: 'read-error' });
       return;
     }
-    for (const name of entries) {
-      if (overflow) return;
-      if (name.startsWith('.')) continue; // outside the bundle (OKF §3.2)
-      const absChild = join(abs, name);
-      const rel = relBase ? `${relBase}/${name}` : name;
-      if (!visit(rel)) return;
-      let st;
-      try {
-        st = lstatSync(absChild);
-      } catch (e) {
-        issues.push({ level: 'error', file: rel, message: `cannot stat (${(e as Error).message})`, code: 'read-error' });
-        continue;
+    try {
+      for (let ent = dir.readSync(); ent !== null; ent = dir.readSync()) {
+        if (overflow) return;
+        const name = ent.name;
+        if (name.startsWith('.')) continue; // outside the bundle (OKF §3.2)
+        const absChild = join(abs, name);
+        const rel = relBase ? `${relBase}/${name}` : name;
+        if (!visit(rel)) return;
+        let st;
+        try {
+          st = lstatSync(absChild);
+        } catch (e) {
+          issues.push({ level: 'error', file: rel, message: `cannot stat (${(e as Error).message})`, code: 'read-error' });
+          continue;
+        }
+        if (st.isSymbolicLink()) {
+          issues.push({ level: 'error', file: rel, message: 'symbolic links are not part of the bundle', code: 'symlink' });
+          continue;
+        }
+        if (st.isDirectory()) walk(absChild, rel, depth + 1);
+        else if (st.isFile()) out.add(rel);
       }
-      if (st.isSymbolicLink()) {
-        issues.push({ level: 'error', file: rel, message: 'symbolic links are not part of the bundle', code: 'symlink' });
-        continue;
-      }
-      if (st.isDirectory()) walk(absChild, rel);
-      else if (st.isFile()) out.add(rel);
+    } finally {
+      dir.closeSync();
     }
   };
-  walk(root, '');
+  walk(root, '', 0);
   return out;
+}
+
+/** Nested index.md / log.md: no frontmatter (OKF §8 / §9); root copies are validated elsewhere. */
+function validateNestedReserved(root: string, rel: string, base: string, issues: KnowledgeIssue[]): void {
+  const text = readBounded(root, rel, issues);
+  if (text === undefined) return;
+  const startsFm = startsWithFrontmatter(text);
+  if (base === 'index.md' && startsFm) {
+    issues.push({
+      level: 'error',
+      file: rel,
+      message: 'an index.md below the bundle root must not have frontmatter (OKF §8)',
+      code: 'nested-index-frontmatter',
+    });
+  }
+  if (base === 'log.md') {
+    // Nested logs get the same frontmatter + date-heading rules as the root log.
+    if (startsFm) {
+      issues.push({
+        level: 'error',
+        file: rel,
+        message: 'log.md must not have frontmatter (OKF §9)',
+        code: 'log-frontmatter',
+      });
+    }
+    for (const line of text.split(/\r\n|\n|\r/)) {
+      if (!line.startsWith('## ')) continue;
+      const heading = line.slice(3).trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(heading)) {
+        issues.push({
+          level: 'error',
+          file: rel,
+          message: `a log.md date heading must be YYYY-MM-DD (OKF §9); found ${JSON.stringify(heading)}`,
+          code: 'log-date-heading',
+        });
+      }
+    }
+  }
 }
 
 function readBounded(root: string, rel: string, issues: KnowledgeIssue[]): string | undefined {
@@ -206,10 +263,16 @@ function validateIndex(root: string, rel: string, issues: KnowledgeIssue[]): voi
   }
   const { data } = split;
   if (data.okf_version !== OKF_VERSION) {
+    let got: string;
+    try {
+      got = JSON.stringify(data.okf_version);
+    } catch {
+      got = '[unserializable]';
+    }
     issues.push({
       level: 'error',
       file: rel,
-      message: `okf_version must be "${OKF_VERSION}" (got ${JSON.stringify(data.okf_version)})`,
+      message: `okf_version must be "${OKF_VERSION}" (got ${got})`,
       code: 'okf-version',
     });
   }
@@ -226,11 +289,29 @@ function validateIndex(root: string, rel: string, issues: KnowledgeIssue[]): voi
   }
 }
 
+function startsWithFrontmatter(text: string): boolean {
+  // Shared delimiter check: LF, CRLF, or CR-only (OKF / YAML line endings).
+  const first = text.replace(/^\uFEFF/, '').split(/\r\n|\n|\r/, 1)[0] ?? '';
+  return first === '---';
+}
+
 function validateLog(root: string, rel: string, issues: KnowledgeIssue[]): void {
   const text = readBounded(root, rel, issues);
   if (text === undefined) return;
-  if (text.startsWith('---\n') || text.startsWith('---\r\n')) {
+  if (startsWithFrontmatter(text)) {
     issues.push({ level: 'error', file: rel, message: 'log.md must not have frontmatter (OKF §9)', code: 'log-frontmatter' });
+  }
+  for (const line of text.split(/\r\n|\n|\r/)) {
+    if (!line.startsWith('## ')) continue;
+    const heading = line.slice(3).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(heading)) {
+      issues.push({
+        level: 'error',
+        file: rel,
+        message: `a log.md date heading must be YYYY-MM-DD (OKF §9); found ${JSON.stringify(heading)}`,
+        code: 'log-date-heading',
+      });
+    }
   }
 }
 
@@ -359,14 +440,14 @@ function validateConcept(
     });
   }
 
-  // status: unknown is not stable
-  if (split.data.status !== undefined) {
+  // status: unknown is not stable. Only stringify string statuses — other types are shape-validated elsewhere.
+  if (typeof split.data.status === 'string') {
     const eff = okfEffectiveStatus(split.data.status);
     if (eff === 'unknown') {
       issues.push({
         level: 'warning',
         file: rel,
-        message: `status "${String(split.data.status)}" is not a known lifecycle value (not treated as stable)`,
+        message: `status "${split.data.status}" is not a known lifecycle value (not treated as stable)`,
         code: 'unknown-status',
       });
     }
@@ -437,29 +518,40 @@ function validateSourcesAndFootnotes(
     }
   }
 
-  const refs = new Set<string>();
-  for (const m of body.matchAll(FOOTNOTE_REF)) {
-    // Skip footnote definitions (same pattern at line start with :)
-    refs.add(m[1]!);
-  }
-  // Remove definition labels from "refs" by checking defs separately
+  // Definitions only count in prose (ignore fenced/indented examples).
   const defs = new Set<string>();
-  for (const m of body.matchAll(FOOTNOTE_DEF)) defs.add(m[1]!);
+  for (const line of proseLines(body)) {
+    const m = /^\[\^([^\]\s]+)\]:/.exec(line.trimStart());
+    if (m) defs.add(m[1]!);
+  }
 
-  for (const id of refs) {
-    if (defs.has(id)) {
-      // definition line also matches FOOTNOTE_REF; ignore those that are only defs
-    }
-    if (!ids.has(id) && !defs.has(id)) {
-      // A ref that is only a definition marker: FOOTNOTE_REF matches [^id] in [^id]: too
+  // Prose (outside fenced/indented code): every [^id] must match sources[].id (OKF §5.1 / upstream W108).
+  const reportedOrphan = new Set<string>();
+  for (const line of proseLines(body)) {
+    const forRefs = line.replace(/`[^`]*`/g, '');
+    for (const m of forRefs.matchAll(FOOTNOTE_REF)) {
+      const id = m[1]!;
+      const idx = m.index ?? 0;
+      // Definition lines also match FOOTNOTE_REF on [^id]: — those are checked via defs below.
+      if (forRefs.slice(idx + m[0].length).startsWith(':') && forRefs.slice(0, idx).trim() === '') continue;
+      if (!ids.has(id) && !reportedOrphan.has(id)) {
+        reportedOrphan.add(id);
+        issues.push({
+          level: 'error',
+          file: rel,
+          message: `footnote [^${id}] has no matching sources[].id`,
+          code: 'footnote-mismatch',
+        });
+      }
     }
   }
-  // Claim bullets must cite a source footnote. Strip inline code so `[^{...}]` inside ticks is ignored.
-  for (const line of body.split('\n')) {
+
+  // Claim bullets (prose only) must cite a source footnote.
+  for (const line of proseLines(body)) {
     if (!/^\s*-\s+\S/.test(line)) continue;
-    const stripped = line.replace(/`[^`]*`/g, '')
-    // Pure navigation links (only a markdown link, no claim text) are allowed without footnotes.
-    if (/^\s*-\s+\[[^\]]+\]\([^)]+\)\s*$/.test(stripped)) continue;
+    // Pure navigation links (classify before stripping inline-code labels).
+    if (/^\s*-\s+\[[^\]]+\]\([^)]+\)\s*$/.test(line)) continue;
+    const stripped = line.replace(/`[^`]*`/g, '');
     const footnotes = [...stripped.matchAll(FOOTNOTE_REF)].map((m) => m[1]!);
     if (!footnotes.length) {
       issues.push({
@@ -471,7 +563,8 @@ function validateSourcesAndFootnotes(
       continue;
     }
     for (const id of footnotes) {
-      if (!ids.has(id)) {
+      if (!ids.has(id) && !reportedOrphan.has(id)) {
+        reportedOrphan.add(id);
         issues.push({
           level: 'error',
           file: rel,
@@ -493,17 +586,56 @@ function validateSourcesAndFootnotes(
   }
 }
 
+/** Opening fence marker: backticks or tildes, length >= 3 (CommonMark). */
+function openingFence(stripped: string): string | null {
+  const m = /^(```+|~~~+)/.exec(stripped);
+  return m ? m[1]! : null;
+}
+
+/** True when `stripped` closes `fence` (same character, length >= opening; CommonMark). */
+function closesFence(stripped: string, fence: string): boolean {
+  const m = /^(```+|~~~+)\s*$/.exec(stripped);
+  return Boolean(m && m[1]![0] === fence[0] && m[1]!.length >= fence.length);
+}
+
+/**
+ * Body lines outside fenced and indented code (matches upstream validate.py prose_lines).
+ * Inline code is left intact so navigation bullets like `- [`path`](target)` still classify.
+ */
+function proseLines(body: string): string[] {
+  const out: string[] = [];
+  let fence: string | null = null;
+  for (const line of body.split('\n')) {
+    const stripped = line.trimStart();
+    if (fence === null) {
+      const open = openingFence(stripped);
+      if (open) {
+        fence = open;
+        continue;
+      }
+    } else {
+      if (closesFence(stripped, fence)) fence = null;
+      continue;
+    }
+    if (line.startsWith('    ') || line.startsWith('\t')) continue;
+    out.push(line);
+  }
+  return out;
+}
+
 function collectHeadings(body: string): string[] {
   const out: string[] = [];
   let fence: string | null = null;
   for (const line of body.split('\n')) {
     const stripped = line.trimStart();
-    if (fence === null && (stripped.startsWith('```') || stripped.startsWith('~~~'))) {
-      fence = stripped.slice(0, 3);
-      continue;
-    }
-    if (fence !== null) {
-      if (stripped.startsWith(fence)) fence = null;
+    if (fence === null) {
+      const open = openingFence(stripped);
+      if (open) {
+        fence = open;
+        continue;
+      }
+    } else {
+      if (closesFence(stripped, fence)) fence = null;
       continue;
     }
     const m = HEADING.exec(line);

@@ -349,6 +349,8 @@ describe('AC: YAML traps and concept naming', () => {
 
   it('encodes scoped packages and refuses .. / leading dot', () => {
     expect(encodeOkfConceptSegment('@scope/pkg')).toBe('%40scope%2Fpkg');
+    expect(encodeOkfConceptSegment('index')).toBe('index%2Eokf');
+    expect(encodeOkfConceptSegment('log')).toBe('log%2Eokf');
     expect(() => assertSafeConceptKey('..')).toThrow();
     expect(() => assertSafeConceptKey('.hidden')).toThrow();
   });
@@ -416,6 +418,101 @@ describe('CR regression: validate/export/render hardening', () => {
     const issues = validateBundle(knowledgePaths(dir).dir);
     expect(issues.some((i) => i.code === 'bad-commit')).toBe(true);
     expect(issues.some((i) => i.code === 'missing-footnote')).toBe(true);
+  });
+
+  it('quotes YAML 1.2 core number/null/special-float lookalikes', async () => {
+    const { shouldQuoteOkfString } = await import('../../apps/cli/src/engine/knowledge/frontmatter.js');
+    for (const v of ['0x10', '0o7', '+1', '+12e03', '.5', '1.', '.inf', '.nan', '~', 'null']) {
+      expect(shouldQuoteOkfString(v), v).toBe(true);
+    }
+    expect(shouldQuoteOkfString('Turbine Project')).toBe(false);
+  });
+
+  it('quotes titles that would be YAML sequence indicators and avoids reserved package basenames', async () => {
+    const dir = newRepo({
+      'packages/index/package.json': JSON.stringify({ name: 'index', version: '1.0.0' }, null, 2) + '\n',
+    });
+    writeFileSync(
+      join(dir, 'package.json'),
+      JSON.stringify(
+        { name: 'root', version: '1.0.0', private: true, workspaces: ['packages/*'], scripts: { test: 'vitest run' } },
+        null,
+        2,
+      ) + '\n',
+    );
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-q', '-m', 'reserved-pkg');
+    const store = openStore();
+    const dashCfg = defaultConfig(tmpdir(), '- demo');
+    await understandProjectWithBrief(store, dir, { factoryRoot: factoryRoot(), config: dashCfg });
+    const index = readFileSync(knowledgePaths(dir).index, 'utf8');
+    expect(index).toMatch(/title:\s*"- demo"/);
+    expect(existsSync(join(knowledgePaths(dir).dir, 'structure/packages/index%2Eokf.md'))).toBe(true);
+    expect(existsSync(join(knowledgePaths(dir).dir, 'structure/packages/index.md'))).toBe(false);
+    expect(validateBundle(knowledgePaths(dir).dir).filter((i) => i.level === 'error')).toEqual([]);
+  });
+
+  it('rejects nested reserved index/log frontmatter and orphan prose footnotes; ignores fenced claim-like lines', async () => {
+    const dir = newRepo();
+    const store = openStore();
+    await understand(dir, store);
+    const k = knowledgePaths(dir).dir;
+    mkdirSync(join(k, 'project'), { recursive: true });
+    writeFileSync(join(k, 'project/index.md'), '---\ntitle: nested\n---\n\nsection index\n');
+    writeFileSync(join(k, 'project/log.md'), '---\ntitle: nested-log\n---\n\n## 2024-01-01\n');
+    writeFileSync(
+      join(k, 'project/overview.md'),
+      `---\ntype: Turbine Project\ntitle: t\ndescription: d\ngenerated: { by: turbine/0.5.0, at: "2024-01-01T00:00:00Z" }\nx-turbine-commit: ${'a'.repeat(40)}\nsources:\n  - id: commit\n    resource: git:commit@${'a'.repeat(40)}\n    title: commit\n---\n\n# Summary\n\nSee also [^missing-prose].\n\n# Facts\n\n- a real claim [^commit]\n\n\`\`\`\n- fenced example without citation\n\`\`\`\n\n[^commit]: commit\n`,
+    );
+    const issues = validateBundle(k);
+    expect(issues.some((i) => i.code === 'nested-index-frontmatter')).toBe(true);
+    expect(issues.some((i) => i.code === 'log-frontmatter' && i.file === 'project/log.md')).toBe(true);
+    expect(issues.some((i) => i.code === 'footnote-mismatch' && i.message.includes('missing-prose'))).toBe(true);
+    expect(issues.filter((i) => i.code === 'missing-footnote' && i.file === 'project/overview.md')).toHaveLength(0);
+  });
+
+  it('approved brief sections get human verified.at equal to generated.at (not an older approvedAt)', async () => {
+    const { approveBrief } = await import('../../apps/cli/src/engine/context/brief-approve.js');
+    const { briefConfigOf } = await import('../../apps/cli/src/engine/context/brief.js');
+    const dir = newRepo();
+    const store = openStore();
+    const o = await understand(dir, store);
+    expect(o.brief?.confirmToken).toBeTruthy();
+    approveBrief({
+      store,
+      projectRoot: dir,
+      repoRoot: dir,
+      repoPath: dir,
+      sections: briefConfigOf(cfg()).sections,
+      reviewer: 'Alice',
+      confirmToken: o.brief!.confirmToken,
+      presence: 'tty-hash-confirmation',
+    });
+    await understand(dir, store);
+    const briefDir = join(knowledgePaths(dir).dir, 'brief');
+    expect(existsSync(briefDir)).toBe(true);
+    const files = readdirSync(briefDir).filter((n) => n.endsWith('.md'));
+    expect(files.length).toBeGreaterThan(0);
+    for (const name of files) {
+      const split = splitFrontmatter(readFileSync(join(briefDir, name), 'utf8'));
+      expect(split.ok).toBe(true);
+      if (!split.ok) continue;
+      const g = split.data.generated as { at?: string };
+      const v = split.data.verified as { by?: string; at?: string } | undefined;
+      if (!v) continue;
+      expect(String(v.by)).toMatch(/^human:/);
+      expect(v.at).toBe(g.at);
+      expect(okfTrustTier({ generated: g, verified: v })).toBe('human-reviewed');
+    }
+  });
+
+  it('log.md uses a real UTC calendar date heading', async () => {
+    const dir = newRepo();
+    const store = openStore();
+    await understand(dir, store);
+    const log = readFileSync(knowledgePaths(dir).log, 'utf8');
+    const today = new Date().toISOString().slice(0, 10);
+    expect(log).toMatch(new RegExp(`## ${today}`));
   });
 
   it('export refuses overlap with the live bundle and validates before replacing', async () => {

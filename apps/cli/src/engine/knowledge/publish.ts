@@ -13,7 +13,16 @@ import { PUBLISHED_CLAIM_STATUSES, err, type BriefState, type RepoSnapshot } fro
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import { resolveCommit } from '../context/git-read.js';
 import { HeadMovedError, ensureContextIgnored, withContextPublishLock } from '../context/render.js';
-import { knowledgePaths, readBoundedUtf8, resolvePhysical, MAX_BUNDLE_FILE_BYTES, MAX_MARKER_BYTES } from './paths.js';
+import {
+  knowledgePaths,
+  readBoundedUtf8,
+  resolvePhysical,
+  MAX_BUNDLE_DEPTH,
+  MAX_BUNDLE_FILE_BYTES,
+  MAX_BUNDLE_FILES,
+  MAX_BUNDLE_TOTAL_BYTES,
+  MAX_MARKER_BYTES,
+} from './paths.js';
 import { bundleContentHash, renderBundle, type BundleFiles } from './render.js';
 import { validateBundle } from './validate.js';
 import { splitFrontmatter } from './frontmatter.js';
@@ -41,7 +50,10 @@ export function publishKnowledgeBundle(input: {
   projectName: string;
   license?: string;
 }): PublishKnowledgeResult {
-  recoverInterruptedSwap(input.projectRoot);
+  // Recovery must run under the publish lock so it cannot restore a live dir mid-swap.
+  withContextPublishLock(input.projectRoot, () => {
+    recoverInterruptedSwap(input.projectRoot);
+  });
   const head = resolveCommit(input.repoRoot, 'HEAD');
   if (!head) throw err('E_CONTEXT_UNAVAILABLE', 'HEAD does not resolve to a commit');
   if (head !== input.snapshot.commit) {
@@ -54,13 +66,18 @@ export function publishKnowledgeBundle(input: {
   const previousLogBody = previousLog?.replace(/^# Directory Update Log\s*/i, '') ?? '';
 
   const marker = readBundleMarker(paths.dir);
-  const claims = input.store.listClaims(input.repoPath, { statuses: [...PUBLISHED_CLAIM_STATUSES], commit: head });
+  // Brief approval + published claims must be read together so a concurrent claim write cannot
+  // appear under an older approvedHash (AGENTS.md: pin reads / same critical section).
+  const { claims, brief } = input.store.transaction(() => ({
+    claims: input.store.listClaims(input.repoPath, { statuses: [...PUBLISHED_CLAIM_STATUSES], commit: head }),
+    brief: input.store.getBriefState(input.repoPath) ?? input.brief,
+  }));
   const withdrawn = listRecentWithdrawals(input.store, input.repoPath);
 
   const files = renderBundle({
     snapshot: input.snapshot,
     claims,
-    brief: input.brief,
+    brief,
     withdrawn,
     previousLogBody,
     cliVersion: input.cliVersion,
@@ -79,11 +96,16 @@ export function publishKnowledgeBundle(input: {
     marker?.snapshot === input.snapshot.hash &&
     bundleOnDiskMatches(paths.dir, files)
   ) {
+    const headStill = resolveCommit(input.repoRoot, 'HEAD');
+    if (!headStill || headStill !== head) {
+      throw new HeadMovedError('HEAD changed while checking the knowledge bundle; nothing was published. Run again.');
+    }
     ensureContextIgnored(input.projectRoot);
     return { commit: head, written: [], unchanged: true, hash };
   }
 
   return withContextPublishLock(input.projectRoot, () => {
+    recoverInterruptedSwap(input.projectRoot);
     const headNow = resolveCommit(input.repoRoot, 'HEAD');
     if (!headNow || headNow !== head) {
       throw new HeadMovedError('HEAD changed while the knowledge bundle was being built; nothing was published. Run again.');
@@ -145,7 +167,8 @@ export function publishKnowledgeBundle(input: {
 
 function writeTree(root: string, files: BundleFiles): void {
   for (const [rel, body] of files) {
-    if (rel.includes('..') || rel.startsWith('/') || rel.split('/').some((p) => p === '..' || p === '.')) {
+    // Segment-based traversal only — `lib..core` is a valid encoded key, not `..`.
+    if (rel.startsWith('/') || rel.split('/').some((p) => p === '' || p === '..' || p === '.')) {
       throw new Error(`refusing to write unsafe bundle path ${rel}`);
     }
     if (rel.split('/').some((p) => p.startsWith('.'))) {
@@ -160,9 +183,33 @@ function writeTree(root: string, files: BundleFiles): void {
 function readExistingBundle(dir: string): Map<string, string> {
   const out = new Map<string, string>();
   if (!existsSync(dir)) return out;
-  const walk = (abs: string, rel: string) => {
-    for (const name of readdirSync(abs)) {
+  let visited = 0;
+  let totalBytes = 0;
+  const walk = (abs: string, rel: string, depth: number) => {
+    if (depth > MAX_BUNDLE_DEPTH) {
+      throw err(
+        'E_CONTEXT_UNAVAILABLE',
+        `previous knowledge bundle exceeds max depth ${MAX_BUNDLE_DEPTH} at ${rel || '.'}; leaving the live bundle unchanged`,
+      );
+    }
+    let names: string[];
+    try {
+      names = readdirSync(abs);
+    } catch (e) {
+      throw err(
+        'E_CONTEXT_UNAVAILABLE',
+        `cannot read previous knowledge path ${rel || '.'} (${(e as Error).message}); leaving the live bundle unchanged`,
+      );
+    }
+    for (const name of names) {
       if (name.startsWith('.')) continue;
+      visited += 1;
+      if (visited > MAX_BUNDLE_FILES) {
+        throw err(
+          'E_CONTEXT_UNAVAILABLE',
+          `previous knowledge bundle has more than ${MAX_BUNDLE_FILES} entries; leaving the live bundle unchanged`,
+        );
+      }
       const child = join(abs, name);
       const childRel = rel ? `${rel}/${name}` : name;
       let st;
@@ -174,12 +221,19 @@ function readExistingBundle(dir: string): Map<string, string> {
           `cannot read previous knowledge path ${childRel} (${(e as Error).message}); leaving the live bundle unchanged`,
         );
       }
-      if (st.isDirectory()) walk(child, childRel);
+      if (st.isDirectory()) walk(child, childRel, depth + 1);
       else if (st.isFile() && name.endsWith('.md')) {
         try {
           const text = readBoundedUtf8(child, MAX_BUNDLE_FILE_BYTES);
           if (text === undefined) {
             throw err('E_CONTEXT_UNAVAILABLE', `cannot read previous knowledge file ${childRel}; leaving the live bundle unchanged`);
+          }
+          totalBytes += Buffer.byteLength(text, 'utf8');
+          if (totalBytes > MAX_BUNDLE_TOTAL_BYTES) {
+            throw err(
+              'E_CONTEXT_UNAVAILABLE',
+              `previous knowledge bundle exceeds ${MAX_BUNDLE_TOTAL_BYTES} aggregate bytes at ${childRel}; leaving the live bundle unchanged`,
+            );
           }
           out.set(childRel, text);
         } catch (e) {
@@ -192,7 +246,7 @@ function readExistingBundle(dir: string): Map<string, string> {
       }
     }
   };
-  walk(dir, '');
+  walk(dir, '', 0);
   return out;
 }
 

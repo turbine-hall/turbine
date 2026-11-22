@@ -120,13 +120,22 @@ export function isTurbineOkfConceptType(type: string): type is TurbineOkfConcept
   return byType.has(type as TurbineOkfConceptType);
 }
 
+/** Basenames reserved by OKF §8 / §9 at every directory depth. */
+const OKF_RESERVED_BASENAMES = new Set(['index', 'log']);
+
 /**
  * Percent-encode a concept path segment per OKF §6 / RFC 3986 (spaces and reserved characters).
  * Keeps unreserved characters unescaped. Rejects empty, `.`, `..`, absolute, and leading-dot names
  * at the call site via `assertSafeConceptKey`.
+ * Never emits the reserved basenames `index` / `log` (those would collide with OKF reserved files).
  */
 export function encodeOkfConceptSegment(name: string): string {
-  return encodeURIComponent(name).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`);
+  let enc = encodeURIComponent(name).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`);
+  if (OKF_RESERVED_BASENAMES.has(enc)) {
+    // Disambiguate without changing decode of ordinary names: append a percent-encoded marker.
+    enc = `${enc}%2Eokf`;
+  }
+  return enc;
 }
 
 /**
