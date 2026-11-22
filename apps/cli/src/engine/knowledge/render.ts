@@ -12,7 +12,7 @@ import {
   type StoredClaim,
   type UnconfirmedItem,
 } from '@turbine-hall/turbine-contracts';
-import { shouldQuoteOkfString } from './frontmatter.js';
+import { shouldQuoteOkfString, splitFrontmatter } from './frontmatter.js';
 
 export type BundleFiles = Map<string, string>;
 
@@ -584,14 +584,34 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
   logEntries.push(
     `* **Update**: Knowledge bundle rebuilt for commit \`${commit.slice(0, 12)}\` (snapshot \`${snapshot.hash.replace(/^sha256:/, '').slice(0, 8)}\`).`,
   );
-  const newBlock = [`## ${today}`, ...logEntries, ''].join('\n');
-  let history = prevWithoutToday;
   const maxLog = 400 * 1024;
-  let combined = [`# Directory Update Log`, '', newBlock, history].join('\n');
-  while (Buffer.byteLength(combined, 'utf8') > maxLog && history.trim()) {
-    const cut = history.lastIndexOf('\n## ');
-    history = cut >= 0 ? history.slice(0, cut).replace(/\n+$/, '\n') : '';
-    combined = [`# Directory Update Log`, '', newBlock, history].join('\n');
+  const updateLine = logEntries[logEntries.length - 1]!;
+  let withdrawals = logEntries.slice(0, -1);
+  let history = prevWithoutToday;
+  const build = () =>
+    [`# Directory Update Log`, '', `## ${today}`, ...withdrawals, updateLine, '', history].join('\n');
+  let combined = build();
+  while (Buffer.byteLength(combined, 'utf8') > maxLog) {
+    if (history.trim()) {
+      const cut = history.lastIndexOf('\n## ');
+      history = cut >= 0 ? history.slice(0, cut).replace(/\n+$/, '\n') : '';
+    } else if (withdrawals.length > 1) {
+      // Drop oldest new withdrawals; full audit remains in the store.
+      const omitted = withdrawals.length - 1;
+      withdrawals = [
+        `* **Withdrawal**: ${omitted} older withdrawal(s) omitted from log.md (still in the store).`,
+        withdrawals[withdrawals.length - 1]!,
+      ];
+    } else if (withdrawals.length === 1) {
+      withdrawals = [`* **Withdrawal**: withdrawal details omitted from log.md (still in the store).`];
+    } else {
+      break;
+    }
+    combined = build();
+    if (!history.trim() && withdrawals.length <= 1 && Buffer.byteLength(combined, 'utf8') > maxLog) {
+      combined = [`# Directory Update Log`, '', `## ${today}`, updateLine, ''].join('\n');
+      break;
+    }
   }
   files.set('log.md', combined.replace(/\n+$/, '\n'));
 
@@ -698,8 +718,9 @@ function extractGeneratedAt(file?: string): string | undefined {
 
 function extractTitle(file?: string): string | undefined {
   if (!file) return undefined;
-  const m = file.match(/^title:\s*(.+)$/m);
-  return m?.[1]?.replace(/^"|"$/g, '').trim();
+  const split = splitFrontmatter(file);
+  if (!split.ok) return undefined;
+  return typeof split.data.title === 'string' ? split.data.title : undefined;
 }
 
 function extractBody(file?: string): string | undefined {

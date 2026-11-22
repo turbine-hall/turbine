@@ -45,7 +45,7 @@ These come from review findings on PR #9 (about 80 findings) and PR #11 (about 2
 10. **Implement the standard the spec states, not a convenient subset.** Examples: Node `exports` selection (first valid array target, no fallback on a missing file, a nested condition that gives NO answer falls through to the next key (`{"node":{"import":null},"default":"./index.js"}` is blocked by the nested `null`, it does not fall through), a direct `null` target blocks but inside an array it is passed over (`[null, "./index.js"]` selects `./index.js`), targets start with `./`); JSON/JSONC edge cases (CR-only line endings, duplicate keys, non-finite numbers); OKF actors (`scheme:id` / `kind/id`, no whitespace); trust tiers from current `verified.at >= generated.at` only.
 11. **Verify runtime behaviour when a rule depends on it.** Run the runtime (for example Node) on a small fixture instead of relying on memory.
 12. **Fail closed on prior-state reads.** If a previous publish / log / hand-edit merge input cannot be read, do not publish a partial replacement. Report the path and leave the live artifact unchanged.
-13. **Destructive copy/export is stage-then-swap.** Validate the source first. Never delete the destination before the replacement is ready. Reject targets that overlap the live artifact, `.turbine/`, or the project root (including ancestors/descendants).
+13. **Destructive copy/export is stage-then-swap.** Validate the source first. Never delete the destination before the replacement is ready. Reject the project root and its ancestors, plus anything under `.turbine/` or the live artifact (including ancestors/descendants of those). Safe descendants of the project outside `.turbine/` are allowed so a team can export into a tracked folder to commit.
 14. **Identity keys must stay unique after truncation.** Footnote / source / concept IDs that truncate a path must include a digest of the full identity so two long paths cannot collide.
 15. **Do not promote a partial human review to a whole concept.** Per-item attestation labels stay per-item; concept-level `verified.by: human:…` only when the review covers the full rendered concept.
 16. **Parse config / frontmatter with the real parser.** Do not `JSON.parse` YAML values (comments, quoting, tags). Use the YAML Document API for edits; keep unknown keys.
@@ -59,10 +59,11 @@ CodeRabbit reviews every PR. Recurring findings mean the agent wrote code that v
 1. Re-read this file's correctness rules against every new/changed path.
 2. Add a regression test for each edge case you touch (rules 1–18).
 3. Run `pnpm build && pnpm lint && pnpm typecheck && pnpm test`.
-4. Run a local CodeRabbit review on the branch before `gh pr create`:
+4. Run a local CodeRabbit review on the branch before `gh pr create` (use the PR base branch, not a hard-coded `main`):
 
 ```bash
-coderabbit review --agent --base main
+base=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || echo main)
+coderabbit review --agent --base "$base"
 ```
 
 Fix every actionable critical/major finding (with a regression test) before opening or updating the PR. Do not treat GitHub CodeRabbit as the first review.

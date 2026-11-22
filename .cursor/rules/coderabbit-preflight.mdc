@@ -20,7 +20,13 @@ GitHub CodeRabbit is not the first review. Agents must write code that already m
 ## Before opening or updating a PR
 
 1. `pnpm build && pnpm lint && pnpm typecheck && pnpm test`
-2. `coderabbit review --agent --base main` (or the PR base branch)
-3. Fix actionable critical/major findings with regression tests, then re-run.
+2. Local CodeRabbit against the **PR base branch** (not a hard-coded `main`):
+
+```bash
+base=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || echo main)
+coderabbit review --agent --base "$base"
+```
+
+3. Fix actionable critical/major findings with regression tests, then re-run until local CR is clean.
 
 Do not open a PR that you know will generate a large CodeRabbit review as the cleanup step.

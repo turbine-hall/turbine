@@ -422,8 +422,14 @@ describe('CR regression: validate/export/render hardening', () => {
     const dir = newRepo();
     const store = openStore();
     await understand(dir, store);
-    expect(() => exportKnowledgeBundle({ projectRoot: dir, targetDir: knowledgePaths(dir).dir, force: true })).toThrow(/outside the project|live knowledge|overlap/i);
-    expect(() => exportKnowledgeBundle({ projectRoot: dir, targetDir: join(dir, 'inside-export'), force: true })).toThrow(/outside the project/i);
+    expect(() => exportKnowledgeBundle({ projectRoot: dir, targetDir: knowledgePaths(dir).dir, force: true })).toThrow(
+      /live knowledge|overlap|\.turbine|project root/i,
+    );
+    expect(() => exportKnowledgeBundle({ projectRoot: dir, targetDir: dir, force: true })).toThrow(/project root/i);
+    // Safe descendant outside .turbine/ is allowed (commit/share workflow).
+    const inside = join(dir, 'share-knowledge');
+    const okInside = exportKnowledgeBundle({ projectRoot: dir, targetDir: inside, force: true });
+    expect(okInside.files).toBeGreaterThan(0);
     const target = mkdtempSync(join(tmpdir(), 'turbine-okf-share-'));
     dirs.push(target);
     writeFileSync(join(target, 'old.md'), 'keep\n');

@@ -8,7 +8,7 @@ import {
   writeFileSync,
   lstatSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { PUBLISHED_CLAIM_STATUSES, err, type BriefState, type RepoSnapshot } from '@turbine-hall/turbine-contracts';
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import { resolveCommit } from '../context/git-read.js';
@@ -221,8 +221,22 @@ function recoverInterruptedSwap(projectRoot: string): void {
       rmSync(paths.swapState, { force: true });
       return;
     }
-    if (!existsSync(raw.dir) && existsSync(raw.aside)) {
-      renameSync(raw.aside, raw.dir);
+    const expectedDir = resolvePhysical(paths.dir);
+    const dir = resolvePhysical(raw.dir);
+    const aside = resolvePhysical(raw.aside);
+    // Only recover records this publisher could have written: exact knowledge dir + sibling `.aside.<pid>`.
+    if (dir !== expectedDir) {
+      rmSync(paths.swapState, { force: true });
+      return;
+    }
+    const parent = dirname(expectedDir);
+    const expectedPrefix = `${basename(expectedDir)}.aside.`;
+    if (dirname(aside) !== parent || !basename(aside).startsWith(expectedPrefix)) {
+      rmSync(paths.swapState, { force: true });
+      return;
+    }
+    if (!existsSync(dir) && existsSync(aside)) {
+      renameSync(aside, dir);
     }
   } catch {
     // leave state for a human; do not delete blindly
@@ -380,18 +394,20 @@ function assertSafeExportTarget(target: string, projectRoot: string, sourceDir: 
   const absProject = resolvePhysical(resolve(projectRoot));
   const absTurbine = resolvePhysical(resolve(projectRoot, '.turbine'));
   const under = (parent: string, child: string) => child === parent || child.startsWith(parent.endsWith('/') ? parent : `${parent}/`);
+  // Reject: live bundle overlap, anything under .turbine/, the project root itself, and ancestors of the project.
+  // Allow: other descendants of the project (so teams can export into a tracked folder to commit).
   if (
     absTarget === absSource ||
     under(absTarget, absSource) ||
     under(absSource, absTarget) ||
-    under(absProject, absTarget) ||
+    absTarget === absProject ||
     under(absTarget, absProject) ||
-    under(absTarget, absTurbine) ||
-    under(absTurbine, absTarget)
+    under(absTurbine, absTarget) ||
+    under(absTarget, absTurbine)
   ) {
     throw err(
       'E_INVALID_CONFIG',
-      'export target must be outside the project (and must not overlap the live knowledge bundle or .turbine/)',
+      'export target must not be the project root/an ancestor, or overlap .turbine/ / the live knowledge bundle',
     );
   }
 }

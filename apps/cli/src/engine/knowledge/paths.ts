@@ -1,4 +1,4 @@
-import { existsSync, openSync, readSync, closeSync, fstatSync, realpathSync } from 'node:fs';
+import { constants, existsSync, openSync, readSync, closeSync, fstatSync, realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 
 export const KNOWLEDGE_DIR = 'knowledge';
@@ -35,7 +35,12 @@ export function readBoundedUtf8(abs: string, budget = MAX_BUNDLE_FILE_BYTES): st
   if (!existsSync(abs)) return undefined;
   let fd: number | undefined;
   try {
-    fd = openSync(abs, 'r');
+    // O_NONBLOCK: a FIFO with no writer must not hang forever (POSIX). Fall back to plain 'r' where unsupported.
+    const flags =
+      typeof constants.O_RDONLY === 'number' && typeof constants.O_NONBLOCK === 'number'
+        ? constants.O_RDONLY | constants.O_NONBLOCK
+        : 'r';
+    fd = openSync(abs, flags);
     const st = fstatSync(fd);
     if (!st.isFile()) throw new Error(`not a regular file: ${abs}`);
     if (st.size > budget) throw new Error(`file-too-large:${st.size}`);
