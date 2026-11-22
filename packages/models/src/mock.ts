@@ -147,6 +147,38 @@ export function createMockModelAdapter(id = 'mock-default'): ModelAdapter {
         };
       }
 
+      if (request.schemaId === 'project-brief' || request.skillIds.includes('core/draft-project-brief')) {
+        // Propose one true claim (package.json exists) and one planted-false claim. Only the true one verifies.
+        const section = /## SECTION\n([a-z][a-z0-9-]{0,39})/.exec(request.prompt)?.[1] ?? 'architecture';
+        const commit = /## COMMIT\n([0-9a-f]{40,64})/.exec(request.prompt)?.[1] ?? '0'.repeat(40);
+        const blob = /path=package\.json blob=([0-9a-f]{40,64})/.exec(request.prompt)?.[1] ?? '1'.repeat(40);
+        const idBase = section.replace(/[^a-z0-9]/g, '').slice(0, 12) || 'sec';
+        return {
+          content: {
+            claims: [
+              {
+                id: `mock-${idBase}-pkg`,
+                section,
+                statement: 'package.json is tracked',
+                kind: 'exists',
+                evidence: [{ path: 'package.json', commit, blob }],
+                verifier: { kind: 'exists', path: 'package.json' },
+              },
+              {
+                id: `mock-${idBase}-false`,
+                section,
+                statement: 'Planted false path',
+                kind: 'exists',
+                evidence: [{ path: 'planted-missing.ts', commit, blob: 'a'.repeat(40) }],
+                verifier: { kind: 'exists', path: 'planted-missing.ts' },
+              },
+            ],
+          },
+          usage: { inputTokens: 80, outputTokens: 120 },
+          providerRequestId: `mock_${Date.now()}`,
+        };
+      }
+
       return {
         content: { ok: true, echo: request.prompt.slice(0, 200) },
         usage: { inputTokens: 10, outputTokens: 10 },

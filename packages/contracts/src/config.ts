@@ -139,5 +139,30 @@ export const ProjectConfigSchema = z.object({
       sqaAcceptance: true,
       requirePrApproval: false,
     }),
+  /** Repository context (layer 2 brief). */
+  context: z
+    .object({
+      brief: z
+        .object({
+          /** Section ids the brief may contain (lower-case, hyphenated). */
+          sections: z
+            .array(z.string().regex(/^[a-z][a-z0-9-]{0,39}$/))
+            .min(1)
+            .max(32)
+            .default(['architecture', 'security', 'getting-started', 'testing', 'deployment', 'data-model']),
+          /** Max key files sampled as drafting input; the run reports how many were used. */
+          sampleFileCap: z.number().int().min(1).max(200).default(40),
+        })
+        .default({
+          sections: ['architecture', 'security', 'getting-started', 'testing', 'deployment', 'data-model'],
+          sampleFileCap: 40,
+        }),
+    })
+    .default({
+      brief: {
+        sections: ['architecture', 'security', 'getting-started', 'testing', 'deployment', 'data-model'],
+        sampleFileCap: 40,
+      },
+    }),
 });
 export type ProjectConfig = z.infer<typeof ProjectConfigSchema>;

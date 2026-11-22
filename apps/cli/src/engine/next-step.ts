@@ -1,7 +1,10 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { WorkPackage, WorkState } from '@turbine-hall/turbine-contracts';
+import { briefSectionsFor, loadRoles } from '@turbine-hall/turbine-core';
+import { factoryRoot } from '../paths.js';
 import { packetPaths } from './packet.js';
+import { briefPaths } from './context/brief-render.js';
 
 export type NextStep = {
   workId: string;
@@ -33,7 +36,7 @@ export const CONTEXT_READING_STATES: ReadonlySet<WorkState> = new Set<WorkState>
 ]);
 
 const readFirst = (before: 'planning' | 'implementing') =>
-  `Read PROJECT.md and CONTEXT.md before ${before}. CONTEXT.md is a selection of files with a checkable reason each, not a complete list; PROJECT.md holds the verified project facts.`;
+  `Read PROJECT.md and CONTEXT.md before ${before}. CONTEXT.md is a selection of files with a checkable reason each, not a complete list; PROJECT.md holds verified project facts and the project brief (verified claims at the recorded commit, or labelled draft/human-attested).`;
 
 function worktreePathFor(projectRoot: string, workId: string): string {
   return join(projectRoot, '.turbine', 'worktrees', workId);
@@ -50,6 +53,8 @@ export function computeNextStep(input: {
   projectRoot: string;
   work: WorkPackage;
   defaultBaseBranch?: string;
+  /** When true, omit brief section links — handoff sync could not prove they match HEAD. */
+  briefUnavailable?: boolean;
 }): NextStep {
   const step = computeNextStepRaw(input);
   // Several legacy stage names now map to the same document; list each file once.
@@ -60,6 +65,7 @@ function computeNextStepRaw(input: {
   projectRoot: string;
   work: WorkPackage;
   defaultBaseBranch?: string;
+  briefUnavailable?: boolean;
 }): NextStep {
   const { projectRoot, work } = input;
   const base = input.defaultBaseBranch ?? 'staging';
@@ -67,8 +73,17 @@ function computeNextStepRaw(input: {
   const wt = worktreePathFor(projectRoot, work.id);
   const branch = branchFor(work.id);
   // The files an agent reads before it plans or implements (only those that exist).
-  const contextFiles = [paths.projectContext, paths.context].filter((p) => existsSync(p));
-  const sync = `turbine task sync ${work.id}`;
+  const roleIds = new Set(work.selectedRoles.map((r) => r.id));
+  const roleBrief = briefSectionsFor(loadRoles(factoryRoot()).filter((r) => roleIds.has(r.id)));
+  const briefFiles = input.briefUnavailable
+    ? []
+    : (roleBrief ?? []).map((s) => briefPaths(projectRoot).section(s)).filter((p) => existsSync(p));
+  const contextFiles = [paths.projectContext, paths.context, ...briefFiles].filter((p) => existsSync(p));
+  const briefNote = input.briefUnavailable
+    ? 'Project brief is unavailable for this checkout (could not reverify claims at HEAD). Run: turbine understand'
+    : roleBrief?.length
+      ? `Role brief sections: ${roleBrief.join(', ')} (verified claims at the commit recorded in PROJECT.md).`
+      : 'PROJECT.md includes the project brief when present (verified claims at the recorded commit).';  const sync = `turbine task sync ${work.id}`;
   const next = `turbine task next ${work.id}`;
   const approve = `turbine task approve ${work.id}`;
   const humanOnly = [
@@ -144,7 +159,7 @@ function computeNextStepRaw(input: {
         doNow: 'Run sync to create the plan (in SPEC.md).',
         commands: [sync, next],
         openFiles: [paths.status, ...contextFiles],
-        agentPlaybook: [readFirst('planning'), 'Run turbine task sync <id>.', 'Then ask the human to review SPEC.md → Plan.'],
+        agentPlaybook: [readFirst('planning'), briefNote, 'Run turbine task sync <id>.', 'Then ask the human to review SPEC.md → Plan.'],
       };
 
     case 'PLAN_REVIEW':
@@ -174,6 +189,7 @@ function computeNextStepRaw(input: {
         ],
         agentPlaybook: [
           readFirst('implementing'),
+          briefNote,
           'Run turbine task sync <id> (execute).',
           'Read SPEC.md → Requirements and Plan; follow the plan steps and file list.',
           'Make all code changes in the worktree path.',
@@ -199,6 +215,7 @@ function computeNextStepRaw(input: {
         branch,
         agentPlaybook: [
           readFirst('implementing'),
+          briefNote,
           'Never commit on staging/main for this task.',
           'Implement + typecheck in worktree.',
           'Commit on turbine/* branch.',

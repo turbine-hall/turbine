@@ -1,0 +1,11 @@
+{
+  "id": "core/draft-project-brief",
+  "version": "0.1.0",
+  "source": "turbine-original",
+  "license": "UNLICENSED-internal",
+  "runnerCompatibility": ["turbine-models"],
+  "inputs": ["repository-context"],
+  "outputs": ["project-brief"],
+  "requiredCapabilities": ["none"],
+  "resourceLimits": { "maxModelCalls": 6 }
+}

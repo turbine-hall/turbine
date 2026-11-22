@@ -7,14 +7,18 @@ import { listModels } from '@turbine-hall/turbine-models';
 import { loadSkills } from '@turbine-hall/turbine-skills';
 import { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import { err } from '@turbine-hall/turbine-contracts';
-import { formatOutcome, understandOnInit, understandProject } from './engine/context/understand.js';
+import { formatOutcome, understandOnInitWithBrief, understandProjectWithBrief } from './engine/context/understand.js';
 import { lintProjectContext } from './engine/context/render.js';
 import { lintTaskContexts } from './engine/context/task-render.js';
+import { briefConfigOf, briefDiff } from './engine/context/brief.js';
+import { approveBrief, attestClaim } from './engine/context/brief-approve.js';
+import { renderClaimBullet } from './engine/context/brief-render.js';
 import { Engine } from './engine/engine.js';
 import { initProject, openContext } from './engine/project.js';
 import { handleError, printResult } from './output.js';
 import { callerCwd, factoryRoot, findProjectRoot } from './paths.js';
 import { HUMAN_PRESENCE, ask, askReviewer, assertHumanTerminal } from './human-gate.js';
+import { repoToplevel } from './engine/context/git-read.js';
 
 const program = new Command();
 program.name('turbine').description('Turbine Hall CLI').version('0.5.0');
@@ -27,17 +31,20 @@ program
   .command('init')
   .option('--project <path>', 'Project path')
   .option('--non-interactive', 'Non-interactive init')
-  .action((opts) => {
+  .action(async (opts) => {
     try {
       const result = initProject({
         projectPath: opts.project,
         nonInteractive: !!opts.nonInteractive,
       });
-      // A repository that already has commits gets its project facts right away.
+      // A repository that already has commits gets its project facts (and brief draft) right away.
       let context: string | undefined;
       const store = new WorkStore(result.paths.dbPath);
       try {
-        context = understandOnInit(store, result.paths.root);
+        context = await understandOnInitWithBrief(store, result.paths.root, {
+          factoryRoot: factoryRoot(),
+          config: result.config,
+        });
       } catch (e) {
         process.stderr.write(`Warning: project facts were not built: ${(e as Error).message}\nRun: turbine understand\n`);
       } finally {
@@ -61,18 +68,135 @@ program
 program
   .command('understand')
   .option('--json', 'JSON output')
-  .description('Build or refresh the project facts (a snapshot of the repository at HEAD) and render .turbine/context/')
+  .description('Build or refresh project facts and the verified-claims brief; render .turbine/context/')
+  .action(async (opts) => {
+    try {
+      const ctx = openContext();
+      try {
+        const o = await understandProjectWithBrief(ctx.store, ctx.projectRoot, {
+          factoryRoot: ctx.factoryRoot,
+          config: ctx.config,
+        });
+        if (opts.json) {
+          printResult(
+            {
+              status: o.status,
+              snapshot: o.snapshot.hash,
+              commit: o.snapshot.commit,
+              dirty: o.dirty,
+              written: o.written,
+              repaired: o.repaired,
+              diff: o.diff,
+              brief: o.brief,
+            },
+            true,
+          );
+        } else process.stdout.write(`${formatOutcome(o).join('\n')}\n`);
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+const contextCmd = program.command('context').description('Project brief (verified claims)');
+contextCmd
+  .command('show')
+  .option('--json', 'JSON output')
+  .description('Show the published brief claims and approval status')
   .action((opts) => {
     try {
       const ctx = openContext();
       try {
-        const o = understandProject(ctx.store, ctx.projectRoot);
+        const { state, claims, confirmToken } = briefDiff(ctx.store, ctx.projectRoot);
         if (opts.json) {
-          printResult(
-            { status: o.status, snapshot: o.snapshot.hash, commit: o.snapshot.commit, dirty: o.dirty, written: o.written, repaired: o.repaired, diff: o.diff },
-            true,
-          );
-        } else process.stdout.write(`${formatOutcome(o).join('\n')}\n`);
+          printResult({ state, claims, confirmToken }, true);
+          return;
+        }
+        if (!state) {
+          process.stdout.write('No brief yet. Run: turbine understand\n');
+          return;
+        }
+        const approved = state.approvedHash === state.claimsHash;
+        process.stdout.write(
+          `Brief at ${state.commit.slice(0, 8)} — ${approved ? 'approved' : 'draft, not approved'} (claims ${state.claimsHash.slice(0, 15)}…)\n`,
+        );
+        if (!approved && confirmToken) process.stdout.write(`Approve code: ${confirmToken}\n`);
+        process.stdout.write(`Sample files (cap ${state.sampleCap}): ${state.samplePaths.join(', ') || '(none)'}\n\n`);
+        for (const c of claims) {
+          process.stdout.write(`${renderClaimBullet(c)}\n\n`);
+        }
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+contextCmd
+  .command('approve')
+  .description('Human-only: approve the current verified claim set (hash-bound)')
+  .action(async () => {
+    try {
+      assertHumanTerminal('turbine context approve');
+      const ctx = openContext();
+      try {
+        const { state, claims, confirmToken } = briefDiff(ctx.store, ctx.projectRoot);
+        if (!state || !confirmToken) throw err('E_NOT_FOUND', 'No brief to approve; run: turbine understand');
+        process.stdout.write(`Review ${claims.length} published claim(s) at ${state.commit.slice(0, 8)}:\n\n`);
+        for (const c of claims) process.stdout.write(`${renderClaimBullet(c)}\n\n`);
+        process.stdout.write(`\nType the code ${confirmToken} to confirm you reviewed exactly this claim set.\n`);
+        const token = await ask('Code: ');
+        const reviewer = await askReviewer(ctx.projectRoot);
+        const next = approveBrief({
+          store: ctx.store,
+          projectRoot: ctx.projectRoot,
+          repoRoot: repoToplevel(ctx.projectRoot) ?? ctx.projectRoot,
+          repoPath: ctx.projectRoot,
+          sections: briefConfigOf(ctx.config).sections,
+          reviewer,
+          confirmToken: token,
+          presence: HUMAN_PRESENCE,
+        });
+        printResult({ approved: true, by: next.approvedBy, at: next.approvedAt, claimsHash: next.claimsHash }, false);
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+contextCmd
+  .command('attest')
+  .argument('<claim-json-or-file>', 'Claim JSON string, or path to a JSON file')
+  .description('Human-only: attest a claim that cannot be verified mechanically')
+  .action(async (arg: string) => {
+    try {
+      assertHumanTerminal('turbine context attest');
+      const ctx = openContext();
+      try {
+        let rawText = arg;
+        try {
+          rawText = readFileSync(arg, 'utf8');
+        } catch {
+          // treat as inline JSON
+        }
+        const raw = JSON.parse(rawText) as unknown;
+        const reviewer = await askReviewer(ctx.projectRoot);
+        const claim = attestClaim({
+          store: ctx.store,
+          projectRoot: ctx.projectRoot,
+          repoRoot: repoToplevel(ctx.projectRoot) ?? ctx.projectRoot,
+          repoPath: ctx.projectRoot,
+          sections: briefConfigOf(ctx.config).sections,
+          raw,
+          reviewer,
+          presence: HUMAN_PRESENCE,
+        });
+        printResult({ attested: true, id: claim.id, section: claim.section }, false);
       } finally {
         ctx.store.close();
       }

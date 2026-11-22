@@ -18,6 +18,11 @@ export type RoleManifest = {
    * Absent means DEFAULT_CONTEXT_BUDGET.
    */
   context_budget?: ContextBudget;
+  /**
+   * Optional brief sections this role needs (e.g. security-reviewer → ["security"]).
+   * Absent means the role does not declare a preference; the project default sections still apply.
+   */
+  brief_sections?: string[];
 };
 
 /** A malformed `context_budget` is an error, not a silent fallback to the default: the limit is a promise. */
@@ -30,12 +35,37 @@ function checkBudget(role: RoleManifest, file: string): RoleManifest {
   return { ...role, context_budget: parsed.data };
 }
 
+function checkBriefSections(role: RoleManifest, file: string): RoleManifest {
+  if (role.brief_sections === undefined) return role;
+  if (!Array.isArray(role.brief_sections) || role.brief_sections.length === 0 || role.brief_sections.length > 32) {
+    throw err('E_INVALID_CONFIG', `roles/${file}: brief_sections must be a non-empty array of at most 32 section names`);
+  }
+  for (const s of role.brief_sections) {
+    if (typeof s !== 'string' || !/^[a-z][a-z0-9-]{0,39}$/.test(s)) {
+      throw err('E_INVALID_CONFIG', `roles/${file}: brief_sections entry "${String(s)}" must be a lower-case section name`);
+    }
+  }
+  return role;
+}
+
 export function loadRoles(rootDir: string): RoleManifest[] {
   const dir = join(rootDir, 'roles');
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
     .filter((f) => f.endsWith('.json'))
-    .map((f) => checkBudget(JSON.parse(readFileSync(join(dir, f), 'utf8')) as RoleManifest, f));
+    .map((f) => checkBriefSections(checkBudget(JSON.parse(readFileSync(join(dir, f), 'utf8')) as RoleManifest, f), f));
+}
+
+/**
+ * Brief sections the selected roles asked for (union), or undefined when none declare a preference.
+ * Callers intersect with the project-configured section list.
+ */
+export function briefSectionsFor(roles: RoleManifest[]): string[] | undefined {
+  const asked = new Set<string>();
+  for (const r of roles) {
+    for (const s of r.brief_sections ?? []) asked.add(s);
+  }
+  return asked.size ? [...asked].sort() : undefined;
 }
 
 export function getRole(rootDir: string, roleId: string): RoleManifest {
