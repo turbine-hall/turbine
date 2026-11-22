@@ -161,8 +161,14 @@ function parseTree(out: Buffer): TreeListing {
     const path = rec.slice(tab + 1);
     const known = /^\d+$/.test(size ?? '');
     // `git ls-tree -l` prints "-" for trees and submodules and "BAD" for a blob it cannot find.
-    if (type === 'blob' && !known) throw new Error(`git object ${id} (${path}) is missing from the repository`);
-    entries.push({ mode: mode!, type: type!, id: id!, size: known ? Number(size) : 0, path });
+    // A missing blob is recorded with size -1 so a claim that needs THAT path can refuse, without aborting the whole tree.
+    entries.push({
+      mode: mode!,
+      type: type!,
+      id: id!,
+      size: type === 'blob' && !known ? -1 : known ? Number(size) : 0,
+      path,
+    });
   }
   return { entries, undecodable };
 }

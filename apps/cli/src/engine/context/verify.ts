@@ -117,6 +117,7 @@ export class CommitReader {
     if (entry.type !== 'blob') return { ok: false, reason: `${path} is a ${entry.type}, not a file` };
     // git stores a symlink as a blob holding the link's target NAME. That is not the content of the file it points at.
     if (entry.mode === SYMLINK_MODE) return { ok: false, reason: `${path} is a symbolic link; its blob is the link target, not file content` };
+    if (entry.size < 0) return { ok: false, reason: `${path} is tracked but its blob ${entry.id.slice(0, 12)} is missing from the repository` };
     if (entry.size > maxBytes) return { ok: false, reason: `${path} is ${entry.size} bytes, over the ${maxBytes}-byte limit for reading it` };
     let buf = this.blobs.get(entry.id);
     if (!buf) {

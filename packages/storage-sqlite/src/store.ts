@@ -586,7 +586,14 @@ export class WorkStore {
   }
 
   /** Claims of one repository, in the order each claim id was first stored (re-saving an id does not move it). `statuses` / `section` / `commit` narrow the list. */
-  listClaims(repoPath: string, filter: { statuses?: readonly ClaimStatus[]; section?: string; commit?: string } = {}): StoredClaim[] {
+  /**
+   * Claims of one repository. Optional `limit` / `afterId` page by claim id so a transition can process a bounded batch
+   * without loading every payload at once. `afterId` is exclusive; the next page starts after that id (lexicographic).
+   */
+  listClaims(
+    repoPath: string,
+    filter: { statuses?: readonly ClaimStatus[]; section?: string; commit?: string; limit?: number; afterId?: string } = {},
+  ): StoredClaim[] {
     const where = ['repo_path = ?'];
     const args: string[] = [repoPath];
     if (filter.section !== undefined) {
@@ -604,7 +611,16 @@ export class WorkStore {
       where.push(`status IN (${statuses.map(() => '?').join(', ')})`);
       args.push(...statuses);
     }
-    const rows = this.db.prepare(`SELECT ${CLAIM_COLUMNS} FROM claims WHERE ${where.join(' AND ')} ORDER BY rowid ASC`).all(...args) as ClaimRow[];
+    if (filter.afterId !== undefined) {
+      where.push('id > ?');
+      args.push(filter.afterId);
+    }
+    let sql = `SELECT ${CLAIM_COLUMNS} FROM claims WHERE ${where.join(' AND ')} ORDER BY id ASC`;
+    if (filter.limit !== undefined) {
+      if (!Number.isInteger(filter.limit) || filter.limit < 1) throw new Error('listClaims limit must be a positive integer');
+      sql += ` LIMIT ${filter.limit}`;
+    }
+    const rows = this.db.prepare(sql).all(...args) as ClaimRow[];
     return rows.map((r) => this.parseClaimRow(r));
   }
 

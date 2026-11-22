@@ -170,20 +170,30 @@ export function reverifyOnCommit(store: WorkStore, repoRoot: string, repoPath: s
     if (elsewhere.length) {
       throw new Error(`published claims sit at commit ${elsewhere[0]}, not ${prev}; carry them to ${prev} first so the frontier does not move past them unchecked`);
     }
-    const claims = store.listClaims(repoPath, { statuses: PUBLISHED_CLAIM_STATUSES, commit: prev });
-    // Compared by what the tree holds (object id and type), not by `git diff`: a mode-only change does not change the
-    // blob, and a diff over thousands of cited paths would overflow the command line.
+    // Bounded pages: a repository with tens of thousands of claims must not load every payload before any work starts.
+    const PAGE = 64;
     const before = new CommitReader(repoRoot, prev);
-    const changed = new Set<string>();
-    for (const c of claims) {
-      for (const e of c.claim.evidence) {
-        const a = before.entry(e.path);
-        const b = reader.entry(e.path);
-        // A regular file turned into a symlink keeps its blob id (the target name) but no longer has that content.
-        if (!a || !b || a.id !== b.id || a.type !== b.type || (a.mode === SYMLINK_MODE) !== (b.mode === SYMLINK_MODE)) changed.add(e.path);
-      }
-    }
     const sections = new Set<string>();
+    let afterId: string | undefined;
+    for (;;) {
+      const claims = store.listClaims(repoPath, {
+        statuses: PUBLISHED_CLAIM_STATUSES,
+        commit: prev,
+        limit: PAGE,
+        ...(afterId === undefined ? {} : { afterId }),
+      });
+      if (!claims.length) break;
+      // Compared by what the tree holds (object id and type), not by `git diff`: a mode-only change does not change the
+      // blob, and a diff over thousands of cited paths would overflow the command line.
+      const changed = new Set<string>();
+      for (const c of claims) {
+        for (const e of c.claim.evidence) {
+          const a = before.entry(e.path);
+          const b = reader.entry(e.path);
+          // A regular file turned into a symlink keeps its blob id (the target name) but no longer has that content.
+          if (!a || !b || a.id !== b.id || a.type !== b.type || (a.mode === SYMLINK_MODE) !== (b.mode === SYMLINK_MODE)) changed.add(e.path);
+        }
+      }
 
     for (const stored of claims) {
       const { claim } = stored;
@@ -212,6 +222,9 @@ export function reverifyOnCommit(store: WorkStore, repoRoot: string, repoPath: s
       }
       store.saveClaim({ repoPath, claim: rebind(reader, claim), status: 'verified', reason: clip(v.reason) });
       result.kept.push(claim.id);
+      }
+      afterId = claims[claims.length - 1]!.claim.id;
+      if (claims.length < PAGE) break;
     }
     result.sections = [...sections].sort();
     // The frontier moves forward only, and also when the transition withdrew the last published claim.
