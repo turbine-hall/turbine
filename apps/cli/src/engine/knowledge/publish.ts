@@ -3,7 +3,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
-  readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -14,7 +13,7 @@ import { PUBLISHED_CLAIM_STATUSES, err, type BriefState, type RepoSnapshot } fro
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import { resolveCommit } from '../context/git-read.js';
 import { HeadMovedError, ensureContextIgnored, withContextPublishLock } from '../context/render.js';
-import { knowledgePaths } from './paths.js';
+import { knowledgePaths, readBoundedUtf8, resolvePhysical, MAX_BUNDLE_FILE_BYTES, MAX_MARKER_BYTES } from './paths.js';
 import { bundleContentHash, renderBundle, type BundleFiles } from './render.js';
 import { validateBundle } from './validate.js';
 import { splitFrontmatter } from './frontmatter.js';
@@ -42,6 +41,7 @@ export function publishKnowledgeBundle(input: {
   projectName: string;
   license?: string;
 }): PublishKnowledgeResult {
+  recoverInterruptedSwap(input.projectRoot);
   const head = resolveCommit(input.repoRoot, 'HEAD');
   if (!head) throw err('E_CONTEXT_UNAVAILABLE', 'HEAD does not resolve to a commit');
   if (head !== input.snapshot.commit) {
@@ -115,16 +115,20 @@ export function publishKnowledgeBundle(input: {
         throw new HeadMovedError('HEAD changed before the knowledge bundle was published; nothing was published. Run again.');
       }
 
-      // Swap: move old aside, move staging in, remove aside.
+      // Swap with recoverable aside: persist swap state before moving the live tree.
       const aside = `${paths.dir}.aside.${process.pid}`;
+      const swapFile = knowledgePaths(input.projectRoot).swapState;
+      writeFileSync(swapFile, `${JSON.stringify({ aside, staging, dir: paths.dir }, null, 2)}\n`, 'utf8');
       if (existsSync(paths.dir)) renameSync(paths.dir, aside);
       try {
         renameSync(staging, paths.dir);
       } catch (e) {
         if (existsSync(aside)) renameSync(aside, paths.dir);
+        rmSync(swapFile, { force: true });
         throw e;
       }
       rmSync(aside, { recursive: true, force: true });
+      rmSync(swapFile, { force: true });
       ensureContextIgnored(input.projectRoot);
       return {
         commit: head,
@@ -173,8 +177,13 @@ function readExistingBundle(dir: string): Map<string, string> {
       if (st.isDirectory()) walk(child, childRel);
       else if (st.isFile() && name.endsWith('.md')) {
         try {
-          out.set(childRel, readFileSync(child, 'utf8'));
+          const text = readBoundedUtf8(child, MAX_BUNDLE_FILE_BYTES);
+          if (text === undefined) {
+            throw err('E_CONTEXT_UNAVAILABLE', `cannot read previous knowledge file ${childRel}; leaving the live bundle unchanged`);
+          }
+          out.set(childRel, text);
         } catch (e) {
+          if (e instanceof Error && e.name === 'TurbineError') throw e;
           throw err(
             'E_CONTEXT_UNAVAILABLE',
             `cannot read previous knowledge file ${childRel} (${(e as Error).message}); leaving the live bundle unchanged`,
@@ -189,14 +198,37 @@ function readExistingBundle(dir: string): Map<string, string> {
 
 function readBundleMarker(dir: string): { commit: string; hash: string; snapshot: string } | undefined {
   const file = join(dir, '.turbine-bundle.json');
-  if (!existsSync(file)) return undefined;
   try {
-    const raw = JSON.parse(readFileSync(file, 'utf8')) as { commit?: string; hash?: string; snapshot?: string };
+    const text = readBoundedUtf8(file, MAX_MARKER_BYTES);
+    if (text === undefined) return undefined;
+    const raw = JSON.parse(text) as { commit?: string; hash?: string; snapshot?: string };
     if (raw.commit && raw.hash && raw.snapshot) return { commit: raw.commit, hash: raw.hash, snapshot: raw.snapshot };
   } catch {
     return undefined;
   }
   return undefined;
+}
+
+function recoverInterruptedSwap(projectRoot: string): void {
+  const paths = knowledgePaths(projectRoot);
+  if (!existsSync(paths.swapState)) return;
+  try {
+    const raw = JSON.parse(readBoundedUtf8(paths.swapState, MAX_MARKER_BYTES) ?? '') as {
+      aside?: string;
+      dir?: string;
+    };
+    if (!raw.dir || !raw.aside) {
+      rmSync(paths.swapState, { force: true });
+      return;
+    }
+    if (!existsSync(raw.dir) && existsSync(raw.aside)) {
+      renameSync(raw.aside, raw.dir);
+    }
+  } catch {
+    // leave state for a human; do not delete blindly
+    return;
+  }
+  rmSync(paths.swapState, { force: true });
 }
 
 function bundleOnDiskMatches(dir: string, files: BundleFiles): boolean {
@@ -205,7 +237,8 @@ function bundleOnDiskMatches(dir: string, files: BundleFiles): boolean {
     const abs = join(dir, rel);
     if (!existsSync(abs)) return false;
     try {
-      const disk = readFileSync(abs, 'utf8');
+      const disk = readBoundedUtf8(abs, MAX_BUNDLE_FILE_BYTES);
+      if (disk === undefined) return false;
       const want = body.endsWith('\n') ? body : `${body}\n`;
       if (disk !== want) return false;
     } catch {
@@ -230,6 +263,26 @@ function listRecentWithdrawals(
 /**
  * Preserve unknown frontmatter keys from a previous on-disk concept by editing the YAML Document in place.
  */
+const RENDERER_OWNED_KEYS = new Set([
+  'type',
+  'title',
+  'description',
+  'resource',
+  'tags',
+  'sources',
+  'usage_window',
+  'generated',
+  'verified',
+  'status',
+  'superseded_by',
+  'stale_after',
+  'okf_version',
+  'license',
+  'x-turbine-commit',
+  'x-turbine-blob',
+  'x-turbine-profile',
+]);
+
 function mergeUnknownKeys(files: BundleFiles, previous: Map<string, string>): void {
   for (const [rel, body] of files) {
     const prev = previous.get(rel);
@@ -237,13 +290,13 @@ function mergeUnknownKeys(files: BundleFiles, previous: Map<string, string>): vo
     const prevSplit = splitFrontmatter(prev);
     const nextSplit = splitFrontmatter(body);
     if (!prevSplit.ok || !nextSplit.ok) continue;
-    const known = new Set(Object.keys(nextSplit.data));
     const extras: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(prevSplit.data)) {
-      if (!known.has(k)) extras[k] = v;
+      if (RENDERER_OWNED_KEYS.has(k)) continue; // never restore omitted generated/verified/etc.
+      if (k in nextSplit.data) continue;
+      extras[k] = v;
     }
     if (!Object.keys(extras).length) continue;
-    // Rebuild frontmatter with extras appended, keeping generated values from the new render.
     try {
       const doc = parseDocument(nextSplit.raw, { uniqueKeys: true, schema: 'core', version: '1.2' });
       if (!isMap(doc.contents)) continue;
@@ -268,43 +321,52 @@ export function exportKnowledgeBundle(input: {
   if (!existsSync(source)) throw err('E_NOT_FOUND', 'No knowledge bundle; run: turbine understand');
   assertSafeExportTarget(input.targetDir, input.projectRoot, source);
 
-  const issues = validateBundle(source);
-  const errors = issues.filter((i) => i.level === 'error');
-  if (errors.length) {
-    throw err('E_CONTEXT_UNAVAILABLE', `source bundle is invalid; fix with turbine understand: ${errors[0]!.message}`);
-  }
-
-  const files = readExistingBundle(source);
-  const absTarget = resolve(input.targetDir);
-  const stagingParent = dirname(absTarget);
-  mkdirSync(stagingParent, { recursive: true });
-  const staging = mkdtempSync(join(stagingParent, '.turbine-knowledge-export-'));
-  try {
-    writeTree(staging, files);
-    if (existsSync(absTarget)) {
-      const entries = readdirSync(absTarget);
-      if (entries.length && !input.force) {
-        throw err('E_INVALID_CONFIG', `export target ${input.targetDir} is not empty; pass --force to replace`);
-      }
-      if (input.force) {
-        const aside = `${absTarget}.aside.${process.pid}`;
-        renameSync(absTarget, aside);
-        try {
-          renameSync(staging, absTarget);
-        } catch (e) {
-          if (existsSync(aside)) renameSync(aside, absTarget);
-          throw e;
-        }
-        rmSync(aside, { recursive: true, force: true });
-        return { targetDir: absTarget, files: files.size };
-      }
+  return withContextPublishLock(input.projectRoot, () => {
+    const issues = validateBundle(source);
+    const errors = issues.filter((i) => i.level === 'error');
+    if (errors.length) {
+      throw err('E_CONTEXT_UNAVAILABLE', `source bundle is invalid; fix with turbine understand: ${errors[0]!.message}`);
     }
-    renameSync(staging, absTarget);
-    return { targetDir: absTarget, files: files.size };
-  } catch (e) {
-    rmSync(staging, { recursive: true, force: true });
-    throw e;
-  }
+
+    const files = readExistingBundle(source);
+    const absTarget = resolvePhysical(resolve(input.targetDir));
+    // Re-check after physical resolution (symlink parents).
+    assertSafeExportTarget(absTarget, input.projectRoot, source);
+
+    const stagingParent = dirname(absTarget);
+    mkdirSync(stagingParent, { recursive: true });
+    const staging = mkdtempSync(join(stagingParent, '.turbine-knowledge-export-'));
+    try {
+      writeTree(staging, files);
+      const stagedIssues = validateBundle(staging).filter((i) => i.level === 'error');
+      if (stagedIssues.length) {
+        throw err('E_CONTEXT_UNAVAILABLE', `staged export failed validation: ${stagedIssues[0]!.message}`);
+      }
+      if (existsSync(absTarget)) {
+        const entries = readdirSync(absTarget);
+        if (entries.length && !input.force) {
+          throw err('E_INVALID_CONFIG', `export target ${input.targetDir} is not empty; pass --force to replace`);
+        }
+        if (input.force) {
+          const aside = `${absTarget}.aside.${process.pid}`;
+          renameSync(absTarget, aside);
+          try {
+            renameSync(staging, absTarget);
+          } catch (e) {
+            if (existsSync(aside)) renameSync(aside, absTarget);
+            throw e;
+          }
+          rmSync(aside, { recursive: true, force: true });
+          return { targetDir: absTarget, files: files.size };
+        }
+      }
+      renameSync(staging, absTarget);
+      return { targetDir: absTarget, files: files.size };
+    } catch (e) {
+      rmSync(staging, { recursive: true, force: true });
+      throw e;
+    }
+  });
 }
 
 function assertSafeExportTarget(target: string, projectRoot: string, sourceDir: string): void {
@@ -313,22 +375,23 @@ function assertSafeExportTarget(target: string, projectRoot: string, sourceDir: 
   const parts = target.replace(/\\/g, '/').split('/');
   if (parts.some((p) => p === '..')) throw err('E_INVALID_CONFIG', 'export target must not contain ".."');
 
-  const absTarget = resolve(target);
-  const absSource = resolve(sourceDir);
-  const absProject = resolve(projectRoot);
-  const absTurbine = resolve(projectRoot, '.turbine');
+  const absTarget = resolvePhysical(resolve(target));
+  const absSource = resolvePhysical(resolve(sourceDir));
+  const absProject = resolvePhysical(resolve(projectRoot));
+  const absTurbine = resolvePhysical(resolve(projectRoot, '.turbine'));
   const under = (parent: string, child: string) => child === parent || child.startsWith(parent.endsWith('/') ? parent : `${parent}/`);
   if (
     absTarget === absSource ||
     under(absTarget, absSource) ||
     under(absSource, absTarget) ||
-    absTarget === absProject ||
-    absTarget === absTurbine ||
-    under(absTarget, absTurbine)
+    under(absProject, absTarget) ||
+    under(absTarget, absProject) ||
+    under(absTarget, absTurbine) ||
+    under(absTurbine, absTarget)
   ) {
     throw err(
       'E_INVALID_CONFIG',
-      'export target must not be the live knowledge bundle, .turbine/, the project root, or an ancestor/descendant of those paths',
+      'export target must be outside the project (and must not overlap the live knowledge bundle or .turbine/)',
     );
   }
 }

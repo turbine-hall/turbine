@@ -16,7 +16,7 @@ import { approveBrief, attestClaim } from './engine/context/brief-approve.js';
 import { renderClaimBullet } from './engine/context/brief-render.js';
 import { validateBundle, lintKnowledgeBundle } from './engine/knowledge/validate.js';
 import { exportKnowledgeBundle, lintKnowledgeHandEdits } from './engine/knowledge/publish.js';
-import { knowledgePaths } from './engine/knowledge/paths.js';
+import { knowledgePaths, readBoundedUtf8, MAX_BUNDLE_FILE_BYTES } from './engine/knowledge/paths.js';
 import { splitFrontmatter } from './engine/knowledge/frontmatter.js';
 import { Engine } from './engine/engine.js';
 import { initProject, openContext } from './engine/project.js';
@@ -220,7 +220,11 @@ knowledgeCmd
     try {
       const cwd = callerCwd();
       const root = findProjectRoot(cwd);
-      const target = dir ?? (root ? knowledgePaths(root).dir : undefined);
+      const target = dir
+        ? (dir.startsWith('/') ? dir : join(cwd, dir))
+        : root
+          ? knowledgePaths(root).dir
+          : undefined;
       if (!target) throw err('E_INVALID_CONFIG', `No .turbine project found from ${cwd}. Run: turbine init --project .`);
       const issues = validateBundle(target);
       if (opts.json) printResult(issues, true);
@@ -228,7 +232,7 @@ knowledgeCmd
       else {
         for (const i of issues) process.stdout.write(`${i.level}: ${i.file}: ${i.message}\n`);
       }
-      if (issues.some((i) => i.level === 'error')) process.exit(3);
+      if (issues.some((i) => i.level === 'error')) process.exitCode = 3;
     } catch (e) {
       handleError(e);
     }
@@ -243,7 +247,9 @@ knowledgeCmd
     try {
       const ctx = openContext();
       try {
-        const result = exportKnowledgeBundle({ projectRoot: ctx.projectRoot, targetDir: dir, force: !!opts.force });
+        const cwd = callerCwd();
+        const targetDir = dir.startsWith('/') ? dir : join(cwd, dir);
+        const result = exportKnowledgeBundle({ projectRoot: ctx.projectRoot, targetDir, force: !!opts.force });
         printResult(result, false);
       } finally {
         ctx.store.close();
@@ -275,7 +281,15 @@ knowledgeCmd
           if (st.isDirectory()) walk(child, childRel);
           else if (st.isFile() && name.endsWith('.md') && name !== 'index.md' && name !== 'log.md' && name !== 'README.md') {
             if (concept && childRel !== concept && !childRel.endsWith(`/${concept}`)) continue;
-            const text = readFileSync(child, 'utf8');
+            let text: string;
+            try {
+              const body = readBoundedUtf8(child, MAX_BUNDLE_FILE_BYTES);
+              if (body === undefined) continue;
+              text = body;
+            } catch (e) {
+              rows.push({ path: childRel, trust: `unreadable:${(e as Error).message}` });
+              continue;
+            }
             const split = splitFrontmatter(text);
             if (!split.ok || typeof split.data.type !== 'string') continue;
             rows.push({

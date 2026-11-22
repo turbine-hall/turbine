@@ -299,8 +299,8 @@ describe('AC: failed validation or HEAD move publishes nothing', () => {
     const store = openStore();
     await understand(dir, store);
     expect(() => exportKnowledgeBundle({ projectRoot: dir, targetDir: 'foo/../../etc' })).toThrow(/\.\./);
-    const target = join(dir, 'export-out');
-    mkdirSync(target);
+    const target = mkdtempSync(join(tmpdir(), 'turbine-okf-export-'));
+    dirs.push(target);
     writeFileSync(join(target, 'keep.txt'), 'x');
     expect(() => exportKnowledgeBundle({ projectRoot: dir, targetDir: target })).toThrow(/not empty/);
     const ok = exportKnowledgeBundle({ projectRoot: dir, targetDir: target, force: true });
@@ -422,9 +422,10 @@ describe('CR regression: validate/export/render hardening', () => {
     const dir = newRepo();
     const store = openStore();
     await understand(dir, store);
-    expect(() => exportKnowledgeBundle({ projectRoot: dir, targetDir: knowledgePaths(dir).dir, force: true })).toThrow(/live knowledge|overlap|ancestor/i);
-    const target = join(dir, 'share-out');
-    mkdirSync(target);
+    expect(() => exportKnowledgeBundle({ projectRoot: dir, targetDir: knowledgePaths(dir).dir, force: true })).toThrow(/outside the project|live knowledge|overlap/i);
+    expect(() => exportKnowledgeBundle({ projectRoot: dir, targetDir: join(dir, 'inside-export'), force: true })).toThrow(/outside the project/i);
+    const target = mkdtempSync(join(tmpdir(), 'turbine-okf-share-'));
+    dirs.push(target);
     writeFileSync(join(target, 'old.md'), 'keep\n');
     // Corrupt the source so validation fails; target must remain.
     writeFileSync(join(knowledgePaths(dir).dir, 'project/overview.md'), '# broken\n');

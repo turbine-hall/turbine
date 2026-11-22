@@ -12,7 +12,7 @@ import {
   type StoredClaim,
   type UnconfirmedItem,
 } from '@turbine-hall/turbine-contracts';
-import { shouldQuoteOkfString, splitFrontmatter } from './frontmatter.js';
+import { shouldQuoteOkfString } from './frontmatter.js';
 
 export type BundleFiles = Map<string, string>;
 
@@ -334,8 +334,11 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
       continue; // unsafe name skipped — never invent a path
     }
     const entries = snapshot.facts.filter((f) => f.category === 'entry-point' && f.source.path.startsWith(pkg.source.path.replace(/package\.json$/, '') || ''));
-    const scripts = snapshot.facts.filter((f) => f.category === 'script' && (f.data as { workspace?: string } | undefined)?.workspace === ((pkg.data as { workspace?: string })?.workspace ?? '.'));
-    const deps = snapshot.dependencies.filter((d) => d.workspace === ((pkg.data as { workspace?: string })?.workspace ?? '.') || d.workspace === name);
+    const pkgDir = String((pkg.data as { dir?: string } | undefined)?.dir ?? '.');
+    const scripts = snapshot.facts.filter(
+      (f) => f.category === 'script' && String((f.data as { dir?: string } | undefined)?.dir ?? '.') === pkgDir,
+    );
+    const deps = snapshot.dependencies.filter((d) => d.workspace === pkgDir || d.workspace === name);
     const s = factSource(pkg, 'pkg');
     const sources = [s];
     const body = [
@@ -569,20 +572,29 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
 
   // --- log.md ---
   const today = utcDateFromCommit(commit);
+  const prev = (input.previousLogBody ?? '').replace(/^\s*# Directory Update Log\s*/i, '').trimStart();
+  const prevWithoutToday = stripLogDay(prev, today, commit);
+  const alreadyLogged = new Set<string>();
+  for (const m of prevWithoutToday.matchAll(/Claim `([^`]+)` removed/g)) alreadyLogged.add(m[1]!);
   const logEntries: string[] = [];
-  if (withdrawn.length) {
-    for (const w of withdrawn) {
-      logEntries.push(`* **Withdrawal**: Claim \`${w.id}\` removed from brief section \`${w.section}\`: ${oneLine(w.reason)}`);
-    }
+  for (const w of withdrawn) {
+    if (alreadyLogged.has(w.id)) continue;
+    logEntries.push(`* **Withdrawal**: Claim \`${w.id}\` removed from brief section \`${w.section}\`: ${oneLine(w.reason)}`);
   }
   logEntries.push(
     `* **Update**: Knowledge bundle rebuilt for commit \`${commit.slice(0, 12)}\` (snapshot \`${snapshot.hash.replace(/^sha256:/, '').slice(0, 8)}\`).`,
   );
   const newBlock = [`## ${today}`, ...logEntries, ''].join('\n');
-  const prev = (input.previousLogBody ?? '').replace(/^\s*# Directory Update Log\s*/i, '').trimStart();
-  // Drop an existing same-day header for this commit rebuild to keep idempotent same-commit output:
-  const prevWithoutToday = stripLogDay(prev, today, commit);
-  files.set('log.md', [`# Directory Update Log`, '', newBlock, prevWithoutToday].join('\n').replace(/\n+$/, '\n'));
+  let history = prevWithoutToday;
+  const maxLog = 400 * 1024;
+  let combined = [`# Directory Update Log`, '', newBlock, history].join('\n');
+  while (Buffer.byteLength(combined, 'utf8') > maxLog && history.trim()) {
+    const cut = history.lastIndexOf('\n## ');
+    history = cut >= 0 ? history.slice(0, cut).replace(/\n+$/, '\n') : '';
+    combined = [`# Directory Update Log`, '', newBlock, history].join('\n');
+  }
+  files.set('log.md', combined.replace(/\n+$/, '\n'));
+
 
   return files;
 }
@@ -635,7 +647,6 @@ function conceptFile(input: {
 }): string {
   void input.contentKey;
   const prevAt = extractGeneratedAt(input.previous);
-  const prevUnknown = extractUnknownKeys(input.previous);
   const contentChanged = !input.previous || extractBody(input.previous) !== input.body || extractTitle(input.previous) !== input.title;
   const at = generatedAtFor(prevAt, contentChanged);
   const fm: Record<string, unknown> = {
@@ -660,10 +671,7 @@ function conceptFile(input: {
       fm.verified = { by: input.verifyBy, at };
     }
   }
-  // Preserve unknown keys from a previous hand-edited file (OKF §4.1).
-  for (const [k, v] of Object.entries(prevUnknown)) {
-    if (!(k in fm)) fm[k] = v;
-  }
+  // Extension keys are preserved at publish time via the YAML Document API (OKF §4.1).
   return `${emitFrontmatter(fm)}\n${input.body}`;
 }
 
@@ -701,33 +709,6 @@ function extractBody(file?: string): string | undefined {
   return file.slice(idx + 5);
 }
 
-function extractUnknownKeys(file?: string): Record<string, unknown> {
-  if (!file) return {};
-  const split = splitFrontmatter(file);
-  if (!split.ok) return {};
-  const reserved = new Set([
-    'type',
-    'title',
-    'description',
-    'resource',
-    'tags',
-    'sources',
-    'usage_window',
-    'generated',
-    'verified',
-    'status',
-    'superseded_by',
-    'stale_after',
-    'x-turbine-commit',
-    'x-turbine-blob',
-    'x-turbine-profile',
-  ]);
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(split.data)) {
-    if (!reserved.has(k)) out[k] = v;
-  }
-  return out;
-}
 
 function utcDateFromCommit(commit: string): string {
   // Stable date from commit id so same commit → same log heading.

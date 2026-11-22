@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import {
   OKF_VERSION,
@@ -17,7 +17,7 @@ import {
 } from '@turbine-hall/turbine-contracts';
 import type { LintIssue } from '../docs/lint.js';
 import { splitFrontmatter } from './frontmatter.js';
-import { MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_FILES, knowledgePaths } from './paths.js';
+import { MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_FILES, knowledgePaths, readBoundedUtf8 } from './paths.js';
 
 const FOOTNOTE_REF = /\[\^([^\]\s]+)\]/g;
 const FOOTNOTE_DEF = /^\[\^([^\]\s]+)\]:/gm;
@@ -59,6 +59,7 @@ export function validateBundle(dir: string): KnowledgeIssue[] {
     validateLog(rootReal, 'log.md', issues);
   }
 
+  const indexCommit = readIndexCommit(rootReal, issues);
   const seenConceptPaths = new Set<string>();
   for (const rel of [...files].sort()) {
     if (RESERVED.has(rel.split('/').pop()!)) continue;
@@ -68,7 +69,7 @@ export function validateBundle(dir: string): KnowledgeIssue[] {
     }
     if (!rel.endsWith('.md')) continue;
     if (rel.split('/').some((p) => p.startsWith('.'))) continue;
-    validateConcept(rootReal, rel, issues, seenConceptPaths);
+    validateConcept(rootReal, rel, issues, seenConceptPaths, indexCommit);
   }
 
   // Required fixed-layout files for a complete Turbine bundle: path exists AND is the expected concept type.
@@ -110,7 +111,22 @@ export function validateBundle(dir: string): KnowledgeIssue[] {
 
 function listBundleFiles(root: string, issues: KnowledgeIssue[]): Set<string> {
   const out = new Set<string>();
+  let visited = 0;
   let overflow = false;
+  const visit = (rel: string) => {
+    visited += 1;
+    if (visited > MAX_BUNDLE_FILES) {
+      overflow = true;
+      issues.push({
+        level: 'error',
+        file: rel || '.',
+        message: `bundle has more than ${MAX_BUNDLE_FILES} entries`,
+        code: 'too-many-files',
+      });
+      return false;
+    }
+    return true;
+  };
   const walk = (abs: string, relBase: string) => {
     if (overflow) return;
     let entries: string[];
@@ -125,6 +141,7 @@ function listBundleFiles(root: string, issues: KnowledgeIssue[]): Set<string> {
       if (name.startsWith('.')) continue; // outside the bundle (OKF §3.2)
       const absChild = join(abs, name);
       const rel = relBase ? `${relBase}/${name}` : name;
+      if (!visit(rel)) return;
       let st;
       try {
         st = lstatSync(absChild);
@@ -137,19 +154,7 @@ function listBundleFiles(root: string, issues: KnowledgeIssue[]): Set<string> {
         continue;
       }
       if (st.isDirectory()) walk(absChild, rel);
-      else if (st.isFile()) {
-        if (out.size >= MAX_BUNDLE_FILES) {
-          overflow = true;
-          issues.push({
-            level: 'error',
-            file: rel,
-            message: `bundle has more than ${MAX_BUNDLE_FILES} files`,
-            code: 'too-many-files',
-          });
-          return;
-        }
-        out.add(rel);
-      }
+      else if (st.isFile()) out.add(rel);
     }
   };
   walk(root, '');
@@ -158,7 +163,6 @@ function listBundleFiles(root: string, issues: KnowledgeIssue[]): Set<string> {
 
 function readBounded(root: string, rel: string, issues: KnowledgeIssue[]): string | undefined {
   const abs = join(root, rel);
-  // Path validation: stay under root; no .. escape.
   const resolved = resolve(abs);
   if (resolved !== root && !resolved.startsWith(root + sep)) {
     issues.push({ level: 'error', file: rel, message: 'path escapes the bundle root', code: 'path-escape' });
@@ -170,18 +174,24 @@ function readBounded(root: string, rel: string, issues: KnowledgeIssue[]): strin
       issues.push({ level: 'error', file: rel, message: 'not a regular file', code: 'not-file' });
       return undefined;
     }
-    if (st.size > MAX_BUNDLE_FILE_BYTES) {
+    const text = readBoundedUtf8(abs, MAX_BUNDLE_FILE_BYTES);
+    if (text === undefined) {
+      issues.push({ level: 'error', file: rel, message: 'cannot read file', code: 'read-error' });
+      return undefined;
+    }
+    return text;
+  } catch (e) {
+    const msg = (e as Error).message;
+    if (msg.startsWith('file-too-large:')) {
       issues.push({
         level: 'error',
         file: rel,
-        message: `file is ${st.size} bytes, over the ${MAX_BUNDLE_FILE_BYTES} byte budget`,
+        message: `file is over the ${MAX_BUNDLE_FILE_BYTES} byte budget`,
         code: 'file-too-large',
       });
       return undefined;
     }
-    return readFileSync(abs, 'utf8');
-  } catch (e) {
-    issues.push({ level: 'error', file: rel, message: `cannot read (${(e as Error).message})`, code: 'read-error' });
+    issues.push({ level: 'error', file: rel, message: `cannot read (${msg})`, code: 'read-error' });
     return undefined;
   }
 }
@@ -238,7 +248,23 @@ function validateReadme(root: string, rel: string, issues: KnowledgeIssue[]): vo
   }
 }
 
-function validateConcept(root: string, rel: string, issues: KnowledgeIssue[], seen: Set<string>): void {
+
+function readIndexCommit(root: string, issues: KnowledgeIssue[]): string | undefined {
+  const text = readBounded(root, 'index.md', issues);
+  if (text === undefined) return undefined;
+  const split = splitFrontmatter(text);
+  if (!split.ok) return undefined;
+  const c = split.data['x-turbine-commit'];
+  return typeof c === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(c) ? c : undefined;
+}
+
+function validateConcept(
+  root: string,
+  rel: string,
+  issues: KnowledgeIssue[],
+  seen: Set<string>,
+  indexCommit: string | undefined,
+): void {
   const text = readBounded(root, rel, issues);
   if (text === undefined) return;
   const split = splitFrontmatter(text);
@@ -323,6 +349,14 @@ function validateConcept(root: string, rel: string, issues: KnowledgeIssue[], se
   const commit = split.data['x-turbine-commit'];
   if (typeof commit !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commit)) {
     issues.push({ level: 'error', file: rel, message: 'x-turbine-commit must be a full git object id', code: 'bad-commit' });
+  }
+  else if (indexCommit && commit !== indexCommit) {
+    issues.push({
+      level: 'error',
+      file: rel,
+      message: `x-turbine-commit ${commit.slice(0, 12)} does not match index commit ${indexCommit.slice(0, 12)}`,
+      code: 'commit-mismatch',
+    });
   }
 
   // status: unknown is not stable
@@ -420,11 +454,13 @@ function validateSourcesAndFootnotes(
       // A ref that is only a definition marker: FOOTNOTE_REF matches [^id] in [^id]: too
     }
   }
-  // Claim bullets (lines starting with `- ` that are not footnotes) must have a footnote.
+  // Claim bullets must cite a source footnote. Strip inline code so `[^{...}]` inside ticks is ignored.
   for (const line of body.split('\n')) {
     if (!/^\s*-\s+\S/.test(line)) continue;
-    if (/^\s*-\s+\[/.test(line) && line.includes('](')) continue; // index-style links
-    const footnotes = [...line.matchAll(FOOTNOTE_REF)].map((m) => m[1]!);
+    const stripped = line.replace(/`[^`]*`/g, '')
+    // Pure navigation links (only a markdown link, no claim text) are allowed without footnotes.
+    if (/^\s*-\s+\[[^\]]+\]\([^)]+\)\s*$/.test(stripped)) continue;
+    const footnotes = [...stripped.matchAll(FOOTNOTE_REF)].map((m) => m[1]!);
     if (!footnotes.length) {
       issues.push({
         level: 'error',
