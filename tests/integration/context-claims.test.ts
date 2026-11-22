@@ -2499,6 +2499,14 @@ describe('review round 11 (PR #12): findings from the tenth local CodeRabbit rev
     expect(publishClaim(openStore(), good, good, claim({ kind: 'imports', evidence: [ev(good, cg, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } })).published).toBe(true);
   });
 
+  it('a .cjs file may use a top-level return; its require still verifies', () => {
+    const d = newRepo({ 'load.cjs': "const path = require('node:path');\nreturn path;\n" });
+    const c = head(d);
+    expect(
+      publishClaim(openStore(), d, d, claim({ kind: 'imports', evidence: [ev(d, c, 'load.cjs', 1)], verifier: { kind: 'imports', from: 'load.cjs', specifier: 'node:path' } })).published,
+    ).toBe(true);
+  });
+
   it('a transition refuses to move the frontier past a published claim at another commit', () => {
     const dir = newRepo();
     const a = head(dir);

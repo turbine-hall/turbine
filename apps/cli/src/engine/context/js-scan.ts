@@ -65,6 +65,13 @@ export function jsxFile(path: string): boolean {
   return !/\.[cm]?ts$/.test(path);
 }
 
+/** `.cjs` is CommonJS: Node allows a top-level `return`. Other extensions are parsed as modules. */
+export function commonjsFile(path: string): boolean {
+  return /\.cjs$/i.test(path);
+}
+
+export type ScanOpts = { jsx?: boolean; commonjs?: boolean };
+
 export type ParsedSource =
   | { ok: true; ts: typeof TS; sf: TS.SourceFile; source: string; lineAt: (pos: number) => number }
   | { ok: false; reason: string };
@@ -74,9 +81,11 @@ export type ParsedSource =
  * `{ ok: false }`: a partial parse is never handed on. `lineAt` maps a character offset to a 1-based line (LF, CRLF
  * and bare CR all end a line).
  */
-export function parseSource(input: string, opts: { jsx: boolean } = { jsx: true }): ParsedSource {
+export function parseSource(input: string, opts: ScanOpts = { jsx: true }): ParsedSource {
   const ts = loadTs();
   const s = input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
+  const jsx = opts.jsx !== false;
+  const allowTopLevelReturn = opts.commonjs === true;
 
   const lineStarts = [0];
   for (let i = 0; i < s.length; i++) {
@@ -100,7 +109,10 @@ export function parseSource(input: string, opts: { jsx: boolean } = { jsx: true 
 
   let sf: TS.SourceFile;
   try {
-    sf = ts.createSourceFile(opts.jsx ? 'module.tsx' : 'module.ts', s, ts.ScriptTarget.Latest, true, opts.jsx ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+    // Name the file `.cjs` when CommonJS so the parser applies that format; otherwise keep the module/TSX names.
+    const fileName = allowTopLevelReturn ? 'module.cjs' : jsx ? 'module.tsx' : 'module.ts';
+    const kind = allowTopLevelReturn ? ts.ScriptKind.JS : jsx ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+    sf = ts.createSourceFile(fileName, s, ts.ScriptTarget.Latest, true, kind);
   } catch (e) {
     // A stack overflow in a deeply nested file is a failure of that file, not of the run.
     if (e instanceof RangeError) return { ok: false, reason: 'the text is nested too deeply to parse' };
@@ -115,12 +127,13 @@ export function parseSource(input: string, opts: { jsx: boolean } = { jsx: true 
   }
   // Control-flow errors the binder reports that parseDiagnostics omit: a `return` outside a function, or a `break` /
   // `continue` that is not enclosed by a valid target. An explicit stack: deep ASTs must not overflow the call stack.
+  // CommonJS (`.cjs`) may use a top-level `return`; modules may not.
   type Ctx = { inFunction: boolean; loops: number; switches: number; labels: ReadonlySet<string>; loopLabels: ReadonlySet<string> };
   let illegal: { node: TS.Node; why: string } | undefined;
   const todo: Array<{ n: TS.Node; ctx: Ctx }> = [{ n: sf, ctx: { inFunction: false, loops: 0, switches: 0, labels: new Set(), loopLabels: new Set() } }];
   while (todo.length && !illegal) {
     const { n, ctx } = todo.pop()!;
-    if (ts.isReturnStatement(n) && !ctx.inFunction) illegal = { node: n, why: 'a top-level return is not valid in a module' };
+    if (ts.isReturnStatement(n) && !ctx.inFunction && !allowTopLevelReturn) illegal = { node: n, why: 'a top-level return is not valid in a module' };
     else if (ts.isBreakStatement(n) || ts.isContinueStatement(n)) {
       const label = n.label?.text;
       const isContinue = ts.isContinueStatement(n);
@@ -181,7 +194,12 @@ export function parseSource(input: string, opts: { jsx: boolean } = { jsx: true 
   return { ok: true, ts, sf, source: s, lineAt };
 }
 
-export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }): ModuleScan {
+/** Scan options derived from a repository path (JSX vs TS, and CommonJS `.cjs`). */
+export function scanOptsFor(path: string): ScanOpts {
+  return { jsx: jsxFile(path), commonjs: commonjsFile(path) };
+}
+
+export function scanModule(input: string, opts: ScanOpts = { jsx: true }): ModuleScan {
   const parsed = parseSource(input, opts);
   if (!parsed.ok) return parsed;
   const { ts, sf, source: s, lineAt } = parsed;

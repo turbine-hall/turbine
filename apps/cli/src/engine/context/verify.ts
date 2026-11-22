@@ -3,7 +3,7 @@ import { manifestPath, parseClaimSafe } from '@turbine-hall/turbine-contracts';
 import type { AbsencePattern, Claim, ClaimEvidence, ClaimVerifier } from '@turbine-hall/turbine-contracts';
 import { listTreeDetailed, readBlobs, resolveCommit } from './git-read.js';
 import type { TreeEntry } from './git-read.js';
-import { jsxFile, parseSource, scanModule } from './js-scan.js';
+import { parseSource, scanModule, scanOptsFor } from './js-scan.js';
 import { InexactNumber, JsoncLimitError, parseJsonc } from './jsonc.js';
 import type { LineRange } from './jsonc.js';
 
@@ -254,7 +254,7 @@ function verifyExists(reader: CommitReader, claim: Claim, v: Extract<ClaimVerifi
   if (v.symbol === undefined) return pass(`${v.path} is tracked at commit ${reader.commit.slice(0, 12)} (blob ${entry.id.slice(0, 12)})`);
   const t = reader.text(v.path);
   if (!t.ok) return unconfirmed(t.reason);
-  const scan = scanModule(t.text, { jsx: jsxFile(v.path) });
+  const scan = scanModule(t.text, scanOptsFor(v.path));
   if (!scan.ok) return unconfirmed(`${v.path} cannot be parsed: ${scan.reason}`);
   const cited = citedLines(claim, v.path);
   const exported = v.symbol === 'default' ? scan.defaultExports : scan.exports;
@@ -280,7 +280,7 @@ function undecided(scan: { unconfirmedAt: number[]; unreadableAt: number[] }, pa
 function verifyImports(reader: CommitReader, claim: Claim, v: Extract<ClaimVerifier, { kind: 'imports' }>): VerifyResult {
   const t = reader.text(v.from);
   if (!t.ok) return unconfirmed(t.reason);
-  const scan = scanModule(t.text, { jsx: jsxFile(v.from) });
+  const scan = scanModule(t.text, scanOptsFor(v.from));
   // The compiler API decides what is an import. A file that does not parse proves nothing.
   if (!scan.ok) return unconfirmed(`${v.from} cannot be parsed: ${scan.reason}`);
   const cited = citedLines(claim, v.from);
@@ -296,7 +296,7 @@ function verifyImports(reader: CommitReader, claim: Claim, v: Extract<ClaimVerif
 function verifyUse(reader: CommitReader, claim: Claim, path: string, name: string): VerifyResult {
   const t = reader.text(path);
   if (!t.ok) return unconfirmed(t.reason);
-  const scan = scanModule(t.text, { jsx: jsxFile(path) });
+  const scan = scanModule(t.text, scanOptsFor(path));
   if (!scan.ok) return unconfirmed(`${path} cannot be parsed: ${scan.reason}`);
   const cited = citedLines(claim, path);
   const uses = scan.imports.filter((i) => i.specifier === name || i.specifier.startsWith(`${name}/`));
@@ -310,7 +310,7 @@ function verifyUse(reader: CommitReader, claim: Claim, path: string, name: strin
 function verifyCalls(reader: CommitReader, claim: Claim, v: Extract<ClaimVerifier, { kind: 'calls' }>): VerifyResult {
   const t = reader.text(v.path);
   if (!t.ok) return unconfirmed(t.reason);
-  const parsed = parseSource(t.text, { jsx: jsxFile(v.path) });
+  const parsed = parseSource(t.text, scanOptsFor(v.path));
   if (!parsed.ok) return unconfirmed(`${v.path} cannot be parsed: ${parsed.reason}`);
   const { ts, sf, lineAt } = parsed;
   /** `a`, `a.b.c`, `this.x`, `super.x`: the dotted name written at the call. Anything computed has no name. A loop, not recursion: a chain can be tens of thousands of segments long. */
