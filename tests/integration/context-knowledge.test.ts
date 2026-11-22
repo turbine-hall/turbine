@@ -355,7 +355,7 @@ describe('AC: YAML traps and concept naming', () => {
 });
 
 describe('AC: task next points agents to the bundle', () => {
-  it('openFiles include knowledge/index.md when present', async () => {
+  it('openFiles include knowledge/index.md when present and fresh at HEAD', async () => {
     const dir = newRepo();
     const store = openStore();
     await understand(dir, store);
@@ -372,6 +372,70 @@ describe('AC: task next points agents to the bundle', () => {
     });
     expect(step.openFiles).toContain(knowledgePaths(dir).index);
     expect(step.agentPlaybook.join('\n')).toMatch(/knowledge\/index\.md/i);
+  });
+
+  it('omits the knowledge index when the bundle commit is not HEAD', async () => {
+    const dir = newRepo();
+    const store = openStore();
+    await understand(dir, store);
+    writeFileSync(join(dir, 'src/stale.ts'), 'export {};\n');
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-q', '-m', 'move-head');
+    const step = computeNextStep({
+      projectRoot: dir,
+      work: {
+        id: 'work_okf_stale',
+        currentState: 'PLANNING',
+        selectedRoles: [],
+      } as never,
+      defaultBaseBranch: 'staging',
+    });
+    expect(step.openFiles).not.toContain(knowledgePaths(dir).index);
+    expect(step.agentPlaybook.join('\n')).toMatch(/stale|understand/i);
+  });
+});
+
+describe('CR regression: validate/export/render hardening', () => {
+  it('rejects a fixed-path file that is not the required concept type', async () => {
+    const dir = newRepo();
+    const store = openStore();
+    await understand(dir, store);
+    writeFileSync(join(knowledgePaths(dir).dir, 'project/overview.md'), '# just prose\n');
+    expect(validateBundle(knowledgePaths(dir).dir).some((i) => i.code === 'missing-required-concept')).toBe(true);
+  });
+
+  it('rejects a non-string x-turbine-commit and proof bullets when sources are absent', async () => {
+    const dir = newRepo();
+    const store = openStore();
+    await understand(dir, store);
+    const file = join(knowledgePaths(dir).dir, 'project/overview.md');
+    writeFileSync(
+      file,
+      `---\ntype: Turbine Project\ntitle: t\ndescription: d\ngenerated: { by: turbine/0.5.0, at: "2024-01-01T00:00:00Z" }\nx-turbine-commit: 123\n---\n\n# Summary\n\n# Facts\n\n- a fact without citation\n`,
+    );
+    const issues = validateBundle(knowledgePaths(dir).dir);
+    expect(issues.some((i) => i.code === 'bad-commit')).toBe(true);
+    expect(issues.some((i) => i.code === 'missing-footnote')).toBe(true);
+  });
+
+  it('export refuses overlap with the live bundle and validates before replacing', async () => {
+    const dir = newRepo();
+    const store = openStore();
+    await understand(dir, store);
+    expect(() => exportKnowledgeBundle({ projectRoot: dir, targetDir: knowledgePaths(dir).dir, force: true })).toThrow(/live knowledge|overlap|ancestor/i);
+    const target = join(dir, 'share-out');
+    mkdirSync(target);
+    writeFileSync(join(target, 'old.md'), 'keep\n');
+    // Corrupt the source so validation fails; target must remain.
+    writeFileSync(join(knowledgePaths(dir).dir, 'project/overview.md'), '# broken\n');
+    expect(() => exportKnowledgeBundle({ projectRoot: dir, targetDir: target, force: true })).toThrow(/invalid/i);
+    expect(readFileSync(join(target, 'old.md'), 'utf8')).toBe('keep\n');
+  });
+
+  it('okfHumanActor strips spaces so verified.by stays valid', async () => {
+    const { okfHumanActor, OkfActorSchema } = await import('../../packages/contracts/dist/index.js');
+    expect(OkfActorSchema.safeParse(okfHumanActor('Jane Doe')).success).toBe(true);
+    expect(okfHumanActor('Jane Doe')).toBe('human:Jane-Doe');
   });
 });
 

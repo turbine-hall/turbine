@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 export const KNOWLEDGE_DIR = 'knowledge';
@@ -12,6 +13,18 @@ export function knowledgePaths(projectRoot: string) {
     readme: join(dir, 'README.md'),
     marker: join(dir, '.turbine-bundle.json'),
   };
+}
+
+/** Marker commit the live bundle was published for, if readable. */
+export function knowledgeBundleCommit(projectRoot: string): string | undefined {
+  const marker = knowledgePaths(projectRoot).marker;
+  if (!existsSync(marker)) return undefined;
+  try {
+    const raw = JSON.parse(readFileSync(marker, 'utf8')) as { commit?: unknown };
+    return typeof raw.commit === 'string' ? raw.commit : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Byte budget for any single bundle file read back as untrusted input. */

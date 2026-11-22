@@ -71,7 +71,7 @@ export function validateBundle(dir: string): KnowledgeIssue[] {
     validateConcept(rootReal, rel, issues, seenConceptPaths);
   }
 
-  // Required fixed-layout files for a complete Turbine bundle.
+  // Required fixed-layout files for a complete Turbine bundle: path exists AND is the expected concept type.
   for (const profile of TURBINE_OKF_PROFILE_CONCEPTS) {
     if (profile.naming !== 'fixed') continue;
     const path = turbineOkfConceptPath(profile.type);
@@ -82,6 +82,26 @@ export function validateBundle(dir: string): KnowledgeIssue[] {
         message: `required ${profile.type} concept is missing`,
         code: 'missing-required-concept',
       });
+      continue;
+    }
+    const text = readBounded(rootReal, path, issues);
+    if (text === undefined) {
+      issues.push({
+        level: 'error',
+        file: path,
+        message: `required ${profile.type} concept is unreadable`,
+        code: 'missing-required-concept',
+      });
+      continue;
+    }
+    const split = splitFrontmatter(text);
+    if (!split.ok || split.data.type !== profile.type) {
+      issues.push({
+        level: 'error',
+        file: path,
+        message: `required ${profile.type} concept is missing or not a typed concept at this path`,
+        code: 'missing-required-concept',
+      });
     }
   }
 
@@ -90,11 +110,9 @@ export function validateBundle(dir: string): KnowledgeIssue[] {
 
 function listBundleFiles(root: string, issues: KnowledgeIssue[]): Set<string> {
   const out = new Set<string>();
+  let overflow = false;
   const walk = (abs: string, relBase: string) => {
-    if (out.size > MAX_BUNDLE_FILES) {
-      issues.push({ level: 'error', file: relBase || '.', message: `bundle has more than ${MAX_BUNDLE_FILES} files`, code: 'too-many-files' });
-      return;
-    }
+    if (overflow) return;
     let entries: string[];
     try {
       entries = readdirSync(abs);
@@ -103,6 +121,7 @@ function listBundleFiles(root: string, issues: KnowledgeIssue[]): Set<string> {
       return;
     }
     for (const name of entries) {
+      if (overflow) return;
       if (name.startsWith('.')) continue; // outside the bundle (OKF §3.2)
       const absChild = join(abs, name);
       const rel = relBase ? `${relBase}/${name}` : name;
@@ -118,7 +137,19 @@ function listBundleFiles(root: string, issues: KnowledgeIssue[]): Set<string> {
         continue;
       }
       if (st.isDirectory()) walk(absChild, rel);
-      else if (st.isFile()) out.add(rel);
+      else if (st.isFile()) {
+        if (out.size >= MAX_BUNDLE_FILES) {
+          overflow = true;
+          issues.push({
+            level: 'error',
+            file: rel,
+            message: `bundle has more than ${MAX_BUNDLE_FILES} files`,
+            code: 'too-many-files',
+          });
+          return;
+        }
+        out.add(rel);
+      }
     }
   };
   walk(root, '');
@@ -290,7 +321,7 @@ function validateConcept(root: string, rel: string, issues: KnowledgeIssue[], se
     }
   }
   const commit = split.data['x-turbine-commit'];
-  if (typeof commit === 'string' && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commit)) {
+  if (typeof commit !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commit)) {
     issues.push({ level: 'error', file: rel, message: 'x-turbine-commit must be a full git object id', code: 'bad-commit' });
   }
 
@@ -347,13 +378,13 @@ function validateSourcesAndFootnotes(
   issues: KnowledgeIssue[],
 ): void {
   const sources = data.sources;
-  if (sources === undefined) return;
-  if (!Array.isArray(sources)) {
+  // Absent sources still means proof-bearing bullets must not claim footnotes/ids.
+  if (sources !== undefined && !Array.isArray(sources)) {
     issues.push({ level: 'error', file: rel, message: 'sources must be a list', code: 'bad-sources' });
     return;
   }
   const ids = new Set<string>();
-  for (const entry of sources) {
+  for (const entry of sources ?? []) {
     const parsed = OkfSourceEntrySchema.safeParse(entry);
     if (!parsed.success) {
       issues.push({

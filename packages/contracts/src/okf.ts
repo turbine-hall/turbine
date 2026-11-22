@@ -30,6 +30,20 @@ export const OkfActorSchema = z
   .regex(/^([^\s/:]+\/\S+|[A-Za-z][A-Za-z0-9+.-]*:\S+)$/, 'expected an OKF actor (kind/id or scheme:id)');
 export type OkfActor = z.infer<typeof OkfActorSchema>;
 
+/**
+ * Build a `human:<id>` actor that always satisfies {@link OkfActorSchema}.
+ * Whitespace and other illegal id characters become `-`; empty input → `human:unknown`.
+ */
+export function okfHumanActor(name: string): OkfActor {
+  const raw = name.trim().replace(/^human:/i, '');
+  const id = raw
+    .replace(/[^A-Za-z0-9+._-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+  const actor = `human:${id || 'unknown'}`;
+  return OkfActorSchema.parse(actor);
+}
+
 export const OkfStatusSchema = z.enum(['draft', 'stable', 'deprecated']);
 export type OkfStatus = z.infer<typeof OkfStatusSchema>;
 

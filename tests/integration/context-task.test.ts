@@ -655,7 +655,9 @@ describe('criterion c — the selection is rebuilt before `next` points to it wh
     expect(md).not.toContain('STALE');
     expect(md).toContain('The listed files and their scores are unchanged.');
     expect(next.openFiles).toContain(paths.context);
-    expect(next.agentPlaybook[0]).toMatch(/knowledge\/index\.md.*CONTEXT\.md before implementing/s);
+    expect(next.agentPlaybook[0]).toMatch(
+      /(knowledge\/index\.md.*CONTEXT\.md before implementing|Knowledge bundle is missing or stale.*CONTEXT\.md before implementing)/s,
+    );
   });
 
   it('`execute` and `plan` also rebuild first (a CHANGES_REQUESTED cycle never reads the old selection)', async () => {
@@ -804,9 +806,9 @@ describe('criterion d — agent notes survive re-renders; edits to the generated
 // =================================================================== criterion (e)
 
 describe('criterion e — `turbine task next` tells agents to read the knowledge bundle and CONTEXT.md before planning and implementing', () => {
-  const PLAN_LINE = /knowledge\/index\.md.*CONTEXT\.md before planning/s;
-  const IMPL_LINE = /knowledge\/index\.md.*CONTEXT\.md before implementing/s;
-  const knowledgeIndex = (root: string) => join(root, '.turbine', 'knowledge', 'index.md');
+  // Fresh bundle → knowledge/index.md first; stale/missing → explicit understand instruction. Both require CONTEXT.md.
+  const PLAN_LINE = /(knowledge\/index\.md.*CONTEXT\.md before planning|Knowledge bundle is missing or stale.*CONTEXT\.md before planning)/s;
+  const IMPL_LINE = /(knowledge\/index\.md.*CONTEXT\.md before implementing|Knowledge bundle is missing or stale.*CONTEXT\.md before implementing)/s;
 
   it('REQUIREMENTS_APPROVED, PLAN_APPROVED, IMPLEMENTING and CHANGES_REQUESTED, through the engine', async () => {
     const dir = project();
@@ -817,9 +819,7 @@ describe('criterion e — `turbine task next` tells agents to read the knowledge
       const w = engine.ctx.store.getWork(work.id);
       expect(w.currentState).toBe(state);
       const step = engine.next(work.id);
-      expect(step.openFiles, state).toEqual(
-        expect.arrayContaining([paths.context, paths.projectContext, knowledgeIndex(dir)].filter((p) => existsSync(p))),
-      );
+      expect(step.openFiles, state).toEqual(expect.arrayContaining([paths.context, paths.projectContext]));
       expect(existsSync(paths.context) && existsSync(paths.projectContext)).toBe(true);
       expect(step.agentPlaybook[0], state).toMatch(line);
       expect(step.agentPlaybook[0], state).toContain('not a complete list');
@@ -877,7 +877,9 @@ describe('criterion e — `turbine task next` tells agents to read the knowledge
     expect(out.status, out.stderr).toBe(0);
     expect(out.stdout).toContain('CONTEXT.md');
     expect(out.stdout).toContain('PROJECT.md');
-    expect(out.stdout).toMatch(/knowledge\/index\.md.*CONTEXT\.md before implementing/s);
+    expect(out.stdout).toMatch(
+      /(knowledge\/index\.md.*CONTEXT\.md before implementing|Knowledge bundle is missing or stale.*CONTEXT\.md before implementing)/s,
+    );
   });
 });
 

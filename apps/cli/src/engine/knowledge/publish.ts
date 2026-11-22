@@ -9,7 +9,7 @@ import {
   writeFileSync,
   lstatSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { PUBLISHED_CLAIM_STATUSES, err, type BriefState, type RepoSnapshot } from '@turbine-hall/turbine-contracts';
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import { resolveCommit } from '../context/git-read.js';
@@ -161,22 +161,29 @@ function readExistingBundle(dir: string): Map<string, string> {
       if (name.startsWith('.')) continue;
       const child = join(abs, name);
       const childRel = rel ? `${rel}/${name}` : name;
-      const st = lstatSync(child);
+      let st;
+      try {
+        st = lstatSync(child);
+      } catch (e) {
+        throw err(
+          'E_CONTEXT_UNAVAILABLE',
+          `cannot read previous knowledge path ${childRel} (${(e as Error).message}); leaving the live bundle unchanged`,
+        );
+      }
       if (st.isDirectory()) walk(child, childRel);
       else if (st.isFile() && name.endsWith('.md')) {
         try {
           out.set(childRel, readFileSync(child, 'utf8'));
-        } catch {
-          // skip unreadable
+        } catch (e) {
+          throw err(
+            'E_CONTEXT_UNAVAILABLE',
+            `cannot read previous knowledge file ${childRel} (${(e as Error).message}); leaving the live bundle unchanged`,
+          );
         }
       }
     }
   };
-  try {
-    walk(dir, '');
-  } catch {
-    return out;
-  }
+  walk(dir, '');
   return out;
 }
 
@@ -259,37 +266,71 @@ export function exportKnowledgeBundle(input: {
 }): { targetDir: string; files: number } {
   const source = knowledgePaths(input.projectRoot).dir;
   if (!existsSync(source)) throw err('E_NOT_FOUND', 'No knowledge bundle; run: turbine understand');
-  assertSafeExportTarget(input.targetDir);
-  if (existsSync(input.targetDir)) {
-    const entries = readdirSync(input.targetDir);
-    if (entries.length && !input.force) {
-      throw err('E_INVALID_CONFIG', `export target ${input.targetDir} is not empty; pass --force to replace`);
-    }
-    if (input.force) rmSync(input.targetDir, { recursive: true, force: true });
-  }
+  assertSafeExportTarget(input.targetDir, input.projectRoot, source);
+
   const issues = validateBundle(source);
   const errors = issues.filter((i) => i.level === 'error');
   if (errors.length) {
     throw err('E_CONTEXT_UNAVAILABLE', `source bundle is invalid; fix with turbine understand: ${errors[0]!.message}`);
   }
-  mkdirSync(input.targetDir, { recursive: true });
+
   const files = readExistingBundle(source);
-  writeTree(input.targetDir, files);
-  // Also copy marker if present
-  const marker = join(source, '.turbine-bundle.json');
-  if (existsSync(marker)) {
-    // marker starts with . — write beside export as _turbine-bundle.json for portability
-    writeFileSync(join(input.targetDir, 'index.md'), readFileSync(join(input.targetDir, 'index.md'))); // touch
+  const absTarget = resolve(input.targetDir);
+  const stagingParent = dirname(absTarget);
+  mkdirSync(stagingParent, { recursive: true });
+  const staging = mkdtempSync(join(stagingParent, '.turbine-knowledge-export-'));
+  try {
+    writeTree(staging, files);
+    if (existsSync(absTarget)) {
+      const entries = readdirSync(absTarget);
+      if (entries.length && !input.force) {
+        throw err('E_INVALID_CONFIG', `export target ${input.targetDir} is not empty; pass --force to replace`);
+      }
+      if (input.force) {
+        const aside = `${absTarget}.aside.${process.pid}`;
+        renameSync(absTarget, aside);
+        try {
+          renameSync(staging, absTarget);
+        } catch (e) {
+          if (existsSync(aside)) renameSync(aside, absTarget);
+          throw e;
+        }
+        rmSync(aside, { recursive: true, force: true });
+        return { targetDir: absTarget, files: files.size };
+      }
+    }
+    renameSync(staging, absTarget);
+    return { targetDir: absTarget, files: files.size };
+  } catch (e) {
+    rmSync(staging, { recursive: true, force: true });
+    throw e;
   }
-  return { targetDir: input.targetDir, files: files.size };
 }
 
-function assertSafeExportTarget(target: string): void {
+function assertSafeExportTarget(target: string, projectRoot: string, sourceDir: string): void {
   if (!target || target === '.' || target === '..') throw err('E_INVALID_CONFIG', 'export target path is required');
   if (target.includes('\0')) throw err('E_INVALID_CONFIG', 'export target must not contain NUL');
-  // Refuse path traversal segments.
   const parts = target.replace(/\\/g, '/').split('/');
   if (parts.some((p) => p === '..')) throw err('E_INVALID_CONFIG', 'export target must not contain ".."');
+
+  const absTarget = resolve(target);
+  const absSource = resolve(sourceDir);
+  const absProject = resolve(projectRoot);
+  const absTurbine = resolve(projectRoot, '.turbine');
+  const under = (parent: string, child: string) => child === parent || child.startsWith(parent.endsWith('/') ? parent : `${parent}/`);
+  if (
+    absTarget === absSource ||
+    under(absTarget, absSource) ||
+    under(absSource, absTarget) ||
+    absTarget === absProject ||
+    absTarget === absTurbine ||
+    under(absTarget, absTurbine)
+  ) {
+    throw err(
+      'E_INVALID_CONFIG',
+      'export target must not be the live knowledge bundle, .turbine/, the project root, or an ancestor/descendant of those paths',
+    );
+  }
 }
 
 /** Detect hand edits: generated content hash drift vs marker / concept regenerated values. */

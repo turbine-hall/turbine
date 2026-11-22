@@ -3,6 +3,7 @@ import {
   PUBLISHED_CLAIM_STATUSES,
   TURBINE_OKF_PROFILE,
   contentHashText,
+  okfHumanActor,
   okfTrustTier,
   turbineOkfConceptPath,
   type BriefState,
@@ -11,7 +12,7 @@ import {
   type StoredClaim,
   type UnconfirmedItem,
 } from '@turbine-hall/turbine-contracts';
-import { shouldQuoteOkfString } from './frontmatter.js';
+import { shouldQuoteOkfString, splitFrontmatter } from './frontmatter.js';
 
 export type BundleFiles = Map<string, string>;
 
@@ -39,17 +40,19 @@ export type RenderBundleInput = {
 
 const oneLine = (t: string) => t.replace(/\s*[\r\n\u2028\u2029]+\s*/g, ' ');
 
-/** Deterministic ISO date-time for a content hash (same content → same timestamp string via fixed epoch from hash). */
-function generatedAtFor(contentKey: string, previousAt: string | undefined, contentChanged: boolean): string {
+/**
+ * `generated.at` is the real change time (OKF §5.2 / §5.3). Reuse the previous value when
+ * content is unchanged so same store+commit stays byte-identical; never invent a fake past date.
+ */
+function generatedAtFor(previousAt: string | undefined, contentChanged: boolean, nowIso?: string): string {
   if (!contentChanged && previousAt) return previousAt;
-  // Derive a stable timestamp from the content key so identical content yields identical output.
-  const hex = contentHashText(contentKey).replace(/^sha256:/, '').slice(0, 8);
-  const n = Number.parseInt(hex, 16);
-  const day = (n % 28) + 1;
-  const hour = n % 24;
-  const min = Math.floor(n / 24) % 60;
-  const sec = Math.floor(n / (24 * 60)) % 60;
-  return `2020-01-${String(day).padStart(2, '0')}T${String(hour).padStart(2, '0')}:${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}Z`;
+  const now = nowIso ?? new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  if (previousAt && previousAt >= now) {
+    // Keep chronology: a rewrite must not look older than the prior generation.
+    const prevMs = Date.parse(previousAt);
+    if (Number.isFinite(prevMs)) return new Date(prevMs + 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  }
+  return now;
 }
 
 function yamlScalar(value: string): string {
@@ -125,8 +128,11 @@ function emitYamlValue(key: string, value: unknown, indent: number): string[] {
 }
 
 function sourceId(prefix: string, path: string, blob: string): string {
-  const raw = `${prefix}-${path.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '')}-${blob.slice(0, 8)}`;
-  return raw.slice(0, 64) || `${prefix}-${blob.slice(0, 8)}`;
+  // Digest of the full path+blob stays unique after truncation of the readable prefix.
+  const digest = contentHashText(`${path}@${blob}`).replace(/^sha256:/, '').slice(0, 12);
+  const readable = path.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 32);
+  const raw = `${prefix}-${readable}-${digest}`;
+  return raw.slice(0, 64) || `${prefix}-${digest}`;
 }
 
 function citeFootnote(id: string, title: string): string {
@@ -388,12 +394,15 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
   ];
   const seenCmd = new Set<string>();
   for (const c of commands) {
-    const name = String((c.data as { name?: string; script?: string } | undefined)?.name ?? (c.data as { script?: string })?.script ?? c.key);
-    if (seenCmd.has(name)) continue;
-    seenCmd.add(name);
+    const data = (c.data ?? {}) as { name?: string; script?: string; dir?: string };
+    const name = String(data.name ?? data.script ?? c.key);
+    const workspace = String(data.dir ?? '.');
+    const conceptKey = workspace === '.' || workspace === '' ? name : `${workspace}/${name}`;
+    if (seenCmd.has(conceptKey)) continue;
+    seenCmd.add(conceptKey);
     let path: string;
     try {
-      path = turbineOkfConceptPath('Turbine Command', name);
+      path = turbineOkfConceptPath('Turbine Command', conceptKey);
     } catch {
       continue;
     }
@@ -403,13 +412,13 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
       path,
       conceptFile({
         type: 'Turbine Command',
-        title: name,
+        title: conceptKey,
         description: oneLine(c.statement).slice(0, 120),
         commit,
         blob: c.source.blob,
         turbineBy,
         verifyBy,
-        contentKey: JSON.stringify({ key: c.key, blob: c.source.blob }),
+        contentKey: JSON.stringify({ key: c.key, workspace, blob: c.source.blob }),
         sources: [s],
         body,
         verified: true,
@@ -504,7 +513,6 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
     const sources: SourceAcc[] = [];
     const bullets: string[] = [];
     const defs: string[] = [];
-    let humanVerified = false;
     for (const sc of sectionClaims) {
       const e = sc.claim.evidence[0]!;
       const sid = sourceId('claim', e.path, e.blob);
@@ -512,9 +520,10 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
       const label = sc.status === 'attested' ? 'human-attested' : 'verified';
       bullets.push(`- ${oneLine(renderClaimLine(sc))} _[${label}]_[^${sid}]`);
       defs.push(citeFootnote(sid, `${e.path}@${e.blob.slice(0, 8)}`));
-      if (sc.status === 'attested') humanVerified = true;
     }
-    if (approved) humanVerified = true;
+    // Concept-level human review only when the whole section is covered (approved brief, or every claim attested).
+    const allAttested = sectionClaims.length > 0 && sectionClaims.every((c) => c.status === 'attested');
+    const humanVerified = approved || allAttested;
     const body = [
       '# Claims',
       '',
@@ -523,7 +532,14 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
       ...[...new Set(defs)],
       '',
     ].join('\n');
-    const humanId = brief?.approvedBy ? `human:${brief.approvedBy}` : undefined;
+    let humanId: string | undefined;
+    if (humanVerified) {
+      if (brief?.approvedBy) humanId = okfHumanActor(brief.approvedBy);
+      else {
+        const fromReason = sectionClaims.find((c) => c.status === 'attested')?.reason?.match(/by ([^,]+)/)?.[1]?.trim();
+        if (fromReason) humanId = okfHumanActor(fromReason);
+      }
+    }
     files.set(
       path,
       conceptFile({
@@ -542,9 +558,8 @@ export function renderBundle(input: RenderBundleInput): BundleFiles {
         body,
         verified: sectionClaims.length > 0,
         humanVerified,
-        humanId: humanVerified && humanId ? humanId : sectionClaims.find((c) => c.status === 'attested')?.reason?.match(/by ([^,]+)/)?.[1]
-          ? `human:${sectionClaims.find((c) => c.status === 'attested')!.reason!.match(/by ([^,]+)/)![1]!.trim()}`
-          : humanId,
+        humanId,
+        verifiedAt: humanVerified ? brief?.approvedAt ?? undefined : undefined,
         status: approved ? 'stable' : 'draft',
         previous: input.previousFiles?.get(path),
         allowEmptySources: true,
@@ -613,14 +628,16 @@ function conceptFile(input: {
   verified: boolean;
   humanVerified?: boolean;
   humanId?: string;
+  verifiedAt?: string;
   status?: string;
   previous?: string;
   allowEmptySources?: boolean;
 }): string {
+  void input.contentKey;
   const prevAt = extractGeneratedAt(input.previous);
   const prevUnknown = extractUnknownKeys(input.previous);
   const contentChanged = !input.previous || extractBody(input.previous) !== input.body || extractTitle(input.previous) !== input.title;
-  const at = generatedAtFor(input.contentKey, prevAt, contentChanged);
+  const at = generatedAtFor(prevAt, contentChanged);
   const fm: Record<string, unknown> = {
     type: input.type,
     title: input.title,
@@ -637,7 +654,8 @@ function conceptFile(input: {
   }
   if (input.verified) {
     if (input.humanVerified && input.humanId) {
-      fm.verified = { by: input.humanId.startsWith('human:') ? input.humanId : `human:${input.humanId}`, at };
+      const by = input.humanId.startsWith('human:') ? okfHumanActor(input.humanId) : okfHumanActor(input.humanId);
+      fm.verified = { by, at: input.verifiedAt ?? at };
     } else {
       fm.verified = { by: input.verifyBy, at };
     }
@@ -685,17 +703,28 @@ function extractBody(file?: string): string | undefined {
 
 function extractUnknownKeys(file?: string): Record<string, unknown> {
   if (!file) return {};
-  // Minimal: preserve x-* keys from previous frontmatter via line scan (full Document merge happens in publish).
+  const split = splitFrontmatter(file);
+  if (!split.ok) return {};
+  const reserved = new Set([
+    'type',
+    'title',
+    'description',
+    'resource',
+    'tags',
+    'sources',
+    'usage_window',
+    'generated',
+    'verified',
+    'status',
+    'superseded_by',
+    'stale_after',
+    'x-turbine-commit',
+    'x-turbine-blob',
+    'x-turbine-profile',
+  ]);
   const out: Record<string, unknown> = {};
-  const split = file.split(/\n---\n/);
-  if (split.length < 2) return out;
-  const block = split[0]!.replace(/^---\n/, '');
-  for (const line of block.split('\n')) {
-    const m = /^(x-[A-Za-z0-9-]+):\s*(.+)$/.exec(line);
-    if (m && m[1] !== 'x-turbine-commit' && m[1] !== 'x-turbine-blob' && m[1] !== 'x-turbine-profile') {
-      const raw = m[2]!.trim();
-      out[m[1]!] = raw.startsWith('"') ? JSON.parse(raw) : raw;
-    }
+  for (const [k, v] of Object.entries(split.data)) {
+    if (!reserved.has(k)) out[k] = v;
   }
   return out;
 }
