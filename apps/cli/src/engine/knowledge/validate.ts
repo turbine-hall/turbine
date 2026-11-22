@@ -3,6 +3,7 @@ import { join, resolve, sep } from 'node:path';
 import {
   OKF_VERSION,
   OkfActorSchema,
+  OkfConceptFrontmatterSchema,
   OkfSourceEntrySchema,
   OkfTimestampSchema,
   TURBINE_OKF_PROFILE,
@@ -262,6 +263,19 @@ function validateConcept(root: string, rel: string, issues: KnowledgeIssue[], se
     issues.push({ level: 'error', file: rel, message: 'duplicate concept path', code: 'duplicate' });
   }
   seen.add(rel);
+
+  const shape = OkfConceptFrontmatterSchema.safeParse(split.data);
+  if (!shape.success) {
+    for (const issue of shape.error.issues) {
+      const path = issue.path.map(String).join('.') || 'frontmatter';
+      issues.push({
+        level: 'error',
+        file: rel,
+        message: `wrong type for ${path}: ${issue.message}`,
+        code: `wrong-type:${path}`,
+      });
+    }
+  }
 
   for (const field of profile.requiredFields) {
     const value = split.data[field];
