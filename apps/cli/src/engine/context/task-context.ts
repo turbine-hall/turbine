@@ -91,6 +91,10 @@ export function readTaskFiles(
   repoRoot: string,
   entries: TreeEntry[],
 ): { files: Array<{ path: string; size: number }>; text: (path: string) => string | undefined; notScanned: { tooLarge: number; overCap: number; metadataSkipped: number } } {
+  // Same rule as buildSnapshot: a missing blob aborts the scan with the path (claims handle size -1 per path).
+  for (const e of entries) {
+    if (e.type === 'blob' && e.size < 0) throw new Error(`git object ${e.id} (${e.path}) is missing from the repository`);
+  }
   const regular = entries.filter((e) => e.type === 'blob' && e.mode !== '120000' && !NODE_MODULES.test(e.path));
   const notScanned = { tooLarge: 0, overCap: 0, metadataSkipped: 0 };
   const toRead: TreeEntry[] = [];

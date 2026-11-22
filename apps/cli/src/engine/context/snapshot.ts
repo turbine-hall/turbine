@@ -287,6 +287,11 @@ export function buildSnapshot(repoRoot: string, commit: string): RepoSnapshot {
   const tree = treeIdOf(repoRoot, resolved);
   const listing = listTreeDetailed(repoRoot, resolved);
   const entries = listing.entries;
+  // Claims may list a tree that has a missing blob (size -1) and refuse only that path. A snapshot cannot:
+  // every admitted fact must come from a readable object, so a missing blob aborts the whole build with the path.
+  for (const e of entries) {
+    if (e.type === 'blob' && e.size < 0) throw new Error(`git object ${e.id} (${e.path}) is missing from the repository`);
+  }
   const b = new Builder(repoRoot, resolved, tree, entries);
   b.undecodable = listing.undecodable;
   if (listing.undecodable > 0) {
