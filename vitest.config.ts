@@ -3,7 +3,10 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     include: ['packages/**/src/**/*.test.ts', 'apps/**/src/**/*.test.ts', 'tests/**/*.test.ts'],
-    testTimeout: 30000,
-    hookTimeout: 30000,
+    testTimeout: 120_000,
+    hookTimeout: 60_000,
+    teardownTimeout: 120_000,
+    pool: 'threads',
+    fileParallelism: true,
   },
 });

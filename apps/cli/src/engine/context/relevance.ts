@@ -2,7 +2,7 @@ import { posix } from 'node:path';
 import type { ContextBudget, ImportEdge, OmittedFile, Reason, RelevantFile, SelectionLimits } from '@turbine-hall/turbine-contracts';
 import { prefixMatches } from './glob.js';
 import { buildGraph, makeResolver, SOURCE_EXT, type Graph, type WorkspacePackage } from './import-graph.js';
-import { jsxFile, scanModule } from './js-scan.js';
+import { scanModule, scanOptsFor } from './js-scan.js';
 import { pathWordMatches } from './path-words.js';
 
 /**
@@ -495,7 +495,7 @@ export function verifyRelevantFiles(selected: RelevantFile[], input: VerifyInput
   const edgeHolds = (e: ImportEdge, where: string): boolean => {
     const t = input.text(e.from);
     if (t === undefined) return (problems.push(`${where}: ${e.from} was not read`), false);
-    const scan = scanModule(t, { jsx: jsxFile(e.from) });
+    const scan = scanModule(t, scanOptsFor(e.from));
     if (!scan.ok) return (problems.push(`${where}: ${e.from} cannot be parsed (${scan.reason})`), false);
     const found = scan.imports.find((i) => i.line === e.line && i.specifier === e.specifier && i.kind === e.kind && i.statement === e.statement);
     if (!found) return (problems.push(`${where}: no such statement at ${e.from}:${e.line}`), false);
@@ -533,7 +533,7 @@ export function verifyRelevantFiles(selected: RelevantFile[], input: VerifyInput
         }
         case 'exports-symbol': {
           const t = input.text(f.path);
-          const scan = t === undefined ? undefined : scanModule(t, { jsx: jsxFile(f.path) });
+          const scan = t === undefined ? undefined : scanModule(t, scanOptsFor(f.path));
           const ex = scan?.ok ? scan.exports.find((e) => e.name === r.symbol && e.line === r.line && e.statement === r.statement) : undefined;
           if (!ex) problems.push(`${where}: ${f.path} does not export ${r.symbol} at line ${r.line}`);
           if (input.request.slice(r.offset, r.offset + r.quote.length) !== r.quote || r.quote !== r.symbol) problems.push(`${where}: the request does not mention ${r.symbol} at ${r.offset}`);

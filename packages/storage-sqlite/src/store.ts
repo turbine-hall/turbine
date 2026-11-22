@@ -1,6 +1,8 @@
 import type {
   Artifact,
   ArtifactDependencyEdge,
+  Claim,
+  ClaimStatus,
   Decision,
   EecInvalidationEvent,
   EngineeringEvidenceContract,
@@ -9,20 +11,29 @@ import type {
   RecoveryPlan,
   RepoSnapshot,
   RoleRun,
+  StoredClaim,
   WorkPackage,
 } from '@turbine-hall/turbine-contracts';
 import {
   ArtifactDependencyEdgeSchema,
   ArtifactSchema,
+  ClaimSchema,
+  ClaimStatusSchema,
+  MAX_CLAIM_BYTES,
+  MAX_CLAIM_REASON_BYTES,
+  assertClaimBudget,
   DecisionSchema,
   EecInvalidationEventSchema,
   EngineeringEvidenceContractSchema,
   EngineEventSchema,
   EvidenceSchema,
+  GitObjectIdSchema,
   RecoveryPlanSchema,
   RepoSnapshotSchema,
   RoleRunSchema,
+  StoredClaimSchema,
   assertNoUnsafeKeys,
+  claimCommit,
   WorkPackageSchema,
   createId,
   err,
@@ -31,6 +42,41 @@ import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import type { SqliteDb } from './db.js';
 import { openDatabase } from './db.js';
+
+/**
+ * The claim columns, with the payload measured in BYTES inside SQLite: a payload over the limit comes back as NULL, so an
+ * oversized or damaged row is never read into memory by this process.
+ */
+// `octet_length` (SQLite 3.43+, bundled with Node 22.5 and later) reads the stored size without loading the value.
+const MAX_CLAIM_SECTION_BYTES = 1024;
+const MAX_CLAIM_ID_BYTES = 256;
+const MAX_CLAIM_CREATED_AT_BYTES = 64;
+/** Metadata columns are size-capped in SQL the same way as `data` and `reason`. */
+const CLAIM_COLUMNS = `
+  CASE WHEN octet_length(id) > ${MAX_CLAIM_ID_BYTES} THEN NULL ELSE id END AS id,
+  CASE WHEN octet_length(repo_path) > ${MAX_CLAIM_BYTES} THEN NULL ELSE repo_path END AS repo_path,
+  CASE WHEN octet_length(section) > ${MAX_CLAIM_SECTION_BYTES} THEN NULL ELSE section END AS section,
+  CASE WHEN octet_length("commit") IN (40, 64) THEN "commit" ELSE NULL END AS "commit",
+  CASE WHEN octet_length(data) > ${MAX_CLAIM_BYTES} THEN NULL ELSE data END AS data, status,
+  CASE WHEN octet_length(reason) > ${MAX_CLAIM_REASON_BYTES} THEN NULL ELSE reason END AS reason,
+  coalesce(octet_length(reason) > ${MAX_CLAIM_REASON_BYTES}, 0) AS reason_oversized,
+  CASE WHEN octet_length(section) > ${MAX_CLAIM_SECTION_BYTES} OR octet_length(id) > ${MAX_CLAIM_ID_BYTES}
+    OR octet_length("commit") NOT IN (40, 64) OR octet_length(created_at) > ${MAX_CLAIM_CREATED_AT_BYTES}
+    OR octet_length(repo_path) > ${MAX_CLAIM_BYTES} THEN 1 ELSE 0 END AS meta_oversized,
+  CASE WHEN octet_length(created_at) > ${MAX_CLAIM_CREATED_AT_BYTES} THEN NULL ELSE created_at END AS created_at`;
+
+type ClaimRow = {
+  id: string | null;
+  repo_path: string | null;
+  section: string | null;
+  commit: string | null;
+  data: string | null;
+  status: string;
+  reason: string | null;
+  reason_oversized: number;
+  meta_oversized: number;
+  created_at: string | null;
+};
 
 function now(): string {
   return new Date().toISOString();
@@ -440,6 +486,168 @@ export class WorkStore {
       throw new Error(`snapshot stored under ${row.hash} actually has hash ${parsed.hash} (the row was replaced or corrupted)`);
     }
     return parsed;
+  }
+
+  /**
+   * Store a claim under a status. This method only records: it does not decide whether a claim is true.
+   * `verified` must only ever be passed by code that has just run the claim's verifier against `claimCommit(claim)`
+   * (see publishClaim / reverifyOnCommit in the engine); the claim table is the brief's only source, so nothing else
+   * may write that status. A `rejected` record never replaces a claim that is already published: the published
+   * claim stays and false is returned. Otherwise the record is stored (replacing an older record of the same id).
+   */
+  saveClaim(input: { repoPath: string; claim: Claim; status: ClaimStatus; reason?: string }): boolean {
+    // A row under an empty path could be written but never read back (the stored-claim schema needs a path).
+    if (typeof input.repoPath !== 'string' || input.repoPath === '') throw new Error('a claim is stored under a non-empty repository path');
+    if (Buffer.byteLength(input.repoPath, 'utf8') > MAX_CLAIM_BYTES) throw new Error(`a claim repository path is over ${MAX_CLAIM_BYTES} bytes`);
+    assertClaimBudget(input.claim);
+    assertNoUnsafeKeys(input.claim);
+    const claim = ClaimSchema.parse(input.claim);
+    const status = ClaimStatusSchema.parse(input.status);
+    const reason = input.reason?.trim() || undefined;
+    if (reason !== undefined) {
+      if (reason.includes('\0')) throw new Error('a claim reason must not contain a NUL byte');
+      if (Buffer.byteLength(reason, 'utf8') > MAX_CLAIM_REASON_BYTES) throw new Error(`a claim reason is over ${MAX_CLAIM_REASON_BYTES} bytes`);
+    }
+    if ((status === 'rejected' || status === 'withdrawn') && !reason) throw new Error(`a ${status} claim must record why`);
+    // One statement, so the "never replace a published claim with a rejection" rule cannot race another writer.
+    const written = this.db
+      .prepare(
+        `INSERT INTO claims(id, repo_path, section, "commit", data, status, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(repo_path, id) DO UPDATE SET section = excluded.section, "commit" = excluded."commit", data = excluded.data,
+           status = excluded.status, reason = excluded.reason, created_at = excluded.created_at
+         WHERE NOT (claims.status IN ('verified', 'attested') AND excluded.status = 'rejected')`,
+      )
+      .run(claim.id, input.repoPath, claim.section, claimCommit(claim), JSON.stringify(claim), status, reason ?? null, now());
+    return Number(written.changes) === 1;
+  }
+
+  /** Withdraw a published claim (or any claim not already withdrawn). The claim stays on record with the reason. */
+  withdrawClaim(repoPath: string, id: string, reason: string): boolean {
+    if (!reason.trim()) throw new Error('a withdrawn claim must record why');
+    const clipped = reason.trim();
+    if (clipped.includes('\0')) throw new Error('a claim reason must not contain a NUL byte');
+    if (Buffer.byteLength(clipped, 'utf8') > MAX_CLAIM_REASON_BYTES) throw new Error(`a claim reason is over ${MAX_CLAIM_REASON_BYTES} bytes`);
+    const r = this.db
+      .prepare(`UPDATE claims SET status = 'withdrawn', reason = ? WHERE repo_path = ? AND id = ? AND status <> 'withdrawn'`)
+      .run(clipped, repoPath, id);
+    return Number(r.changes) === 1;
+  }
+
+  /** The commit this repository's claims have been carried to, or null before any claim was published or carried. */
+  getClaimFrontier(repoPath: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT CASE WHEN octet_length("commit") IN (40, 64) THEN "commit" ELSE NULL END AS "commit" FROM claim_frontier WHERE repo_path = ?`,
+      )
+      .get(repoPath) as { commit: string | null } | undefined;
+    if (!row) return null;
+    if (row.commit === null) throw new Error(`claim frontier for ${repoPath} is stored with a commit id that is not a full object id`);
+    return GitObjectIdSchema.parse(row.commit);
+  }
+
+  /**
+   * The distinct commits at which this repository has published claims. Metadata only: the claim payloads are not read.
+   * Used by the engine to refuse a transition that would move the frontier past an unchecked published claim.
+   * `exceptId` omits one claim (the one being replaced) so a sole claim can move forward without hiding a sibling.
+   */
+  listPublishedClaimCommits(repoPath: string, opts: { exceptId?: string } = {}): string[] {
+    const rows = (
+      opts.exceptId === undefined
+        ? this.db.prepare(
+            `SELECT DISTINCT CASE WHEN octet_length("commit") IN (40, 64) THEN "commit" ELSE NULL END AS "commit"
+             FROM claims WHERE repo_path = ? AND status IN ('verified', 'attested') ORDER BY 1`,
+          ).all(repoPath)
+        : this.db.prepare(
+            `SELECT DISTINCT CASE WHEN octet_length("commit") IN (40, 64) THEN "commit" ELSE NULL END AS "commit"
+             FROM claims WHERE repo_path = ? AND status IN ('verified', 'attested') AND id <> ? ORDER BY 1`,
+          ).all(repoPath, opts.exceptId)
+    ) as Array<{ commit: string | null }>;
+    return rows.map((r) => {
+      if (r.commit === null) throw new Error(`a published claim in ${repoPath} is stored with a commit id that is not a full object id`);
+      return GitObjectIdSchema.parse(r.commit);
+    });
+  }
+
+  /** Record the commit the claims are carried to. Like `saveClaim`, a trusted write: only publishClaim / reverifyOnCommit move it. */
+  setClaimFrontier(repoPath: string, commit: string): void {
+    if (typeof repoPath !== 'string' || repoPath === '') throw new Error('a claim frontier is stored under a non-empty repository path');
+    const id = GitObjectIdSchema.parse(commit);
+    this.db
+      .prepare(
+        `INSERT INTO claim_frontier(repo_path, "commit", updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(repo_path) DO UPDATE SET "commit" = excluded."commit", updated_at = excluded.updated_at`,
+      )
+      .run(repoPath, id, now());
+  }
+
+  getClaim(repoPath: string, id: string): StoredClaim | null {
+    const row = this.db.prepare(`SELECT ${CLAIM_COLUMNS} FROM claims WHERE repo_path = ? AND id = ?`).get(repoPath, id) as ClaimRow | undefined;
+    return row ? this.parseClaimRow(row) : null;
+  }
+
+  /** Claims of one repository, in the order each claim id was first stored (re-saving an id does not move it). `statuses` / `section` / `commit` narrow the list. */
+  /**
+   * Claims of one repository. Optional `limit` / `afterId` page by claim id so a transition can process a bounded batch
+   * without loading every payload at once. `afterId` is exclusive; the next page starts after that id (lexicographic).
+   */
+  listClaims(
+    repoPath: string,
+    filter: { statuses?: readonly ClaimStatus[]; section?: string; commit?: string; limit?: number; afterId?: string } = {},
+  ): StoredClaim[] {
+    const where = ['repo_path = ?'];
+    const args: string[] = [repoPath];
+    if (filter.section !== undefined) {
+      where.push('section = ?');
+      args.push(filter.section);
+    }
+    if (filter.commit !== undefined) {
+      where.push('"commit" = ?');
+      args.push(filter.commit);
+    }
+    if (filter.statuses) {
+      // An empty list matches nothing; it must not fall back to "every status".
+      if (!filter.statuses.length) return [];
+      const statuses = [...new Set(filter.statuses.map((s) => ClaimStatusSchema.parse(s)))];
+      where.push(`status IN (${statuses.map(() => '?').join(', ')})`);
+      args.push(...statuses);
+    }
+    if (filter.afterId !== undefined) {
+      where.push('id > ?');
+      args.push(filter.afterId);
+    }
+    let sql = `SELECT ${CLAIM_COLUMNS} FROM claims WHERE ${where.join(' AND ')} ORDER BY id ASC`;
+    if (filter.limit !== undefined) {
+      if (!Number.isInteger(filter.limit) || filter.limit < 1) throw new Error('listClaims limit must be a positive integer');
+      sql += ` LIMIT ${filter.limit}`;
+    }
+    const rows = this.db.prepare(sql).all(...args) as ClaimRow[];
+    return rows.map((r) => this.parseClaimRow(r));
+  }
+
+  /** The schema proves the JSON is a valid claim; this proves it is the one the row is filed under. */
+  private parseClaimRow(row: ClaimRow): StoredClaim {
+    // The size was measured in bytes by SQLite, and an oversized payload was not returned at all.
+    if (row.data === null) throw new Error(`claim ${row.id} is stored with more than ${MAX_CLAIM_BYTES} bytes of data`);
+    // An over-budget reason is an invalid row, not a missing reason.
+    if (row.meta_oversized || row.id === null || row.repo_path === null || row.section === null || row.commit === null || row.created_at === null) {
+      throw new Error(`claim ${row.id ?? '(unknown)'} is stored with metadata over its size limit`);
+    }
+    if (row.reason_oversized) throw new Error(`claim ${row.id} is stored with a reason of more than ${MAX_CLAIM_REASON_BYTES} bytes`);
+    const raw: unknown = JSON.parse(row.data);
+    // The budget walk is iterative and stops at a fixed depth; the unsafe-key walk below recurses, so it only sees what fits.
+    assertClaimBudget(raw);
+    assertNoUnsafeKeys(raw);
+    const stored = StoredClaimSchema.parse({
+      repoPath: row.repo_path,
+      claim: raw,
+      section: row.section,
+      commit: row.commit,
+      status: row.status,
+      ...(row.reason === null ? {} : { reason: row.reason }),
+      createdAt: row.created_at,
+    });
+    if (stored.claim.id !== row.id) throw new Error(`claim stored under ${row.id} actually has id ${stored.claim.id} (the row was replaced or corrupted)`);
+    return stored;
   }
 
   /**

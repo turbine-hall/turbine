@@ -1,7 +1,7 @@
 import { posix } from 'node:path';
 import type { ImportEdge, ImportKind } from '@turbine-hall/turbine-contracts';
 import { parseJsonc } from './jsonc.js';
-import { jsxFile, scanModule, type ScannedExport } from './js-scan.js';
+import { scanModule, scanOptsFor, type ScannedExport } from './js-scan.js';
 import { loadBuildConfig, sourceOfBuildOutput } from './tsconfig-view.js';
 
 /**
@@ -318,7 +318,7 @@ export function buildGraph(sourcePaths: string[], text: (path: string) => string
   for (const path of sourcePaths) {
     const t = text(path);
     if (t === undefined) continue;
-    const scan = scanModule(t, { jsx: jsxFile(path) });
+    const scan = scanModule(t, scanOptsFor(path));
     if (!scan.ok) {
       unreadable.push(path);
       continue;

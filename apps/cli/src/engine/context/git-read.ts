@@ -161,8 +161,14 @@ function parseTree(out: Buffer): TreeListing {
     const path = rec.slice(tab + 1);
     const known = /^\d+$/.test(size ?? '');
     // `git ls-tree -l` prints "-" for trees and submodules and "BAD" for a blob it cannot find.
-    if (type === 'blob' && !known) throw new Error(`git object ${id} (${path}) is missing from the repository`);
-    entries.push({ mode: mode!, type: type!, id: id!, size: known ? Number(size) : 0, path });
+    // A missing blob is recorded with size -1 so a claim that needs THAT path can refuse, without aborting the whole tree.
+    entries.push({
+      mode: mode!,
+      type: type!,
+      id: id!,
+      size: type === 'blob' && !known ? -1 : known ? Number(size) : 0,
+      path,
+    });
   }
   return { entries, undecodable };
 }
@@ -214,6 +220,34 @@ export function readBlobs(repoRoot: string, blobIds: string[], expectedBytes = 0
  * Which of `paths` git reports as changed between two commits (A added, M modified, D deleted, T type change).
  * Renames are not followed, so a moved file shows as D and A. Throws when either commit cannot be read.
  */
+/** Whether `ancestor` is `descendant` or one of its ancestors. Throws when either is not a commit of the repository. */
+export function isAncestor(repoRoot: string, ancestor: string, descendant: string): boolean {
+  // Grafts rewrite parent links without changing the stored commits: a comparison that used them would not be a fact of the repository.
+  const grafts = run(repoRoot, ['rev-parse', '--git-path', 'info/grafts']);
+  if (grafts.status === 0) {
+    const path = String(grafts.stdout).trim();
+    if (path && existsSync(resolve(repoRoot, path))) {
+      throw new Error('this repository has info/grafts; ancestry cannot be settled from the stored parent links until the grafts are removed');
+    }
+  }
+  // Shallow state is read before AND after: a "no" is settled only if the history was complete for the whole query.
+  const full = (): boolean => {
+    const shallow = run(repoRoot, ['rev-parse', '--is-shallow-repository']);
+    return shallow.status === 0 && String(shallow.stdout).trim() === 'false';
+  };
+  const completeBefore = full();
+  const r = run(repoRoot, ['merge-base', '--is-ancestor', ancestor, descendant]);
+  if (r.status === 0) return true;
+  if (r.status === 1) {
+    // In a shallow repository git stops at the boundary and ignores the parent link behind it: "no" is then not a settled answer.
+    if (!completeBefore || !full()) {
+      throw new Error('the history of this repository is shallow (or could not be checked), so it is not known whether the commits are related; fetch the full history and try again');
+    }
+    return false;
+  }
+  throw new Error(`git merge-base --is-ancestor failed: ${r.stderr || `exit ${r.status}`}`);
+}
+
 export function changedBetween(repoRoot: string, from: string, to: string, paths: string[]): Array<{ path: string; status: string }> {
   if (!paths.length) return [];
   const out = must(repoRoot, ['diff', '--name-status', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', from, to, '--', ...paths.map((p) => `:(literal)${p}`)]);

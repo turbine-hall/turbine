@@ -43,8 +43,16 @@ export type ModuleScan =
       ok: true;
       imports: ScannedImport[];
       exports: ScannedExport[];
+      /** The default export (`export default …`, `export { x as default }`), named "default". Kept apart from `exports`, which the import graph reads as named exports. */
+      defaultExports: ScannedExport[];
+      /** How many `export * from '…'` statements the file has: they re-export names this scan does not list. */
+      starReexports: number;
       /** `require()` calls found but not stated, because `require` is bound in the file and may not be the loader. */
       unconfirmed: number;
+      /** Lines of the `require()` calls counted in `unconfirmed`. */
+      unconfirmedAt: number[];
+      /** Start lines of statements whose specifier is written with an escape or as a template literal (`'\\u0066oo'`): found, but not stated, so not silently dropped. */
+      unreadableAt: number[];
     }
   | { ok: false; reason: string };
 
@@ -57,9 +65,27 @@ export function jsxFile(path: string): boolean {
   return !/\.[cm]?ts$/.test(path);
 }
 
-export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }): ModuleScan {
+/** `.cjs` is CommonJS: Node allows a top-level `return`. Other extensions are parsed as modules. */
+export function commonjsFile(path: string): boolean {
+  return /\.cjs$/i.test(path);
+}
+
+export type ScanOpts = { jsx?: boolean; commonjs?: boolean };
+
+export type ParsedSource =
+  | { ok: true; ts: typeof TS; sf: TS.SourceFile; source: string; lineAt: (pos: number) => number }
+  | { ok: false; reason: string };
+
+/**
+ * Parse ONE source text with the TypeScript parser. Any syntax error, or a text too deeply nested to parse, is
+ * `{ ok: false }`: a partial parse is never handed on. `lineAt` maps a character offset to a 1-based line (LF, CRLF
+ * and bare CR all end a line).
+ */
+export function parseSource(input: string, opts: ScanOpts = { jsx: true }): ParsedSource {
   const ts = loadTs();
   const s = input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
+  const jsx = opts.jsx !== false;
+  const allowTopLevelReturn = opts.commonjs === true;
 
   const lineStarts = [0];
   for (let i = 0; i < s.length; i++) {
@@ -83,7 +109,10 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
 
   let sf: TS.SourceFile;
   try {
-    sf = ts.createSourceFile(opts.jsx ? 'module.tsx' : 'module.ts', s, ts.ScriptTarget.Latest, true, opts.jsx ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+    // Name the file `.cjs` when CommonJS so the parser applies that format; otherwise keep the module/TSX names.
+    const fileName = allowTopLevelReturn ? 'module.cjs' : jsx ? 'module.tsx' : 'module.ts';
+    const kind = allowTopLevelReturn ? ts.ScriptKind.JS : jsx ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+    sf = ts.createSourceFile(fileName, s, ts.ScriptTarget.Latest, true, kind);
   } catch (e) {
     // A stack overflow in a deeply nested file is a failure of that file, not of the run.
     if (e instanceof RangeError) return { ok: false, reason: 'the text is nested too deeply to parse' };
@@ -96,18 +125,132 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
     const d = diagnostics[0]!;
     return { ok: false, reason: `${ts.flattenDiagnosticMessageText(d.messageText, ' ')} near line ${lineAt(d.start)}` };
   }
+  // Control-flow errors the binder reports that parseDiagnostics omit: a `return` outside a function, or a `break` /
+  // `continue` that is not enclosed by a valid target. An explicit stack: deep ASTs must not overflow the call stack.
+  // CommonJS (`.cjs`) may use a top-level `return`; modules may not.
+  type Ctx = { inFunction: boolean; loops: number; switches: number; labels: ReadonlySet<string>; loopLabels: ReadonlySet<string> };
+  let illegal: { node: TS.Node; why: string } | undefined;
+  const todo: Array<{ n: TS.Node; ctx: Ctx }> = [{ n: sf, ctx: { inFunction: false, loops: 0, switches: 0, labels: new Set(), loopLabels: new Set() } }];
+  while (todo.length && !illegal) {
+    const { n, ctx } = todo.pop()!;
+    if (ts.isReturnStatement(n) && !ctx.inFunction && !allowTopLevelReturn) illegal = { node: n, why: 'a top-level return is not valid in a module' };
+    else if (ts.isBreakStatement(n) || ts.isContinueStatement(n)) {
+      const label = n.label?.text;
+      const isContinue = ts.isContinueStatement(n);
+      if (label === undefined) {
+        if (isContinue ? ctx.loops === 0 : ctx.loops === 0 && ctx.switches === 0) {
+          illegal = { node: n, why: `a ${isContinue ? 'continue' : 'break'} outside a ${isContinue ? 'loop' : 'loop or switch'} is not valid` };
+        }
+      } else if (isContinue ? !ctx.loopLabels.has(label) : !ctx.labels.has(label)) {
+        illegal = { node: n, why: `a ${isContinue ? 'continue' : 'break'} to label "${label}" has no matching enclosing ${isContinue ? 'loop' : 'target'}` };
+      }
+    }
+    if (illegal) break;
+    const enterFn =
+      ts.isFunctionDeclaration(n) ||
+      ts.isFunctionExpression(n) ||
+      ts.isArrowFunction(n) ||
+      ts.isMethodDeclaration(n) ||
+      ts.isConstructorDeclaration(n) ||
+      ts.isGetAccessorDeclaration(n) ||
+      ts.isSetAccessorDeclaration(n);
+    // A class static block is its own jump boundary: it may not return, and it may not break/continue to an outer loop.
+    const enterStatic = ts.isClassStaticBlockDeclaration(n);
+    const isLoop = ts.isForStatement(n) || ts.isForInStatement(n) || ts.isForOfStatement(n) || ts.isWhileStatement(n) || ts.isDoStatement(n);
+    const isSwitch = ts.isSwitchStatement(n);
+    // Nested functions and static blocks do not inherit outer loops, switches, or labels (a `break` inside `f` must
+    // not see the `for` that encloses `function f() { break; }`). A static block also clears `inFunction`.
+    let next: Ctx =
+      enterFn || enterStatic
+        ? { inFunction: enterFn, loops: 0, switches: 0, labels: new Set(), loopLabels: new Set() }
+        : {
+            inFunction: ctx.inFunction,
+            loops: ctx.loops + (isLoop ? 1 : 0),
+            switches: ctx.switches + (isSwitch ? 1 : 0),
+            labels: ctx.labels,
+            loopLabels: ctx.loopLabels,
+          };
+    if (ts.isLabeledStatement(n)) {
+      if (ctx.labels.has(n.label.text)) {
+        illegal = { node: n, why: `a duplicate label "${n.label.text}" is not valid` };
+        break;
+      }
+      const labels = new Set(ctx.labels);
+      labels.add(n.label.text);
+      const loopLabels = new Set(ctx.loopLabels);
+      // `outer: inner: for (;;)` — both labels name the loop. Follow chained labeled statements; do not descend into a block.
+      let body: TS.Statement = n.statement;
+      while (ts.isLabeledStatement(body)) body = body.statement;
+      if (ts.isForStatement(body) || ts.isForInStatement(body) || ts.isForOfStatement(body) || ts.isWhileStatement(body) || ts.isDoStatement(body)) loopLabels.add(n.label.text);
+      next = { ...next, labels, loopLabels };
+    }
+    const children: TS.Node[] = [];
+    ts.forEachChild(n, (c) => {
+      children.push(c);
+    });
+    for (let i = children.length - 1; i >= 0; i--) todo.push({ n: children[i]!, ctx: next });
+  }
+  if (illegal) return { ok: false, reason: `${illegal.why} near line ${lineAt(illegal.node.getStart(sf))}` };
+  return { ok: true, ts, sf, source: s, lineAt };
+}
+
+/** Scan options derived from a repository path (JSX vs TS, and CommonJS `.cjs`). */
+export function scanOptsFor(path: string): ScanOpts {
+  return { jsx: jsxFile(path), commonjs: commonjsFile(path) };
+}
+
+export function scanModule(input: string, opts: ScanOpts = { jsx: true }): ModuleScan {
+  const parsed = parseSource(input, opts);
+  if (!parsed.ok) return parsed;
+  const { ts, sf, source: s, lineAt } = parsed;
 
   const text = (a: number, b: number) => s.slice(a, b).replace(/\r\n?/g, '\n');
   const startOf = (n: TS.Node) => n.getStart(sf);
   const imports: Array<ScannedImport & { viaCall?: true }> = [];
   const exports: ScannedExport[] = [];
+  const defaultExports: ScannedExport[] = [];
+  let starReexports = 0;
   let requireBound = false;
 
   /** A string literal written without escapes: its value is exactly the text between the quotes. */
-  const plainString = (n: TS.Node | undefined): TS.StringLiteral | undefined => (n && ts.isStringLiteral(n) && s.slice(startOf(n) + 1, n.end - 1) === n.text ? n : undefined);
+  const unreadableAt: number[] = [];
+  /** `from` is where the statement that holds the string starts: an escaped specifier is recorded against that line. */
+  const plainString = (arg: TS.Node | undefined, from: number): TS.StringLiteral | undefined => {
+    // `import(('pkg'))`, `import('pkg' as string)`: the same module name, written inside wrappers that do not change it.
+    let n = arg;
+    while (n && (ts.isParenthesizedExpression(n) || ts.isAsExpression(n) || ts.isNonNullExpression(n) || ts.isSatisfiesExpression(n) || ts.isTypeAssertionExpression(n))) n = n.expression;
+    if (!n) return undefined;
+    // `import(`pkg`)`: a template without substitutions names a module, but is not a string literal this scanner trusts.
+    if (ts.isNoSubstitutionTemplateLiteral(n)) {
+      unreadableAt.push(lineAt(from));
+      return undefined;
+    }
+    // A computed specifier (`import('./' + name)`) is a statement this scanner found but cannot state: record it, do not drop it.
+    if (!ts.isStringLiteral(n)) {
+      unreadableAt.push(lineAt(from));
+      return undefined;
+    }
+    if (s.slice(startOf(n) + 1, n.end - 1) === n.text) return n;
+    unreadableAt.push(lineAt(from));
+    return undefined;
+  };
   const addImport = (kind: ImportKind, spec: TS.StringLiteral, from: number, to: number, viaCall = false) =>
     imports.push({ specifier: spec.text, kind, line: lineAt(from), statement: text(from, to), ...(viaCall ? { viaCall: true as const } : {}) });
-  const addExport = (name: string, from: number, to: number) => exports.push({ name, line: lineAt(from), statement: text(from, to) });
+  // `statement` is normalised by the caller, once per statement: a clause naming thousands of exports shares one.
+  const addExport = (name: string, line: number, statement: string) => exports.push({ name, line, statement });
+  const addDefault = (line: number, statement: string) => defaultExports.push({ name: 'default', line, statement });
+
+  /** The identifiers a declaration name binds, through object and array patterns (an explicit stack: a pattern can nest deeply). */
+  const boundNames = (name: TS.BindingName): string[] => {
+    const out: string[] = [];
+    const todo: TS.BindingName[] = [name];
+    while (todo.length) {
+      const b = todo.pop()!;
+      if (ts.isIdentifier(b)) out.push(b.text);
+      else for (const el of b.elements) if (ts.isBindingElement(el)) todo.push(el.name);
+    }
+    return out.reverse();
+  };
 
   const modifiersOf = (n: TS.Node): readonly TS.Modifier[] => (ts.canHaveModifiers(n) ? (ts.getModifiers(n) ?? []) : []);
 
@@ -140,7 +283,7 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
 
   const topLevel = (n: TS.Node) => {
     if (ts.isImportDeclaration(n)) {
-      const spec = plainString(n.moduleSpecifier);
+      const spec = plainString(n.moduleSpecifier, startOf(n));
       if (!spec) return;
       const kind: ImportKind = !n.importClause ? 'side-effect' : n.importClause.phaseModifier === ts.SyntaxKind.TypeKeyword ? 'import-type' : 'import';
       addImport(kind, spec, startOf(n), spec.end);
@@ -148,34 +291,63 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
     }
     if (ts.isImportEqualsDeclaration(n)) {
       if (ts.isExternalModuleReference(n.moduleReference)) {
-        const spec = plainString(n.moduleReference.expression);
+        const spec = plainString(n.moduleReference.expression, startOf(n));
         if (spec) addImport('require', spec, startOf(n), n.moduleReference.end);
       }
+      // `export import fs = require('node:fs')` and `export import x = Ns.Member` also export the alias.
+      if (modifiersOf(n).some((m) => m.kind === ts.SyntaxKind.ExportKeyword)) addExport(n.name.text, lineAt(startOf(n)), text(startOf(n), n.end));
       return;
     }
     if (ts.isExportDeclaration(n)) {
       const from = startOf(n);
-      const spec = plainString(n.moduleSpecifier);
-      if (n.moduleSpecifier && !spec) return;
+      const spec = plainString(n.moduleSpecifier, from);
+      // An untrusted specifier withholds the import edge only: the names the statement exports are still read.
       if (spec) addImport('re-export', spec, from, spec.end);
       const clause = n.exportClause;
-      if (!clause) return;
-      if (ts.isNamespaceExport(clause)) {
-        addExport(clause.name.text, from, clause.name.end);
+      if (!clause) {
+        if (n.moduleSpecifier) starReexports++;
         return;
       }
-      for (const el of clause.elements) if (el.name.text !== 'default') addExport(el.name.text, from, clause.end);
+      if (ts.isNamespaceExport(clause)) {
+        if (clause.name.text === 'default') addDefault(lineAt(from), text(from, clause.name.end));
+        else addExport(clause.name.text, lineAt(from), text(from, clause.name.end));
+        return;
+      }
+      const line = lineAt(from);
+      const statement = text(from, clause.end);
+      for (const el of clause.elements) {
+        if (el.name.text === 'default') addDefault(line, statement);
+        else addExport(el.name.text, line, statement);
+      }
+      return;
+    }
+    if (ts.isExportAssignment(n)) {
+      if (!n.isExportEquals) addDefault(lineAt(startOf(n)), text(startOf(n), n.end));
       return;
     }
     const exportKeyword = modifiersOf(n).find((m) => m.kind === ts.SyntaxKind.ExportKeyword);
-    if (!exportKeyword || modifiersOf(n).some((m) => m.kind === ts.SyntaxKind.DefaultKeyword)) return;
+    const defaultKeyword = modifiersOf(n).find((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
+    if (exportKeyword && defaultKeyword) {
+      addDefault(lineAt(startOf(exportKeyword)), text(startOf(exportKeyword), defaultKeyword.end));
+      return;
+    }
+    if (!exportKeyword) return;
     const from = startOf(exportKeyword);
     if (ts.isVariableStatement(n)) {
-      for (const d of n.declarationList.declarations) if (ts.isIdentifier(d.name)) addExport(d.name.text, from, d.name.end);
+      // One excerpt for the whole statement, shared by every name it binds: a statement with thousands of declarations is not copied per name.
+      const line = lineAt(from);
+      let excerpt: string | undefined;
+      const statement = (): string => (excerpt ??= text(from, n.declarationList.end));
+      for (const d of n.declarationList.declarations) {
+        // `export const { start: run, ...rest } = api` exports `run` and `rest`: the names the pattern binds, not its property names.
+        const names = boundNames(d.name);
+        if (!names.length) continue;
+        for (const name of names) addExport(name, line, statement());
+      }
     } else if (ts.isFunctionDeclaration(n) || ts.isClassDeclaration(n) || ts.isEnumDeclaration(n) || ts.isInterfaceDeclaration(n) || ts.isTypeAliasDeclaration(n)) {
-      if (n.name) addExport(n.name.text, from, n.name.end);
+      if (n.name) addExport(n.name.text, lineAt(from), text(from, n.name.end));
     } else if (ts.isModuleDeclaration(n) && ts.isIdentifier(n.name)) {
-      addExport(n.name.text, from, n.name.end);
+      addExport(n.name.text, lineAt(from), text(from, n.name.end));
     }
   };
 
@@ -186,13 +358,14 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
     if (n.parent === sf) topLevel(n);
     if (bindsRequire(n)) requireBound = true;
     if (ts.isCallExpression(n)) {
-      const callee = n.expression;
+      let callee: TS.Expression = n.expression;
+      while (ts.isParenthesizedExpression(callee)) callee = callee.expression;
       const arg = n.arguments[0];
       if (ts.isIdentifier(callee) && callee.text === 'require' && n.arguments.length === 1) {
-        const spec = plainString(arg);
+        const spec = plainString(arg, startOf(n));
         if (spec) addImport('require', spec, startOf(n), n.end, true);
       } else if (callee.kind === ts.SyntaxKind.ImportKeyword) {
-        const spec = plainString(arg);
+        const spec = plainString(arg, startOf(n));
         if (spec) addImport('dynamic', spec, startOf(n), n.end);
       }
     }
@@ -204,10 +377,13 @@ export function scanModule(input: string, opts: { jsx: boolean } = { jsx: true }
   }
 
   let unconfirmed = 0;
+  const unconfirmedAt: number[] = [];
   const kept: ScannedImport[] = [];
   for (const { viaCall, ...imp } of imports) {
-    if (viaCall && requireBound) unconfirmed++;
-    else kept.push(imp);
+    if (viaCall && requireBound) {
+      unconfirmed++;
+      unconfirmedAt.push(imp.line);
+    } else kept.push(imp);
   }
-  return { ok: true, imports: kept, exports, unconfirmed };
+  return { ok: true, imports: kept, exports, defaultExports, starReexports, unconfirmed, unconfirmedAt, unreadableAt };
 }
