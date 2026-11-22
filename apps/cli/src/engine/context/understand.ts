@@ -136,11 +136,27 @@ export type UnderstandOutcome = FreshSnapshot & {
   written: string[];
   /** The snapshot was current but its generated files were missing or edited, so they were regenerated. */
   repaired: boolean;
+  /** Layer 2 brief outcome when drafting ran (or was skipped with zero model calls). */
+  brief?: {
+    modelCalls: number;
+    sectionsDrafted: string[];
+    approved: boolean;
+    claimsHash: string;
+    confirmToken: string;
+    samplePaths: string[];
+    sampleCap: number;
+  };
+};
+
+export type UnderstandBriefOpts = {
+  factoryRoot: string;
+  config: import('@turbine-hall/turbine-contracts').ProjectConfig;
+  model?: import('@turbine-hall/turbine-models').ModelAdapter;
 };
 
 /**
- * `turbine understand`: no snapshot → build; up to date → change nothing; stale → rebuild.
- * Then (re)render the generated files.
+ * `turbine understand` Layer 1: no snapshot → build; up to date → change nothing; stale → rebuild.
+ * Then (re)render the generated Facts files.
  */
 export function understandProject(store: WorkStore, projectRoot: string): UnderstandOutcome {
   const at = repoHead(projectRoot);
@@ -157,6 +173,46 @@ export function understandProject(store: WorkStore, projectRoot: string): Unders
   const dirty = hasUncommittedChanges(at.repoRoot);
   const repaired = fresh.status === 'current' && !contextFilesCurrent(projectRoot, fresh.snapshot);
   return { ...fresh, dirty, written: publishFresh(store, projectRoot, fresh), repaired };
+}
+
+/**
+ * Layer 1 + Layer 2: after Facts are fresh, draft / reverify / render the brief (no model calls when unchanged).
+ */
+export async function understandProjectWithBrief(
+  store: WorkStore,
+  projectRoot: string,
+  briefOpts: UnderstandBriefOpts,
+): Promise<UnderstandOutcome> {
+  const base = understandProject(store, projectRoot);
+  const at = repoHead(projectRoot);
+  if ('error' in at) {
+    // understandProject already succeeded at this HEAD; a race that removes the repo is a hard failure.
+    throw err('E_CONTEXT_UNAVAILABLE', `repository became unreadable while drafting the brief (${'reason' in at ? at.reason : at.error})`);
+  }
+  const { briefConfigOf, ensureBrief } = await import('./brief.js');
+  const brief = await ensureBrief({
+    store,
+    projectRoot,
+    repoRoot: at.repoRoot,
+    repoPath: projectRoot,
+    snapshot: base.snapshot,
+    config: briefConfigOf(briefOpts.config),
+    factoryRoot: briefOpts.factoryRoot,
+    model: briefOpts.model,
+  });
+  return {
+    ...base,
+    written: [...base.written, ...brief.written],
+    brief: {
+      modelCalls: brief.modelCalls,
+      sectionsDrafted: brief.sectionsDrafted,
+      approved: brief.approved,
+      claimsHash: brief.claimsHash,
+      confirmToken: brief.confirmToken,
+      samplePaths: brief.samplePaths,
+      sampleCap: brief.sampleCap,
+    },
+  };
 }
 
 const MAX_DIFF_LINES = 80;
@@ -185,6 +241,16 @@ export function formatOutcome(o: UnderstandOutcome): string[] {
     if (diffLines.length > MAX_DIFF_LINES) lines.push(`  … ${diffLines.length - MAX_DIFF_LINES} more`);
   }
   if (o.dirty) lines.push('Note: uncommitted changes exist (not included).');
+  if (o.brief) {
+    const b = o.brief;
+    if (b.modelCalls === 0) lines.push('Project brief: unchanged (no model calls).');
+    else lines.push(`Project brief: drafted ${b.sectionsDrafted.join(', ') || '(none)'} (${b.modelCalls} model call(s); sample ${b.samplePaths.length}/${b.sampleCap}).`);
+    lines.push(
+      b.approved
+        ? `Brief approved — verified claims at ${o.snapshot.commit.slice(0, 8)}.`
+        : `Brief draft, not approved — verified claims at ${o.snapshot.commit.slice(0, 8)}. Review with: turbine context show; approve with: turbine context approve (code ${b.confirmToken}).`,
+    );
+  }
   return lines;
 }
 
@@ -196,4 +262,18 @@ export function understandOnInit(store: WorkStore, projectRoot: string): string 
     return undefined;
   }
   return formatOutcome(understandProject(store, projectRoot)).join('\n');
+}
+
+/** Like understandOnInit, but also drafts the Layer 2 brief. */
+export async function understandOnInitWithBrief(
+  store: WorkStore,
+  projectRoot: string,
+  briefOpts: UnderstandBriefOpts,
+): Promise<string | undefined> {
+  const at = repoHead(projectRoot);
+  if ('error' in at) {
+    if (at.error === 'broken-head') throw brokenHeadError(at, projectRoot);
+    return undefined;
+  }
+  return formatOutcome(await understandProjectWithBrief(store, projectRoot, briefOpts)).join('\n');
 }

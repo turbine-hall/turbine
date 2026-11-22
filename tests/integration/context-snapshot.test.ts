@@ -709,7 +709,8 @@ describe('the CLI end to end', () => {
     expect(again.status, again.stderr).toBe(0);
     const [first, ...rest] = again.stdout.trim().split('\n');
     expect(first).toMatch(/^Project understood \(snapshot [0-9a-f]{8}\)$/);
-    expect(rest).toEqual(['Note: uncommitted changes exist (not included).']); // init added .cursor/ files
+    expect(rest[0]).toBe('Note: uncommitted changes exist (not included).'); // init added .cursor/ files
+    expect(rest.some((l) => /Project brief: unchanged \(no model calls\)/.test(l))).toBe(true);
     expect([statSync(p.snapshot).mtimeMs, statSync(p.project).mtimeMs]).toEqual(mtimes);
 
     const lint = run(repo, 'lint');

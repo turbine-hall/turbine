@@ -167,4 +167,21 @@ CREATE TABLE IF NOT EXISTS claim_frontier (
 );
 `,
   },
+  {
+    version: 6,
+    sql: `
+-- Layer 2 brief approval state. claims_hash is the published claim set; approved_hash is set only after a human gate.
+CREATE TABLE IF NOT EXISTS brief_state (
+  repo_path TEXT PRIMARY KEY,
+  "commit" TEXT NOT NULL,
+  claims_hash TEXT NOT NULL,
+  approved_hash TEXT,
+  approved_by TEXT,
+  approved_at TEXT,
+  sample_cap INTEGER NOT NULL,
+  sample_paths TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`,
+  },
 ];

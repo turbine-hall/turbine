@@ -12,6 +12,8 @@ export const HUMAN_ONLY_PATTERNS: string[] = [
   // legacy approval commands (removed, but block anyway)
   String.raw`\btask\s+(requirements|plan)\s+(approve|reject)\b`,
   String.raw`\btask\s+accept\b`,
+  // layer 2 brief human gates
+  String.raw`\bcontext\s+(approve|attest)\b`,
   // writing the engine state directly
   String.raw`\b(sqlite3|rm|mv|cp|truncate|dd)\b[^|;&]*\.turbine/state\b`,
   String.raw`>\s*[^|;&]*\.turbine/state\b`,

@@ -1,6 +1,7 @@
 import type {
   Artifact,
   ArtifactDependencyEdge,
+  BriefState,
   Claim,
   ClaimStatus,
   Decision,
@@ -17,6 +18,7 @@ import type {
 import {
   ArtifactDependencyEdgeSchema,
   ArtifactSchema,
+  BriefStateSchema,
   ClaimSchema,
   ClaimStatusSchema,
   MAX_CLAIM_BYTES,
@@ -622,6 +624,75 @@ export class WorkStore {
     }
     const rows = this.db.prepare(sql).all(...args) as ClaimRow[];
     return rows.map((r) => this.parseClaimRow(r));
+  }
+
+  getBriefState(repoPath: string): BriefState | null {
+    const row = this.db
+      .prepare(
+        `SELECT repo_path, "commit", claims_hash, approved_hash, approved_by, approved_at, sample_cap, sample_paths, updated_at
+         FROM brief_state WHERE repo_path = ?`,
+      )
+      .get(repoPath) as
+      | {
+          repo_path: string;
+          commit: string;
+          claims_hash: string;
+          approved_hash: string | null;
+          approved_by: string | null;
+          approved_at: string | null;
+          sample_cap: number;
+          sample_paths: string;
+          updated_at: string;
+        }
+      | undefined;
+    if (!row) return null;
+    let samplePaths: unknown;
+    try {
+      samplePaths = JSON.parse(row.sample_paths);
+    } catch {
+      throw new Error(`brief_state for ${repoPath} has invalid sample_paths JSON`);
+    }
+    return BriefStateSchema.parse({
+      repoPath: row.repo_path,
+      commit: row.commit,
+      claimsHash: row.claims_hash,
+      approvedHash: row.approved_hash,
+      approvedBy: row.approved_by,
+      approvedAt: row.approved_at,
+      sampleCap: row.sample_cap,
+      samplePaths,
+      updatedAt: row.updated_at,
+    });
+  }
+
+  /** Record or replace the brief approval / draft state for a repository. */
+  saveBriefState(state: BriefState): void {
+    const s = BriefStateSchema.parse(state);
+    this.db
+      .prepare(
+        `INSERT INTO brief_state(repo_path, "commit", claims_hash, approved_hash, approved_by, approved_at, sample_cap, sample_paths, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(repo_path) DO UPDATE SET
+           "commit" = excluded."commit",
+           claims_hash = excluded.claims_hash,
+           approved_hash = excluded.approved_hash,
+           approved_by = excluded.approved_by,
+           approved_at = excluded.approved_at,
+           sample_cap = excluded.sample_cap,
+           sample_paths = excluded.sample_paths,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        s.repoPath,
+        s.commit,
+        s.claimsHash,
+        s.approvedHash,
+        s.approvedBy,
+        s.approvedAt,
+        s.sampleCap,
+        JSON.stringify(s.samplePaths),
+        s.updatedAt,
+      );
   }
 
   /** The schema proves the JSON is a valid claim; this proves it is the one the row is filed under. */
