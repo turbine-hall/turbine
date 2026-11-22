@@ -5,6 +5,7 @@ import { briefSectionsFor, loadRoles } from '@turbine-hall/turbine-core';
 import { factoryRoot } from '../paths.js';
 import { packetPaths } from './packet.js';
 import { briefPaths } from './context/brief-render.js';
+import { knowledgePaths } from './knowledge/paths.js';
 
 export type NextStep = {
   workId: string;
@@ -36,7 +37,7 @@ export const CONTEXT_READING_STATES: ReadonlySet<WorkState> = new Set<WorkState>
 ]);
 
 const readFirst = (before: 'planning' | 'implementing') =>
-  `Read PROJECT.md and CONTEXT.md before ${before}. CONTEXT.md is a selection of files with a checkable reason each, not a complete list; PROJECT.md holds verified project facts and the project brief (verified claims at the recorded commit, or labelled draft/human-attested).`;
+  `Read .turbine/knowledge/index.md first (OKF bundle), then CONTEXT.md before ${before}. CONTEXT.md is a selection of files with a checkable reason each, not a complete list. PROJECT.md is superseded by the knowledge bundle for one release.`;
 
 function worktreePathFor(projectRoot: string, workId: string): string {
   return join(projectRoot, '.turbine', 'worktrees', workId);
@@ -78,12 +79,20 @@ function computeNextStepRaw(input: {
   const briefFiles = input.briefUnavailable
     ? []
     : (roleBrief ?? []).map((s) => briefPaths(projectRoot).section(s)).filter((p) => existsSync(p));
-  const contextFiles = [paths.projectContext, paths.context, ...briefFiles].filter((p) => existsSync(p));
+  const knowledgeIndex = knowledgePaths(projectRoot).index;
+  const knowledgeBrief = input.briefUnavailable
+    ? []
+    : (roleBrief ?? [])
+        .map((s) => join(knowledgePaths(projectRoot).dir, 'brief', `${encodeURIComponent(s)}.md`))
+        .filter((p) => existsSync(p));
+  const contextFiles = [knowledgeIndex, paths.projectContext, paths.context, ...knowledgeBrief, ...briefFiles].filter((p) =>
+    existsSync(p),
+  );
   const briefNote = input.briefUnavailable
-    ? 'Project brief is unavailable for this checkout (could not reverify claims at HEAD). Run: turbine understand'
+    ? 'Project knowledge/brief is unavailable for this checkout (could not reverify claims at HEAD). Run: turbine understand'
     : roleBrief?.length
-      ? `Role brief sections: ${roleBrief.join(', ')} (verified claims at the commit recorded in PROJECT.md).`
-      : 'PROJECT.md includes the project brief when present (verified claims at the recorded commit).';  const sync = `turbine task sync ${work.id}`;
+      ? `Read .turbine/knowledge/index.md; role brief sections: ${roleBrief.join(', ')} under knowledge/brief/ (verified claims at the recorded commit).`
+      : 'Read .turbine/knowledge/index.md first (OKF bundle of verified facts and claims).';  const sync = `turbine task sync ${work.id}`;
   const next = `turbine task next ${work.id}`;
   const approve = `turbine task approve ${work.id}`;
   const humanOnly = [

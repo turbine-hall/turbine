@@ -146,6 +146,12 @@ export type UnderstandOutcome = FreshSnapshot & {
     samplePaths: string[];
     sampleCap: number;
   };
+  /** OKF knowledge bundle outcome when published after facts + brief. */
+  knowledge?: {
+    unchanged: boolean;
+    commit: string;
+    hash: string;
+  };
 };
 
 export type UnderstandBriefOpts = {
@@ -200,9 +206,20 @@ export async function understandProjectWithBrief(
     factoryRoot: briefOpts.factoryRoot,
     model: briefOpts.model,
   });
+  const { publishKnowledgeBundle } = await import('../knowledge/publish.js');
+  const knowledge = publishKnowledgeBundle({
+    store,
+    projectRoot,
+    repoRoot: at.repoRoot,
+    repoPath: projectRoot,
+    snapshot: base.snapshot,
+    brief: store.getBriefState(projectRoot),
+    cliVersion: '0.5.0',
+    projectName: briefOpts.config.project?.name ?? 'project',
+  });
   return {
     ...base,
-    written: [...base.written, ...brief.written],
+    written: [...base.written, ...brief.written, ...knowledge.written],
     brief: {
       modelCalls: brief.modelCalls,
       sectionsDrafted: brief.sectionsDrafted,
@@ -212,6 +229,7 @@ export async function understandProjectWithBrief(
       samplePaths: brief.samplePaths,
       sampleCap: brief.sampleCap,
     },
+    knowledge: { unchanged: knowledge.unchanged, commit: knowledge.commit, hash: knowledge.hash },
   };
 }
 
@@ -249,6 +267,13 @@ export function formatOutcome(o: UnderstandOutcome): string[] {
       b.approved
         ? `Brief approved — verified claims at ${o.snapshot.commit.slice(0, 8)}.`
         : `Brief draft, not approved — verified claims at ${o.snapshot.commit.slice(0, 8)}. Review with: turbine context show; approve with: turbine context approve (code ${b.confirmToken}).`,
+    );
+  }
+  if (o.knowledge) {
+    lines.push(
+      o.knowledge.unchanged
+        ? 'Knowledge bundle: unchanged (no writes).'
+        : `Knowledge bundle: wrote .turbine/knowledge/ for commit ${o.knowledge.commit.slice(0, 8)}.`,
     );
   }
   return lines;

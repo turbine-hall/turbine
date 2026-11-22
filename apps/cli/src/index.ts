@@ -1,18 +1,23 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { createJiraAdapter } from '@turbine-hall/turbine-adapter-jira';
 import { assertTransition, listFrameworks, loadRoles } from '@turbine-hall/turbine-core';
 import { listModels } from '@turbine-hall/turbine-models';
 import { loadSkills } from '@turbine-hall/turbine-skills';
 import { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
-import { err } from '@turbine-hall/turbine-contracts';
+import { err, okfTrustTier } from '@turbine-hall/turbine-contracts';
 import { formatOutcome, understandOnInitWithBrief, understandProjectWithBrief } from './engine/context/understand.js';
 import { lintProjectContext } from './engine/context/render.js';
 import { lintTaskContexts } from './engine/context/task-render.js';
 import { briefConfigOf, briefDiff } from './engine/context/brief.js';
 import { approveBrief, attestClaim } from './engine/context/brief-approve.js';
 import { renderClaimBullet } from './engine/context/brief-render.js';
+import { validateBundle, lintKnowledgeBundle } from './engine/knowledge/validate.js';
+import { exportKnowledgeBundle, lintKnowledgeHandEdits } from './engine/knowledge/publish.js';
+import { knowledgePaths } from './engine/knowledge/paths.js';
+import { splitFrontmatter } from './engine/knowledge/frontmatter.js';
 import { Engine } from './engine/engine.js';
 import { initProject, openContext } from './engine/project.js';
 import { handleError, printResult } from './output.js';
@@ -205,6 +210,98 @@ contextCmd
     }
   });
 
+const knowledgeCmd = program.command('knowledge').description('OKF v0.3 knowledge bundle (.turbine/knowledge/)');
+knowledgeCmd
+  .command('validate')
+  .argument('[dir]', 'Bundle directory (default: .turbine/knowledge)')
+  .option('--json', 'JSON output')
+  .description('Validate OKF conformance and the Turbine profile')
+  .action((dir: string | undefined, opts: { json?: boolean }) => {
+    try {
+      const cwd = callerCwd();
+      const root = findProjectRoot(cwd);
+      const target = dir ?? (root ? knowledgePaths(root).dir : undefined);
+      if (!target) throw err('E_INVALID_CONFIG', `No .turbine project found from ${cwd}. Run: turbine init --project .`);
+      const issues = validateBundle(target);
+      if (opts.json) printResult(issues, true);
+      else if (!issues.length) process.stdout.write('Knowledge bundle OK.\n');
+      else {
+        for (const i of issues) process.stdout.write(`${i.level}: ${i.file}: ${i.message}\n`);
+      }
+      if (issues.some((i) => i.level === 'error')) process.exit(3);
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+knowledgeCmd
+  .command('export')
+  .argument('<dir>', 'Destination directory for a validated copy')
+  .option('--force', 'Replace a non-empty target')
+  .description('Write a validated copy of the knowledge bundle for committing or sharing')
+  .action((dir: string, opts: { force?: boolean }) => {
+    try {
+      const ctx = openContext();
+      try {
+        const result = exportKnowledgeBundle({ projectRoot: ctx.projectRoot, targetDir: dir, force: !!opts.force });
+        printResult(result, false);
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+knowledgeCmd
+  .command('show')
+  .argument('[concept]', 'Optional concept path relative to the bundle')
+  .option('--json', 'JSON output')
+  .description('List concepts and their trust tiers')
+  .action((concept: string | undefined, opts: { json?: boolean }) => {
+    try {
+      const cwd = callerCwd();
+      const root = findProjectRoot(cwd);
+      if (!root) throw err('E_INVALID_CONFIG', `No .turbine project found from ${cwd}. Run: turbine init --project .`);
+      const dir = knowledgePaths(root).dir;
+      if (!existsSync(dir)) throw err('E_NOT_FOUND', 'No knowledge bundle; run: turbine understand');
+      const rows: Array<{ path: string; type?: string; title?: string; trust: string }> = [];
+      const walk = (abs: string, rel: string) => {
+        for (const name of readdirSync(abs)) {
+          if (name.startsWith('.')) continue;
+          const child = join(abs, name);
+          const childRel = rel ? `${rel}/${name}` : name;
+          const st = lstatSync(child);
+          if (st.isDirectory()) walk(child, childRel);
+          else if (st.isFile() && name.endsWith('.md') && name !== 'index.md' && name !== 'log.md' && name !== 'README.md') {
+            if (concept && childRel !== concept && !childRel.endsWith(`/${concept}`)) continue;
+            const text = readFileSync(child, 'utf8');
+            const split = splitFrontmatter(text);
+            if (!split.ok || typeof split.data.type !== 'string') continue;
+            rows.push({
+              path: childRel,
+              type: split.data.type,
+              title: typeof split.data.title === 'string' ? split.data.title : undefined,
+              trust: okfTrustTier({
+                generated: split.data.generated as { by?: string; at?: string } | undefined,
+                verified: split.data.verified,
+              }),
+            });
+          }
+        }
+      };
+      walk(dir, '');
+      rows.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+      if (opts.json) printResult(rows, true);
+      else {
+        process.stdout.write(`Knowledge bundle (${rows.length} concepts)\n`);
+        for (const r of rows) process.stdout.write(`${r.trust.padEnd(18)} ${r.path}${r.title ? ` — ${r.title}` : ''}\n`);
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
 program
   .command('lint')
   .option('--json', 'JSON output')
@@ -216,7 +313,12 @@ program
       const cwd = callerCwd();
       const root = findProjectRoot(cwd);
       if (!root) throw err('E_INVALID_CONFIG', `No .turbine project found from ${cwd}. Run: turbine init --project .`);
-      const issues = [...lintProjectContext(root), ...lintTaskContexts(root)];
+      const issues = [
+        ...lintProjectContext(root),
+        ...lintTaskContexts(root),
+        ...lintKnowledgeBundle(root),
+        ...lintKnowledgeHandEdits(root),
+      ];
       if (opts.json) printResult(issues, true);
       else if (!issues.length) process.stdout.write('Project context OK.\n');
       else for (const i of issues) process.stdout.write(`${i.level.toUpperCase().padEnd(7)} ${i.file}: ${i.message}\n`);
