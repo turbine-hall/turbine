@@ -20,3 +20,4 @@ coverage/
 .idea/
 .vscode/
 !docs/
+tests/fixtures/okf-upstream/.venv/

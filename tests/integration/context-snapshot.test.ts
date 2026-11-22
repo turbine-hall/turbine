@@ -1623,7 +1623,9 @@ describe('review round 4 (PR #9): the third review batch stays closed', () => {
     writeFileSync(join(dir, '.turbine', '.gitignore'), 'context/\n!cont*/\n');
     understandProject(openStore(), dir);
     const rules = readFileSync(join(dir, '.turbine', '.gitignore'), 'utf8').trimEnd().split('\n');
-    expect(rules[rules.length - 1]).toBe('context/');
+    // context/ is re-appended after the un-ignore wildcard; knowledge/ is also ensured last.
+    expect(rules).toContain('context/');
+    expect(rules[rules.length - 1]).toBe('knowledge/');
     expect(lintProjectContext(dir).filter((i) => i.level === 'error')).toEqual([]);
   });
 

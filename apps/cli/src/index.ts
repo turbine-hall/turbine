@@ -1,18 +1,29 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { readFileSync } from 'node:fs';
+import { existsSync, lstatSync, opendirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { createJiraAdapter } from '@turbine-hall/turbine-adapter-jira';
 import { assertTransition, listFrameworks, loadRoles } from '@turbine-hall/turbine-core';
 import { listModels } from '@turbine-hall/turbine-models';
 import { loadSkills } from '@turbine-hall/turbine-skills';
 import { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
-import { err } from '@turbine-hall/turbine-contracts';
+import { err, okfTrustTier } from '@turbine-hall/turbine-contracts';
 import { formatOutcome, understandOnInitWithBrief, understandProjectWithBrief } from './engine/context/understand.js';
 import { lintProjectContext } from './engine/context/render.js';
 import { lintTaskContexts } from './engine/context/task-render.js';
 import { briefConfigOf, briefDiff } from './engine/context/brief.js';
 import { approveBrief, attestClaim } from './engine/context/brief-approve.js';
 import { renderClaimBullet } from './engine/context/brief-render.js';
+import { validateBundle, lintKnowledgeBundle } from './engine/knowledge/validate.js';
+import { exportKnowledgeBundle, lintKnowledgeHandEdits } from './engine/knowledge/publish.js';
+import {
+  knowledgePaths,
+  readBoundedUtf8,
+  MAX_BUNDLE_DEPTH,
+  MAX_BUNDLE_FILE_BYTES,
+  MAX_BUNDLE_FILES,
+} from './engine/knowledge/paths.js';
+import { splitFrontmatter } from './engine/knowledge/frontmatter.js';
 import { Engine } from './engine/engine.js';
 import { initProject, openContext } from './engine/project.js';
 import { handleError, printResult } from './output.js';
@@ -205,6 +216,145 @@ contextCmd
     }
   });
 
+const knowledgeCmd = program.command('knowledge').description('OKF v0.3 knowledge bundle (.turbine/knowledge/)');
+knowledgeCmd
+  .command('validate')
+  .argument('[dir]', 'Bundle directory (default: .turbine/knowledge)')
+  .option('--json', 'JSON output')
+  .description('Validate OKF conformance and the Turbine profile')
+  .action((dir: string | undefined, opts: { json?: boolean }) => {
+    try {
+      const cwd = callerCwd();
+      const root = findProjectRoot(cwd);
+      const target = dir
+        ? (dir.startsWith('/') ? dir : join(cwd, dir))
+        : root
+          ? knowledgePaths(root).dir
+          : undefined;
+      if (!target) throw err('E_INVALID_CONFIG', `No .turbine project found from ${cwd}. Run: turbine init --project .`);
+      const issues = validateBundle(target);
+      if (opts.json) printResult(issues, true);
+      else if (!issues.length) process.stdout.write('Knowledge bundle OK.\n');
+      else {
+        for (const i of issues) process.stdout.write(`${i.level}: ${i.file}: ${i.message}\n`);
+      }
+      if (issues.some((i) => i.level === 'error')) process.exitCode = 3;
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+knowledgeCmd
+  .command('export')
+  .argument('<dir>', 'Destination directory for a validated copy')
+  .option('--force', 'Replace a non-empty target')
+  .description('Write a validated copy of the knowledge bundle for committing or sharing')
+  .action((dir: string, opts: { force?: boolean }) => {
+    try {
+      const ctx = openContext();
+      try {
+        const cwd = callerCwd();
+        const targetDir = dir.startsWith('/') ? dir : join(cwd, dir);
+        const result = exportKnowledgeBundle({ projectRoot: ctx.projectRoot, targetDir, force: !!opts.force });
+        printResult(result, false);
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+knowledgeCmd
+  .command('show')
+  .argument('[concept]', 'Optional concept path relative to the bundle')
+  .option('--json', 'JSON output')
+  .description('List concepts and their trust tiers')
+  .action((concept: string | undefined, opts: { json?: boolean }) => {
+    try {
+      const cwd = callerCwd();
+      const root = findProjectRoot(cwd);
+      if (!root) throw err('E_INVALID_CONFIG', `No .turbine project found from ${cwd}. Run: turbine init --project .`);
+      const dir = knowledgePaths(root).dir;
+      if (!existsSync(dir)) throw err('E_NOT_FOUND', 'No knowledge bundle; run: turbine understand');
+      const rows: Array<{ path: string; type?: string; title?: string; trust: string }> = [];
+      let visited = 0;
+      let budgetHit: string | undefined;
+      const walk = (abs: string, rel: string, depth: number) => {
+        if (budgetHit) return;
+        if (depth > MAX_BUNDLE_DEPTH) {
+          budgetHit = `bundle exceeds max depth ${MAX_BUNDLE_DEPTH}`;
+          return;
+        }
+        let dirHandle;
+        try {
+          dirHandle = opendirSync(abs);
+        } catch (e) {
+          budgetHit = `cannot read ${rel || '.'}: ${(e as Error).message}`;
+          return;
+        }
+        try {
+          for (let ent = dirHandle.readSync(); ent !== null; ent = dirHandle.readSync()) {
+            if (budgetHit) return;
+            // Count every scanned entry (including hidden) so the budget bounds enumeration work.
+            visited += 1;
+            if (visited > MAX_BUNDLE_FILES) {
+              budgetHit = `bundle has more than ${MAX_BUNDLE_FILES} entries`;
+              return;
+            }
+            const name = ent.name;
+            if (name.startsWith('.')) continue;
+            const child = join(abs, name);
+            const childRel = rel ? `${rel}/${name}` : name;
+            let st;
+            try {
+              st = lstatSync(child);
+            } catch (e) {
+              rows.push({ path: childRel, trust: `unreadable:${(e as Error).message}` });
+              continue;
+            }
+            if (st.isDirectory()) walk(child, childRel, depth + 1);
+            else if (st.isFile() && name.endsWith('.md') && name !== 'index.md' && name !== 'log.md' && name !== 'README.md') {
+              if (concept && childRel !== concept && !childRel.endsWith(`/${concept}`)) continue;
+              let text: string;
+              try {
+                const body = readBoundedUtf8(child, MAX_BUNDLE_FILE_BYTES);
+                if (body === undefined) continue;
+                text = body;
+              } catch (e) {
+                rows.push({ path: childRel, trust: `unreadable:${(e as Error).message}` });
+                continue;
+              }
+              const split = splitFrontmatter(text);
+              if (!split.ok || typeof split.data.type !== 'string') continue;
+              rows.push({
+                path: childRel,
+                type: split.data.type,
+                title: typeof split.data.title === 'string' ? split.data.title : undefined,
+                trust: okfTrustTier({
+                  generated: split.data.generated as { by?: string; at?: string } | undefined,
+                  verified: split.data.verified,
+                }),
+              });
+            }
+          }
+        } finally {
+          dirHandle.closeSync();
+        }
+      };
+      walk(dir, '', 0);
+      if (budgetHit) throw err('E_CONTEXT_UNAVAILABLE', budgetHit);
+      rows.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+      if (opts.json) printResult(rows, true);
+      else {
+        process.stdout.write(`Knowledge bundle (${rows.length} concepts)\n`);
+        for (const r of rows) process.stdout.write(`${r.trust.padEnd(18)} ${r.path}${r.title ? ` — ${r.title}` : ''}\n`);
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
 program
   .command('lint')
   .option('--json', 'JSON output')
@@ -216,7 +366,21 @@ program
       const cwd = callerCwd();
       const root = findProjectRoot(cwd);
       if (!root) throw err('E_INVALID_CONFIG', `No .turbine project found from ${cwd}. Run: turbine init --project .`);
-      const issues = [...lintProjectContext(root), ...lintTaskContexts(root)];
+      const issues = [
+        ...lintProjectContext(root),
+        ...lintTaskContexts(root),
+        ...lintKnowledgeBundle(root),
+      ];
+      try {
+        issues.push(...lintKnowledgeHandEdits(root));
+      } catch (e) {
+        // A hand-edit check failure must not discard the other lint diagnostics.
+        issues.push({
+          level: 'error',
+          file: 'knowledge/',
+          message: `hand-edit check failed: ${(e as Error).message}`,
+        });
+      }
       if (opts.json) printResult(issues, true);
       else if (!issues.length) process.stdout.write('Project context OK.\n');
       else for (const i of issues) process.stdout.write(`${i.level.toUpperCase().padEnd(7)} ${i.file}: ${i.message}\n`);

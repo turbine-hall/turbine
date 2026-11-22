@@ -5,6 +5,8 @@ import { briefSectionsFor, loadRoles } from '@turbine-hall/turbine-core';
 import { factoryRoot } from '../paths.js';
 import { packetPaths } from './packet.js';
 import { briefPaths } from './context/brief-render.js';
+import { knowledgeBundleCommit, knowledgePaths } from './knowledge/paths.js';
+import { resolveCommit } from './context/git-read.js';
 
 export type NextStep = {
   workId: string;
@@ -35,8 +37,10 @@ export const CONTEXT_READING_STATES: ReadonlySet<WorkState> = new Set<WorkState>
   'CHANGES_REQUESTED',
 ]);
 
-const readFirst = (before: 'planning' | 'implementing') =>
-  `Read PROJECT.md and CONTEXT.md before ${before}. CONTEXT.md is a selection of files with a checkable reason each, not a complete list; PROJECT.md holds verified project facts and the project brief (verified claims at the recorded commit, or labelled draft/human-attested).`;
+const readFirst = (before: 'planning' | 'implementing', knowledgeOk: boolean) =>
+  knowledgeOk
+    ? `Read .turbine/knowledge/index.md first (OKF bundle), then CONTEXT.md before ${before}. CONTEXT.md is a selection of files with a checkable reason each, not a complete list. PROJECT.md is superseded by the knowledge bundle for one release.`
+    : `Knowledge bundle is missing or stale (run turbine understand). Read CONTEXT.md before ${before}. CONTEXT.md is a selection of files with a checkable reason each, not a complete list.`;
 
 function worktreePathFor(projectRoot: string, workId: string): string {
   return join(projectRoot, '.turbine', 'worktrees', workId);
@@ -78,12 +82,29 @@ function computeNextStepRaw(input: {
   const briefFiles = input.briefUnavailable
     ? []
     : (roleBrief ?? []).map((s) => briefPaths(projectRoot).section(s)).filter((p) => existsSync(p));
-  const contextFiles = [paths.projectContext, paths.context, ...briefFiles].filter((p) => existsSync(p));
-  const briefNote = input.briefUnavailable
-    ? 'Project brief is unavailable for this checkout (could not reverify claims at HEAD). Run: turbine understand'
+  const head = resolveCommit(projectRoot, 'HEAD');
+  const bundleCommit = knowledgeBundleCommit(projectRoot);
+  const knowledgeFresh = Boolean(head && bundleCommit && head === bundleCommit);
+  const knowledgeUnavailable = Boolean(input.briefUnavailable) || !knowledgeFresh;
+  const knowledgeIndex = knowledgePaths(projectRoot).index;
+  const knowledgeBrief = knowledgeUnavailable
+    ? []
+    : (roleBrief ?? [])
+        .map((s) => join(knowledgePaths(projectRoot).dir, 'brief', `${encodeURIComponent(s)}.md`))
+        .filter((p) => existsSync(p));
+  const contextFiles = [
+    ...(knowledgeUnavailable ? [] : [knowledgeIndex]),
+    paths.projectContext,
+    paths.context,
+    ...knowledgeBrief,
+    ...briefFiles,
+  ].filter((p) => existsSync(p));
+  const knowledgeOk = !knowledgeUnavailable && existsSync(knowledgeIndex);
+  const briefNote = knowledgeUnavailable
+    ? 'Project knowledge/brief is unavailable or stale for this checkout (bundle commit ≠ HEAD, or brief could not be reverified). Run: turbine understand'
     : roleBrief?.length
-      ? `Role brief sections: ${roleBrief.join(', ')} (verified claims at the commit recorded in PROJECT.md).`
-      : 'PROJECT.md includes the project brief when present (verified claims at the recorded commit).';  const sync = `turbine task sync ${work.id}`;
+      ? `Read .turbine/knowledge/index.md; role brief sections: ${roleBrief.join(', ')} under knowledge/brief/ (verified claims at the recorded commit).`
+      : 'Read .turbine/knowledge/index.md first (OKF bundle of verified facts and claims).';  const sync = `turbine task sync ${work.id}`;
   const next = `turbine task next ${work.id}`;
   const approve = `turbine task approve ${work.id}`;
   const humanOnly = [
@@ -159,7 +180,7 @@ function computeNextStepRaw(input: {
         doNow: 'Run sync to create the plan (in SPEC.md).',
         commands: [sync, next],
         openFiles: [paths.status, ...contextFiles],
-        agentPlaybook: [readFirst('planning'), briefNote, 'Run turbine task sync <id>.', 'Then ask the human to review SPEC.md → Plan.'],
+        agentPlaybook: [readFirst('planning', knowledgeOk), briefNote, 'Run turbine task sync <id>.', 'Then ask the human to review SPEC.md → Plan.'],
       };
 
     case 'PLAN_REVIEW':
@@ -188,7 +209,7 @@ function computeNextStepRaw(input: {
           `After execute, open ${paths.executionBrief} and cd into the worktree — not the main checkout.`,
         ],
         agentPlaybook: [
-          readFirst('implementing'),
+          readFirst('implementing', knowledgeOk),
           briefNote,
           'Run turbine task sync <id> (execute).',
           'Read SPEC.md → Requirements and Plan; follow the plan steps and file list.',
@@ -214,7 +235,7 @@ function computeNextStepRaw(input: {
         worktreePath: existsSync(wt) ? wt : undefined,
         branch,
         agentPlaybook: [
-          readFirst('implementing'),
+          readFirst('implementing', knowledgeOk),
           briefNote,
           'Never commit on staging/main for this task.',
           'Implement + typecheck in worktree.',

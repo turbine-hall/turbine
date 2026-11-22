@@ -1,0 +1,32 @@
+---
+description: Prevent CodeRabbit churn — write to AGENTS.md rules and review locally before PRs
+alwaysApply: true
+---
+
+# CodeRabbit preflight (write once, not fix later)
+
+GitHub CodeRabbit is not the first review. Agents must write code that already matches `AGENTS.md` correctness rules 1–18 and the local CodeRabbit profile (`.coderabbit.yaml` + auto-discovered `AGENTS.md`).
+
+## When implementing
+
+- Fail closed on unreadable prior state (never drop log/unknown keys silently).
+- Stage → validate → swap for any publish/export; reject path overlap with live artifacts.
+- Keep truncated IDs unique via a digest of the full identity.
+- Never promote a partial human attestation to whole-concept `verified.by`.
+- OKF / YAML: real parser + Document API; quote number/boolean-like strings; actors have no whitespace.
+- Stop walks when budgets are exceeded.
+- Only recommend generated artifacts whose commit matches HEAD.
+
+## Before opening or updating a PR
+
+1. `pnpm build && pnpm lint && pnpm typecheck && pnpm test`
+2. Local CodeRabbit against the **PR base branch** (not a hard-coded `main`):
+
+```bash
+base=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || echo main)
+coderabbit review --agent --base "$base"
+```
+
+3. Fix actionable critical/major findings with regression tests, then re-run until local CR is clean.
+
+Do not open a PR that you know will generate a large CodeRabbit review as the cleanup step.

@@ -20,6 +20,11 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # OKF upstream validate.py (tests/fixtures/okf-upstream) needs PyYAML.
+      - run: python3 -m pip install pyyaml
       # Workspace packages resolve types from dist/; build before typecheck/test.
       - run: pnpm build
       - run: pnpm lint

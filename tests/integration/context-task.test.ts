@@ -655,7 +655,9 @@ describe('criterion c — the selection is rebuilt before `next` points to it wh
     expect(md).not.toContain('STALE');
     expect(md).toContain('The listed files and their scores are unchanged.');
     expect(next.openFiles).toContain(paths.context);
-    expect(next.agentPlaybook[0]).toMatch(/^Read PROJECT\.md and CONTEXT\.md before implementing/);
+    expect(next.agentPlaybook[0]).toMatch(
+      /(knowledge\/index\.md.*CONTEXT\.md before implementing|Knowledge bundle is missing or stale.*CONTEXT\.md before implementing)/s,
+    );
   });
 
   it('`execute` and `plan` also rebuild first (a CHANGES_REQUESTED cycle never reads the old selection)', async () => {
@@ -803,9 +805,10 @@ describe('criterion d — agent notes survive re-renders; edits to the generated
 
 // =================================================================== criterion (e)
 
-describe('criterion e — `turbine task next` tells agents to read PROJECT.md and CONTEXT.md before planning and implementing', () => {
-  const PLAN_LINE = /^Read PROJECT\.md and CONTEXT\.md before planning\./;
-  const IMPL_LINE = /^Read PROJECT\.md and CONTEXT\.md before implementing\./;
+describe('criterion e — `turbine task next` tells agents to read the knowledge bundle and CONTEXT.md before planning and implementing', () => {
+  // Fresh bundle → knowledge/index.md first; stale/missing → explicit understand instruction. Both require CONTEXT.md.
+  const PLAN_LINE = /(knowledge\/index\.md.*CONTEXT\.md before planning|Knowledge bundle is missing or stale.*CONTEXT\.md before planning)/s;
+  const IMPL_LINE = /(knowledge\/index\.md.*CONTEXT\.md before implementing|Knowledge bundle is missing or stale.*CONTEXT\.md before implementing)/s;
 
   it('REQUIREMENTS_APPROVED, PLAN_APPROVED, IMPLEMENTING and CHANGES_REQUESTED, through the engine', async () => {
     const dir = project();
@@ -848,7 +851,7 @@ describe('criterion e — `turbine task next` tells agents to read PROJECT.md an
     expect(planning.openFiles).toEqual(expect.arrayContaining([paths.context, paths.projectContext]));
     expect(planning.agentPlaybook[0]).toMatch(PLAN_LINE);
     const review = computeNextStep({ projectRoot: dir, work: { ...work, currentState: 'REQUIREMENTS_REVIEW' }, defaultBaseBranch: 'staging' });
-    expect(review.agentPlaybook.join('\n')).not.toContain('PROJECT.md and CONTEXT.md');
+    expect(review.agentPlaybook.join('\n')).not.toMatch(/knowledge\/index\.md.*CONTEXT\.md/s);
     // a file that does not exist is never offered to open
     rmSync(paths.context);
     const missing = computeNextStep({ projectRoot: dir, work: { ...work, currentState: 'PLANNING' }, defaultBaseBranch: 'staging' });
@@ -856,7 +859,7 @@ describe('criterion e — `turbine task next` tells agents to read PROJECT.md an
     expect(missing.openFiles).toContain(paths.projectContext);
   });
 
-  it('STATUS.md links CONTEXT.md; the CLI `task next` prints both files', async () => {
+  it('STATUS.md links CONTEXT.md; the CLI `task next` prints knowledge + CONTEXT', async () => {
     const dir = project();
     const engine = engineFor(dir);
     const work = await toPlanApproved(engine);
@@ -874,7 +877,9 @@ describe('criterion e — `turbine task next` tells agents to read PROJECT.md an
     expect(out.status, out.stderr).toBe(0);
     expect(out.stdout).toContain('CONTEXT.md');
     expect(out.stdout).toContain('PROJECT.md');
-    expect(out.stdout).toContain('Read PROJECT.md and CONTEXT.md before implementing');
+    expect(out.stdout).toMatch(
+      /(knowledge\/index\.md.*CONTEXT\.md before implementing|Knowledge bundle is missing or stale.*CONTEXT\.md before implementing)/s,
+    );
   });
 });
 
