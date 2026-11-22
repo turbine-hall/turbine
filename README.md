@@ -165,12 +165,16 @@ alias turbine='pnpm --dir /path/to/turbine turbine'
 
 ```bash
 cd /path/to/your-app
-turbine init --project .     # creates .turbine/ in this directory
+turbine init --project .     # creates .turbine/ in this directory; runs `understand` when the repo has commits
 turbine doctor               # projectRoot should be your app, not the turbine repo
 
 # Create your first task
 turbine task create --title "Add password reset endpoint" --file ./request.md
 ```
+
+### `turbine understand` (project knowledge)
+
+`turbine understand` snapshots the repository at HEAD, drafts a verified-claims brief, and publishes an [OKF](https://github.com/open-knowledge-format/open-knowledge-format) v0.3 knowledge bundle under `.turbine/knowledge/` (profile `turbine-okf/1`). The store is the source of truth; the markdown files are a deterministic render. The live bundle is git-ignored by default — use `turbine knowledge export <dir>` when you want a validated copy to commit or share. A second run at the same commit writes nothing. Agents should start from `.turbine/knowledge/index.md`.
 
 ### Configure quality checks (required)
 
