@@ -60,12 +60,21 @@ function generatedAtFor(previousAt: string | undefined, contentChanged: boolean,
 
 function yamlScalar(value: string): string {
   // Quote anything that is not a safe YAML 1.2 plain scalar (leading `-` is a sequence indicator).
+  // Control characters (incl. CR/LF/DEL) must be quoted; check via char codes to satisfy no-control-regex.
+  let hasControl = false;
+  for (let i = 0; i < value.length; i++) {
+    const c = value.charCodeAt(i);
+    if (c <= 0x1f || c === 0x7f) {
+      hasControl = true;
+      break;
+    }
+  }
   if (
     value === '' ||
     value !== value.trim() ||
     shouldQuoteOkfString(value) ||
     /[:#{}[\],&*?|>!%@`]/.test(value) ||
-    /[\n\r\u0000-\u001f\u007f]/.test(value) ||
+    hasControl ||
     value.includes("'") ||
     value.includes('"') ||
     /^[-?]/.test(value)

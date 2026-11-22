@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { existsSync, lstatSync, opendirSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, opendirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createJiraAdapter } from '@turbine-hall/turbine-adapter-jira';
 import { assertTransition, listFrameworks, loadRoles } from '@turbine-hall/turbine-core';
