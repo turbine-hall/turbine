@@ -204,11 +204,26 @@ describe('AC: human edit that breaks a claim is rejected (markers removed → wi
     const before = readFileSync(file, 'utf8');
     const ids = parseClaimIdsFromSection(before);
     expect(ids.length).toBeGreaterThan(0);
+    const editedId = ids[0]!;
     const edited = before.replace(/- .+? _\[verified\]_/, '- Totally different unsupported assertion _[verified]_');
     expect(edited).not.toBe(before);
     writeFileSync(file, edited);
-    const o2 = await understandProjectWithBrief(store, dir, { factoryRoot: factoryRoot(), config: defaultCfg() });
+    // Second draft returns no replacement claims so the withdrawn row is not republished under the same id.
+    const emptyBrief = createMockModelAdapter('mock-empty-brief');
+    const origRun = emptyBrief.run.bind(emptyBrief);
+    emptyBrief.run = async (req) => {
+      if (req.schemaId === 'project-brief' || req.skillIds.includes('core/draft-project-brief')) {
+        return { content: { claims: [] }, usage: { inputTokens: 1, outputTokens: 1 }, providerRequestId: 'empty' };
+      }
+      return origRun(req);
+    };
+    const o2 = await understandProjectWithBrief(store, dir, {
+      factoryRoot: factoryRoot(),
+      config: defaultCfg(),
+      model: emptyBrief,
+    });
     expect(o2.brief!.sectionsDrafted).toContain('architecture');
+    expect(store.getClaim(dir, editedId)?.status).toBe('withdrawn');
     const body = readFileSync(file, 'utf8');
     expect(body).not.toMatch(/Totally different unsupported assertion/);
   });

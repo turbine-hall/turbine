@@ -131,9 +131,18 @@ export type EnsureBriefResult = {
   confirmToken: string;
 };
 
+export type SyncBriefResult = {
+  ok: boolean;
+  commit: string;
+  rewritten: boolean;
+  withdrawn: number;
+  reason?: string;
+};
+
 /**
  * Carry published brief claims to HEAD and rewrite brief pages when anything was withdrawn.
  * Deterministic: no model calls. Used by task next / task start so agents never see stale verified text.
+ * On failure (`ok: false`), callers must omit brief links from the handoff.
  */
 export function syncBriefClaimsToHead(input: {
   store: WorkStore;
@@ -141,61 +150,92 @@ export function syncBriefClaimsToHead(input: {
   repoRoot: string;
   repoPath: string;
   sections: string[];
-}): { commit: string; rewritten: boolean; withdrawn: number } {
-  const commit = resolveCommit(input.repoRoot, 'HEAD');
-  if (!commit) return { commit: '', rewritten: false, withdrawn: 0 };
+}): SyncBriefResult {
+  try {
+    const commit = resolveCommit(input.repoRoot, 'HEAD');
+    if (!commit) return { ok: false, commit: '', rewritten: false, withdrawn: 0, reason: 'HEAD does not resolve' };
 
-  let withdrawn = 0;
-  const frontier = input.store.getClaimFrontier(input.repoPath);
-  if (frontier && frontier !== commit) {
-    const r = reverifyOnCommit(input.store, input.repoRoot, input.repoPath, frontier, commit);
-    withdrawn = r.withdrawn.length;
+    const prev = input.store.getBriefState(input.repoPath);
+    // Honour human section edits before reverify/rewrite so task next cannot restore a deleted claim block.
+    const before = input.store.listClaims(input.repoPath, { statuses: [...PUBLISHED_CLAIM_STATUSES] });
+    const editWithdrawn = applyHumanSectionEdits(input.store, input.projectRoot, input.repoPath, input.sections, before);
+
+    let withdrawn = 0;
+    const pending = new Set<string>([...(prev?.pendingSections ?? []), ...editWithdrawn]);
+    const frontier = input.store.getClaimFrontier(input.repoPath);
+    if (frontier && frontier !== commit) {
+      const r = reverifyOnCommit(input.store, input.repoRoot, input.repoPath, frontier, commit);
+      withdrawn = r.withdrawn.length;
+      for (const s of r.sections) pending.add(s);
+    }
+
+    // Pin the published set to this commit; refuse if HEAD/frontier moved mid-flight.
+    const headNow = resolveCommit(input.repoRoot, 'HEAD');
+    const frontierNow = input.store.getClaimFrontier(input.repoPath);
+    if (!headNow || headNow !== commit || (frontierNow && frontierNow !== commit)) {
+      return { ok: false, commit, rewritten: false, withdrawn, reason: 'HEAD or claim frontier moved during brief sync' };
+    }
+
+    const published = input.store.listClaims(input.repoPath, { statuses: [...PUBLISHED_CLAIM_STATUSES], commit });
+    const claimsHash = claimsHashOf(published);
+    if (!prev && published.length === 0 && pending.size === 0) return { ok: true, commit, rewritten: false, withdrawn };
+
+    const stillApproved = prev?.approvedHash === claimsHash ? prev : null;
+    const state: BriefState = {
+      repoPath: input.repoPath,
+      commit,
+      claimsHash,
+      approvedHash: stillApproved?.approvedHash ?? null,
+      approvedBy: stillApproved?.approvedBy ?? null,
+      approvedAt: stillApproved?.approvedAt ?? null,
+      sampleCap: prev?.sampleCap ?? 40,
+      samplePaths: prev?.samplePaths ?? [],
+      pendingSections: [...pending].sort(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const projectPath = contextPaths(input.projectRoot).project;
+    const existingProject = existsSync(projectPath) ? readFileSync(projectPath, 'utf8') : undefined;
+    const marker = existingProject ? readBriefMarker(existingProject) : undefined;
+    const bySection = new Map<string, StoredClaim[]>();
+    for (const s of input.sections) bySection.set(s, []);
+    for (const c of published) {
+      const list = bySection.get(c.claim.section);
+      if (list) list.push(c);
+    }
+    const expectedProjectBody = renderBriefProjectBody(input.sections, bySection, state);
+    const filesCurrent =
+      marker?.commit === commit &&
+      marker?.claims === claimsHash &&
+      marker?.content === contentHashText(expectedProjectBody) &&
+      input.sections.every((s) => {
+        const file = briefPaths(input.projectRoot).section(s);
+        if (!existsSync(file)) return false;
+        return readFileSync(file, 'utf8') === renderSectionBody(s, bySection.get(s) ?? [], state);
+      });
+
+    const unchanged =
+      withdrawn === 0 &&
+      editWithdrawn.length === 0 &&
+      (prev?.pendingSections?.length ?? 0) === state.pendingSections.length &&
+      prev?.commit === commit &&
+      prev?.claimsHash === claimsHash &&
+      filesCurrent;
+    if (unchanged) return { ok: true, commit, rewritten: false, withdrawn: 0 };
+
+    // Validate + write pages first; only then seal brief_state so a render failure cannot leave state ahead of files.
+    writeBriefFiles(input.projectRoot, input.sections, published, state, existingProject);
+    input.store.saveBriefState(state);
+    return { ok: true, commit, rewritten: true, withdrawn };
+  } catch (e) {
+    return {
+      ok: false,
+      commit: resolveCommit(input.repoRoot, 'HEAD') ?? '',
+      rewritten: false,
+      withdrawn: 0,
+      reason: e instanceof Error ? e.message : String(e),
+    };
   }
-
-  const published = input.store.listClaims(input.repoPath, { statuses: [...PUBLISHED_CLAIM_STATUSES] });
-  const claimsHash = claimsHashOf(published);
-  const prev = input.store.getBriefState(input.repoPath);
-  if (!prev && published.length === 0) return { commit, rewritten: false, withdrawn };
-
-  const stillApproved = prev?.approvedHash === claimsHash ? prev : null;
-  const state: BriefState = {
-    repoPath: input.repoPath,
-    commit,
-    claimsHash,
-    approvedHash: stillApproved?.approvedHash ?? null,
-    approvedBy: stillApproved?.approvedBy ?? null,
-    approvedAt: stillApproved?.approvedAt ?? null,
-    sampleCap: prev?.sampleCap ?? 40,
-    samplePaths: prev?.samplePaths ?? [],
-    updatedAt: new Date().toISOString(),
-  };
-
-  const projectPath = contextPaths(input.projectRoot).project;
-  const existingProject = existsSync(projectPath) ? readFileSync(projectPath, 'utf8') : undefined;
-  const marker = existingProject ? readBriefMarker(existingProject) : undefined;
-  const bySection = new Map<string, StoredClaim[]>();
-  for (const s of input.sections) bySection.set(s, []);
-  for (const c of published) {
-    const list = bySection.get(c.claim.section);
-    if (list) list.push(c);
-  }
-  const expectedProjectBody = renderBriefProjectBody(input.sections, bySection, state);
-  const filesCurrent =
-    marker?.commit === commit &&
-    marker?.claims === claimsHash &&
-    marker?.content === contentHashText(expectedProjectBody) &&
-    input.sections.every((s) => {
-      const file = briefPaths(input.projectRoot).section(s);
-      if (!existsSync(file)) return false;
-      return readFileSync(file, 'utf8') === renderSectionBody(s, bySection.get(s) ?? [], state);
-    });
-
-  const unchanged = withdrawn === 0 && prev?.commit === commit && prev?.claimsHash === claimsHash && filesCurrent;
-  if (unchanged) return { commit, rewritten: false, withdrawn: 0 };
-
-  input.store.saveBriefState(state);
-  writeBriefFiles(input.projectRoot, input.sections, published, state, existingProject);
-  return { commit, rewritten: true, withdrawn };
 }
 
 /**
@@ -219,16 +259,19 @@ export async function ensureBrief(input: {
   if (commit !== input.snapshot.commit) throw new Error(`snapshot commit ${input.snapshot.commit} is not HEAD ${commit}`);
 
   const sections = input.config.sections;
+  const prevState = input.store.getBriefState(input.repoPath);
+  const published = () => input.store.listClaims(input.repoPath, { statuses: [...PUBLISHED_CLAIM_STATUSES], commit });
+
+  // Apply human edits against the pre-reverify claim set so a rebind of citations is not mistaken for an edit.
+  const existingBefore = input.store.listClaims(input.repoPath, { statuses: [...PUBLISHED_CLAIM_STATUSES] });
+  const editWithdrawn = applyHumanSectionEdits(input.store, input.projectRoot, input.repoPath, sections, existingBefore);
+
   let sectionsReverified: string[] = [];
   const frontier = input.store.getClaimFrontier(input.repoPath);
   if (frontier && frontier !== commit) {
     const r = reverifyOnCommit(input.store, input.repoRoot, input.repoPath, frontier, commit);
     sectionsReverified = r.sections;
   }
-
-  const published = () => input.store.listClaims(input.repoPath, { statuses: [...PUBLISHED_CLAIM_STATUSES], commit });
-  const existing = published();
-  const prevState = input.store.getBriefState(input.repoPath);
 
   const needDraft = new Set<string>();
   // No brief_state yet (first draft or interrupted before save): finish every configured section.
@@ -239,6 +282,9 @@ export async function ensureBrief(input: {
     for (const s of sections) {
       if (!existsSync(briefPaths(input.projectRoot).section(s))) needDraft.add(s);
     }
+    for (const s of prevState.pendingSections) {
+      if (sections.includes(s)) needDraft.add(s);
+    }
   }
   for (const s of sectionsReverified) {
     if (sections.includes(s)) needDraft.add(s);
@@ -246,8 +292,6 @@ export async function ensureBrief(input: {
   for (const s of input.forceSections ?? []) {
     if (sections.includes(s)) needDraft.add(s);
   }
-  // Apply human edits: missing markers or mutated assertion text → withdraw and redraft.
-  const editWithdrawn = applyHumanSectionEdits(input.store, input.projectRoot, input.repoPath, sections, existing);
   for (const s of editWithdrawn) needDraft.add(s);
 
   let modelCalls = 0;
@@ -308,6 +352,12 @@ export async function ensureBrief(input: {
   const claimsHash = claimsHashOf(finalClaims);
   const prev = input.store.getBriefState(input.repoPath);
   const stillApproved = prev?.approvedHash === claimsHash ? prev : null;
+  // Pending sections that were drafted this run are cleared; any other pending entries remain.
+  const drafted = new Set(sectionsDrafted);
+  const pendingSections = (prev?.pendingSections ?? []).filter((s) => sections.includes(s) && !drafted.has(s));
+  for (const s of sectionsReverified) {
+    if (sections.includes(s) && !drafted.has(s) && !pendingSections.includes(s)) pendingSections.push(s);
+  }
   const state: BriefState = {
     repoPath: input.repoPath,
     commit,
@@ -317,6 +367,7 @@ export async function ensureBrief(input: {
     approvedAt: stillApproved?.approvedAt ?? null,
     sampleCap,
     samplePaths,
+    pendingSections,
     updatedAt: new Date().toISOString(),
   };
 
@@ -354,11 +405,11 @@ export async function ensureBrief(input: {
     throw new HeadMovedError('Published claims changed before the project brief was written; nothing was sealed. Run again.');
   }
 
+  // Write pages before sealing state so a render failure cannot leave brief_state ahead of the files.
+  const written = unchanged ? [] : writeBriefFiles(input.projectRoot, sections, claimsAtWrite, state, existingProject);
   if (!unchanged) {
     input.store.saveBriefState(state);
   }
-
-  const written = unchanged ? [] : writeBriefFiles(input.projectRoot, sections, claimsAtWrite, state, existingProject);
 
   return {
     commit,

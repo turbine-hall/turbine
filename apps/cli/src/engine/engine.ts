@@ -1629,8 +1629,8 @@ export class Engine {
     // Before anything points at CONTEXT.md, make it true for the checkout as it is now: rebuilt when the base
     // commit moved or the task re-entered CHANGES_REQUESTED. If the rebuild cannot run, the file says so;
     // the old selection is never left in place as if it were current.
+    const briefOk = CONTEXT_READING_STATES.has(work.currentState) ? this.syncBriefForHandoff() : true;
     if (CONTEXT_READING_STATES.has(work.currentState)) {
-      this.syncBriefForHandoff();
       try {
         this.ensureTaskContext(work);
       } catch (e) {
@@ -1641,23 +1641,21 @@ export class Engine {
       projectRoot: this.ctx.projectRoot,
       work,
       defaultBaseBranch: baseBranch,
+      briefUnavailable: !briefOk,
     });
   }
 
-  /** Deterministic brief reverify + rewrite (no model calls) so task handoffs never expose withdrawn claims. */
-  private syncBriefForHandoff(): void {
+  /** Deterministic brief reverify + rewrite (no model calls). Returns false when the brief must be omitted from the handoff. */
+  private syncBriefForHandoff(): boolean {
     const repoRoot = repoToplevel(this.ctx.projectRoot) ?? this.ctx.projectRoot;
-    try {
-      syncBriefClaimsToHead({
-        store: this.ctx.store,
-        projectRoot: this.ctx.projectRoot,
-        repoRoot,
-        repoPath: this.ctx.projectRoot,
-        sections: briefConfigOf(this.ctx.config).sections,
-      });
-    } catch {
-      // Brief sync failure must not block task next; understand remains the recovery path.
-    }
+    const result = syncBriefClaimsToHead({
+      store: this.ctx.store,
+      projectRoot: this.ctx.projectRoot,
+      repoRoot,
+      repoPath: this.ctx.projectRoot,
+      sections: briefConfigOf(this.ctx.config).sections,
+    });
+    return result.ok;
   }
 
   async execute(idOrAlias: string): Promise<{

@@ -53,6 +53,8 @@ export function computeNextStep(input: {
   projectRoot: string;
   work: WorkPackage;
   defaultBaseBranch?: string;
+  /** When true, omit brief section links — handoff sync could not prove they match HEAD. */
+  briefUnavailable?: boolean;
 }): NextStep {
   const step = computeNextStepRaw(input);
   // Several legacy stage names now map to the same document; list each file once.
@@ -63,6 +65,7 @@ function computeNextStepRaw(input: {
   projectRoot: string;
   work: WorkPackage;
   defaultBaseBranch?: string;
+  briefUnavailable?: boolean;
 }): NextStep {
   const { projectRoot, work } = input;
   const base = input.defaultBaseBranch ?? 'staging';
@@ -72,12 +75,15 @@ function computeNextStepRaw(input: {
   // The files an agent reads before it plans or implements (only those that exist).
   const roleIds = new Set(work.selectedRoles.map((r) => r.id));
   const roleBrief = briefSectionsFor(loadRoles(factoryRoot()).filter((r) => roleIds.has(r.id)));
-  const briefFiles = (roleBrief ?? []).map((s) => briefPaths(projectRoot).section(s)).filter((p) => existsSync(p));
+  const briefFiles = input.briefUnavailable
+    ? []
+    : (roleBrief ?? []).map((s) => briefPaths(projectRoot).section(s)).filter((p) => existsSync(p));
   const contextFiles = [paths.projectContext, paths.context, ...briefFiles].filter((p) => existsSync(p));
-  const briefNote = roleBrief?.length
-    ? `Role brief sections: ${roleBrief.join(', ')} (verified claims at the commit recorded in PROJECT.md).`
-    : 'PROJECT.md includes the project brief when present (verified claims at the recorded commit).';
-  const sync = `turbine task sync ${work.id}`;
+  const briefNote = input.briefUnavailable
+    ? 'Project brief is unavailable for this checkout (could not reverify claims at HEAD). Run: turbine understand'
+    : roleBrief?.length
+      ? `Role brief sections: ${roleBrief.join(', ')} (verified claims at the commit recorded in PROJECT.md).`
+      : 'PROJECT.md includes the project brief when present (verified claims at the recorded commit).';  const sync = `turbine task sync ${work.id}`;
   const next = `turbine task next ${work.id}`;
   const approve = `turbine task approve ${work.id}`;
   const humanOnly = [

@@ -33,6 +33,11 @@ export const BriefStateSchema = z
     sampleCap: z.number().int().min(1).max(200),
     /** Paths sampled for the last draft (reported; may be empty when no model call ran). */
     samplePaths: z.array(z.string()).max(200),
+    /**
+     * Sections that lost claims during a deterministic handoff sync and still need `understand` to redraft.
+     * Cleared when those sections are drafted successfully.
+     */
+    pendingSections: z.array(BriefSectionSchema).max(40).default([]),
     updatedAt: z.string().min(1),
   })
   .strict();

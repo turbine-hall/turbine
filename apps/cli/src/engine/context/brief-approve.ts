@@ -117,7 +117,7 @@ export function attestClaim(input: {
   };
   const reason = `Human-attested (by ${input.reviewer.trim()}, date ${new Date().toISOString().slice(0, 10)}, commit ${head.slice(0, 8)})`;
 
-  const { saved, state } = input.store.transaction(() => {
+  const { saved, state, published } = input.store.transaction(() => {
     const headNow = resolveCommit(input.repoRoot, 'HEAD');
     if (!headNow || headNow !== head) {
       throw err('E_CONTEXT_UNAVAILABLE', 'HEAD moved while the claim was being attested; nothing was stored, try again');
@@ -127,12 +127,12 @@ export function attestClaim(input: {
     input.store.setClaimFrontier(input.repoPath, headNow);
     // Clear approval: claim set changed.
     const prev = input.store.getBriefState(input.repoPath);
-    const published = input.store.listClaims(input.repoPath, { statuses: [...PUBLISHED_CLAIM_STATUSES] });
+    const publishedNow = input.store.listClaims(input.repoPath, { statuses: [...PUBLISHED_CLAIM_STATUSES] });
     const nextState: BriefState | null = prev
       ? {
           ...prev,
           commit: headNow,
-          claimsHash: claimsHashOf(published),
+          claimsHash: claimsHashOf(publishedNow),
           approvedHash: null,
           approvedBy: null,
           approvedAt: null,
@@ -140,14 +140,13 @@ export function attestClaim(input: {
         }
       : null;
     if (nextState) input.store.saveBriefState(nextState);
-    return { saved: claim, state: nextState, published };
+    return { saved: claim, state: nextState, published: publishedNow };
   });
 
-  // Render markers immediately so the next understand does not treat the attestation as a human removal.
+  // Render the same rows/hash the transaction sealed so markers match claimsHash.
   if (state) {
     const projectPath = contextPaths(input.projectRoot).project;
     const existing = existsSync(projectPath) ? readFileSync(projectPath, 'utf8') : undefined;
-    const published = input.store.listClaims(input.repoPath, { statuses: [...PUBLISHED_CLAIM_STATUSES] });
     writeBriefFiles(input.projectRoot, input.sections, published, state, existing);
   }
 

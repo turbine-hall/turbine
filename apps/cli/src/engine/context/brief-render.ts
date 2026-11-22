@@ -153,6 +153,12 @@ export function briefPaths(projectRoot: string) {
  * Write `.turbine/context/brief/<section>.md` and merge the brief block into PROJECT.md.
  * Returns the paths written.
  */
+/** True when a brief/*.md file looks like a Turbine-generated section page (not a user notes file). */
+function looksLikeGeneratedSectionPage(name: string, body: string): boolean {
+  if (!/^[a-z][a-z0-9-]{0,39}\.md$/.test(name)) return false;
+  return /^# [a-z][a-z0-9-]{0,39}\r?\n/.test(body) && /verified claims at|Draft, not approved/.test(body);
+}
+
 export function writeBriefFiles(
   projectRoot: string,
   sections: string[],
@@ -162,48 +168,62 @@ export function writeBriefFiles(
 ): string[] {
   const written: string[] = [];
   const paths = briefPaths(projectRoot);
-  mkdirSync(paths.dir, { recursive: true });
   const bySection = new Map<string, StoredClaim[]>();
   for (const s of sections) bySection.set(s, []);
   for (const c of claims) {
     const list = bySection.get(c.claim.section);
     if (list) list.push(c);
   }
+
+  // Prepare and validate PROJECT.md before any page is published, so a damaged marker cannot leave half-written state.
+  const projectPath = contextPaths(projectRoot).project;
+  const body = renderBriefProjectBody(sections, bySection, state);
+  const marker = `<!-- turbine:brief begin commit=${state.commit} claims=${state.claimsHash} content=${contentHashText(body)} -->`;
+  let nextProject: string | undefined;
+  if (existsSync(projectPath) || existingProject !== undefined) {
+    const text = existingProject ?? readFileSync(projectPath, 'utf8');
+    const eol = text.includes('\r\n') ? '\r\n' : '\n';
+    const block = `${marker}\n${body}\n<!-- turbine:brief end -->`.split('\n').join(eol);
+    const begins = (text.match(BRIEF_BEGIN_ANY) ?? []).length;
+    const ends = (text.match(BRIEF_END_ANY) ?? []).length;
+    if (begins === 0 && ends === 0) {
+      nextProject = `${text.replace(/\r?\n*$/, eol)}${eol}${block}${eol}`;
+    } else if (begins === 1 && ends === 1 && BRIEF_SECTION.test(text)) {
+      nextProject = text.replace(BRIEF_SECTION, () => block);
+    } else {
+      throw new Error('.turbine/context/PROJECT.md has a damaged brief section; restore the turbine:brief markers');
+    }
+  }
+
+  mkdirSync(paths.dir, { recursive: true });
   for (const section of sections) {
-    const body = renderSectionBody(section, bySection.get(section) ?? [], state);
+    const sectionBody = renderSectionBody(section, bySection.get(section) ?? [], state);
     const file = paths.section(section);
-    writeAtomic(file, body);
+    writeAtomic(file, sectionBody);
     written.push(file);
   }
 
-  // Retire section files no longer in the configured brief so agents cannot pick up stale verified pages.
+  // Retire only Turbine-generated section pages that left the configured brief (never arbitrary .md notes).
   if (existsSync(paths.dir)) {
     const keep = new Set(sections.map((s) => `${s}.md`));
     for (const name of readdirSync(paths.dir)) {
       if (!name.endsWith('.md') || keep.has(name)) continue;
-      unlinkSync(join(paths.dir, name));
+      const file = join(paths.dir, name);
+      let page: string;
+      try {
+        page = readFileSync(file, 'utf8');
+      } catch {
+        continue;
+      }
+      if (!looksLikeGeneratedSectionPage(name, page)) continue;
+      unlinkSync(file);
     }
   }
 
-  const projectPath = contextPaths(projectRoot).project;
-  const body = renderBriefProjectBody(sections, bySection, state);
-  const marker = `<!-- turbine:brief begin commit=${state.commit} claims=${state.claimsHash} content=${contentHashText(body)} -->`;
-  if (!existsSync(projectPath) && existingProject === undefined) return written;
-  const text = existingProject ?? readFileSync(projectPath, 'utf8');
-  const eol = text.includes('\r\n') ? '\r\n' : '\n';
-  const block = `${marker}\n${body}\n<!-- turbine:brief end -->`.split('\n').join(eol);
-  const begins = (text.match(BRIEF_BEGIN_ANY) ?? []).length;
-  const ends = (text.match(BRIEF_END_ANY) ?? []).length;
-  let next: string;
-  if (begins === 0 && ends === 0) {
-    next = `${text.replace(/\r?\n*$/, eol)}${eol}${block}${eol}`;
-  } else if (begins === 1 && ends === 1 && BRIEF_SECTION.test(text)) {
-    next = text.replace(BRIEF_SECTION, () => block);
-  } else {
-    throw new Error('.turbine/context/PROJECT.md has a damaged brief section; restore the turbine:brief markers');
+  if (nextProject !== undefined) {
+    writeAtomic(projectPath, nextProject);
+    written.push(projectPath);
   }
-  writeAtomic(projectPath, next);
-  written.push(projectPath);
   return written;
 }
 

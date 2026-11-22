@@ -629,7 +629,7 @@ export class WorkStore {
   getBriefState(repoPath: string): BriefState | null {
     const row = this.db
       .prepare(
-        `SELECT repo_path, "commit", claims_hash, approved_hash, approved_by, approved_at, sample_cap, sample_paths, updated_at
+        `SELECT repo_path, "commit", claims_hash, approved_hash, approved_by, approved_at, sample_cap, sample_paths, pending_sections, updated_at
          FROM brief_state WHERE repo_path = ?`,
       )
       .get(repoPath) as
@@ -642,15 +642,22 @@ export class WorkStore {
           approved_at: string | null;
           sample_cap: number;
           sample_paths: string;
+          pending_sections: string;
           updated_at: string;
         }
       | undefined;
     if (!row) return null;
     let samplePaths: unknown;
+    let pendingSections: unknown;
     try {
       samplePaths = JSON.parse(row.sample_paths);
     } catch {
       throw new Error(`brief_state for ${repoPath} has invalid sample_paths JSON`);
+    }
+    try {
+      pendingSections = JSON.parse(row.pending_sections);
+    } catch {
+      throw new Error(`brief_state for ${repoPath} has invalid pending_sections JSON`);
     }
     return BriefStateSchema.parse({
       repoPath: row.repo_path,
@@ -661,6 +668,7 @@ export class WorkStore {
       approvedAt: row.approved_at,
       sampleCap: row.sample_cap,
       samplePaths,
+      pendingSections,
       updatedAt: row.updated_at,
     });
   }
@@ -670,8 +678,8 @@ export class WorkStore {
     const s = BriefStateSchema.parse(state);
     this.db
       .prepare(
-        `INSERT INTO brief_state(repo_path, "commit", claims_hash, approved_hash, approved_by, approved_at, sample_cap, sample_paths, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO brief_state(repo_path, "commit", claims_hash, approved_hash, approved_by, approved_at, sample_cap, sample_paths, pending_sections, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(repo_path) DO UPDATE SET
            "commit" = excluded."commit",
            claims_hash = excluded.claims_hash,
@@ -680,6 +688,7 @@ export class WorkStore {
            approved_at = excluded.approved_at,
            sample_cap = excluded.sample_cap,
            sample_paths = excluded.sample_paths,
+           pending_sections = excluded.pending_sections,
            updated_at = excluded.updated_at`,
       )
       .run(
@@ -691,6 +700,7 @@ export class WorkStore {
         s.approvedAt,
         s.sampleCap,
         JSON.stringify(s.samplePaths),
+        JSON.stringify(s.pendingSections),
         s.updatedAt,
       );
   }

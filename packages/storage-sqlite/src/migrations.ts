@@ -184,4 +184,11 @@ CREATE TABLE IF NOT EXISTS brief_state (
 );
 `,
   },
+  {
+    version: 7,
+    sql: `
+-- Sections awaiting understand redraft after a deterministic handoff withdrawal (task next / execute).
+ALTER TABLE brief_state ADD COLUMN pending_sections TEXT NOT NULL DEFAULT '[]';
+`,
+  },
 ];
