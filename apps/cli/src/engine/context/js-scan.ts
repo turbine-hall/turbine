@@ -141,20 +141,33 @@ export function parseSource(input: string, opts: { jsx: boolean } = { jsx: true 
       ts.isConstructorDeclaration(n) ||
       ts.isGetAccessorDeclaration(n) ||
       ts.isSetAccessorDeclaration(n);
+    // A class static block is its own jump boundary: it may not return, and it may not break/continue to an outer loop.
+    const enterStatic = ts.isClassStaticBlockDeclaration(n);
     const isLoop = ts.isForStatement(n) || ts.isForInStatement(n) || ts.isForOfStatement(n) || ts.isWhileStatement(n) || ts.isDoStatement(n);
     const isSwitch = ts.isSwitchStatement(n);
-    let next: Ctx = {
-      inFunction: ctx.inFunction || enterFn,
-      loops: ctx.loops + (isLoop ? 1 : 0),
-      switches: ctx.switches + (isSwitch ? 1 : 0),
-      labels: ctx.labels,
-      loopLabels: ctx.loopLabels,
-    };
+    // Nested functions and static blocks do not inherit outer loops, switches, or labels (a `break` inside `f` must
+    // not see the `for` that encloses `function f() { break; }`). A static block also clears `inFunction`.
+    let next: Ctx =
+      enterFn || enterStatic
+        ? { inFunction: enterFn, loops: 0, switches: 0, labels: new Set(), loopLabels: new Set() }
+        : {
+            inFunction: ctx.inFunction,
+            loops: ctx.loops + (isLoop ? 1 : 0),
+            switches: ctx.switches + (isSwitch ? 1 : 0),
+            labels: ctx.labels,
+            loopLabels: ctx.loopLabels,
+          };
     if (ts.isLabeledStatement(n)) {
+      if (ctx.labels.has(n.label.text)) {
+        illegal = { node: n, why: `a duplicate label "${n.label.text}" is not valid` };
+        break;
+      }
       const labels = new Set(ctx.labels);
       labels.add(n.label.text);
       const loopLabels = new Set(ctx.loopLabels);
-      const body = n.statement;
+      // `outer: inner: for (;;)` — both labels name the loop. Follow chained labeled statements; do not descend into a block.
+      let body: TS.Statement = n.statement;
+      while (ts.isLabeledStatement(body)) body = body.statement;
       if (ts.isForStatement(body) || ts.isForInStatement(body) || ts.isForOfStatement(body) || ts.isWhileStatement(body) || ts.isDoStatement(body)) loopLabels.add(n.label.text);
       next = { ...next, labels, loopLabels };
     }

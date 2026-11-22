@@ -112,12 +112,9 @@ function tableProblems(lines: string[]): { problems: string[]; rows: number } {
       if (htmlClose.test(l)) htmlClose = undefined;
       continue;
     }
-    if (!open && htmlClose === undefined && /<!--/.test(l) && !/-->/.test(l.slice(l.indexOf('<!--') + 4))) {
-      htmlClose = /-->/;
-      fenced.push(true);
-      continue;
-    }
-    if (!open && htmlClose === undefined && /<!--/.test(l) && !/-->/.test(l.slice(l.indexOf('<!--') + 4))) {
+    // GFM HTML comment blocks open only at the start of a line (up to three spaces). A prose mention of `<!--` is not an opener.
+    const htmlCommentOpen = /^\s{0,3}<!--/.exec(l);
+    if (!open && htmlClose === undefined && htmlCommentOpen && !/-->/.test(l.slice(htmlCommentOpen[0].length))) {
       htmlClose = /-->/;
       fenced.push(true);
       continue;
@@ -2623,6 +2620,30 @@ describe('review round 12 (PR #12): findings from the eleventh local CodeRabbit 
     expect(publishClaim(openStore(), bad, bad, claim({ kind: 'imports', evidence: [ev(bad, cBad, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } }))).toMatchObject({ published: false, unconfirmed: true });
   });
 
+  it('a break or return does not inherit a loop or function enclosing a nested function or static block', () => {
+    const leakBreak = newRepo({ 'm.ts': "import 'pkg';\nfor (;;) { function f() { break; } }\n" });
+    const leakStatic = newRepo({ 'm.ts': "import 'pkg';\nfunction outer() { class C { static { return; } } }\n" });
+    const okNested = newRepo({ 'm.ts': "import 'pkg';\nfunction f() { for (;;) { break; } return; }\n" });
+    const cLeak = head(leakBreak);
+    const cStatic = head(leakStatic);
+    const cOk = head(okNested);
+    expect(publishClaim(openStore(), leakBreak, leakBreak, claim({ kind: 'imports', evidence: [ev(leakBreak, cLeak, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } }))).toMatchObject({ published: false, unconfirmed: true });
+    expect(publishClaim(openStore(), leakStatic, leakStatic, claim({ kind: 'imports', evidence: [ev(leakStatic, cStatic, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } }))).toMatchObject({ published: false, unconfirmed: true });
+    expect(publishClaim(openStore(), okNested, okNested, claim({ kind: 'imports', evidence: [ev(okNested, cOk, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } })).published).toBe(true);
+  });
+
+  it('duplicate active labels fail the module; chained labels on a loop remain valid targets', () => {
+    const dup = newRepo({ 'm.ts': "import 'pkg';\nouter: { outer: {} }\n" });
+    const chained = newRepo({ 'm.ts': "import 'pkg';\nouter: inner: for (;;) { continue outer; break inner; }\n" });
+    const reuse = newRepo({ 'm.ts': "import 'pkg';\nouter: for (;;) { break outer; }\nouter: for (;;) { break outer; }\n" });
+    const cDup = head(dup);
+    const cChained = head(chained);
+    const cReuse = head(reuse);
+    expect(publishClaim(openStore(), dup, dup, claim({ kind: 'imports', evidence: [ev(dup, cDup, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } }))).toMatchObject({ published: false, unconfirmed: true });
+    expect(publishClaim(openStore(), chained, chained, claim({ kind: 'imports', evidence: [ev(chained, cChained, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } })).published).toBe(true);
+    expect(publishClaim(openStore(), reuse, reuse, claim({ kind: 'imports', evidence: [ev(reuse, cReuse, 'm.ts', 1)], verifier: { kind: 'imports', from: 'm.ts', specifier: 'pkg' } })).published).toBe(true);
+  });
+
   it('a repository path over the read limit is refused on write, and both 40 and 64-hex object ids round-trip', () => {
     const store = openStore();
     const dir = repoOnce();
@@ -2639,6 +2660,8 @@ describe('review round 12 (PR #12): findings from the eleventh local CodeRabbit 
   it('a table inside an HTML comment is not linted', () => {
     expect(tableProblems(['<!--', '| A | B |', '| - | - |', 'short', '-->']).problems).toEqual([]);
     expect(tableProblems(['| A | B |', '| - | - |', 'short']).problems).toHaveLength(1);
+    // A prose mention of `<!--` is not a block opener: a malformed table after it is still reported.
+    expect(tableProblems(['Use `<!--` to hide notes.', '| A | B |', '| - | - |', 'short']).problems).toHaveLength(1);
   });
 
   it('fixture repositories pin SHA-1 whatever init.defaultObjectFormat says', () => {
