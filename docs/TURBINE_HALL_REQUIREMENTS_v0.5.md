@@ -736,7 +736,7 @@ sf task usage add <id-or-alias> --source <agent> --input <n|unknown> --output <n
 sf task recover <id-or-alias> --apply  # only approved, safely executable affected stages
 ```
 
-Token usage: every Turbine model call records `modelProvider`, `modelId`, and input/output tokens on its `role_run` (`unknown` when the adapter omits usage — never silent 0). Coding-agent usage is append-only via `turbine task usage add` (`usage_records`, migration v8). Packet STATUS/REVIEW (including ACCEPTED) render a Usage section from the store; `turbine task export` includes usage. Optional `budgets.perTask.maxTokens` blocks further Turbine model calls with `E_BUDGET_EXCEEDED` when measured Turbine tokens would exceed it (unknown counts do not count toward the cap). Agents may add records but there is no edit/delete API for human-entered rows.
+Token usage: every Turbine model call records `modelProvider`, `modelId`, and input/output tokens on its `role_run` (`unknown` when the adapter omits usage — never silent 0). Coding-agent usage is append-only via `turbine task usage add` (`usage_records`, migration v8). Packet STATUS/REVIEW (including ACCEPTED) render a Usage section from the store; `turbine task export` includes usage. Optional `budgets.perTask.maxTokens` is a retrospective cap: subsequent checked Turbine model calls are refused with `E_BUDGET_EXCEEDED` once measured Turbine input+output tokens have already reached the limit (unknown counts do not count toward the cap); a single in-flight call may still finish above the remaining allowance because the check uses completed usage, not a prediction of the next call. Agents may add records but there is no edit/delete API for human-entered rows.
 
 ### 8.4 R2+ commands (not implemented in R0/R1)
 

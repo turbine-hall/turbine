@@ -78,8 +78,10 @@ export const ProjectConfigSchema = z.object({
           maxModelCalls: z.number().int().default(15),
           maxExecutionAttempts: z.number().int().default(2),
           /**
-           * Optional cap on measured Turbine-side input+output tokens for the task.
+           * Optional retrospective cap on measured Turbine-side input+output tokens.
            * Null/omitted = no token budget. Unknown usage does not count toward the cap.
+           * Further checked calls are refused once measured usage has reached the limit;
+           * one call may finish above the remaining allowance (check uses completed usage).
            */
           maxTokens: z.number().int().positive().nullable().default(null),
         })

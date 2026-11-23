@@ -14,25 +14,35 @@ export type UsageSourceKind = z.infer<typeof UsageSourceKindSchema>;
  * Distinct usage record (agent-reported or imported). Turbine role_runs remain the source for
  * automatic Turbine model calls; this table holds coding-agent and other external reports.
  */
-export const UsageRecordSchema = z.object({
-  id: z.string(),
-  workId: z.string(),
-  source: UsageSourceKindSchema,
-  /** e.g. cursor, claude-code, codex — required when source is agent */
-  agentName: z.string().optional(),
-  modelProvider: z.string().optional(),
-  modelId: z.string().optional(),
-  tokens: z.object({
-    input: TokenCountSchema,
-    output: TokenCountSchema,
-  }),
-  method: UsageMethodSchema,
-  note: z.string().optional(),
-  recordedAt: z.string(),
-  recordedBy: z.string(),
-  /** Who entered the record — agents must not edit/delete human-entered rows. */
-  enteredBy: z.enum(['human', 'agent']),
-});
+export const UsageRecordSchema = z
+  .object({
+    id: z.string(),
+    workId: z.string(),
+    source: UsageSourceKindSchema,
+    /** e.g. cursor, claude-code, codex — required when source is agent */
+    agentName: z.string().optional(),
+    modelProvider: z.string().optional(),
+    modelId: z.string().optional(),
+    tokens: z.object({
+      input: TokenCountSchema,
+      output: TokenCountSchema,
+    }),
+    method: UsageMethodSchema,
+    note: z.string().optional(),
+    recordedAt: z.string(),
+    recordedBy: z.string(),
+    /** Who entered the record — agents must not edit/delete human-entered rows. */
+    enteredBy: z.enum(['human', 'agent']),
+  })
+  .superRefine((rec, ctx) => {
+    if (rec.source === 'agent' && !rec.agentName?.trim()) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['agentName'],
+        message: 'agentName is required when source is agent',
+      });
+    }
+  });
 export type UsageRecord = z.infer<typeof UsageRecordSchema>;
 
 export const UsageBucketSchema = z.object({

@@ -282,4 +282,73 @@ describe('usage tracking (#1)', () => {
     expect(summary.bySource.turbine.hasUnknown).toBe(true);
     expect(summary.grand.hasUnknown).toBe(true);
   });
+
+  it('CR: unknown-only fields stay unknown (not invented 0)', () => {
+    const summary = summarizeUsage({
+      workId: 'work_x',
+      roleRuns: [
+        {
+          id: 'run_u',
+          workId: 'work_x',
+          roleId: 'requirements-analyst',
+          roleVersion: '1.0.0',
+          skillIds: [],
+          toolCapabilityGrants: [],
+          modelProvider: 'mock',
+          modelId: 'm-unknown',
+          startedAt: 't',
+          endedAt: 't',
+          status: 'succeeded',
+          inputArtifactIds: [],
+          outputArtifactIds: [],
+          attempts: 1,
+          tokens: { input: 'unknown', output: 'unknown' },
+        },
+      ],
+      records: [],
+    });
+    expect(summary.bySource.turbine.calls).toBe(1);
+    expect(summary.bySource.turbine.input).toBe('unknown');
+    expect(summary.bySource.turbine.output).toBe('unknown');
+    expect(summary.bySource.turbine.total).toBe('unknown');
+    expect(summary.bySource.turbine.hasUnknown).toBe(true);
+    expect(summary.byModel[0]?.input).toBe('unknown');
+  });
+
+  it('CR: UsageRecordSchema requires agentName when source is agent', () => {
+    expect(() =>
+      UsageRecordSchema.parse({
+        id: 'usage_x',
+        workId: 'work_x',
+        source: 'agent',
+        tokens: { input: 1, output: 1 },
+        method: 'reported',
+        recordedAt: new Date().toISOString(),
+        recordedBy: 'x',
+        enteredBy: 'human',
+      }),
+    ).toThrow(/agentName/i);
+  });
+
+  it('CR: addUsage persists record+event atomically (same count after success)', () => {
+    const dir = tempProject('usage-tx-', dirs);
+    const { engine, work } = makeTask(dir);
+    const before = engine.ctx.store.listUsageRecords(work.id).length;
+    engine.addUsage({
+      idOrAlias: work.id,
+      source: 'agent',
+      agentName: 'cursor',
+      inputTokens: 3,
+      outputTokens: 4,
+      method: 'reported',
+      recordedBy: 'tester',
+      enteredBy: 'human',
+    });
+    const after = engine.ctx.store.listUsageRecords(work.id);
+    expect(after).toHaveLength(before + 1);
+    const events = engine.ctx.store.listEvents(work.id).filter((e) => e.type === 'usage.recorded');
+    expect(events.length).toBeGreaterThanOrEqual(1);
+    expect((events.at(-1)!.payload as { usageId?: string }).usageId).toBe(after.at(-1)!.id);
+    engine.ctx.store.close();
+  });
 });

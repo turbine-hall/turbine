@@ -7,26 +7,63 @@ function asCount(v: number | 'unknown' | undefined): TokenCount {
   return 'unknown';
 }
 
-function addCounts(a: TokenCount, b: TokenCount): { value: TokenCount; unknown: boolean } {
-  const aU = a === 'unknown';
-  const bU = b === 'unknown';
-  if (aU && bU) return { value: 'unknown', unknown: true };
-  if (aU) return { value: b, unknown: true };
-  if (bU) return { value: a, unknown: true };
-  return { value: (a as number) + (b as number), unknown: false };
+/**
+ * Aggregate token fields. Empty accumulators start with no known observation (`null`);
+ * unknown-only fields stay `'unknown'` (never invented 0). Measured zeros are preserved.
+ */
+function addField(
+  prev: TokenCount | null,
+  next: TokenCount,
+): { value: TokenCount; unknown: boolean } {
+  const nextU = next === 'unknown';
+  if (prev === null) {
+    return { value: next, unknown: nextU };
+  }
+  const prevU = prev === 'unknown';
+  if (prevU && nextU) return { value: 'unknown', unknown: true };
+  if (prevU) return { value: next, unknown: true };
+  if (nextU) return { value: prev, unknown: true };
+  return { value: (prev as number) + (next as number), unknown: false };
 }
 
 function totalOf(input: TokenCount, output: TokenCount): { value: TokenCount; unknown: boolean } {
-  return addCounts(input, output);
+  const inU = input === 'unknown';
+  const outU = output === 'unknown';
+  if (inU && outU) return { value: 'unknown', unknown: true };
+  if (inU) return { value: output, unknown: true };
+  if (outU) return { value: input, unknown: true };
+  return { value: (input as number) + (output as number), unknown: false };
 }
 
-function emptySide() {
-  return { calls: 0, input: 0 as TokenCount, output: 0 as TokenCount, total: 0 as TokenCount, hasUnknown: false };
+type SideAcc = {
+  calls: number;
+  input: TokenCount | null;
+  output: TokenCount | null;
+  hasUnknown: boolean;
+};
+
+function emptySide(): SideAcc {
+  return { calls: 0, input: null, output: null, hasUnknown: false };
+}
+
+function finalizeSide(side: SideAcc) {
+  // No calls → numeric zeros. Calls with only unknown observations → 'unknown'.
+  const displayIn: TokenCount = side.calls === 0 ? 0 : side.input === null ? 'unknown' : side.input;
+  const displayOut: TokenCount = side.calls === 0 ? 0 : side.output === null ? 'unknown' : side.output;
+  const tot = totalOf(displayIn, displayOut);
+  return {
+    calls: side.calls,
+    input: displayIn,
+    output: displayOut,
+    total: tot.value,
+    hasUnknown: side.hasUnknown || tot.unknown || displayIn === 'unknown' || displayOut === 'unknown',
+  };
 }
 
 /**
  * Build a usage summary from Turbine role_runs + external usage_records.
- * Unknown token counts are never coerced to 0 in displayed totals (hasUnknown is set).
+ * Unknown token counts are never coerced to 0 in displayed totals (hasUnknown is set;
+ * unknown-only fields remain `'unknown'`).
  */
 export function summarizeUsage(input: {
   workId: string;
@@ -35,22 +72,22 @@ export function summarizeUsage(input: {
 }): UsageSummary {
   const turbine = emptySide();
   const agent = emptySide();
-  const byModel = new Map<string, UsageBucket & { _unknown: boolean }>();
+  const byModel = new Map<
+    string,
+    UsageBucket & { _in: TokenCount | null; _out: TokenCount | null; _unknown: boolean }
+  >();
 
   const bump = (
-    side: ReturnType<typeof emptySide>,
+    side: SideAcc,
     tokens: { input: TokenCount; output: TokenCount },
     meta: { modelId?: string; modelProvider?: string; agentName?: string; source: 'turbine' | 'agent' },
   ) => {
     side.calls += 1;
-    const inAdd = addCounts(side.input, tokens.input);
-    const outAdd = addCounts(side.output, tokens.output);
+    const inAdd = addField(side.input, tokens.input);
+    const outAdd = addField(side.output, tokens.output);
     side.input = inAdd.value;
     side.output = outAdd.value;
     side.hasUnknown = side.hasUnknown || inAdd.unknown || outAdd.unknown;
-    const tot = totalOf(side.input, side.output);
-    side.total = tot.value;
-    side.hasUnknown = side.hasUnknown || tot.unknown;
 
     const modelKey = meta.modelId ?? meta.agentName ?? '(unknown-model)';
     const key = `${meta.source}:${meta.modelProvider ?? ''}:${modelKey}`;
@@ -65,15 +102,21 @@ export function summarizeUsage(input: {
       output: 0 as TokenCount,
       total: 0 as TokenCount,
       hasUnknown: false,
+      _in: null as TokenCount | null,
+      _out: null as TokenCount | null,
       _unknown: false,
     };
     prev.calls += 1;
-    const pi = addCounts(prev.input, tokens.input);
-    const po = addCounts(prev.output, tokens.output);
-    prev.input = pi.value;
-    prev.output = po.value;
+    const pi = addField(prev._in, tokens.input);
+    const po = addField(prev._out, tokens.output);
+    prev._in = pi.value;
+    prev._out = po.value;
     prev._unknown = prev._unknown || pi.unknown || po.unknown;
-    const pt = totalOf(prev.input, prev.output);
+    const displayIn = prev._in ?? 'unknown';
+    const displayOut = prev._out ?? 'unknown';
+    const pt = totalOf(displayIn, displayOut);
+    prev.input = displayIn;
+    prev.output = displayOut;
     prev.total = pt.value;
     prev.hasUnknown = prev._unknown || pt.unknown;
     byModel.set(key, prev);
@@ -103,37 +146,42 @@ export function summarizeUsage(input: {
     });
   }
 
-  const grandIn = addCounts(turbine.input, agent.input);
-  const grandOut = addCounts(turbine.output, agent.output);
-  const grandTot = totalOf(grandIn.value, grandOut.value);
+  const t = finalizeSide(turbine);
+  const a = finalizeSide(agent);
+  // Grand: combine finalized sides. Empty side contributes nothing, not invented 0.
+  const gIn =
+    t.calls === 0 && a.calls === 0
+      ? ({ value: 0 as TokenCount, unknown: false } as const)
+      : t.calls === 0
+        ? { value: a.input, unknown: a.hasUnknown }
+        : a.calls === 0
+          ? { value: t.input, unknown: t.hasUnknown }
+          : addField(t.input, a.input);
+  const gOut =
+    t.calls === 0 && a.calls === 0
+      ? ({ value: 0 as TokenCount, unknown: false } as const)
+      : t.calls === 0
+        ? { value: a.output, unknown: a.hasUnknown }
+        : a.calls === 0
+          ? { value: t.output, unknown: t.hasUnknown }
+          : addField(t.output, a.output);
+  const grandTot = totalOf(gIn.value, gOut.value);
 
   return {
     workId: input.workId,
     bySource: {
-      turbine: {
-        calls: turbine.calls,
-        input: turbine.input,
-        output: turbine.output,
-        total: turbine.total,
-        hasUnknown: turbine.hasUnknown,
-      },
-      agent: {
-        calls: agent.calls,
-        input: agent.input,
-        output: agent.output,
-        total: agent.total,
-        hasUnknown: agent.hasUnknown,
-      },
+      turbine: t,
+      agent: a,
     },
     byModel: [...byModel.values()]
-      .map(({ _unknown: _, ...rest }) => rest)
+      .map(({ _unknown: _, _in: _i, _out: _o, ...rest }) => rest)
       .sort((a, b) => a.key.localeCompare(b.key)),
     grand: {
       calls: turbine.calls + agent.calls,
-      input: grandIn.value,
-      output: grandOut.value,
+      input: gIn.value,
+      output: gOut.value,
       total: grandTot.value,
-      hasUnknown: grandIn.unknown || grandOut.unknown || grandTot.unknown || turbine.hasUnknown || agent.hasUnknown,
+      hasUnknown: gIn.unknown || gOut.unknown || grandTot.unknown || t.hasUnknown || a.hasUnknown,
     },
     records: input.records,
     roleRunCount: input.roleRuns.filter((r) => r.status === 'succeeded' || r.status === 'failed').length,

@@ -248,20 +248,31 @@ export class Engine {
       recordedBy: input.recordedBy,
       enteredBy: input.enteredBy,
     };
-    this.ctx.store.saveUsageRecord(record);
-    this.ctx.store.appendEvent({
-      workId: work.id,
-      type: 'usage.recorded',
-      payload: {
-        usageId: record.id,
-        source: record.source,
-        agentName: record.agentName,
-        modelId: record.modelId,
-        method: record.method,
-        enteredBy: record.enteredBy,
-      },
+    // Record + event commit together so a mid-write failure cannot leave a counted row without its event
+    // (retry would otherwise insert a second ID and double-count in summaries).
+    this.ctx.store.transaction(() => {
+      this.ctx.store.saveUsageRecord(record);
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'usage.recorded',
+        payload: {
+          usageId: record.id,
+          source: record.source,
+          agentName: record.agentName,
+          modelId: record.modelId,
+          method: record.method,
+          enteredBy: record.enteredBy,
+        },
+      });
     });
-    this.render(work.id, [`Usage recorded (${record.source}${record.agentName ? `:${record.agentName}` : ''})`]);
+    // Render after commit: packet refresh must not roll back counted usage. Failures here are
+    // surfaceable via sync/render; the record already exists so a blind retry would double-count —
+    // callers should not re-add on render-only errors.
+    try {
+      this.render(work.id, [`Usage recorded (${record.source}${record.agentName ? `:${record.agentName}` : ''})`]);
+    } catch {
+      /* usage is committed; next sync/render refreshes the packet */
+    }
     return record;
   }
 
@@ -1801,6 +1812,10 @@ export class Engine {
           d.artifactHashes.includes(plan.contentHash),
       );
     if (!planOk) throw err('E_STALE_REVISION', 'Current plan is not approved');
+
+    // Token budget is checked before leaving PLAN_APPROVED / preparing worktrees so a maxTokens
+    // exhaustion cannot still spend a guidance model call on the first execute.
+    this.checkBudget(work.id);
 
     // Rebuilt when the base commit moved or this is a new CHANGES_REQUESTED cycle, before anything points at it.
     // It runs before the task leaves PLAN_APPROVED / CHANGES_REQUESTED and before any worktree exists, so a
