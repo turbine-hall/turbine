@@ -15,6 +15,9 @@ import {
   type RiskProfile,
   type RoleRun,
   type TaskContext,
+  type UsageMethod,
+  type UsageRecord,
+  type UsageSummary,
   type WorkPackage,
   type WorkState,
   type WorkType,
@@ -116,6 +119,7 @@ import {
   writeFile,
   writeFileAtomic,
 } from './packet.js';
+import { measuredTurbineTokens, summarizeUsage } from './usage.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -191,6 +195,85 @@ export class Engine {
   /** Await the latest packet-mirror attempt (tests / sync). */
   async waitForMirror(): Promise<MirrorRunResult | undefined> {
     return this.mirrorJob;
+  }
+
+  /** Turbine role_runs + external usage_records summary for a task. */
+  usageSummary(idOrAlias: string): UsageSummary {
+    const work = this.ctx.store.getWork(idOrAlias);
+    return summarizeUsage({
+      workId: work.id,
+      roleRuns: this.ctx.store.listRoleRuns(work.id),
+      records: this.ctx.store.listUsageRecords(work.id),
+    });
+  }
+
+  /**
+   * Record coding-agent (or other) usage against a task. Agents may add records; there is no
+   * edit/delete API for human-entered rows (FR-006).
+   */
+  addUsage(input: {
+    idOrAlias: string;
+    source: 'turbine' | 'agent';
+    agentName?: string;
+    modelId?: string;
+    modelProvider?: string;
+    inputTokens: number | 'unknown';
+    outputTokens: number | 'unknown';
+    method: UsageMethod;
+    note?: string;
+    recordedBy: string;
+    enteredBy: 'human' | 'agent';
+  }): UsageRecord {
+    const work = this.ctx.store.getWork(input.idOrAlias);
+    if (input.source === 'agent' && !input.agentName?.trim()) {
+      throw err('E_INVALID_CONFIG', 'agentName is required when source is agent');
+    }
+    if (input.inputTokens !== 'unknown' && (!Number.isFinite(input.inputTokens) || input.inputTokens < 0)) {
+      throw err('E_INVALID_CONFIG', 'input tokens must be a non-negative number or unknown');
+    }
+    if (input.outputTokens !== 'unknown' && (!Number.isFinite(input.outputTokens) || input.outputTokens < 0)) {
+      throw err('E_INVALID_CONFIG', 'output tokens must be a non-negative number or unknown');
+    }
+    const record: UsageRecord = {
+      id: createId('usage'),
+      workId: work.id,
+      source: input.source,
+      agentName: input.agentName?.trim() || undefined,
+      modelId: input.modelId,
+      modelProvider: input.modelProvider,
+      tokens: { input: input.inputTokens, output: input.outputTokens },
+      method: input.method,
+      note: input.note,
+      recordedAt: now(),
+      recordedBy: input.recordedBy,
+      enteredBy: input.enteredBy,
+    };
+    // Record + event commit together so a mid-write failure cannot leave a counted row without its event
+    // (retry would otherwise insert a second ID and double-count in summaries).
+    this.ctx.store.transaction(() => {
+      this.ctx.store.saveUsageRecord(record);
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'usage.recorded',
+        payload: {
+          usageId: record.id,
+          source: record.source,
+          agentName: record.agentName,
+          modelId: record.modelId,
+          method: record.method,
+          enteredBy: record.enteredBy,
+        },
+      });
+    });
+    // Render after commit: packet refresh must not roll back counted usage. Failures here are
+    // surfaceable via sync/render; the record already exists so a blind retry would double-count —
+    // callers should not re-add on render-only errors.
+    try {
+      this.render(work.id, [`Usage recorded (${record.source}${record.agentName ? `:${record.agentName}` : ''})`]);
+    } catch {
+      /* usage is committed; next sync/render refreshes the packet */
+    }
+    return record;
   }
 
   private artifactLocation(workId: string, type: string, revision: number): string {
@@ -426,11 +509,21 @@ export class Engine {
         ...run,
         status: 'succeeded',
         endedAt: now(),
-        tokens: { input: result.usage?.inputTokens, output: result.usage?.outputTokens },
+        tokens: {
+          input: typeof result.usage?.inputTokens === 'number' ? result.usage.inputTokens : 'unknown',
+          output: typeof result.usage?.outputTokens === 'number' ? result.usage.outputTokens : 'unknown',
+        },
       });
       return result;
     } catch (e) {
-      this.ctx.store.saveRoleRun({ ...run, status: 'failed', endedAt: now(), errorCode: (e as { code?: string }).code ?? 'E_RUN_FAILURE' });
+      this.ctx.store.saveRoleRun({
+        ...run,
+        status: 'failed',
+        endedAt: now(),
+        errorCode: (e as { code?: string }).code ?? 'E_RUN_FAILURE',
+        // Failures still record model identity; usage is unknown unless the adapter already returned it (it did not here).
+        tokens: { input: 'unknown', output: 'unknown' },
+      });
       throw e;
     }
   }
@@ -457,6 +550,13 @@ export class Engine {
     const max = this.ctx.config.budgets.perTask.maxModelCalls;
     if (budget.modelCalls >= max) {
       throw err('E_BUDGET_EXCEEDED', `Model call budget exceeded (${budget.modelCalls}/${max})`);
+    }
+    const maxTokens = this.ctx.config.budgets.perTask.maxTokens;
+    if (maxTokens != null) {
+      const used = measuredTurbineTokens(this.ctx.store.listRoleRuns(workId));
+      if (used >= maxTokens) {
+        throw err('E_BUDGET_EXCEEDED', `Token budget exceeded (${used}/${maxTokens} measured Turbine tokens)`);
+      }
     }
   }
 
@@ -1713,6 +1813,14 @@ export class Engine {
       );
     if (!planOk) throw err('E_STALE_REVISION', 'Current plan is not approved');
 
+    // Reuse existing worktrees (CHANGES_REQUESTED loop) or create them on first execute.
+    // Budget applies only when this path will call the model (first execute); a model-free
+    // resume with existing worktrees must not be blocked by an exhausted token budget.
+    const existing = this.repoStates(work.id);
+    if (existing.length === 0) {
+      this.checkBudget(work.id);
+    }
+
     // Rebuilt when the base commit moved or this is a new CHANGES_REQUESTED cycle, before anything points at it.
     // It runs before the task leaves PLAN_APPROVED / CHANGES_REQUESTED and before any worktree exists, so a
     // failure here (an unreadable repository, an unwritable packet folder) leaves the task retryable.
@@ -1728,8 +1836,6 @@ export class Engine {
       this.ctx.store.saveEec(eec);
     }
 
-    // Reuse existing worktrees (CHANGES_REQUESTED loop) or create them.
-    const existing = this.repoStates(work.id);
     const repos =
       existing.length > 0
         ? observe(existing).repos
@@ -2040,6 +2146,11 @@ export class Engine {
       analysis: this.analyzeWork(work.id),
       evidenceFiles,
       contextFile: existsSync(paths.context),
+      usage: summarizeUsage({
+        workId: work.id,
+        roleRuns: this.ctx.store.listRoleRuns(work.id),
+        records: this.ctx.store.listUsageRecords(work.id),
+      }),
     };
     const glossary = join(this.ctx.projectRoot, '.turbine', 'GLOSSARY.md');
     if (!existsSync(glossary)) writeFile(glossary, GLOSSARY);

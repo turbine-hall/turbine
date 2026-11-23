@@ -13,6 +13,7 @@ import type {
   RepoSnapshot,
   RoleRun,
   StoredClaim,
+  UsageRecord,
   WorkPackage,
 } from '@turbine-hall/turbine-contracts';
 import {
@@ -34,6 +35,7 @@ import {
   RepoSnapshotSchema,
   RoleRunSchema,
   StoredClaimSchema,
+  UsageRecordSchema,
   assertNoUnsafeKeys,
   claimCommit,
   WorkPackageSchema,
@@ -767,6 +769,22 @@ export class WorkStore {
 
   releaseClaim(workId: string, token: string): void {
     this.db.prepare(`DELETE FROM work_claims WHERE work_id = ? AND owner = ?`).run(workId, token);
+  }
+
+  saveUsageRecord(record: UsageRecord): void {
+    const parsed = UsageRecordSchema.parse(record);
+    this.db
+      .prepare(
+        `INSERT INTO usage_records(id, work_id, data, recorded_at) VALUES (?, ?, ?, ?)`,
+      )
+      .run(parsed.id, parsed.workId, JSON.stringify(parsed), parsed.recordedAt);
+  }
+
+  listUsageRecords(workId: string): UsageRecord[] {
+    const rows = this.db
+      .prepare(`SELECT data FROM usage_records WHERE work_id = ? ORDER BY recorded_at ASC`)
+      .all(workId) as { data: string }[];
+    return rows.map((r) => UsageRecordSchema.parse(JSON.parse(r.data)));
   }
 
   getBudget(workId: string): { modelCalls: number; estimatedCost: number } {

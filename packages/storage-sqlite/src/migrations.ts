@@ -191,4 +191,17 @@ CREATE TABLE IF NOT EXISTS brief_state (
 ALTER TABLE brief_state ADD COLUMN pending_sections TEXT NOT NULL DEFAULT '[]';
 `,
   },
+  {
+    version: 8,
+    sql: `
+-- Per-task usage records (coding-agent reported / imported). Turbine model calls stay in role_runs.
+CREATE TABLE IF NOT EXISTS usage_records (
+  id TEXT PRIMARY KEY,
+  work_id TEXT NOT NULL,
+  data TEXT NOT NULL,
+  recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_records_work ON usage_records(work_id);
+`,
+  },
 ];
