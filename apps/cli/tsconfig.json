@@ -16,6 +16,7 @@
     { "path": "../../packages/skills" },
     { "path": "../../packages/tools" },
     { "path": "../../packages/adapter-jira" },
+    { "path": "../../packages/adapter-github" },
     { "path": "../../packages/adapter-git" },
     { "path": "../../packages/adapter-tests" },
     { "path": "../../packages/executor" }

@@ -574,10 +574,11 @@ task
   .option('--file <path>')
   .option('--type <type>', 'feature')
   .option('--json')
-  .action((opts) => {
+  .action(async (opts) => {
     try {
       const engine = withEngine();
       const work = engine.createTask({ title: opts.title, file: opts.file, type: opts.type });
+      await engine.waitForMirror();
       printResult(
         {
           id: work.id,
@@ -1386,6 +1387,7 @@ async function decideCommand(id: string, action: 'approve' | 'reject', reason?: 
     out.write('\nRecorded as a local attestation (identity not cryptographically verified).\n');
     const work = (result as { work: { id: string; currentState: string } }).work;
     printResult({ id: work.id, state: work.currentState }, false);
+    await engine.waitForMirror();
   } finally {
     engine.ctx.store.close();
   }

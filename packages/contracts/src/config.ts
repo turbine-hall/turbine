@@ -23,9 +23,26 @@ export const ProjectConfigSchema = z.object({
             credentialRef: z.string().nullable().default(null),
           })
           .default({ enabled: false, siteUrl: null, credentialRef: null }),
+        github: z
+          .object({
+            enabled: z.boolean().default(false),
+            /**
+             * Documented enterprise API hint only. Live mirror uses `GITHUB_API_BASE_URL` (env)
+             * or https://api.github.com — never this repo-owned field with the env token.
+             */
+            apiBaseUrl: z.string().nullable().default(null),
+            credentialRef: z.string().nullable().default(null),
+            /**
+             * owner/repo values that may receive packet mirrors. Empty = no GitHub mirrors
+             * (fail closed). Compared case-insensitively.
+             */
+            mirrorRepos: z.array(z.string()).default([]),
+          })
+          .default({ enabled: false, apiBaseUrl: null, credentialRef: null, mirrorRepos: [] }),
       })
       .default({
         jira: { enabled: false, siteUrl: null, credentialRef: null },
+        github: { enabled: false, apiBaseUrl: null, credentialRef: null, mirrorRepos: [] },
       }),
   }),
   models: z.object({
