@@ -104,12 +104,13 @@ export function createJiraAdapter(config: JiraConfig): ToolAdapter {
         }
 
         const auth = Buffer.from(`${config.email}:${config.apiToken}`).toString('base64');
-        const url = `${config.siteUrl.replace(/\/$/, '')}/rest/api/3/issue/${encodeURIComponent(key)}`;
+        const url = `${httpsSiteBase(config.siteUrl)}/rest/api/3/issue/${encodeURIComponent(key)}`;
         const res = await fetch(url, {
           headers: {
             Authorization: `Basic ${auth}`,
             Accept: 'application/json',
           },
+          signal: AbortSignal.timeout(15_000),
         });
         if (!res.ok) {
           throw err('E_ADAPTER', `Jira read failed: ${res.status} ${res.statusText}`);
@@ -167,16 +168,22 @@ export function createJiraAdapter(config: JiraConfig): ToolAdapter {
           method: 'PUT',
           headers,
           body: JSON.stringify({ body: textToAdf(bodyText) }),
+          signal: AbortSignal.timeout(15_000),
         });
-        if (!res.ok) throw err('E_ADAPTER', `Jira comment update failed: ${res.status} ${res.statusText}`);
-        const json = (await res.json()) as { id: string };
-        return { data: { id: json.id, body: bodyText, created: false }, externalOperationId: json.id };
+        if (res.status === 404) {
+          // Sticky comment deleted — fall through to create.
+        } else {
+          if (!res.ok) throw err('E_ADAPTER', `Jira comment update failed: ${res.status} ${res.statusText}`);
+          const json = (await res.json()) as { id: string };
+          return { data: { id: json.id, body: bodyText, created: false }, externalOperationId: json.id };
+        }
       }
 
       const res = await fetch(`${base}/rest/api/3/issue/${encodeURIComponent(key)}/comment`, {
         method: 'POST',
         headers,
         body: JSON.stringify({ body: textToAdf(bodyText) }),
+        signal: AbortSignal.timeout(15_000),
       });
       if (!res.ok) throw err('E_ADAPTER', `Jira comment create failed: ${res.status} ${res.statusText}`);
       const json = (await res.json()) as { id: string };

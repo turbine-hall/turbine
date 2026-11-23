@@ -27,8 +27,8 @@ export const ProjectConfigSchema = z.object({
           .object({
             enabled: z.boolean().default(false),
             /**
-             * Optional API base (default https://api.github.com). Must be https when set.
-             * Token from GITHUB_TOKEN / GH_TOKEN.
+             * Documented enterprise API hint only. Live mirror uses `GITHUB_API_BASE_URL` (env)
+             * or https://api.github.com — never this repo-owned field with the env token.
              */
             apiBaseUrl: z.string().nullable().default(null),
             credentialRef: z.string().nullable().default(null),

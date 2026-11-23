@@ -206,6 +206,27 @@ describe('issue packet mirror (#21)', () => {
     ).rejects.toThrow(/https/i);
   });
 
+  it('caps Jira mirror bodies under the Cloud comment limit', async () => {
+    const dir = tempProject('turbine-mirror-jira-budget-', dirs);
+    const engine = new Engine(openContext(dir));
+    const work = engine.createTask({
+      title: 'Budget',
+      text: '# Budget\n\nbody\n',
+      type: 'feature',
+    });
+    await engine.waitForMirror();
+    const paths = packetPaths(dir, work.id);
+    writeFileSync(paths.status, 'S'.repeat(20_000), 'utf8');
+    writeFileSync(paths.spec, 'P'.repeat(20_000), 'utf8');
+    const body = buildMirrorBody({
+      work,
+      projectRoot: dir,
+      budget: 32_000,
+    });
+    expect(body.length).toBeLessThanOrEqual(32_000);
+    engine.ctx.store.close();
+  });
+
   it('mirrors PLAN and REVIEW packet content via sticky comment (FR-006)', async () => {
     const dir = tempProject('turbine-mirror-plan-review-', dirs);
     const cfg = loadConfig(join(dir, '.turbine', 'project.yaml'));

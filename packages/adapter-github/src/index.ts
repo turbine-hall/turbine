@@ -109,16 +109,21 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
           method: 'PATCH',
           headers,
           body: JSON.stringify({ body }),
+          signal: AbortSignal.timeout(15_000),
         });
-        if (!res.ok) throw err('E_ADAPTER', `GitHub comment update failed: ${res.status} ${res.statusText}`);
-        const json = (await res.json()) as { id: number; body: string };
-        return { data: { id: String(json.id), body: json.body, created: false }, externalOperationId: String(json.id) };
+        if (res.status !== 404) {
+          if (!res.ok) throw err('E_ADAPTER', `GitHub comment update failed: ${res.status} ${res.statusText}`);
+          const json = (await res.json()) as { id: number; body: string };
+          return { data: { id: String(json.id), body: json.body, created: false }, externalOperationId: String(json.id) };
+        }
+        // Sticky comment deleted — fall through to create.
       }
 
       const res = await fetch(`${api}/repos/${owner}/${repo}/issues/${number}/comments`, {
         method: 'POST',
         headers,
         body: JSON.stringify({ body }),
+        signal: AbortSignal.timeout(15_000),
       });
       if (!res.ok) throw err('E_ADAPTER', `GitHub comment create failed: ${res.status} ${res.statusText}`);
       const json = (await res.json()) as { id: number; body: string };

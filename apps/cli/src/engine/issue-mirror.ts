@@ -6,6 +6,8 @@ import { packetPaths } from './packet.js';
 
 /** Max characters for the whole mirror body (GitHub soft limit is higher; keep room for truncation notice). */
 export const MIRROR_BODY_BUDGET = 55_000;
+/** Jira Cloud comment/description character limit (leave room for truncation notice). */
+export const MIRROR_JIRA_BODY_BUDGET = 32_000;
 /** Per-section cap before truncation notice. */
 export const MIRROR_SECTION_BUDGET = 12_000;
 
@@ -130,7 +132,10 @@ function readSection(path: string, missing: string): string {
 export function buildMirrorBody(input: {
   work: WorkPackage;
   projectRoot: string;
+  /** Provider-specific total budget (defaults to GitHub budget). */
+  budget?: number;
 }): string {
+  const budget = input.budget ?? MIRROR_BODY_BUDGET;
   const paths = packetPaths(input.projectRoot, input.work.id);
   const hint = `.turbine/tasks/${input.work.id}/`;
   const sections: Array<[string, string]> = [
@@ -158,8 +163,8 @@ export function buildMirrorBody(input: {
   }
 
   let out = parts.join('\n');
-  if (out.length > MIRROR_BODY_BUDGET) {
-    out = `${out.slice(0, MIRROR_BODY_BUDGET - 100)}\n\n_…mirror truncated to ${MIRROR_BODY_BUDGET} chars. See \`${hint}\`._`;
+  if (out.length > budget) {
+    out = `${out.slice(0, Math.max(0, budget - 100))}\n\n_…mirror truncated to ${budget} chars. See \`${hint}\`._`;
   }
   return out;
 }
@@ -242,7 +247,12 @@ export async function mirrorLinkedIssues(input: {
     (githubCfg?.mirrorRepos ?? []).map((r) => r.trim().toLowerCase()).filter(Boolean),
   );
 
-  const body = buildMirrorBody({ work: input.work, projectRoot: input.projectRoot });
+  const githubBody = buildMirrorBody({ work: input.work, projectRoot: input.projectRoot });
+  const jiraBody = buildMirrorBody({
+    work: input.work,
+    projectRoot: input.projectRoot,
+    budget: MIRROR_JIRA_BODY_BUDGET,
+  });
   const state = loadMirrorState(input.projectRoot, input.work.id);
   const broker = new ToolBroker({
     allow: input.config.tools.allow,
@@ -294,7 +304,7 @@ export async function mirrorLinkedIssues(input: {
             owner: link.owner,
             repo: link.repo,
             number: link.number,
-            body,
+            body: githubBody,
             ...(commentId ? { commentId } : {}),
           },
         });
@@ -322,7 +332,7 @@ export async function mirrorLinkedIssues(input: {
           grants,
           arguments: {
             key: link.key,
-            body,
+            body: jiraBody,
             ...(commentId ? { commentId } : {}),
           },
         });

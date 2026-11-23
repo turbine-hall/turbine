@@ -2062,7 +2062,6 @@ export class Engine {
   private async runIssueMirror(work: WorkPackage, sourceText?: string): Promise<MirrorRunResult | undefined> {
     try {
       const jiraCfg = this.ctx.config.inputs.adapters.jira;
-      const githubCfg = this.ctx.config.inputs.adapters.github;
       const adapters: MirrorAdapters = this.mirrorFixtureMode
         ? {
             // Fixture mode: never invent live adapters — missing provider → explicit skip.
@@ -2073,7 +2072,8 @@ export class Engine {
             github:
               this.mirrorAdapters?.github ??
               createGitHubAdapter({
-                apiBaseUrl: githubCfg?.apiBaseUrl ?? undefined,
+                // Host trust is env-only — never take apiBaseUrl from repo project.yaml with the env token.
+                apiBaseUrl: process.env.GITHUB_API_BASE_URL || undefined,
                 token: process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN,
               }),
             jira:
