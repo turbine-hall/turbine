@@ -61,6 +61,38 @@ describe('planning deliverables (#17)', () => {
     expect(lintMermaid(mermaid)).toBeUndefined();
   });
 
+  it('normalizePlan drops blank string diagrams', () => {
+    const plan = normalizePlan({
+      summary: 'x',
+      diagrams: ['', '   ', 'flowchart LR\n  a-->b'],
+      steps: [],
+      testPlan: [],
+      risks: [],
+    });
+    expect(plan.diagrams).toHaveLength(1);
+    expect(plan.diagrams[0]?.mermaid).toMatch(/flowchart/);
+  });
+
+  it('lintPacket rejects an unclosed Mermaid fence in EXECUTIVE-SUMMARY.md', async () => {
+    const dir = tempProject('turbine-plan-lint-', dirs);
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const packet = join(dir, '.turbine', 'tasks', 'W-lint');
+    mkdirSync(packet, { recursive: true });
+    for (const [name, body] of [
+      ['STATUS.md', '# Status\n\n## Documents\n'],
+      ['SPEC.md', '# Spec\n\n## Requirements\n\n## Open questions\n\n## Context\n\n## Non-goals\n\n## Decisions\n'],
+      ['REVIEW.md', '# Review\n\n## 1. What changed\n\n## 2. Traceability\n\n## 3. AI review\n\n## 4. Checks\n\n## 5. Acceptance\n\n## Decisions\n'],
+      ['PLAN.md', '# Plan\n\n## Summary\n\n## Architecture\n\n## Data model\n\n## Interfaces\n\n## Steps\n\n## Test plan\n\n## Risks\n\n## Coding-agent token estimate\n'],
+      ['EXECUTIVE-SUMMARY.md', '# Exec\n\n## Overview\n\nok\n\n## Diagrams\n\n```mermaid\nflowchart LR\n  a-->b\n'],
+    ] as const) {
+      writeFileSync(join(packet, name), body);
+    }
+    const paths = packetPaths(dir, 'W-lint');
+    const issues = lintPacket(paths, { track: 'standard', requirementIds: [], hasPlan: true });
+    expect(issues.some((i) => i.level === 'error' && i.message.includes('unclosed Mermaid'))).toBe(true);
+  });
+
   it('normalizePlan keeps detailed fields, diagrams, and estimated token budget', () => {
     const plan = normalizePlan({
       summary: 'Ship the feature',

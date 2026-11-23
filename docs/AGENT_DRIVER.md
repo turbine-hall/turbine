@@ -29,7 +29,7 @@ turbine task next <id>
 | IMPORTED / ASSESSING | either | `sync` / assess |
 | NEEDS_CLARIFICATION / REQUIREMENTS_REVIEW | human | edit requirements / answer questions in `SPEC.md` → `sync` → human runs `turbine task approve` |
 | REQUIREMENTS_APPROVED | either | `sync` → plan |
-| PLAN_REVIEW | human | read the Plan in `SPEC.md` (fix CRITICAL items from `turbine task analyze`) → human runs `turbine task approve` |
+| PLAN_REVIEW | human | read `PLAN.md` and `EXECUTIVE-SUMMARY.md` (fix CRITICAL items from `turbine task analyze`) → human runs `turbine task approve` |
 | PLAN_APPROVED | either | `sync` → execute handoff |
 | IMPLEMENTING / CHANGES_REQUESTED | agent | code **in the worktree(s)**, commit everything, `sync` (stays here until there is a commit and nothing uncommitted) |
 | AI_REVIEW | either | `sync` |

@@ -98,8 +98,17 @@ export function lintPacket(paths: PacketPaths, opts: { track: Track; requirement
       LINE_BUDGET[opts.track].executiveSummary,
       opts.track,
     );
-    if (execMd && !/```mermaid/.test(execMd)) {
-      issues.push({ level: 'error', file: 'EXECUTIVE-SUMMARY.md', message: 'missing Mermaid diagram fence' });
+    if (execMd) {
+      const complete = [...execMd.matchAll(/```mermaid\n([\s\S]*?)```/g)];
+      if (!complete.length) {
+        issues.push({
+          level: 'error',
+          file: 'EXECUTIVE-SUMMARY.md',
+          message: /```mermaid/.test(execMd)
+            ? 'unclosed Mermaid diagram fence'
+            : 'missing Mermaid diagram fence',
+        });
+      }
     }
   }
   // CONTEXT.md is generated from the store; a hand edit to the generated part is reported (and overwritten).

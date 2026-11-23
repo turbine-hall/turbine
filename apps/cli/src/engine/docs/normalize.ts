@@ -135,7 +135,11 @@ export function normalizePlan(raw: unknown): NormalizedPlan {
   });
   const diagrams = arr(o.diagrams)
     .map((d): PlanDiagram | null => {
-      if (typeof d === 'string') return { title: 'Change overview', mermaid: d };
+      if (typeof d === 'string') {
+        const mermaid = d.trim();
+        if (!mermaid) return null;
+        return { title: 'Change overview', mermaid };
+      }
       const x = (d ?? {}) as Record<string, unknown>;
       const mermaid = str(x.mermaid ?? x.diagram ?? x.body);
       if (!mermaid) return null;
