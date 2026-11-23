@@ -6,20 +6,26 @@ import { writeAtomic } from './context/render.js';
  * Task packet layout (Phase 3 document standard):
  *
  *   .turbine/tasks/<work-id>/
- *     STATUS.md   — where the task is, who acts next, gate progress, blockers
- *     SPEC.md     — requirements, open questions, context, plan, test plan (humans edit requirements here)
- *     REVIEW.md   — what changed (git), traceability, AI review, checks, acceptance checklist
- *     CONTEXT.md  — the files relevant to the task and why (generated from the store; "## Agent notes" kept)
- *     evidence/   — raw JSON and logs (never inlined in the documents above)
+ *     STATUS.md              — where the task is, who acts next, gate progress, blockers
+ *     SPEC.md                — requirements, open questions, context (humans edit requirements here)
+ *     PLAN.md                — detailed implementation plan (generated from the plan artifact)
+ *     EXECUTIVE-SUMMARY.md   — high-level plan narrative + Mermaid diagrams
+ *     REVIEW.md              — what changed (git), traceability, AI review, checks, acceptance checklist
+ *     CONTEXT.md             — the files relevant to the task and why (generated from the store; "## Agent notes" kept)
+ *     evidence/              — raw JSON and logs (never inlined in the documents above)
  *
  * The legacy keys (request, requirements, plan, …) are kept as aliases so callers that
- * name a stage still land on the right file.
+ * name a stage still land on the right file. `plan` aliases to PLAN.md (canonical plan doc).
  */
 export type PacketPaths = {
   dir: string;
   status: string;
   spec: string;
   review: string;
+  /** Detailed plan document (generated). */
+  planDoc: string;
+  /** Executive summary + diagrams (generated). */
+  executiveSummary: string;
   /** CONTEXT.md: the files relevant to this task, each with a checkable reason (generated; notes kept). */
   context: string;
   /** The project facts the task context points to (`turbine understand`); shared by every task. */
@@ -42,11 +48,15 @@ export function packetPaths(projectRoot: string, workId: string): PacketPaths {
   const status = join(dir, 'STATUS.md');
   const spec = join(dir, 'SPEC.md');
   const review = join(dir, 'REVIEW.md');
+  const planDoc = join(dir, 'PLAN.md');
+  const executiveSummary = join(dir, 'EXECUTIVE-SUMMARY.md');
   return {
     dir,
     status,
     spec,
     review,
+    planDoc,
+    executiveSummary,
     context: join(dir, 'CONTEXT.md'),
     projectContext: join(projectRoot, '.turbine', 'context', 'PROJECT.md'),
     evidenceDir: join(dir, 'evidence'),
@@ -54,7 +64,7 @@ export function packetPaths(projectRoot: string, workId: string): PacketPaths {
     request: spec,
     assessment: spec,
     requirements: spec,
-    plan: spec,
+    plan: planDoc,
     executionBrief: status,
     changeReport: review,
     verify: review,

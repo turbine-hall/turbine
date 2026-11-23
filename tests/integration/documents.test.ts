@@ -180,9 +180,20 @@ describe('plan analysis', () => {
         return {
           content: {
             summary: 'Only handles FR-002',
+            architecture: 'Auth gate only',
+            dataModel: 'no data model change',
+            interfaces: 'no interface change',
+            executiveSummary: 'Narrow plan that intentionally omits FR-001.',
+            diagrams: [{ title: 'Auth only', mermaid: 'flowchart LR\n  req[Request] --> auth[AuthGate]' }],
             steps: [{ id: 'S1', description: 'Refuse unauthorised users', requirementIds: ['FR-002'], files: ['src/auth.js'] }],
             testPlan: [{ requirementId: 'FR-002', test: '403 for others', kind: 'unit' }],
             risks: [],
+            estimatedComplexity: 'low',
+            codingAgentTokenEstimate: {
+              totalTokens: 70000,
+              basis: 'low base + 1 step + 1 file',
+              confidence: 'estimated',
+            },
           },
         };
       },
@@ -280,7 +291,9 @@ describe('plan must touch every repository in scope', () => {
     const { analyze } = await import('../../apps/cli/src/engine/docs/analyze.js');
     const requirements = [{ id: 'FR-001', statement: 'WHEN x THE SYSTEM SHALL y', kind: 'behavioral' as const, status: 'confirmed' as const, priority: 'P0' as const }];
     const plan = (files: string[]) => ({
-      summary: '', risks: [],
+      summary: '',
+      risks: [],
+      diagrams: [] as Array<{ title: string; mermaid: string }>,
       steps: [{ id: 'S1', description: 'do it', requirementIds: ['FR-001'], files }],
       testPlan: [{ requirementId: 'FR-001', test: 't', kind: 'unit' }],
     });
@@ -297,7 +310,13 @@ describe('planned files must exist or be clearly new', () => {
   it('suggests the real file when the plan names a near-miss (campaign.entity.ts → campaign.schema.ts)', async () => {
     const { analyze } = await import('../../apps/cli/src/engine/docs/analyze.js');
     const requirements = [{ id: 'FR-001', statement: 'WHEN x THE SYSTEM SHALL y', kind: 'behavioral' as const, status: 'confirmed' as const, priority: 'P0' as const }];
-    const plan = { summary: '', risks: [], steps: [{ id: 'S1', description: 'd', requirementIds: ['FR-001'], files: ['src/a.ts'] }], testPlan: [{ requirementId: 'FR-001', test: 't', kind: 'unit' }] };
+    const plan = {
+      summary: '',
+      risks: [],
+      diagrams: [] as Array<{ title: string; mermaid: string }>,
+      steps: [{ id: 'S1', description: 'd', requirementIds: ['FR-001'], files: ['src/a.ts'] }],
+      testPlan: [{ requirementId: 'FR-001', test: 't', kind: 'unit' }],
+    };
     const trace = [{ requirementId: 'FR-001', priority: 'P0', statement: '', steps: ['S1'], plannedTests: ['t'], files: [], tests: [], checks: 'not-run' as const, planned: true }];
     const out = analyze({
       state: 'PLAN_REVIEW', requirements, unknowns: [], facts: [], plan, trace,

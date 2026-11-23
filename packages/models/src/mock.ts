@@ -87,22 +87,49 @@ export function createMockModelAdapter(id = 'mock-default'): ModelAdapter {
         };
       }
 
-      if (request.schemaId === 'plan' || request.skillIds.includes('core/plan-change')) {
+      if (
+        request.schemaId === 'plan' ||
+        request.skillIds.includes('core/plan-change') ||
+        request.skillIds.includes('core/plan-executive-summary')
+      ) {
         const ids = [...request.prompt.matchAll(/^- ([A-Za-z]+[-_]\w+) \(P[012]\):/gm)].map((m) => m[1]!);
         const reqIds = ids.length ? ids : ['FR-001'];
+        const steps = [
+          { id: 'S1', description: 'Implement the main behaviour', requirementIds: [reqIds[0]!], files: ['src/'] },
+          ...(reqIds.length > 1
+            ? [{ id: 'S2', description: 'Handle the remaining requirements', requirementIds: reqIds.slice(1), files: ['src/'] }]
+            : []),
+          { id: `S${reqIds.length > 1 ? 3 : 2}`, description: 'Add tests', requirementIds: reqIds, files: ['test/'] },
+        ];
+        const fileCount = new Set(steps.flatMap((s) => s.files)).size;
+        const totalTokens = 50_000 + 15_000 * steps.length + 5_000 * fileCount;
         return {
           content: {
             summary: 'Bounded implementation plan',
-            steps: [
-              { id: 'S1', description: 'Implement the main behaviour', requirementIds: [reqIds[0]], files: ['src/'] },
-              ...(reqIds.length > 1
-                ? [{ id: 'S2', description: 'Handle the remaining requirements', requirementIds: reqIds.slice(1), files: ['src/'] }]
-                : []),
-              { id: `S${reqIds.length > 1 ? 3 : 2}`, description: 'Add tests', requirementIds: reqIds, files: ['test/'] },
+            architecture: 'Keep existing module boundaries; extend the touched packages only.',
+            dataModel: 'no data model change',
+            interfaces: 'no interface change',
+            executiveSummary:
+              'This change implements the approved requirements with a small, bounded set of file edits and matching tests. Scope stays inside the listed repositories.',
+            diagrams: [
+              {
+                title: 'Change overview',
+                mermaid: ['flowchart LR', '  spec[ApprovedSpec] --> plan[DetailedPlan]', '  plan --> code[CodingAgent]', '  code --> review[HumanReview]'].join(
+                  '\n',
+                ),
+              },
             ],
+            steps,
             testPlan: reqIds.map((id) => ({ requirementId: id, test: `Test for ${id}`, kind: 'unit' })),
             risks: [{ risk: 'Mock plan — no real repository analysis', mitigation: 'Review the diff carefully' }],
             estimatedComplexity: 'low',
+            codingAgentTokenEstimate: {
+              totalTokens,
+              inputTokens: Math.round(totalTokens * 0.7),
+              outputTokens: Math.round(totalTokens * 0.3),
+              basis: `low base 50000 + 15000×${steps.length} steps + 5000×${fileCount} files`,
+              confidence: 'estimated',
+            },
           },
           usage: { inputTokens: 140, outputTokens: 220 },
           providerRequestId: `mock_${Date.now()}`,

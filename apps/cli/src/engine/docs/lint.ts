@@ -16,6 +16,9 @@ const REQUIRED: Record<'STATUS.md' | 'SPEC.md' | 'REVIEW.md', string[]> = {
   'REVIEW.md': ['## 1. What changed', '## 2. Traceability', '## 3. AI review', '## 4. Checks', '## 5. Acceptance', '## Decisions'],
 };
 
+const PLAN_REQUIRED = ['## Summary', '## Architecture', '## Data model', '## Interfaces', '## Steps', '## Test plan', '## Risks', '## Coding-agent token estimate'];
+const EXEC_REQUIRED = ['## Overview', '## Diagrams'];
+
 const MERMAID_TYPES = /^(flowchart|graph|sequenceDiagram|stateDiagram(-v2)?|classDiagram|erDiagram|gantt|pie|journey)\b/;
 
 export function lintMermaid(block: string): string | undefined {
@@ -30,27 +33,40 @@ export function lintMermaid(block: string): string | undefined {
   return undefined;
 }
 
-export function lintPacket(paths: PacketPaths, opts: { track: Track; requirementIds: string[] }): LintIssue[] {
+function lintMarkdownDoc(
+  issues: LintIssue[],
+  name: string,
+  path: string,
+  requiredHeadings: string[],
+  budget: number,
+  track: Track,
+): string | undefined {
+  if (!existsSync(path)) {
+    issues.push({ level: 'error', file: name, message: 'missing' });
+    return undefined;
+  }
+  const md = readFileSync(path, 'utf8');
+  for (const h of requiredHeadings) {
+    if (!md.split('\n').some((l) => l.startsWith(h))) issues.push({ level: 'error', file: name, message: `missing section "${h}"` });
+  }
+  if (/```json/i.test(md)) issues.push({ level: 'error', file: name, message: 'raw JSON inline — raw data belongs in evidence/' });
+  const blocks = [...md.matchAll(/```mermaid\n([\s\S]*?)```/g)].map((m) => m[1]!);
+  blocks.forEach((b, i) => {
+    const problem = lintMermaid(b);
+    if (problem) issues.push({ level: 'error', file: name, message: `diagram ${i + 1}: ${problem}` });
+  });
+  const count = md.split('\n').length;
+  if (count > budget) issues.push({ level: 'warning', file: name, message: `${count} lines (budget for ${track} track: ${budget})` });
+  return md;
+}
+
+export function lintPacket(paths: PacketPaths, opts: { track: Track; requirementIds: string[]; hasPlan?: boolean }): LintIssue[] {
   const issues: LintIssue[] = [];
   const files = { 'STATUS.md': paths.status, 'SPEC.md': paths.spec, 'REVIEW.md': paths.review } as const;
   for (const [name, path] of Object.entries(files) as Array<[keyof typeof REQUIRED, string]>) {
-    if (!existsSync(path)) {
-      issues.push({ level: 'error', file: name, message: 'missing' });
-      continue;
-    }
-    const md = readFileSync(path, 'utf8');
-    for (const h of REQUIRED[name]) {
-      if (!md.split('\n').some((l) => l.startsWith(h))) issues.push({ level: 'error', file: name, message: `missing section "${h}"` });
-    }
-    if (/```json/i.test(md)) issues.push({ level: 'error', file: name, message: 'raw JSON inline — raw data belongs in evidence/' });
-    const blocks = [...md.matchAll(/```mermaid\n([\s\S]*?)```/g)].map((m) => m[1]!);
-    blocks.forEach((b, i) => {
-      const problem = lintMermaid(b);
-      if (problem) issues.push({ level: 'error', file: name, message: `diagram ${i + 1}: ${problem}` });
-    });
-    const budget = LINE_BUDGET[opts.track][name === 'STATUS.md' ? 'status' : name === 'SPEC.md' ? 'spec' : 'review'];
-    const count = md.split('\n').length;
-    if (count > budget) issues.push({ level: 'warning', file: name, message: `${count} lines (budget for ${opts.track} track: ${budget})` });
+    const budgetKey = name === 'STATUS.md' ? 'status' : name === 'SPEC.md' ? 'spec' : 'review';
+    const md = lintMarkdownDoc(issues, name, path, REQUIRED[name], LINE_BUDGET[opts.track][budgetKey], opts.track);
+    if (!md) continue;
     if (name === 'SPEC.md') {
       const parsed = parseSpecMarkdown(md);
       const ids = new Set(parsed.requirements.map((r) => r.id));
@@ -69,6 +85,21 @@ export function lintPacket(paths: PacketPaths, opts: { track: Track; requirement
       for (const id of opts.requirementIds) {
         if (!trace.includes(`| ${id} |`)) issues.push({ level: 'error', file: name, message: `requirement ${id} missing from traceability` });
       }
+    }
+  }
+  const planPresent = opts.hasPlan ?? existsSync(paths.planDoc);
+  if (planPresent) {
+    lintMarkdownDoc(issues, 'PLAN.md', paths.planDoc, PLAN_REQUIRED, LINE_BUDGET[opts.track].plan, opts.track);
+    const execMd = lintMarkdownDoc(
+      issues,
+      'EXECUTIVE-SUMMARY.md',
+      paths.executiveSummary,
+      EXEC_REQUIRED,
+      LINE_BUDGET[opts.track].executiveSummary,
+      opts.track,
+    );
+    if (execMd && !/```mermaid/.test(execMd)) {
+      issues.push({ level: 'error', file: 'EXECUTIVE-SUMMARY.md', message: 'missing Mermaid diagram fence' });
     }
   }
   // CONTEXT.md is generated from the store; a hand edit to the generated part is reported (and overwritten).

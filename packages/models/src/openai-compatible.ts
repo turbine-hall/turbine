@@ -75,7 +75,7 @@ function systemForSchema(schemaId: string): string {
       ? 'Include fields: summary, requirements[{id (FR-001…),priority (P0|P1|P2),kind,statement (EARS: WHEN … THE SYSTEM SHALL …)}], nonGoals[], userFlow{steps[{from,to,message}]} (optional), testIntent[], requestCoverage[{itemId,requirementIds[],nonGoal?,question?}] covering EVERY item listed under REQUEST ITEMS. kind MUST be exactly one of: behavioral | technical | nonfunctional.'
       : '',
     schemaId === 'plan'
-      ? 'Include fields: summary, steps[{id,description,requirementIds[],files[]}], testPlan[{requirementId,test,kind}], risks[{risk,mitigation}], estimatedComplexity. Every requirement ID must be covered by a step and every P0 by a test.'
+      ? 'Include fields: summary, architecture, dataModel, interfaces, executiveSummary, diagrams[{title,mermaid}], steps[{id,description,requirementIds[],files[]}], testPlan[{requirementId,test,kind}], risks[{risk,mitigation}], estimatedComplexity, codingAgentTokenEstimate{totalTokens,inputTokens?,outputTokens?,basis,confidence:"estimated"}. Every requirement ID must be covered by a step and every P0 by a test. Token estimate is a heuristic for the coding agent, never billed cost.'
       : '',
     schemaId === 'review'
       ? 'Include fields: findings[{severity,claim,file,line,quote}], claims{dependenciesAdded[],testFilesChanged[]}, coverage[{requirementId,testFile}], summary. Cite only files listed under CHANGED FILES; copy quotes exactly from the DIFF.'

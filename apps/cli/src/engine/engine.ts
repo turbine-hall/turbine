@@ -365,6 +365,7 @@ export class Engine {
    */
   private async runAsRole(input: {
     skill: SkillManifest;
+    companionSkills?: SkillManifest[];
     model: ModelAdapter;
     workId: string;
     roleId: string;
@@ -373,13 +374,16 @@ export class Engine {
     maxOutputTokens: number;
   }): Promise<{ content: unknown; usage?: { inputTokens?: number; outputTokens?: number } }> {
     const work = this.ctx.store.getWork(input.workId);
+    const companions = input.companionSkills ?? [];
     const { grants } = this.roleGrants(work, input.roleId, input.skill.id);
+    for (const c of companions) this.roleGrants(work, input.roleId, c.id);
+    const skillIds = [input.skill.id, ...companions.map((c) => c.id)];
     const run: RoleRun = {
       id: createId('run'),
       workId: work.id,
       roleId: input.roleId,
       roleVersion: getRole(this.ctx.factoryRoot, input.roleId).version,
-      skillIds: [input.skill.id],
+      skillIds,
       toolCapabilityGrants: grants,
       modelProvider: input.model.provider,
       modelId: input.model.id,
@@ -392,7 +396,7 @@ export class Engine {
     };
     this.ctx.store.saveRoleRun(run);
     try {
-      const result = await runSkill({ ...input, grantedCapabilities: grants });
+      const result = await runSkill({ ...input, companionSkills: companions, grantedCapabilities: grants });
       this.ctx.store.saveRoleRun({
         ...run,
         status: 'succeeded',
@@ -1132,6 +1136,7 @@ export class Engine {
     this.checkBudget(work.id);
     const model = getModel(this.ctx.config.models.profiles.analysis?.model ?? 'mock-default');
     const skill = getSkill(this.ctx.factoryRoot, 'core/plan-change');
+    const executiveSummarySkill = getSkill(this.ctx.factoryRoot, 'core/plan-executive-summary');
     const spec = this.ctx.store.getLatestArtifact(work.id, 'specification');
     const specJson = (() => {
       try {
@@ -1164,6 +1169,7 @@ export class Engine {
       : '';
     const result = await this.runAsRole({
       skill,
+      companionSkills: [executiveSummarySkill],
       model,
       workId: work.id,
       roleId: work.selectedRoles.some((r) => r.id === 'project-manager') || !work.selectedRoles.some((r) => r.id === 'architect')
@@ -1171,7 +1177,7 @@ export class Engine {
         : 'architect',
       context: `REQUIREMENTS (link every step and test to these IDs):\n${work.acceptanceCriteria.map((c) => `- ${c.id} (${c.priority ?? 'P1'}): ${c.statement}`).join('\n')}\n\nVALID REQUIREMENT IDS: ${validIds.join(', ')}. Use only these; every one needs at least one step, and every P0 at least one test.${feedback}\n\nAPPROVED SPEC CONTEXT:\n${specText}\n\nPROJECT_EVIDENCE (each line ends with its source):\n${repoContext}\n\nTASK_CONTEXT (files that may matter, each with a checkable reason; a selection, NOT a complete list):\n${taskContextText}${extraRepoEvidence ? `\n\n${extraRepoEvidence}` : ''}\n\nREPOSITORIES IN SCOPE:\n- project (this repo)\n${(work.repositories ?? []).map((r) => `- ${r.name}: ${r.path}`).join('\n')}\nOnly plan changes in these repositories; if another repo is needed, say so under risks.`,
       schemaId: 'plan',
-      maxOutputTokens: 4000,
+      maxOutputTokens: 5000,
     });
     // The completed model call is charged on its own, committed before publication. Publication can roll back
     // (a failed write, a lost claim); the call still happened, so it still counts.
@@ -1915,9 +1921,11 @@ export class Engine {
 
   lintWork(idOrAlias: string): LintIssue[] {
     const work = this.ctx.store.getWork(idOrAlias);
+    const hasPlan = Boolean(this.ctx.store.getLatestArtifact(work.id, 'plan'));
     return lintPacket(packetPaths(this.ctx.projectRoot, work.id), {
       track: trackFor(work),
       requirementIds: work.acceptanceCriteria.map((c) => c.id),
+      hasPlan,
     });
   }
 
