@@ -2061,7 +2061,6 @@ export class Engine {
 
   private async runIssueMirror(work: WorkPackage, sourceText?: string): Promise<MirrorRunResult | undefined> {
     try {
-      const jiraCfg = this.ctx.config.inputs.adapters.jira;
       const adapters: MirrorAdapters = this.mirrorFixtureMode
         ? {
             // Fixture mode: never invent live adapters — missing provider → explicit skip.
@@ -2079,7 +2078,8 @@ export class Engine {
             jira:
               this.mirrorAdapters?.jira ??
               createJiraAdapter({
-                siteUrl: jiraCfg.siteUrl ?? '',
+                // Host trust is env-only — never take siteUrl from repo project.yaml with the env token.
+                siteUrl: process.env.JIRA_SITE_URL || '',
                 email: process.env.JIRA_EMAIL,
                 apiToken: process.env.JIRA_API_TOKEN,
               }),

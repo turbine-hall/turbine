@@ -25,13 +25,13 @@ describe('issue packet mirror (#21)', () => {
     const links = resolveLinkedIssues(
       {
         id: 'work_x',
-        aliases: ['jira:PROJ-12', 'github:acme/app#9'],
+        aliases: ['jira:PROJ-12', 'github:acme/app#9', 'github:Acme/App#09'],
         sourceRefs: [{ provider: 'file', snapshotHash: 'h' }],
         objective: 'see https://github.com/turbine-hall/turbine/issues/21',
       } as any,
     );
     expect(links.some((l) => l.provider === 'jira' && l.key === 'PROJ-12')).toBe(true);
-    expect(links.some((l) => l.provider === 'github' && l.key === 'acme/app#9')).toBe(true);
+    expect(links.filter((l) => l.provider === 'github' && l.key === 'acme/app#9')).toHaveLength(1);
     expect(links.some((l) => l.provider === 'github' && l.key === 'turbine-hall/turbine#21')).toBe(true);
   });
 

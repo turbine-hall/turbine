@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type { ProjectConfig, WorkPackage } from '@turbine-hall/turbine-contracts';
 import { ToolBroker, type Capability, type ToolAdapter } from '@turbine-hall/turbine-tools';
 import { packetPaths } from './packet.js';
+import { readContextFile } from './context/task-render.js';
 
 /** Max characters for the whole mirror body (GitHub soft limit is higher; keep room for truncation notice). */
 export const MIRROR_BODY_BUDGET = 55_000;
@@ -46,6 +47,14 @@ export function mirrorMarker(workId: string): string {
   return `${MIRROR_MARKER_PREFIX}${workId} -->`;
 }
 
+/** Canonical GitHub identity: lowercase owner/repo + numeric issue (so #01 and #1 collide). */
+export function githubLinkedIssue(owner: string, repo: string, number: number | string): LinkedIssue {
+  const n = Number(number);
+  const o = owner.toLowerCase();
+  const r = repo.toLowerCase();
+  return { provider: 'github', owner: o, repo: r, number: n, key: `${o}/${r}#${n}` };
+}
+
 /** Supported link forms: sourceRefs provider github|jira, aliases github:owner/repo#n / jira:KEY / bare KEY, and github.com/.../issues/N URLs in text. */
 export function resolveLinkedIssues(work: WorkPackage, extraText = ''): LinkedIssue[] {
   const found = new Map<string, LinkedIssue>();
@@ -62,24 +71,10 @@ export function resolveLinkedIssues(work: WorkPackage, extraText = ''): LinkedIs
     if (p === 'github') {
       const fromUrl = ref.url ? [...ref.url.matchAll(GH_URL)][0] : undefined;
       if (fromUrl) {
-        add({
-          provider: 'github',
-          owner: fromUrl[1]!,
-          repo: fromUrl[2]!,
-          number: Number(fromUrl[3]),
-          key: `${fromUrl[1]}/${fromUrl[2]}#${fromUrl[3]}`,
-        });
+        add(githubLinkedIssue(fromUrl[1]!, fromUrl[2]!, fromUrl[3]!));
       } else if (ref.externalId) {
         const m = ref.externalId.match(/^([^/]+)\/([^#]+)#(\d+)$/);
-        if (m) {
-          add({
-            provider: 'github',
-            owner: m[1]!,
-            repo: m[2]!,
-            number: Number(m[3]),
-            key: `${m[1]}/${m[2]}#${m[3]}`,
-          });
-        }
+        if (m) add(githubLinkedIssue(m[1]!, m[2]!, m[3]!));
       }
     }
   }
@@ -87,13 +82,7 @@ export function resolveLinkedIssues(work: WorkPackage, extraText = ''): LinkedIs
   for (const alias of work.aliases ?? []) {
     const gh = alias.match(GH_ALIAS);
     if (gh) {
-      add({
-        provider: 'github',
-        owner: gh[1]!,
-        repo: gh[2]!,
-        number: Number(gh[3]),
-        key: `${gh[1]}/${gh[2]}#${gh[3]}`,
-      });
+      add(githubLinkedIssue(gh[1]!, gh[2]!, gh[3]!));
       continue;
     }
     const jira = alias.match(JIRA_ALIAS);
@@ -106,13 +95,7 @@ export function resolveLinkedIssues(work: WorkPackage, extraText = ''): LinkedIs
 
   const haystack = [work.objective ?? '', extraText].join('\n');
   for (const m of haystack.matchAll(GH_URL)) {
-    add({
-      provider: 'github',
-      owner: m[1]!,
-      repo: m[2]!,
-      number: Number(m[3]),
-      key: `${m[1]}/${m[2]}#${m[3]}`,
-    });
+    add(githubLinkedIssue(m[1]!, m[2]!, m[3]!));
   }
 
   return [...found.values()];
@@ -126,7 +109,13 @@ function truncate(text: string, budget: number, packetHint: string): string {
 
 function readSection(path: string, missing: string): string {
   if (!existsSync(path)) return missing;
-  return readFileSync(path, 'utf8');
+  try {
+    // Bounded nonblocking reader (refuses FIFOs / oversize / non-regular files).
+    return readContextFile(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return missing;
+    throw e;
+  }
 }
 
 export function buildMirrorBody(input: {
@@ -365,21 +354,19 @@ export function githubLinksFromText(text: string): Array<{
   }> = [];
   const seen = new Set<string>();
   for (const m of text.matchAll(GH_URL)) {
-    const owner = m[1]!;
-    const repo = m[2]!;
-    const number = m[3]!;
-    const key = `${owner}/${repo}#${number}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const url = `https://github.com/${owner}/${repo}/issues/${number}`;
+    const link = githubLinkedIssue(m[1]!, m[2]!, m[3]!);
+    if (link.provider !== 'github') continue;
+    if (seen.has(link.key)) continue;
+    seen.add(link.key);
+    const url = `https://github.com/${link.owner}/${link.repo}/issues/${link.number}`;
     out.push({
       sourceRef: {
         provider: 'github',
-        externalId: key,
+        externalId: link.key,
         url,
         snapshotHash: 'pending',
       },
-      alias: `github:${key}`,
+      alias: `github:${link.key}`,
     });
   }
   return out;
