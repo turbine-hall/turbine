@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
-import type { AcceptanceCriterion, Decision, WorkPackage, WorkState } from '@turbine-hall/turbine-contracts';
+import type { AcceptanceCriterion, Decision, UsageSummary, WorkPackage, WorkState } from '@turbine-hall/turbine-contracts';
+import { formatTokenCount } from '../usage.js';
 import type { GateDecision } from '@turbine-hall/turbine-evidence-contract';
 import type { RepoFacts, RepoState } from '../changeset.js';
 import type { CheckRun } from '../checks.js';
@@ -60,7 +61,36 @@ export type PacketData = {
   evidenceFiles: string[];
   /** CONTEXT.md exists for this task (the relevant files and why; a selection, not a complete list). */
   contextFile?: boolean;
+  /** Token/model usage from role_runs + usage_records (generated; never hand-edited). */
+  usage?: UsageSummary;
 };
+
+function renderUsageSection(usage: UsageSummary | undefined): string[] {
+  if (!usage) return [];
+  const lines = [
+    '',
+    '## Usage',
+    '',
+    '_Generated from the store (Turbine `role_runs` + `usage_records`). Unknown means the adapter or reporter omitted a count — not zero._',
+    '',
+    '| Source | Calls | Input | Output | Total |',
+    '|---|---:|---:|---:|---:|',
+    `| Turbine | ${usage.bySource.turbine.calls} | ${formatTokenCount(usage.bySource.turbine.input)} | ${formatTokenCount(usage.bySource.turbine.output)} | ${formatTokenCount(usage.bySource.turbine.total)}${usage.bySource.turbine.hasUnknown ? ' _(+unknown)_' : ''} |`,
+    `| Agent | ${usage.bySource.agent.calls} | ${formatTokenCount(usage.bySource.agent.input)} | ${formatTokenCount(usage.bySource.agent.output)} | ${formatTokenCount(usage.bySource.agent.total)}${usage.bySource.agent.hasUnknown ? ' _(+unknown)_' : ''} |`,
+    `| **Grand** | **${usage.grand.calls}** | **${formatTokenCount(usage.grand.input)}** | **${formatTokenCount(usage.grand.output)}** | **${formatTokenCount(usage.grand.total)}**${usage.grand.hasUnknown ? ' _(+unknown)_' : ''} |`,
+  ];
+  if (usage.byModel.length) {
+    lines.push('', '| Model / agent | Source | Calls | Input | Output | Total |', '|---|---|---:|---:|---:|---:|');
+    for (const b of usage.byModel) {
+      const label = b.modelId ?? b.agentName ?? '(unknown)';
+      lines.push(
+        `| ${esc(label)} | ${b.source} | ${b.calls} | ${formatTokenCount(b.input)} | ${formatTokenCount(b.output)} | ${formatTokenCount(b.total)}${b.hasUnknown ? ' _(+unknown)_' : ''} |`,
+      );
+    }
+  }
+  lines.push('', `_Detail: \`turbine task usage ${usage.workId}\`_`);
+  return lines;
+}
 
 const esc = (t: string) => t.replace(/\|/g, '\\|').replace(/\n+/g, ' ');
 const short = (h?: string) => (h ? h.replace(/^sha256:/, '').slice(0, 8) : '—');
@@ -176,6 +206,7 @@ export function renderStatus(d: PacketData): string {
   if (d.next.commands.length) {
     lines.push('', '## Commands', '', '```bash', ...d.next.commands.filter((c) => c !== 'true'), '```');
   }
+  lines.push(...renderUsageSection(d.usage));
   lines.push(
     '',
     '## Documents',
@@ -401,6 +432,8 @@ export function renderReview(d: PacketData, previousChecks: AcceptanceCheck[]): 
       lines.push(`- [${prev?.checked ? 'x' : ' '}] **${t.requirementId}** (${t.priority}) ${esc(t.statement)} — Observed: ${prev?.observed || '_(what you saw)_'}`);
     }
   }
+
+  lines.push(...renderUsageSection(d.usage));
 
   // Decisions + checklist
   lines.push(

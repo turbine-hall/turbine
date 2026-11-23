@@ -2,7 +2,7 @@
 
 **Product:** Turbine Hall (`turbine`)  
 **Framework pin:** `turbine@0.5.0`  
-**Last updated:** 2026-11-23 (issue packet mirror #21; planning deliverables #17; OKF knowledge bundle #14)
+**Last updated:** 2026-11-23 (token/model usage per task #1; issue packet mirror #21; planning deliverables #17; OKF knowledge bundle #14)
 
 | Area | Status | Notes |
 |---|---|---|
@@ -12,6 +12,7 @@
 | Phase 3 — Skills + requirements | tested | assess/spec skills, mock model, budgets, hash-bound approvals |
 | Phase 4 — Planning + Jira (R0) | tested | plan skill (+ executive-summary companion), git inspect, Jira read + fixtures, recover --dry-run; packet docs PLAN.md + EXECUTIVE-SUMMARY.md with Mermaid and heuristic coding-agent token estimate (#17) |
 | Issue packet mirror (#21) | tested | Sticky Turbine-owned issue comment (STATUS/SPEC/PLAN/EXEC/REVIEW/CONTEXT) on each packet render via `issue.comment`; GitHub from URLs/aliases/sourceRefs, Jira from `jira:` aliases/sourceRefs/takeover; live gate = `tools.allow` + `inputs.adapters.{github,jira}.enabled` + GitHub `mirrorRepos` (not `execution.allowNetwork`); HTTPS-only API bases; fixtureMode is programmatic (injected adapters only); `issue-mirror.test.ts` |
+| Token / model usage per task (#1) | tested | Every role model call records provider/model + tokens on `role_runs` (`unknown` when adapter omits usage); append-only `usage_records` (migration v8) via `turbine task usage add` for coding agents; `turbine task usage` shows per-source / per-model / grand totals (unknown never summed as 0); Usage section in STATUS/REVIEW (ACCEPTED view); export includes usage; optional `budgets.perTask.maxTokens` → `E_BUDGET_EXCEEDED`; no edit/delete of human-entered rows; `usage.test.ts` |
 | Phase 5 — Executor + review (R1) | tested | worktree + supervised handoff, AI/human review, commit-bound evidence |
 | Phase 6 — Verify + accept (R1) | tested | verify/accept, mark-commit stale recovery path, failure-informed roles |
 | MD-first task packets | implemented | Per-work `.turbine/tasks/<id>/` STATUS + stage MDs; `turbine task sync` applies Decisions |

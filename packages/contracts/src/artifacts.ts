@@ -80,8 +80,9 @@ export const RoleRunSchema = z.object({
   attempts: z.number().int(),
   tokens: z
     .object({
-      input: z.number().optional(),
-      output: z.number().optional(),
+      /** Measured count, or the literal `unknown` when the adapter omitted usage (never silent 0). */
+      input: z.union([z.number().nonnegative(), z.literal('unknown')]).optional(),
+      output: z.union([z.number().nonnegative(), z.literal('unknown')]).optional(),
     })
     .optional(),
   cost: z

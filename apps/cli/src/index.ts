@@ -28,8 +28,22 @@ import { Engine } from './engine/engine.js';
 import { initProject, openContext } from './engine/project.js';
 import { handleError, printResult } from './output.js';
 import { callerCwd, factoryRoot, findProjectRoot } from './paths.js';
-import { HUMAN_PRESENCE, ask, askReviewer, assertHumanTerminal } from './human-gate.js';
+import { HUMAN_PRESENCE, ask, askReviewer, assertHumanTerminal, gitUserName } from './human-gate.js';
 import { repoToplevel } from './engine/context/git-read.js';
+import { formatTokenCount } from './engine/usage.js';
+
+function isAgentSession(): boolean {
+  return ['TURBINE_AGENT', 'CLAUDECODE', 'CURSOR_AGENT'].some((k) => process.env[k] && process.env[k] !== '0');
+}
+
+function parseTokenArg(raw: string): number | 'unknown' {
+  if (raw === 'unknown' || raw === '?') return 'unknown';
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) {
+    throw err('E_INVALID_CONFIG', `token count must be a non-negative integer or "unknown" (got ${raw})`);
+  }
+  return n;
+}
 
 const program = new Command();
 program.name('turbine').description('Turbine Hall CLI').version('0.5.0');
@@ -1043,6 +1057,8 @@ task
           decisions: engine.ctx.store.listDecisions(work.id),
           evidence: engine.ctx.store.listEvidence(work.id),
           events: engine.ctx.store.listEvents(work.id),
+          usage: engine.usageSummary(work.id),
+          roleRuns: engine.ctx.store.listRoleRuns(work.id),
           redacted: !!opts.redact,
         },
         true,
@@ -1278,6 +1294,102 @@ task
       else for (const i of issues) process.stdout.write(`${i.level.toUpperCase().padEnd(7)} ${i.file}: ${i.message}\n`);
       engine.ctx.store.close();
       if (issues.some((i) => i.level === 'error')) process.exitCode = 3;
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+const usageCmd = task
+  .command('usage')
+  .description('Token and model usage for a task (Turbine role_runs + coding-agent records)');
+
+usageCmd
+  .command('add')
+  .argument('<id>')
+  .requiredOption('--source <name>', 'agent name (e.g. cursor) — records source=agent')
+  .option('--model <id>', 'model id')
+  .option('--provider <name>', 'model provider')
+  .requiredOption('--input <n>', 'input tokens, or "unknown"')
+  .requiredOption('--output <n>', 'output tokens, or "unknown"')
+  .option('--method <m>', 'measured|reported|estimated', 'reported')
+  .option('--note <text>')
+  .option('--by <name>', 'who recorded this (defaults to git user.name or agent)')
+  .option('--json')
+  .description('Record coding-agent (or other) usage against a task. Append-only; no edit/delete.')
+  .action((id, opts) => {
+    try {
+      const engine = withEngine();
+      const method = String(opts.method);
+      if (!['measured', 'reported', 'estimated'].includes(method)) {
+        throw err('E_INVALID_CONFIG', 'method must be measured, reported, or estimated');
+      }
+      const agent = isAgentSession();
+      const recordedBy =
+        opts.by?.trim() ||
+        (agent ? 'agent:session' : gitUserName(engine.ctx.projectRoot) || 'local-user');
+      const record = engine.addUsage({
+        idOrAlias: id,
+        source: 'agent',
+        agentName: String(opts.source),
+        modelId: opts.model,
+        modelProvider: opts.provider,
+        inputTokens: parseTokenArg(String(opts.input)),
+        outputTokens: parseTokenArg(String(opts.output)),
+        method: method as 'measured' | 'reported' | 'estimated',
+        note: opts.note,
+        recordedBy,
+        enteredBy: agent ? 'agent' : 'human',
+      });
+      printResult(
+        { id: record.id, workId: record.workId, source: record.source, agentName: record.agentName },
+        !!opts.json,
+      );
+      engine.ctx.store.close();
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+usageCmd
+  .argument('<id>')
+  .option('--json')
+  .description('Show per-source and per-model totals (unknown never summed as 0)')
+  .action((id, opts) => {
+    try {
+      const engine = withEngine();
+      const summary = engine.usageSummary(id);
+      if (opts.json) {
+        printResult(summary, true);
+      } else {
+        const out = process.stdout;
+        out.write(`Usage — ${summary.workId}\n`);
+        out.write(
+          `  Turbine: calls=${summary.bySource.turbine.calls} in=${formatTokenCount(summary.bySource.turbine.input)} out=${formatTokenCount(summary.bySource.turbine.output)} total=${formatTokenCount(summary.bySource.turbine.total)}${summary.bySource.turbine.hasUnknown ? ' (+unknown)' : ''}\n`,
+        );
+        out.write(
+          `  Agent:   calls=${summary.bySource.agent.calls} in=${formatTokenCount(summary.bySource.agent.input)} out=${formatTokenCount(summary.bySource.agent.output)} total=${formatTokenCount(summary.bySource.agent.total)}${summary.bySource.agent.hasUnknown ? ' (+unknown)' : ''}\n`,
+        );
+        out.write(
+          `  Grand:   calls=${summary.grand.calls} in=${formatTokenCount(summary.grand.input)} out=${formatTokenCount(summary.grand.output)} total=${formatTokenCount(summary.grand.total)}${summary.grand.hasUnknown ? ' (+unknown)' : ''}\n`,
+        );
+        if (summary.byModel.length) {
+          out.write('  By model:\n');
+          for (const b of summary.byModel) {
+            out.write(
+              `    - ${b.source}/${b.modelId ?? b.agentName ?? '?'}: calls=${b.calls} in=${formatTokenCount(b.input)} out=${formatTokenCount(b.output)} total=${formatTokenCount(b.total)}${b.hasUnknown ? ' (+unknown)' : ''}\n`,
+            );
+          }
+        }
+        if (summary.records.length) {
+          out.write(`  Records (${summary.records.length}):\n`);
+          for (const r of summary.records) {
+            out.write(
+              `    - ${r.id.slice(0, 16)}… ${r.source}${r.agentName ? `:${r.agentName}` : ''} model=${r.modelId ?? '—'} method=${r.method} enteredBy=${r.enteredBy} in=${formatTokenCount(r.tokens.input)} out=${formatTokenCount(r.tokens.output)}\n`,
+            );
+          }
+        }
+      }
+      engine.ctx.store.close();
     } catch (e) {
       handleError(e);
     }

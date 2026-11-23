@@ -77,12 +77,18 @@ export const ProjectConfigSchema = z.object({
           maxEstimatedCost: z.number().default(5),
           maxModelCalls: z.number().int().default(15),
           maxExecutionAttempts: z.number().int().default(2),
+          /**
+           * Optional cap on measured Turbine-side input+output tokens for the task.
+           * Null/omitted = no token budget. Unknown usage does not count toward the cap.
+           */
+          maxTokens: z.number().int().positive().nullable().default(null),
         })
         .default({
           currency: 'USD',
           maxEstimatedCost: 5,
           maxModelCalls: 15,
           maxExecutionAttempts: 2,
+          maxTokens: null,
         }),
     })
     .default({
@@ -91,6 +97,7 @@ export const ProjectConfigSchema = z.object({
         maxEstimatedCost: 5,
         maxModelCalls: 15,
         maxExecutionAttempts: 2,
+        maxTokens: null,
       },
     }),
   tools: z
