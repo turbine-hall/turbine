@@ -30,7 +30,7 @@ import { handleError, printResult } from './output.js';
 import { callerCwd, factoryRoot, findProjectRoot } from './paths.js';
 import { HUMAN_PRESENCE, ask, askReviewer, assertHumanTerminal, gitUserName } from './human-gate.js';
 import { repoToplevel } from './engine/context/git-read.js';
-import { formatTokenCount } from './engine/usage.js';
+import { formatTokenCount, formatUsageQualifiers } from './engine/usage.js';
 
 function isAgentSession(): boolean {
   return ['TURBINE_AGENT', 'CLAUDECODE', 'CURSOR_AGENT'].some((k) => process.env[k] && process.env[k] !== '0');
@@ -1364,19 +1364,19 @@ usageCmd
         const out = process.stdout;
         out.write(`Usage — ${summary.workId}\n`);
         out.write(
-          `  Turbine: calls=${summary.bySource.turbine.calls} in=${formatTokenCount(summary.bySource.turbine.input)} out=${formatTokenCount(summary.bySource.turbine.output)} total=${formatTokenCount(summary.bySource.turbine.total)}${summary.bySource.turbine.hasUnknown ? ' (+unknown)' : ''}\n`,
+          `  Turbine: calls=${summary.bySource.turbine.calls} in=${formatTokenCount(summary.bySource.turbine.input)} out=${formatTokenCount(summary.bySource.turbine.output)} total=${formatTokenCount(summary.bySource.turbine.total)}${formatUsageQualifiers(summary.bySource.turbine)}\n`,
         );
         out.write(
-          `  Agent:   calls=${summary.bySource.agent.calls} in=${formatTokenCount(summary.bySource.agent.input)} out=${formatTokenCount(summary.bySource.agent.output)} total=${formatTokenCount(summary.bySource.agent.total)}${summary.bySource.agent.hasUnknown ? ' (+unknown)' : ''}\n`,
+          `  Agent:   calls=${summary.bySource.agent.calls} in=${formatTokenCount(summary.bySource.agent.input)} out=${formatTokenCount(summary.bySource.agent.output)} total=${formatTokenCount(summary.bySource.agent.total)}${formatUsageQualifiers(summary.bySource.agent)}\n`,
         );
         out.write(
-          `  Grand:   calls=${summary.grand.calls} in=${formatTokenCount(summary.grand.input)} out=${formatTokenCount(summary.grand.output)} total=${formatTokenCount(summary.grand.total)}${summary.grand.hasUnknown ? ' (+unknown)' : ''}\n`,
+          `  Grand:   calls=${summary.grand.calls} in=${formatTokenCount(summary.grand.input)} out=${formatTokenCount(summary.grand.output)} total=${formatTokenCount(summary.grand.total)}${formatUsageQualifiers(summary.grand)}\n`,
         );
         if (summary.byModel.length) {
           out.write('  By model:\n');
           for (const b of summary.byModel) {
             out.write(
-              `    - ${b.source}/${b.modelId ?? b.agentName ?? '?'}: calls=${b.calls} in=${formatTokenCount(b.input)} out=${formatTokenCount(b.output)} total=${formatTokenCount(b.total)}${b.hasUnknown ? ' (+unknown)' : ''}\n`,
+              `    - ${b.source}/${b.modelId ?? b.agentName ?? '?'}: calls=${b.calls} in=${formatTokenCount(b.input)} out=${formatTokenCount(b.output)} total=${formatTokenCount(b.total)}${formatUsageQualifiers(b)}\n`,
             );
           }
         }

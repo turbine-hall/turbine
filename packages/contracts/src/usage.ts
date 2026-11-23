@@ -45,46 +45,33 @@ export const UsageRecordSchema = z
   });
 export type UsageRecord = z.infer<typeof UsageRecordSchema>;
 
-export const UsageBucketSchema = z.object({
+const UsageTotalsSchema = z.object({
+  calls: z.number().int(),
+  input: TokenCountSchema,
+  output: TokenCountSchema,
+  total: TokenCountSchema,
+  hasUnknown: z.boolean(),
+  /** True when any contributing record used method=estimated. */
+  hasEstimated: z.boolean(),
+});
+
+export const UsageBucketSchema = UsageTotalsSchema.extend({
   key: z.string(),
   source: UsageSourceKindSchema,
   modelId: z.string().optional(),
   modelProvider: z.string().optional(),
   agentName: z.string().optional(),
-  calls: z.number().int().nonnegative(),
-  input: TokenCountSchema,
-  output: TokenCountSchema,
-  total: TokenCountSchema,
-  hasUnknown: z.boolean(),
 });
 export type UsageBucket = z.infer<typeof UsageBucketSchema>;
 
 export const UsageSummarySchema = z.object({
   workId: z.string(),
   bySource: z.object({
-    turbine: z.object({
-      calls: z.number().int(),
-      input: TokenCountSchema,
-      output: TokenCountSchema,
-      total: TokenCountSchema,
-      hasUnknown: z.boolean(),
-    }),
-    agent: z.object({
-      calls: z.number().int(),
-      input: TokenCountSchema,
-      output: TokenCountSchema,
-      total: TokenCountSchema,
-      hasUnknown: z.boolean(),
-    }),
+    turbine: UsageTotalsSchema,
+    agent: UsageTotalsSchema,
   }),
   byModel: z.array(UsageBucketSchema),
-  grand: z.object({
-    calls: z.number().int(),
-    input: TokenCountSchema,
-    output: TokenCountSchema,
-    total: TokenCountSchema,
-    hasUnknown: z.boolean(),
-  }),
+  grand: UsageTotalsSchema,
   records: z.array(UsageRecordSchema),
   roleRunCount: z.number().int(),
 });

@@ -40,10 +40,11 @@ type SideAcc = {
   input: TokenCount | null;
   output: TokenCount | null;
   hasUnknown: boolean;
+  hasEstimated: boolean;
 };
 
 function emptySide(): SideAcc {
-  return { calls: 0, input: null, output: null, hasUnknown: false };
+  return { calls: 0, input: null, output: null, hasUnknown: false, hasEstimated: false };
 }
 
 function finalizeSide(side: SideAcc) {
@@ -57,13 +58,14 @@ function finalizeSide(side: SideAcc) {
     output: displayOut,
     total: tot.value,
     hasUnknown: side.hasUnknown || tot.unknown || displayIn === 'unknown' || displayOut === 'unknown',
+    hasEstimated: side.hasEstimated,
   };
 }
 
 /**
  * Build a usage summary from Turbine role_runs + external usage_records.
  * Unknown token counts are never coerced to 0 in displayed totals (hasUnknown is set;
- * unknown-only fields remain `'unknown'`).
+ * unknown-only fields remain `'unknown'`). Estimated contributions set hasEstimated.
  */
 export function summarizeUsage(input: {
   workId: string;
@@ -80,7 +82,13 @@ export function summarizeUsage(input: {
   const bump = (
     side: SideAcc,
     tokens: { input: TokenCount; output: TokenCount },
-    meta: { modelId?: string; modelProvider?: string; agentName?: string; source: 'turbine' | 'agent' },
+    meta: {
+      modelId?: string;
+      modelProvider?: string;
+      agentName?: string;
+      source: 'turbine' | 'agent';
+      estimated: boolean;
+    },
   ) => {
     side.calls += 1;
     const inAdd = addField(side.input, tokens.input);
@@ -88,6 +96,7 @@ export function summarizeUsage(input: {
     side.input = inAdd.value;
     side.output = outAdd.value;
     side.hasUnknown = side.hasUnknown || inAdd.unknown || outAdd.unknown;
+    side.hasEstimated = side.hasEstimated || meta.estimated;
 
     const modelKey = meta.modelId ?? meta.agentName ?? '(unknown-model)';
     const key = `${meta.source}:${meta.modelProvider ?? ''}:${modelKey}`;
@@ -102,6 +111,7 @@ export function summarizeUsage(input: {
       output: 0 as TokenCount,
       total: 0 as TokenCount,
       hasUnknown: false,
+      hasEstimated: false,
       _in: null as TokenCount | null,
       _out: null as TokenCount | null,
       _unknown: false,
@@ -112,6 +122,7 @@ export function summarizeUsage(input: {
     prev._in = pi.value;
     prev._out = po.value;
     prev._unknown = prev._unknown || pi.unknown || po.unknown;
+    prev.hasEstimated = prev.hasEstimated || meta.estimated;
     const displayIn = prev._in ?? 'unknown';
     const displayOut = prev._out ?? 'unknown';
     const pt = totalOf(displayIn, displayOut);
@@ -132,7 +143,12 @@ export function summarizeUsage(input: {
         input: asCount(run.tokens?.input),
         output: asCount(run.tokens?.output),
       },
-      { source: 'turbine', modelId: run.modelId, modelProvider: run.modelProvider },
+      {
+        source: 'turbine',
+        modelId: run.modelId,
+        modelProvider: run.modelProvider,
+        estimated: false, // adapter-reported / measured role_run tokens
+      },
     );
   }
 
@@ -143,6 +159,7 @@ export function summarizeUsage(input: {
       modelId: rec.modelId,
       modelProvider: rec.modelProvider,
       agentName: rec.agentName,
+      estimated: rec.method === 'estimated',
     });
   }
 
@@ -175,13 +192,14 @@ export function summarizeUsage(input: {
     },
     byModel: [...byModel.values()]
       .map(({ _unknown: _, _in: _i, _out: _o, ...rest }) => rest)
-      .sort((a, b) => a.key.localeCompare(b.key)),
+      .sort((x, y) => x.key.localeCompare(y.key)),
     grand: {
       calls: turbine.calls + agent.calls,
       input: gIn.value,
       output: gOut.value,
       total: grandTot.value,
       hasUnknown: gIn.unknown || gOut.unknown || grandTot.unknown || t.hasUnknown || a.hasUnknown,
+      hasEstimated: t.hasEstimated || a.hasEstimated,
     },
     records: input.records,
     roleRunCount: input.roleRuns.filter((r) => r.status === 'succeeded' || r.status === 'failed').length,
@@ -203,4 +221,20 @@ export function measuredTurbineTokens(roleRuns: RoleRun[]): number {
 
 export function formatTokenCount(v: TokenCount): string {
   return v === 'unknown' ? 'unknown' : String(v);
+}
+
+/** Parenthetical qualifiers for CLI / docs (`+unknown`, `+estimated`). */
+export function formatUsageQualifiers(flags: { hasUnknown?: boolean; hasEstimated?: boolean }): string {
+  const parts: string[] = [];
+  if (flags.hasUnknown) parts.push('+unknown');
+  if (flags.hasEstimated) parts.push('+estimated');
+  return parts.length ? ` (${parts.join(', ')})` : '';
+}
+
+/** Markdown italic qualifiers for packet Usage tables. */
+export function formatUsageQualifiersMd(flags: { hasUnknown?: boolean; hasEstimated?: boolean }): string {
+  const parts: string[] = [];
+  if (flags.hasUnknown) parts.push('+unknown');
+  if (flags.hasEstimated) parts.push('+estimated');
+  return parts.length ? ` _(${parts.join(', ')})_` : '';
 }

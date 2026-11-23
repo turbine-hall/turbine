@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import type { AcceptanceCriterion, Decision, UsageSummary, WorkPackage, WorkState } from '@turbine-hall/turbine-contracts';
-import { formatTokenCount } from '../usage.js';
+import { formatTokenCount, formatUsageQualifiersMd } from '../usage.js';
 import type { GateDecision } from '@turbine-hall/turbine-evidence-contract';
 import type { RepoFacts, RepoState } from '../changeset.js';
 import type { CheckRun } from '../checks.js';
@@ -75,16 +75,16 @@ function renderUsageSection(usage: UsageSummary | undefined): string[] {
     '',
     '| Source | Calls | Input | Output | Total |',
     '|---|---:|---:|---:|---:|',
-    `| Turbine | ${usage.bySource.turbine.calls} | ${formatTokenCount(usage.bySource.turbine.input)} | ${formatTokenCount(usage.bySource.turbine.output)} | ${formatTokenCount(usage.bySource.turbine.total)}${usage.bySource.turbine.hasUnknown ? ' _(+unknown)_' : ''} |`,
-    `| Agent | ${usage.bySource.agent.calls} | ${formatTokenCount(usage.bySource.agent.input)} | ${formatTokenCount(usage.bySource.agent.output)} | ${formatTokenCount(usage.bySource.agent.total)}${usage.bySource.agent.hasUnknown ? ' _(+unknown)_' : ''} |`,
-    `| **Grand** | **${usage.grand.calls}** | **${formatTokenCount(usage.grand.input)}** | **${formatTokenCount(usage.grand.output)}** | **${formatTokenCount(usage.grand.total)}**${usage.grand.hasUnknown ? ' _(+unknown)_' : ''} |`,
+    `| Turbine | ${usage.bySource.turbine.calls} | ${formatTokenCount(usage.bySource.turbine.input)} | ${formatTokenCount(usage.bySource.turbine.output)} | ${formatTokenCount(usage.bySource.turbine.total)}${formatUsageQualifiersMd(usage.bySource.turbine)} |`,
+    `| Agent | ${usage.bySource.agent.calls} | ${formatTokenCount(usage.bySource.agent.input)} | ${formatTokenCount(usage.bySource.agent.output)} | ${formatTokenCount(usage.bySource.agent.total)}${formatUsageQualifiersMd(usage.bySource.agent)} |`,
+    `| **Grand** | **${usage.grand.calls}** | **${formatTokenCount(usage.grand.input)}** | **${formatTokenCount(usage.grand.output)}** | **${formatTokenCount(usage.grand.total)}**${formatUsageQualifiersMd(usage.grand)} |`,
   ];
   if (usage.byModel.length) {
     lines.push('', '| Model / agent | Source | Calls | Input | Output | Total |', '|---|---|---:|---:|---:|---:|');
     for (const b of usage.byModel) {
       const label = b.modelId ?? b.agentName ?? '(unknown)';
       lines.push(
-        `| ${esc(label)} | ${b.source} | ${b.calls} | ${formatTokenCount(b.input)} | ${formatTokenCount(b.output)} | ${formatTokenCount(b.total)}${b.hasUnknown ? ' _(+unknown)_' : ''} |`,
+        `| ${esc(label)} | ${b.source} | ${b.calls} | ${formatTokenCount(b.input)} | ${formatTokenCount(b.output)} | ${formatTokenCount(b.total)}${formatUsageQualifiersMd(b)} |`,
       );
     }
   }

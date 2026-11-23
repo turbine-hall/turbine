@@ -330,6 +330,56 @@ describe('usage tracking (#1)', () => {
     ).toThrow(/agentName/i);
   });
 
+  it('CR: estimated method flags hasEstimated on aggregates (not measurement-only)', () => {
+    const measuredOnly = summarizeUsage({
+      workId: 'work_x',
+      roleRuns: [
+        {
+          id: 'run_1',
+          workId: 'work_x',
+          roleId: 'requirements-analyst',
+          roleVersion: '1.0.0',
+          skillIds: [],
+          toolCapabilityGrants: [],
+          modelProvider: 'mock',
+          modelId: 'm1',
+          startedAt: 't',
+          endedAt: 't',
+          status: 'succeeded',
+          inputArtifactIds: [],
+          outputArtifactIds: [],
+          attempts: 1,
+          tokens: { input: 10, output: 5 },
+        },
+      ],
+      records: [],
+    });
+    expect(measuredOnly.bySource.turbine.hasEstimated).toBe(false);
+    expect(measuredOnly.grand.hasEstimated).toBe(false);
+
+    const withEst = summarizeUsage({
+      workId: 'work_x',
+      roleRuns: [],
+      records: [
+        {
+          id: 'usage_e',
+          workId: 'work_x',
+          source: 'agent',
+          agentName: 'cursor',
+          modelId: 'composer',
+          tokens: { input: 100, output: 20 },
+          method: 'estimated',
+          recordedAt: 't',
+          recordedBy: 'tester',
+          enteredBy: 'human',
+        },
+      ],
+    });
+    expect(withEst.bySource.agent.hasEstimated).toBe(true);
+    expect(withEst.grand.hasEstimated).toBe(true);
+    expect(withEst.byModel[0]?.hasEstimated).toBe(true);
+  });
+
   it('CR: addUsage persists record+event atomically (same count after success)', () => {
     const dir = tempProject('usage-tx-', dirs);
     const { engine, work } = makeTask(dir);

@@ -1813,9 +1813,13 @@ export class Engine {
       );
     if (!planOk) throw err('E_STALE_REVISION', 'Current plan is not approved');
 
-    // Token budget is checked before leaving PLAN_APPROVED / preparing worktrees so a maxTokens
-    // exhaustion cannot still spend a guidance model call on the first execute.
-    this.checkBudget(work.id);
+    // Reuse existing worktrees (CHANGES_REQUESTED loop) or create them on first execute.
+    // Budget applies only when this path will call the model (first execute); a model-free
+    // resume with existing worktrees must not be blocked by an exhausted token budget.
+    const existing = this.repoStates(work.id);
+    if (existing.length === 0) {
+      this.checkBudget(work.id);
+    }
 
     // Rebuilt when the base commit moved or this is a new CHANGES_REQUESTED cycle, before anything points at it.
     // It runs before the task leaves PLAN_APPROVED / CHANGES_REQUESTED and before any worktree exists, so a
@@ -1832,8 +1836,6 @@ export class Engine {
       this.ctx.store.saveEec(eec);
     }
 
-    // Reuse existing worktrees (CHANGES_REQUESTED loop) or create them.
-    const existing = this.repoStates(work.id);
     const repos =
       existing.length > 0
         ? observe(existing).repos
