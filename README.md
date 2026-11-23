@@ -15,7 +15,7 @@
 <p align="center">
   <a href="https://github.com/turbine-hall/turbine/actions/workflows/ci.yml"><img src="https://github.com/turbine-hall/turbine/actions/workflows/ci.yml/badge.svg" alt="CI status" /></a>
   <img src="https://img.shields.io/badge/version-0.5.0-blue" alt="Version 0.5.0" />
-  <img src="https://img.shields.io/badge/node-22.13%2B%20%7C%2024%2B%20%7C%2026%2B-brightgreen" alt="Node.js 22.13+, 24+, or 26+" />
+  <img src="https://img.shields.io/badge/node-22.13%E2%80%9322%20%7C%2024.x%20%7C%20%E2%89%A526-brightgreen" alt="Node.js 22.13–22.x, 24.x, or ≥26 (not 23 or 25)" />
   <img src="https://img.shields.io/badge/TypeScript-strict-3178c6" alt="TypeScript" />
   <a href="https://github.com/turbine-hall/turbine/stargazers"><img src="https://img.shields.io/github/stars/turbine-hall/turbine?style=social" alt="GitHub stars" /></a>
 </p>
