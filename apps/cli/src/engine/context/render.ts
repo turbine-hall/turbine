@@ -328,7 +328,10 @@ function readLockOwner(lock: string): { pid: number; ino: number } | undefined {
     fd = openSync(lock, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined; // released meanwhile
-    throw new Error(`the publish lock ${lock} cannot be opened safely (${(e as Error).message}); remove it if no turbine process is running`);
+    throw new Error(
+      `the publish lock ${lock} cannot be opened safely (${(e as Error).message}); remove it if no turbine process is running`,
+      { cause: e },
+    );
   }
   try {
     const st = fstatSync(fd);

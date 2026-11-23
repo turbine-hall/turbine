@@ -87,7 +87,7 @@ export function ensureFreshSnapshot(
   at: RepoHead,
   build: (repoRoot: string, commit: string) => RepoSnapshot = buildSnapshot,
 ): FreshSnapshot {
-  let previous: RepoSnapshot | null = null;
+  let previous: RepoSnapshot | null;
   try {
     previous = store.getLatestSnapshotFor(projectRoot);
   } catch {

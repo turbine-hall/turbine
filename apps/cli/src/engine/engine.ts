@@ -140,7 +140,7 @@ export const githubPrApprovalChecker: PrApprovalChecker = ({ projectRoot, branch
   if (r.status !== 0) {
     return { approved: false, detail: `gh failed: ${(r.stderr || r.error?.message || '').trim()}` };
   }
-  let prs: Array<{ number: number; url: string; reviewDecision: string; headRefOid: string }> = [];
+  let prs: Array<{ number: number; url: string; reviewDecision: string; headRefOid: string }>;
   try {
     prs = JSON.parse(r.stdout || '[]');
   } catch {
@@ -2071,7 +2071,7 @@ export class Engine {
   repoStates(workId: string): RepoState[] {
     const change = this.ctx.store.getLatestArtifact(workId, 'change-report');
     if (!change) return [];
-    let content: Record<string, unknown> = {};
+    let content: Record<string, unknown>;
     try {
       content = JSON.parse(this.ctx.store.getArtifactContent(change.id));
     } catch {
