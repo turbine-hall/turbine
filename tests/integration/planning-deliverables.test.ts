@@ -8,10 +8,13 @@ import { Engine } from '../../apps/cli/src/engine/engine.js';
 import { packetPaths } from '../../apps/cli/src/engine/packet.js';
 import { normalizePlan } from '../../apps/cli/src/engine/docs/normalize.js';
 import { lintPacket, lintMermaid } from '../../apps/cli/src/engine/docs/lint.js';
+import { renderExecutiveSummary, renderPlan } from '../../apps/cli/src/engine/docs/render.js';
+import type { PacketData } from '../../apps/cli/src/engine/docs/render.js';
 import { computeNextStep } from '../../apps/cli/src/engine/next-step.js';
 import { getSkill, loadSkills } from '../../packages/skills/dist/index.js';
 import { factoryRoot } from '../../apps/cli/src/paths.js';
 import { cleanup, tempProject } from './fixture.js';
+
 
 const dirs: string[] = [];
 afterEach(() => cleanup(dirs));
@@ -27,6 +30,35 @@ describe('planning deliverables (#17)', () => {
     expect(ids).toContain('core/plan-change');
     expect(ids).toContain('core/plan-executive-summary');
     expect(getSkill(root, 'core/plan-change').version).toBe('0.2.0');
+  });
+
+  it('renderPlan and renderExecutiveSummary stay lint-shaped when summary/diagrams are empty', () => {
+    const plan = normalizePlan({
+      summary: '',
+      steps: [{ id: 'S1', description: 'Do the thing', requirementIds: ['FR-001'], files: ['a.ts'] }],
+      testPlan: [],
+      risks: [],
+      estimatedComplexity: 'low',
+    });
+    expect(plan.diagrams).toEqual([]);
+    const packet = {
+      projectRoot: '/tmp',
+      track: 'standard' as const,
+      work: { id: 'W-empty', title: 'Empty fields', type: 'feature', currentState: 'PLAN_REVIEW' },
+      plan: { hash: 'abc123', data: plan },
+      decisions: [],
+      evidenceFiles: [],
+      trace: [],
+      changeSetId: undefined,
+    } as unknown as PacketData;
+    const planMd = renderPlan(packet);
+    const execMd = renderExecutiveSummary(packet);
+    expect(planMd).toContain('## Summary');
+    expect(planMd).toContain('_No summary provided._');
+    expect(execMd).toContain('```mermaid');
+    expect(execMd).toContain('No diagram provided by plan');
+    const mermaid = execMd.match(/```mermaid\n([\s\S]*?)```/)?.[1] ?? '';
+    expect(lintMermaid(mermaid)).toBeUndefined();
   });
 
   it('normalizePlan keeps detailed fields, diagrams, and estimated token budget', () => {

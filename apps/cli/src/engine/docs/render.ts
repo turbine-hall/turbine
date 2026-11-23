@@ -438,8 +438,9 @@ export function renderPlan(d: PacketData): string {
     `\`${w.id}\` · plan revision \`${short(d.plan!.hash)}\` · complexity: ${p.complexity ?? '—'}`,
     '',
   ];
-  if (p.summary) lines.push('## Summary', '', p.summary, '');
+  lines.push('## Summary', '', p.summary.trim() || '_No summary provided._', '');
   lines.push('## Architecture', '', p.architecture?.trim() || '_No architecture notes._', '');
+
   lines.push('## Data model', '', p.dataModel?.trim() || '_No data model change._', '');
   lines.push('## Interfaces', '', p.interfaces?.trim() || '_No interface change._', '');
   lines.push('## Steps', '', '| Step | What | Requirements | Files |', '|---|---|---|---|');
@@ -505,7 +506,17 @@ export function renderExecutiveSummary(d: PacketData): string {
       lines.push(`### ${diagram.title}`, '', '```mermaid', diagram.mermaid.trim(), '```', '');
     }
   } else {
-    lines.push('_No diagrams on this plan._', '');
+    // Always emit a Mermaid fence so regenerating EXECUTIVE-SUMMARY.md stays lint-clean
+    // when the model omitted diagrams (lint requires ```mermaid when a plan exists).
+    lines.push(
+      '### No diagram provided',
+      '',
+      '```mermaid',
+      'flowchart LR',
+      '  missing[No diagram provided by plan]',
+      '```',
+      '',
+    );
   }
   lines.push('Full detail: [PLAN.md](PLAN.md). Requirements: [SPEC.md](SPEC.md).');
   return lines.join('\n');
