@@ -5,7 +5,7 @@ Use this playbook when driving Turbine Hall (`turbine`) with a human in the loop
 ## Core rules
 
 1. **Always ask the CLI what to do next** — `turbine task next <work-id>`. Do not invent the workflow.
-2. **The packet is STATUS.md, SPEC.md, REVIEW.md** — `.turbine/tasks/<id>/`. Start with STATUS.md. You may edit requirements / open-question answers in SPEC.md (in the shown line format) and the acceptance observations in REVIEW.md only when a human asks; then run `sync`. Decision sections are display-only; editing them does nothing. Never paste raw JSON into these files.
+2. **The packet is STATUS.md, SPEC.md, PLAN.md, EXECUTIVE-SUMMARY.md, REVIEW.md** — `.turbine/tasks/<id>/`. Start with STATUS.md. You may edit requirements / open-question answers in SPEC.md (in the shown line format) and the acceptance observations in REVIEW.md only when a human asks; then run `sync`. PLAN.md and EXECUTIVE-SUMMARY.md are generated from the plan artifact — do not hand-edit them expecting persistence. Decision sections are display-only; editing them does nothing. Never paste raw JSON into these files.
 3. **Main project folder ≠ task worktree.** Code for a task goes in `.turbine/worktrees/<id>/` on branch `turbine/<id>` until a PR is merged.
 4. **ACCEPTED ≠ merged.** After acceptance, open a PR into `staging`/`main`, merge, then `git pull` in the main folder.
 5. **Never make a human decision.** Requirements, plan, code review and acceptance are approved only by a human running `turbine task approve <id>` in their own terminal (it asks them to type the short hash of what they approve). Agents must never run `approve`, `reject`, `waive`, `cancel` or `changes-requested`, and must never touch `.turbine/state/`. In Cursor, `.cursor/hooks.json` (installed by `turbine init`) blocks these commands.
@@ -29,7 +29,7 @@ turbine task next <id>
 | IMPORTED / ASSESSING | either | `sync` / assess |
 | NEEDS_CLARIFICATION / REQUIREMENTS_REVIEW | human | edit requirements / answer questions in `SPEC.md` → `sync` → human runs `turbine task approve` |
 | REQUIREMENTS_APPROVED | either | `sync` → plan |
-| PLAN_REVIEW | human | read the Plan in `SPEC.md` (fix CRITICAL items from `turbine task analyze`) → human runs `turbine task approve` |
+| PLAN_REVIEW | human | read `PLAN.md` and `EXECUTIVE-SUMMARY.md` (fix CRITICAL items from `turbine task analyze`) → human runs `turbine task approve` |
 | PLAN_APPROVED | either | `sync` → execute handoff |
 | IMPLEMENTING / CHANGES_REQUESTED | agent | code **in the worktree(s)**, commit everything, `sync` (stays here until there is a commit and nothing uncommitted) |
 | AI_REVIEW | either | `sync` |

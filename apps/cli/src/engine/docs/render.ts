@@ -27,10 +27,13 @@ export function trackFor(work: WorkPackage): Track {
   if ((work.type === 'maintenance' || work.type === 'bug') && work.acceptanceCriteria.length <= 4) return 'trivial';
   return 'standard';
 }
-export const LINE_BUDGET: Record<Track, { spec: number; review: number; status: number }> = {
-  trivial: { spec: 90, review: 180, status: 60 },
-  standard: { spec: 160, review: 260, status: 70 },
-  full: { spec: 260, review: 360, status: 80 },
+export const LINE_BUDGET: Record<
+  Track,
+  { spec: number; review: number; status: number; plan: number; executiveSummary: number }
+> = {
+  trivial: { spec: 90, review: 180, status: 60, plan: 120, executiveSummary: 80 },
+  standard: { spec: 160, review: 260, status: 70, plan: 220, executiveSummary: 120 },
+  full: { spec: 260, review: 360, status: 80, plan: 360, executiveSummary: 160 },
 };
 const LIST_CAP: Record<Track, number> = { trivial: 5, standard: 8, full: 12 };
 
@@ -177,7 +180,13 @@ export function renderStatus(d: PacketData): string {
     '',
     '## Documents',
     '',
-    '- [SPEC.md](SPEC.md) — requirements, open questions, plan',
+    '- [SPEC.md](SPEC.md) — requirements, open questions, context',
+    ...(d.plan
+      ? [
+          '- [PLAN.md](PLAN.md) — detailed implementation plan (architecture, data, steps, tests, token estimate)',
+          '- [EXECUTIVE-SUMMARY.md](EXECUTIVE-SUMMARY.md) — high-level plan narrative and diagrams',
+        ]
+      : []),
     '- [REVIEW.md](REVIEW.md) — what changed, traceability, AI review, checks, acceptance',
     ...(d.contextFile
       ? ['- [CONTEXT.md](CONTEXT.md) — files that may matter to this task, each with a checkable reason (a selection, not a complete list)']
@@ -243,19 +252,10 @@ export function renderSpec(d: PacketData): string {
     const p = d.plan.data;
     lines.push('', '## Plan', '');
     if (p.summary) lines.push(p.summary, '');
-    lines.push('| Step | What | Requirements | Files |', '|---|---|---|---|');
-    for (const s of p.steps.slice(0, d.track === 'trivial' ? 6 : 15)) {
-      lines.push(`| ${s.id} | ${esc(s.description)} | ${s.requirementIds.join(', ') || '—'} | ${s.files.map((f) => `\`${f}\``).join(', ') || '—'} |`);
-    }
-    if (p.steps.length > (d.track === 'trivial' ? 6 : 15)) lines.push(`| … | ${p.steps.length} steps in total — see evidence/plan.json | | |`);
-    lines.push('', '### Test plan', '');
-    if (p.testPlan.length) {
-      lines.push('| Requirement | Test | Kind |', '|---|---|---|');
-      for (const t of p.testPlan.slice(0, 20)) lines.push(`| ${t.requirementId || '—'} | ${esc(t.test)} | ${t.kind} |`);
-    } else lines.push('- _No tests planned_');
-    if (p.risks.length) {
-      lines.push('', '### Risks', '', ...capped(p.risks, cap, (r) => `- ${r.risk}${r.mitigation ? ` → _${r.mitigation}_` : ''}`, 'see evidence/plan.json'));
-    }
+    lines.push(
+      `- Full plan: [PLAN.md](PLAN.md) (revision \`${short(d.plan.hash)}\`)`,
+      `- Executive summary: [EXECUTIVE-SUMMARY.md](EXECUTIVE-SUMMARY.md)`,
+    );
     const planCoverage = d.trace.filter((t) => !t.planned);
     if (planCoverage.length) {
       lines.push('', `> ⚠️ Not covered by any plan step: ${planCoverage.map((t) => `${t.requirementId} (${t.priority})`).join(', ')}`);
@@ -268,7 +268,13 @@ export function renderSpec(d: PacketData): string {
     '- [ ] Every requirement is something you could check by hand (no vague words)',
     '- [ ] P0 marks exactly what must work for you to accept',
     '- [ ] Each 🟡 assumption is acceptable, or turned into a requirement',
-    ...(d.plan ? ['- [ ] Every requirement has a plan step and a test', '- [ ] The plan does not touch anything listed in Non-goals'] : []),
+    ...(d.plan
+      ? [
+          '- [ ] Read PLAN.md and EXECUTIVE-SUMMARY.md',
+          '- [ ] Every requirement has a plan step and a test',
+          '- [ ] The plan does not touch anything listed in Non-goals',
+        ]
+      : []),
     '',
     '## Decisions',
     '',
@@ -418,8 +424,113 @@ export function renderReview(d: PacketData, previousChecks: AcceptanceCheck[]): 
   return lines.join('\n');
 }
 
-/** Write STATUS.md, SPEC.md and REVIEW.md (preserving the human's acceptance checklist). */
-export function renderPacket(d: PacketData): { status: string; spec: string; review: string; migrated: string[] } {
+/** Detailed plan document (architecture, steps, tests, coding-agent token estimate). */
+export function renderPlan(d: PacketData): string {
+  const w = d.work;
+  const p = d.plan?.data;
+  if (!p) {
+    return [`# Plan — ${w.title}`, '', `_No plan yet for \`${w.id}\`._`, ''].join('\n');
+  }
+  const cap = LIST_CAP[d.track];
+  const lines = [
+    `# Plan — ${w.title}`,
+    '',
+    `\`${w.id}\` · plan revision \`${short(d.plan!.hash)}\` · complexity: ${p.complexity ?? '—'}`,
+    '',
+  ];
+  lines.push('## Summary', '', p.summary.trim() || '_No summary provided._', '');
+  lines.push('## Architecture', '', p.architecture?.trim() || '_No architecture notes._', '');
+
+  lines.push('## Data model', '', p.dataModel?.trim() || '_No data model change._', '');
+  lines.push('## Interfaces', '', p.interfaces?.trim() || '_No interface change._', '');
+  lines.push('## Steps', '', '| Step | What | Requirements | Files |', '|---|---|---|---|');
+  for (const s of p.steps) {
+    lines.push(
+      `| ${s.id} | ${esc(s.description)} | ${s.requirementIds.join(', ') || '—'} | ${s.files.map((f) => `\`${f}\``).join(', ') || '—'} |`,
+    );
+  }
+  lines.push('', '## Test plan', '');
+  if (p.testPlan.length) {
+    lines.push('| Requirement | Test | Kind |', '|---|---|---|');
+    for (const t of p.testPlan) lines.push(`| ${t.requirementId || '—'} | ${esc(t.test)} | ${t.kind} |`);
+  } else lines.push('- _No tests planned_');
+  lines.push('', '## Risks', '');
+  if (p.risks.length) {
+    lines.push(...capped(p.risks, Math.max(cap, p.risks.length), (r) => `- ${r.risk}${r.mitigation ? ` → _${r.mitigation}_` : ''}`, 'see evidence/plan.json'));
+  } else lines.push('- _None_');
+  lines.push('', '## Coding-agent token estimate', '');
+  const est = p.codingAgentTokenEstimate;
+  if (est) {
+    lines.push(
+      `| Field | Value |`,
+      `|---|---|`,
+      `| Total tokens | ${est.totalTokens} |`,
+      ...(est.inputTokens !== undefined ? [`| Input (est.) | ${est.inputTokens} |`] : []),
+      ...(est.outputTokens !== undefined ? [`| Output (est.) | ${est.outputTokens} |`] : []),
+      `| Confidence | \`${est.confidence}\` (not billed / not measured) |`,
+      `| Basis | ${esc(est.basis)} |`,
+      '',
+    );
+  } else {
+    lines.push('_No coding-agent token estimate on this plan._', '');
+  }
+  const planCoverage = d.trace.filter((t) => !t.planned);
+  if (planCoverage.length) {
+    lines.push(`> ⚠️ Not covered by any plan step: ${planCoverage.map((t) => `${t.requirementId} (${t.priority})`).join(', ')}`, '');
+  }
+  lines.push('Also see [EXECUTIVE-SUMMARY.md](EXECUTIVE-SUMMARY.md) and [SPEC.md](SPEC.md).');
+  return lines.join('\n');
+}
+
+/** High-level narrative + Mermaid diagrams for human plan review. */
+export function renderExecutiveSummary(d: PacketData): string {
+  const w = d.work;
+  const p = d.plan?.data;
+  if (!p) {
+    return [`# Executive summary — ${w.title}`, '', `_No plan yet for \`${w.id}\`._`, ''].join('\n');
+  }
+  const lines = [
+    `# Executive summary — ${w.title}`,
+    '',
+    `\`${w.id}\` · plan revision \`${short(d.plan!.hash)}\``,
+    '',
+    '## Overview',
+    '',
+    p.executiveSummary?.trim() || p.summary || '_No executive summary provided._',
+    '',
+    '## Diagrams',
+    '',
+  ];
+  if (p.diagrams.length) {
+    for (const diagram of p.diagrams) {
+      lines.push(`### ${diagram.title}`, '', '```mermaid', diagram.mermaid.trim(), '```', '');
+    }
+  } else {
+    // Always emit a Mermaid fence so regenerating EXECUTIVE-SUMMARY.md stays lint-clean
+    // when the model omitted diagrams (lint requires ```mermaid when a plan exists).
+    lines.push(
+      '### No diagram provided',
+      '',
+      '```mermaid',
+      'flowchart LR',
+      '  missing[No diagram provided by plan]',
+      '```',
+      '',
+    );
+  }
+  lines.push('Full detail: [PLAN.md](PLAN.md). Requirements: [SPEC.md](SPEC.md).');
+  return lines.join('\n');
+}
+
+/** Write STATUS.md, SPEC.md, PLAN.md, EXECUTIVE-SUMMARY.md and REVIEW.md (preserving the human's acceptance checklist). */
+export function renderPacket(d: PacketData): {
+  status: string;
+  spec: string;
+  review: string;
+  planDoc?: string;
+  executiveSummary?: string;
+  migrated: string[];
+} {
   const paths = packetPaths(d.projectRoot, d.work.id);
   const migrated = migrateLegacyPacket(paths);
   const previous = existsSync(paths.review) ? parseAcceptanceChecklist(readPacketFile(paths.review) ?? '') : [];
@@ -429,5 +540,13 @@ export function renderPacket(d: PacketData): { status: string; spec: string; rev
   writeFile(paths.status, status);
   writeFile(paths.spec, spec);
   writeFile(paths.review, review);
-  return { status, spec, review, migrated };
+  let planDoc: string | undefined;
+  let executiveSummary: string | undefined;
+  if (d.plan) {
+    planDoc = renderPlan(d);
+    executiveSummary = renderExecutiveSummary(d);
+    writeFile(paths.planDoc, planDoc);
+    writeFile(paths.executiveSummary, executiveSummary);
+  }
+  return { status, spec, review, planDoc, executiveSummary, migrated };
 }

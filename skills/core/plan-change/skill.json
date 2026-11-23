@@ -1,6 +1,6 @@
 {
   "id": "core/plan-change",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "source": "turbine-original",
   "license": "UNLICENSED-internal",
   "runnerCompatibility": ["turbine-models"],
