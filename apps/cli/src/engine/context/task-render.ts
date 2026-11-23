@@ -44,7 +44,9 @@ export function readContextFile(file: string): string {
     // fatal: a note in another encoding is an error, not text silently rewritten with replacement characters
     return new TextDecoder('utf-8', { fatal: true }).decode(buf.subarray(0, n));
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'ELOOP') throw new Error('is not a regular file (a symlink or directory)');
+    if ((e as NodeJS.ErrnoException).code === 'ELOOP') {
+      throw new Error('is not a regular file (a symlink or directory)', { cause: e });
+    }
     throw e;
   } finally {
     closeSync(fd);
