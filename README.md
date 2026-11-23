@@ -15,7 +15,7 @@
 <p align="center">
   <a href="https://github.com/turbine-hall/turbine/actions/workflows/ci.yml"><img src="https://github.com/turbine-hall/turbine/actions/workflows/ci.yml/badge.svg" alt="CI status" /></a>
   <img src="https://img.shields.io/badge/version-0.5.0-blue" alt="Version 0.5.0" />
-  <img src="https://img.shields.io/badge/node-%E2%89%A522.12-brightgreen" alt="Node.js 22.12 or later" />
+  <img src="https://img.shields.io/badge/node-22.13%2B%20%7C%2024%2B%20%7C%2026%2B-brightgreen" alt="Node.js 22.13+, 24+, or 26+" />
   <img src="https://img.shields.io/badge/TypeScript-strict-3178c6" alt="TypeScript" />
   <a href="https://github.com/turbine-hall/turbine/stargazers"><img src="https://img.shields.io/github/stars/turbine-hall/turbine?style=social" alt="GitHub stars" /></a>
 </p>
@@ -142,7 +142,7 @@ Changes spanning several repositories (for example frontend + backend) are bound
 
 ### Requirements
 
-- Node.js 22.12+ (uses the built-in `node:sqlite`; required by Commander 15)
+- Node.js `^22.13.0 || ^24.0.0 || >=26.0.0` (intersection of ESLint 10, Vitest 5, and Commander 15; uses built-in `node:sqlite`)
 - pnpm 10+
 - Git
 
