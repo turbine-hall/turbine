@@ -162,6 +162,50 @@ describe('issue packet mirror (#21)', () => {
     engine.ctx.store.close();
   });
 
+  it('skips GitHub mirrors when mirrorRepos does not include the repo (live gate)', async () => {
+    const dir = tempProject('turbine-mirror-repos-', dirs);
+    const cfg = loadConfig(join(dir, '.turbine', 'project.yaml'));
+    if (!cfg.tools.allow.includes('issue.comment')) cfg.tools.allow.push('issue.comment');
+    cfg.inputs.adapters.github.enabled = true;
+    cfg.inputs.adapters.github.mirrorRepos = ['acme/allowed'];
+    saveConfig(join(dir, '.turbine', 'project.yaml'), cfg);
+
+    const ghFixtures = { comments: {} as Record<string, any[]> };
+    const github = createGitHubAdapter({ fixtures: ghFixtures });
+    const result = await mirrorLinkedIssues({
+      projectRoot: dir,
+      work: {
+        id: 'work_gate',
+        title: 'Gate',
+        objective: 'https://github.com/acme/other/issues/1',
+        aliases: ['github:acme/other#1'],
+        sourceRefs: [],
+        currentState: 'IMPORTED',
+      } as any,
+      config: loadConfig(join(dir, '.turbine', 'project.yaml')),
+      adapters: { github },
+      fixtureMode: false,
+    });
+    expect(result.targets[0]?.status).toBe('skipped');
+    expect(result.targets[0]?.reason).toMatch(/mirrorRepos/);
+    expect(listFixtureComments({ fixtures: ghFixtures }, 'acme', 'other', 1)).toHaveLength(0);
+  });
+
+  it('rejects non-HTTPS GitHub apiBaseUrl before attaching the token', async () => {
+    const adapter = createGitHubAdapter({
+      apiBaseUrl: 'http://evil.example/api',
+      token: 'secret-token',
+    });
+    await expect(
+      adapter.invoke({
+        capability: 'issue.comment',
+        workId: 'work_x',
+        correlationId: 'corr_x',
+        arguments: { owner: 'acme', repo: 'app', number: 1, body: 'hi' },
+      }),
+    ).rejects.toThrow(/https/i);
+  });
+
   it('mirrors PLAN and REVIEW packet content via sticky comment (FR-006)', async () => {
     const dir = tempProject('turbine-mirror-plan-review-', dirs);
     const cfg = loadConfig(join(dir, '.turbine', 'project.yaml'));

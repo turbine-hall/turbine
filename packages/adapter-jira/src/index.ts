@@ -48,14 +48,27 @@ function adfToText(node: unknown): string {
 }
 
 function textToAdf(body: string): unknown {
+  const paragraphs = body.split(/\n\n+/).map((paragraph) => paragraph.trimEnd());
+  const content = paragraphs
+    .filter((paragraph, i, arr) => paragraph.length > 0 || (i > 0 && i < arr.length - 1))
+    .map((paragraph) =>
+      paragraph.length > 0
+        ? { type: 'paragraph', content: [{ type: 'text', text: paragraph }] }
+        : { type: 'paragraph', content: [] },
+    );
   return {
     type: 'doc',
     version: 1,
-    content: body.split(/\n\n+/).map((paragraph) => ({
-      type: 'paragraph',
-      content: [{ type: 'text', text: paragraph }],
-    })),
+    content: content.length > 0 ? content : [{ type: 'paragraph', content: [{ type: 'text', text: ' ' }] }],
   };
+}
+
+function httpsSiteBase(siteUrl: string): string {
+  const base = siteUrl.replace(/\/$/, '');
+  if (!/^https:\/\//i.test(base)) {
+    throw err('E_ADAPTER', `Jira siteUrl must be https (got ${base})`);
+  }
+  return base;
 }
 
 export function createJiraAdapter(config: JiraConfig): ToolAdapter {
@@ -142,7 +155,7 @@ export function createJiraAdapter(config: JiraConfig): ToolAdapter {
         throw err('E_ADAPTER', 'Jira is not configured for comments');
       }
       const auth = Buffer.from(`${config.email}:${config.apiToken}`).toString('base64');
-      const base = config.siteUrl.replace(/\/$/, '');
+      const base = httpsSiteBase(config.siteUrl);
       const headers = {
         Authorization: `Basic ${auth}`,
         Accept: 'application/json',

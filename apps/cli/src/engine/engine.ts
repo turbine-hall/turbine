@@ -176,7 +176,10 @@ export class Engine {
    * When unset, live adapters are built from project config + env (still gated by tools policy).
    */
   mirrorAdapters?: MirrorAdapters;
-  /** When true, mirroring may run with fixture adapters even if execution.allowNetwork is false. */
+  /**
+   * When true, mirroring uses only injected `mirrorAdapters` (no live adapters) and skips
+   * adapter enabled / mirrorRepos gates — for offline tests.
+   */
   mirrorFixtureMode = false;
   private mirrorJob: Promise<MirrorRunResult | undefined> = Promise.resolve(undefined);
 
@@ -2041,29 +2044,46 @@ export class Engine {
     const glossary = join(this.ctx.projectRoot, '.turbine', 'GLOSSARY.md');
     if (!existsSync(glossary)) writeFile(glossary, GLOSSARY);
     renderPacket(data);
-    // Packet → linked GitHub/Jira sticky comment (capability + network gated). Never throws out of render.
-    this.mirrorJob = this.runIssueMirror(work, source?.content.text);
+    // Packet → linked GitHub/Jira sticky comment (capability + adapter gated). Serialize jobs so
+    // concurrent renders cannot create duplicate sticky comments or race stale bodies.
+    const sourceText = source?.content.text;
+    this.mirrorJob = this.mirrorJob
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          const fresh = this.ctx.store.getWork(workId);
+          return await this.runIssueMirror(fresh, sourceText);
+        } catch {
+          return undefined;
+        }
+      });
   }
 
   private async runIssueMirror(work: WorkPackage, sourceText?: string): Promise<MirrorRunResult | undefined> {
     try {
       const jiraCfg = this.ctx.config.inputs.adapters.jira;
       const githubCfg = this.ctx.config.inputs.adapters.github;
-      const adapters: MirrorAdapters = {
-        github:
-          this.mirrorAdapters?.github ??
-          createGitHubAdapter({
-            apiBaseUrl: githubCfg?.apiBaseUrl ?? undefined,
-            token: process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN,
-          }),
-        jira:
-          this.mirrorAdapters?.jira ??
-          createJiraAdapter({
-            siteUrl: jiraCfg.siteUrl ?? '',
-            email: process.env.JIRA_EMAIL,
-            apiToken: process.env.JIRA_API_TOKEN,
-          }),
-      };
+      const adapters: MirrorAdapters = this.mirrorFixtureMode
+        ? {
+            // Fixture mode: never invent live adapters — missing provider → explicit skip.
+            github: this.mirrorAdapters?.github,
+            jira: this.mirrorAdapters?.jira,
+          }
+        : {
+            github:
+              this.mirrorAdapters?.github ??
+              createGitHubAdapter({
+                apiBaseUrl: githubCfg?.apiBaseUrl ?? undefined,
+                token: process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN,
+              }),
+            jira:
+              this.mirrorAdapters?.jira ??
+              createJiraAdapter({
+                siteUrl: jiraCfg.siteUrl ?? '',
+                email: process.env.JIRA_EMAIL,
+                apiToken: process.env.JIRA_API_TOKEN,
+              }),
+          };
       const result = await mirrorLinkedIssues({
         projectRoot: this.ctx.projectRoot,
         work,

@@ -236,17 +236,11 @@ export async function mirrorLinkedIssues(input: {
     );
   }
 
-  const networkOk = input.config.execution.allowNetwork || input.fixtureMode === true;
-  if (!networkOk) {
-    return persistLast(
-      links.map((l) => ({
-        provider: l.provider,
-        key: l.key,
-        status: 'skipped' as const,
-        reason: 'execution.allowNetwork is false (and no fixtureMode)',
-      })),
-    );
-  }
+  const githubCfg = input.config.inputs.adapters.github;
+  const jiraCfg = input.config.inputs.adapters.jira;
+  const mirrorRepos = new Set(
+    (githubCfg?.mirrorRepos ?? []).map((r) => r.trim().toLowerCase()).filter(Boolean),
+  );
 
   const body = buildMirrorBody({ work: input.work, projectRoot: input.projectRoot });
   const state = loadMirrorState(input.projectRoot, input.work.id);
@@ -265,6 +259,28 @@ export async function mirrorLinkedIssues(input: {
     const commentId = state.comments[stateKey];
     try {
       if (link.provider === 'github') {
+        if (!input.fixtureMode && !githubCfg?.enabled) {
+          targets.push({
+            provider: 'github',
+            key: link.key,
+            status: 'skipped',
+            reason: 'inputs.adapters.github.enabled is false',
+          });
+          continue;
+        }
+        const repoId = `${link.owner}/${link.repo}`.toLowerCase();
+        if (!input.fixtureMode && !mirrorRepos.has(repoId)) {
+          targets.push({
+            provider: 'github',
+            key: link.key,
+            status: 'skipped',
+            reason:
+              mirrorRepos.size === 0
+                ? 'inputs.adapters.github.mirrorRepos is empty'
+                : `repo ${link.owner}/${link.repo} not in inputs.adapters.github.mirrorRepos`,
+          });
+          continue;
+        }
         if (!input.adapters?.github) {
           targets.push({ provider: 'github', key: link.key, status: 'skipped', reason: 'no github adapter registered' });
           continue;
@@ -286,6 +302,15 @@ export async function mirrorLinkedIssues(input: {
         if (id) state.comments[stateKey] = id;
         targets.push({ provider: 'github', key: link.key, status: 'mirrored', commentId: id || undefined });
       } else {
+        if (!input.fixtureMode && !jiraCfg?.enabled) {
+          targets.push({
+            provider: 'jira',
+            key: link.key,
+            status: 'skipped',
+            reason: 'inputs.adapters.jira.enabled is false',
+          });
+          continue;
+        }
         if (!input.adapters?.jira) {
           targets.push({ provider: 'jira', key: link.key, status: 'skipped', reason: 'no jira adapter registered' });
           continue;

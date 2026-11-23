@@ -26,6 +26,18 @@ export type GitHubConfig = {
 
 const issueKey = (owner: string, repo: string, number: number) => `${owner}/${repo}#${number}`;
 
+function resolveToken(config: GitHubConfig): string | undefined {
+  return config.token ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+}
+
+function httpsApiBase(config: GitHubConfig): string {
+  const api = (config.apiBaseUrl ?? 'https://api.github.com').replace(/\/$/, '');
+  if (!/^https:\/\//i.test(api)) {
+    throw err('E_ADAPTER', `GitHub apiBaseUrl must be https (got ${api})`);
+  }
+  return api;
+}
+
 export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
   const fixtureComments = config.fixtures?.comments ?? {};
 
@@ -34,7 +46,12 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
     capabilities: ['issue.read', 'issue.comment'] as Capability[],
     async healthCheck() {
       if (config.fixtures) return { ok: true, details: 'fixture-mode' };
-      if (!config.token) return { ok: false, details: 'Missing GITHUB_TOKEN / token' };
+      if (!resolveToken(config)) return { ok: false, details: 'Missing GITHUB_TOKEN / token' };
+      try {
+        httpsApiBase(config);
+      } catch (e) {
+        return { ok: false, details: (e as Error).message };
+      }
       return { ok: true, details: 'configured' };
     },
     async invoke({ capability, arguments: args }) {
@@ -77,9 +94,9 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
         return { data: { id, body, created: true }, externalOperationId: id };
       }
 
-      const token = config.token ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+      const token = resolveToken(config);
       if (!token) throw err('E_ADAPTER', 'GitHub token missing (GITHUB_TOKEN)');
-      const api = (config.apiBaseUrl ?? 'https://api.github.com').replace(/\/$/, '');
+      const api = httpsApiBase(config);
       const headers = {
         Authorization: `Bearer ${token}`,
         Accept: 'application/vnd.github+json',

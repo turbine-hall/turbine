@@ -26,15 +26,23 @@ export const ProjectConfigSchema = z.object({
         github: z
           .object({
             enabled: z.boolean().default(false),
-            /** Optional API base (default https://api.github.com). Token from GITHUB_TOKEN / GH_TOKEN. */
+            /**
+             * Optional API base (default https://api.github.com). Must be https when set.
+             * Token from GITHUB_TOKEN / GH_TOKEN.
+             */
             apiBaseUrl: z.string().nullable().default(null),
             credentialRef: z.string().nullable().default(null),
+            /**
+             * owner/repo values that may receive packet mirrors. Empty = no GitHub mirrors
+             * (fail closed). Compared case-insensitively.
+             */
+            mirrorRepos: z.array(z.string()).default([]),
           })
-          .default({ enabled: false, apiBaseUrl: null, credentialRef: null }),
+          .default({ enabled: false, apiBaseUrl: null, credentialRef: null, mirrorRepos: [] }),
       })
       .default({
         jira: { enabled: false, siteUrl: null, credentialRef: null },
-        github: { enabled: false, apiBaseUrl: null, credentialRef: null },
+        github: { enabled: false, apiBaseUrl: null, credentialRef: null, mirrorRepos: [] },
       }),
   }),
   models: z.object({
