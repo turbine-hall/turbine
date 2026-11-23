@@ -23,9 +23,18 @@ export const ProjectConfigSchema = z.object({
             credentialRef: z.string().nullable().default(null),
           })
           .default({ enabled: false, siteUrl: null, credentialRef: null }),
+        github: z
+          .object({
+            enabled: z.boolean().default(false),
+            /** Optional API base (default https://api.github.com). Token from GITHUB_TOKEN / GH_TOKEN. */
+            apiBaseUrl: z.string().nullable().default(null),
+            credentialRef: z.string().nullable().default(null),
+          })
+          .default({ enabled: false, apiBaseUrl: null, credentialRef: null }),
       })
       .default({
         jira: { enabled: false, siteUrl: null, credentialRef: null },
+        github: { enabled: false, apiBaseUrl: null, credentialRef: null },
       }),
   }),
   models: z.object({

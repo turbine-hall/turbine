@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@turbine-hall/turbine-adapter-git": "workspace:*",
+    "@turbine-hall/turbine-adapter-github": "workspace:*",
     "@turbine-hall/turbine-adapter-jira": "workspace:*",
     "@turbine-hall/turbine-adapter-tests": "workspace:*",
     "@turbine-hall/turbine-contracts": "workspace:*",

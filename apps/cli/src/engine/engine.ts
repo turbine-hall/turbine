@@ -48,7 +48,14 @@ import { getSkill, loadSkills, runSkill, type SkillManifest } from '@turbine-hal
 import type { ModelAdapter } from '@turbine-hall/turbine-models';
 import { ToolBroker } from '@turbine-hall/turbine-tools';
 import { createJiraAdapter, issueToMarkdown, type JiraIssue } from '@turbine-hall/turbine-adapter-jira';
+import { createGitHubAdapter } from '@turbine-hall/turbine-adapter-github';
 import { inspectRepo } from '@turbine-hall/turbine-adapter-git';
+import {
+  githubLinksFromText,
+  mirrorLinkedIssues,
+  type MirrorAdapters,
+  type MirrorRunResult,
+} from './issue-mirror.js';
 import { hasUncommittedChanges, observeBranch, repoToplevel } from './context/git-read.js';
 import { briefConfigOf, syncBriefClaimsToHead } from './context/brief.js';
 import { repoHead } from './context/understand.js';
@@ -164,10 +171,23 @@ export const githubPrApprovalChecker: PrApprovalChecker = ({ projectRoot, branch
 export class Engine {
   /** Replaceable for tests; used when humanGates.requirePrApproval is on. */
   prApprovalChecker: PrApprovalChecker = githubPrApprovalChecker;
+  /**
+   * Optional tool adapters for packet→issue mirroring (tests inject fixture adapters).
+   * When unset, live adapters are built from project config + env (still gated by tools policy).
+   */
+  mirrorAdapters?: MirrorAdapters;
+  /** When true, mirroring may run with fixture adapters even if execution.allowNetwork is false. */
+  mirrorFixtureMode = false;
+  private mirrorJob: Promise<MirrorRunResult | undefined> = Promise.resolve(undefined);
 
   constructor(readonly ctx: EngineContext) {
     ensureDefaultMock();
     configureModelsFromProfiles(this.ctx.config.models.profiles);
+  }
+
+  /** Await the latest packet-mirror attempt (tests / sync). */
+  async waitForMirror(): Promise<MirrorRunResult | undefined> {
+    return this.mirrorJob;
   }
 
   private artifactLocation(workId: string, type: string, revision: number): string {
@@ -220,6 +240,7 @@ export class Engine {
     const snapshotHash = contentHashText(sourceText);
     const workId = createId('work');
     const createdAt = now();
+    const ghLinks = githubLinksFromText(sourceText);
 
     const work: WorkPackage = {
       id: workId,
@@ -234,6 +255,7 @@ export class Engine {
           externalId: input.file,
           snapshotHash,
         },
+        ...ghLinks.map((l) => ({ ...l.sourceRef, snapshotHash })),
       ],
       acceptanceCriteria: [],
       constraints: [],
@@ -245,7 +267,7 @@ export class Engine {
       selectedRoles: [],
       currentState: 'IMPORTED',
       currentRevision: 1,
-      aliases: [],
+      aliases: ghLinks.map((l) => l.alias),
       createdAt,
       updatedAt: createdAt,
     };
@@ -1949,6 +1971,21 @@ export class Engine {
     } catch {
       gate = undefined;
     }
+    const mirrorNotes: string[] = [];
+    const lastMirrorPath = join(paths.evidenceDir, 'issue-mirror-last.json');
+    if (existsSync(lastMirrorPath)) {
+      try {
+        const last = JSON.parse(readFileSync(lastMirrorPath, 'utf8')) as MirrorRunResult;
+        for (const t of last.targets ?? []) {
+          if (t.status === 'mirrored') mirrorNotes.push(`Issue mirror → ${t.provider}:${t.key} updated (comment ${t.commentId ?? '—'})`);
+          else if (t.status === 'skipped') mirrorNotes.push(`Issue mirror skipped for ${t.provider}:${t.key}: ${t.reason ?? 'unknown'}`);
+          else mirrorNotes.push(`Issue mirror FAILED for ${t.provider}:${t.key}: ${t.reason ?? 'unknown'}`);
+        }
+      } catch {
+        mirrorNotes.push('Issue mirror: previous result file was unreadable');
+      }
+    }
+    const renderNotes = [...notes, ...mirrorNotes];
     // Raw data goes to evidence/, never inline.
     const evidence: Array<[string, unknown]> = [
       ['assessment.json', assessment?.content],
@@ -1983,7 +2020,7 @@ export class Engine {
       work,
       track: trackFor(work),
       next: computeNextStep({ projectRoot: this.ctx.projectRoot, work }),
-      notes,
+      notes: renderNotes,
       sourceText: source?.content.text ?? work.objective,
       facts: normalizeAssessment(assessment?.content).facts,
       spec: spec ? { hash: spec.hash, data: normalizeSpec(spec.content, work.acceptanceCriteria) } : undefined,
@@ -2004,6 +2041,84 @@ export class Engine {
     const glossary = join(this.ctx.projectRoot, '.turbine', 'GLOSSARY.md');
     if (!existsSync(glossary)) writeFile(glossary, GLOSSARY);
     renderPacket(data);
+    // Packet → linked GitHub/Jira sticky comment (capability + network gated). Never throws out of render.
+    this.mirrorJob = this.runIssueMirror(work, source?.content.text);
+  }
+
+  private async runIssueMirror(work: WorkPackage, sourceText?: string): Promise<MirrorRunResult | undefined> {
+    try {
+      const jiraCfg = this.ctx.config.inputs.adapters.jira;
+      const githubCfg = this.ctx.config.inputs.adapters.github;
+      const adapters: MirrorAdapters = {
+        github:
+          this.mirrorAdapters?.github ??
+          createGitHubAdapter({
+            apiBaseUrl: githubCfg?.apiBaseUrl ?? undefined,
+            token: process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN,
+          }),
+        jira:
+          this.mirrorAdapters?.jira ??
+          createJiraAdapter({
+            siteUrl: jiraCfg.siteUrl ?? '',
+            email: process.env.JIRA_EMAIL,
+            apiToken: process.env.JIRA_API_TOKEN,
+          }),
+      };
+      const result = await mirrorLinkedIssues({
+        projectRoot: this.ctx.projectRoot,
+        work,
+        config: this.ctx.config,
+        sourceText,
+        adapters,
+        fixtureMode: this.mirrorFixtureMode,
+      });
+      if (result.targets.length) {
+        try {
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: 'issue.mirror',
+            payload: {
+              targets: result.targets.map((t) => ({
+                provider: t.provider,
+                key: t.key,
+                status: t.status,
+                reason: t.reason,
+                commentId: t.commentId,
+              })),
+            },
+          });
+        } catch {
+          // Store may already be closed (tests); evidence file is the durable record.
+        }
+      }
+      return result;
+    } catch (e) {
+      const paths = packetPaths(this.ctx.projectRoot, work.id);
+      mkdirSync(paths.evidenceDir, { recursive: true });
+      const failed: MirrorRunResult = {
+        at: new Date().toISOString(),
+        workId: work.id,
+        targets: [
+          {
+            provider: 'github',
+            key: '—',
+            status: 'failed',
+            reason: (e as Error).message,
+          },
+        ],
+      };
+      writeFileSync(join(paths.evidenceDir, 'issue-mirror-last.json'), JSON.stringify(failed, null, 2) + '\n');
+      try {
+        this.ctx.store.appendEvent({
+          workId: work.id,
+          type: 'issue.mirror',
+          payload: { error: (e as Error).message },
+        });
+      } catch {
+        // Store may already be closed (tests); evidence file is the durable record.
+      }
+      return failed;
+    }
   }
 
   /**
@@ -2717,6 +2832,7 @@ export class Engine {
     idOrAlias: string,
     _actorId = 'local-user',
   ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
+    try {
     let work = this.ctx.store.getWork(idOrAlias);
     const paths = packetPaths(this.ctx.projectRoot, work.id);
     const approveHint = `Human approves in their own terminal: turbine task approve ${work.id}`;
@@ -2858,6 +2974,9 @@ export class Engine {
       work,
       detail: { openFile: paths.status, state: work.currentState },
     };
+    } finally {
+      await this.waitForMirror();
+    }
   }
 
   /** What a human is being asked to approve right now (shown before confirmation). */
