@@ -777,7 +777,7 @@ describe('storage — migration v4 and the claim methods', () => {
   it('migration v4 creates the claims table (v3, work_claims, is untouched)', () => {
     const store = openStore();
     const versions = (store.db.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>).map((r) => r.version);
-    expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]); // v5 claim frontier; v6 brief_state; v7 pending_sections; v8 usage; v9 policies; v10 agreements; v11 lane metrics/audits
+    expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]); // v5 claim frontier; v6 brief_state; v7 pending_sections; v8 usage; v9 policies; v10 agreements; v11 lane metrics/audits; v12 lane PRs
     const cols = (store.db.prepare(`PRAGMA table_info(claims)`).all() as Array<{ name: string }>).map((x) => x.name);
     expect(cols).toEqual(['id', 'repo_path', 'section', 'commit', 'data', 'status', 'reason', 'created_at']);
     expect(store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='work_claims'`).all()).toHaveLength(1);

@@ -1535,6 +1535,7 @@ async function decideCommand(id: string, action: 'approve' | 'reject', reason?: 
       reason: why,
       presence: HUMAN_PRESENCE,
     });
+    await engine.waitForLanePr();
     out.write('\nRecorded as a local attestation (identity not cryptographically verified).\n');
     const work = (result as { work: { id: string; currentState: string } }).work;
     printResult({ id: work.id, state: work.currentState }, false);
@@ -1652,6 +1653,36 @@ task
         const result = engine.laneRetry(id, { actor: reviewer, confirmToken: token, presence: HUMAN_PRESENCE });
         printResult({ id: result.work.id, inLane: true, next: `turbine task sync ${result.work.id}` }, false);
         await engine.waitForMirror();
+      } finally {
+        engine.ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+task
+  .command('pr-refresh')
+  .argument('<id>')
+  .option('--json')
+  .description('Poll the recorded PR: record a merge, or return an ejected task to CHANGES_REQUESTED (also runs on sync)')
+  .action(async (id, opts) => {
+    try {
+      const engine = withEngine();
+      try {
+        const result = await engine.refreshLanePullRequest(id);
+        printResult(
+          {
+            id: result.work.id,
+            state: result.work.currentState,
+            pr: result.record.number,
+            result: result.kind,
+            queueState: result.record.queueState,
+            ...(result.reason ? { reason: result.reason } : {}),
+            ...('fixRound' in result ? { fixRound: result.fixRound } : {}),
+          },
+          !!opts.json,
+        );
       } finally {
         engine.ctx.store.close();
       }

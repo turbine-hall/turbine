@@ -57,6 +57,17 @@ export type LaneFacts = {
     artifacts?: Array<{ id: string; contentHash: string }>;
     reason?: string;
   };
+  /** Part C acceptance preconditions. Missing/unconfirmed values fail closed to unknown. */
+  lanePr?: {
+    configAllowsCreate: boolean;
+    configAllowsMerge: boolean;
+    protection: {
+      status: 'confirmed' | 'unknown';
+      mergeQueueRequired: boolean;
+      turbineGateRequired: boolean;
+      reason?: string;
+    };
+  };
 };
 
 export type LaneEvaluation = {
@@ -129,6 +140,19 @@ export function evaluateLaneEligibility(
   }
 
   if (facts.gate === 'acceptance') {
+    // One PR cannot carry a multi-repo change set, so landing would be skipped after the policy already
+    // accepted. Route it to a human now (multi-repo review under `maxRepos` is unaffected).
+    if (facts.repoCount > 1) reasons.push(`PR landing supports one repository; the task changes ${facts.repoCount}`);
+    if (!facts.lanePr || facts.lanePr.protection.status !== 'confirmed') {
+      reasons.push(`merge-queue protection is unknown${facts.lanePr?.protection.reason ? `: ${facts.lanePr.protection.reason}` : ''}`);
+    } else {
+      if (!facts.lanePr.protection.mergeQueueRequired) reasons.push('base branch does not require the merge queue');
+      if (!facts.lanePr.protection.turbineGateRequired) reasons.push('base branch does not require turbine/gate');
+    }
+    if (!facts.lanePr?.configAllowsCreate) reasons.push('project config does not allow pr.create');
+    if (!facts.lanePr?.configAllowsMerge) reasons.push('project config does not allow pr.merge');
+    if (!p.tools.includes('pr.create')) reasons.push(`policy ${policy.name} does not grant pr.create`);
+    if (!p.tools.includes('pr.merge')) reasons.push(`policy ${policy.name} does not grant pr.merge`);
     const a = facts.acceptance;
     if (!a) reasons.push('acceptance facts are missing');
     else {
@@ -142,7 +166,8 @@ export function evaluateLaneEligibility(
     }
   }
 
-  const status: LaneEvaluation['status'] = facts.readErrors.length ? 'unknown' : reasons.length ? 'not-eligible' : 'eligible';
+  const protectionUnknown = facts.gate === 'acceptance' && facts.lanePr?.protection.status !== 'confirmed';
+  const status: LaneEvaluation['status'] = facts.readErrors.length || protectionUnknown ? 'unknown' : reasons.length ? 'not-eligible' : 'eligible';
   const allReasons = facts.readErrors.length ? [...facts.readErrors.map((e) => `could not read: ${e}`), ...reasons] : reasons;
   return {
     policy: policy.name,

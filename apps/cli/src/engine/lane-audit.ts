@@ -15,38 +15,53 @@ export function samplingDraw(record: Pick<LaneMergeRecord, 'id' | 'workId' | 'po
 }
 
 /**
- * Part C's future merge hook calls this entry point. It saves the merge fact and selected audit
+ * Write the merge fact and its selected audit. The caller owns the transaction (writes only, no suspension
+ * check) so a merged PR record, the merge facts and the audit sample commit together.
+ */
+export function savePolicyMergeFacts(
+  store: WorkStore,
+  input: Omit<LaneMergeRecord, 'sampling'>,
+  /** Sampling rate snapshotted when landing was authorized; omitted falls back to the live policy. */
+  opts: { rate?: number } = {},
+): { merge: LaneMergeRecord; audit: LaneAuditRecord | null } {
+  if (input.mergeState !== 'merged' || !input.policyId) {
+    throw err('E_INVALID_CONFIG', 'Audit sampling requires a merged policy record');
+  }
+  let rate = opts.rate;
+  if (rate === undefined) {
+    const approved = store.getLanePolicy(input.policyId);
+    if (!approved) throw err('E_NOT_FOUND', `No approved policy named ${input.policyId}`);
+    rate = approved.policy.sampling.rate;
+  }
+  const { seed, draw } = samplingDraw(input);
+  const selected = draw < rate;
+  const merge = store.saveLaneMergeRecord({ ...input, sampling: { seed, draw, rate, selected } });
+  if (!selected) return { merge, audit: null };
+  const audit = store.enqueueLaneAudit({
+    id: createId('audit'),
+    mergeRecordId: merge.id,
+    workId: merge.workId,
+    policyId: input.policyId,
+    seed,
+    draw,
+    rate,
+    queuedAt: input.recordedAt,
+    outcome: 'queued',
+  });
+  return { merge, audit };
+}
+
+/**
+ * Part C's merge hook calls this entry point. It saves the merge fact and selected audit
  * atomically; a failed queue write cannot leave an un-sampled policy merge behind.
  */
 export function recordPolicyMerge(
   store: WorkStore,
   input: Omit<LaneMergeRecord, 'sampling'>,
+  opts: { rate?: number } = {},
 ): { merge: LaneMergeRecord; audit: LaneAuditRecord | null } {
-  if (input.mergeState !== 'merged' || !input.policyId) {
-    throw err('E_INVALID_CONFIG', 'Audit sampling requires a merged policy record');
-  }
-  const approved = store.getLanePolicy(input.policyId);
-  if (!approved) throw err('E_NOT_FOUND', `No approved policy named ${input.policyId}`);
-  const { seed, draw } = samplingDraw(input);
-  const rate = approved.policy.sampling.rate;
-  const selected = draw < rate;
-  const result = store.transaction(() => {
-    const merge = store.saveLaneMergeRecord({ ...input, sampling: { seed, draw, rate, selected } });
-    if (!selected) return { merge, audit: null };
-    const audit = store.enqueueLaneAudit({
-      id: createId('audit'),
-      mergeRecordId: merge.id,
-      workId: merge.workId,
-      policyId: input.policyId!,
-      seed,
-      draw,
-      rate,
-      queuedAt: input.recordedAt,
-      outcome: 'queued',
-    });
-    return { merge, audit };
-  });
-  evaluateSuspendWhen(store, input.policyId);
+  const result = store.transaction(() => savePolicyMergeFacts(store, input, opts));
+  evaluateSuspendWhen(store, input.policyId!);
   return result;
 }
 
