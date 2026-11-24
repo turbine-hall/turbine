@@ -1,6 +1,6 @@
 {
   "name": "@turbine-hall/turbine-cli",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Turbine Hall CLI — governed human/AI software workflow",
   "type": "module",
   "bin": {
