@@ -144,6 +144,7 @@ import {
   configAllows,
   confirmMergeQueueProtection,
   ensureAcceptedPr,
+  landingIncomplete,
   refreshLanePr,
   type LanePrTarget,
 } from './lane-pr.js';
@@ -273,6 +274,10 @@ export class Engine {
     if (errors.length) throw errors[0];
   }
 
+  private lanePrAdapter() {
+    return this.lanePrTarget?.adapter ?? createGitHubAdapter({ apiBaseUrl: process.env.GITHUB_API_BASE_URL });
+  }
+
   private resolveLanePrTarget(): LanePrTarget | undefined {
     if (this.lanePrTarget) return this.lanePrTarget;
     const remote = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: this.ctx.projectRoot, encoding: 'utf8' });
@@ -281,58 +286,154 @@ export class Engine {
     const match = value.match(/github\.com[/:]([^/]+)\/([^/]+)$/i);
     if (!match) return undefined;
     return {
-      adapter: createGitHubAdapter({ apiBaseUrl: process.env.GITHUB_API_BASE_URL }),
+      adapter: this.lanePrAdapter(),
       owner: match[1]!,
       repo: match[2]!,
       baseBranch: (this.ctx.config as { git?: { defaultBaseBranch?: string } }).git?.defaultBaseBranch ?? 'main',
     };
   }
 
-  private policyForAcceptedWork(workId: string): ApprovedLanePolicy | undefined {
+  /**
+   * Who authorized landing the ACCEPTED task, from the recorded acceptance decision only. A policy acceptance is
+   * authorized by the exact policy approval it recorded (hash + approval decision); a newer approval of the same
+   * name, an edit, or a suspension never substitutes for it, and is not human acceptance either.
+   */
+  private acceptanceAuthority(workId: string):
+    | { kind: 'none' }
+    | { kind: 'stale'; reason: string }
+    | { kind: 'blocked'; reason: string; decision: Decision }
+    | { kind: 'human'; decision: Decision }
+    | { kind: 'policy'; decision: Decision; policy: ApprovedLanePolicy } {
+    const work = this.ctx.store.getWork(workId);
+    if (work.currentState !== 'ACCEPTED') return { kind: 'stale', reason: `task is ${work.currentState}, not ACCEPTED` };
     const decision = this.ctx.store
       .listDecisions(workId)
       .filter((entry) => entry.gate === 'sqa-acceptance' && entry.action === 'approve' && !entry.invalidatedAt)
       .sort((a, b) => a.decidedAt.localeCompare(b.decidedAt) || a.id.localeCompare(b.id))
       .at(-1);
-    return decision?.actorType === 'policy' && decision.policyId
-      ? (this.ctx.store.getLanePolicy(decision.policyId) ?? undefined)
-      : undefined;
+    if (!decision) return { kind: 'none' };
+    // The acceptance transition adds one revision; anything else means the accepted revision is no longer current.
+    if (decision.workRevision + 1 !== work.currentRevision) {
+      return { kind: 'stale', reason: `accepted revision ${decision.workRevision + 1} is not the current revision ${work.currentRevision}` };
+    }
+    if (!decision.commitSha || decision.commitSha !== this.currentCommit(workId)) {
+      return { kind: 'stale', reason: 'the accepted commit is not the current commit' };
+    }
+    if (decision.actorType !== 'policy') return { kind: 'human', decision };
+    const blocked = (reason: string) => ({ kind: 'blocked' as const, reason, decision });
+    if (!decision.policyId || !decision.policyHash || !decision.policyApprovalDecisionId) {
+      return blocked('the policy acceptance does not record which policy approval authorized it');
+    }
+    let snapshot: ApprovedLanePolicy | null;
+    try {
+      snapshot = this.ctx.store.getLanePolicy(decision.policyId);
+    } catch (e) {
+      return blocked(`policy ${decision.policyId} is unreadable: ${(e as Error).message}`);
+    }
+    if (!snapshot) return blocked(`policy ${decision.policyId} is no longer approved`);
+    if (snapshot.status !== 'active') return blocked(`policy ${decision.policyId} is ${snapshot.status}`);
+    if (snapshot.contentHash !== decision.policyHash || snapshot.approvedDecisionId !== decision.policyApprovalDecisionId) {
+      return blocked(`policy ${decision.policyId} was changed or re-approved after this acceptance`);
+    }
+    return { kind: 'policy', decision, policy: snapshot };
   }
 
-  private queueAcceptedPr(work: WorkPackage, policy = this.policyForAcceptedWork(work.id)): void {
-    // Human acceptance only opens a PR when the project opted in; a policy path stays strict.
-    if (!policy && !configAllows(this.ctx.config.tools, 'pr.create')) {
-      this.ctx.store.appendEvent({
-        workId: work.id,
-        type: 'lane.pr-automation-skipped',
-        payload: { reason: 'pr.create is not allowed by project config' },
-      });
+  /** The PR target a policy acceptance was evaluated against; never re-resolved from origin mid-flight. */
+  private boundLanePrTarget(workId: string, decisionId: string): LanePrTarget | undefined {
+    const bound = this.ctx.store
+      .listEvents(workId)
+      .filter((event) => event.type === 'lane.acceptance-target-bound' && event.payload.decisionId === decisionId)
+      .at(-1);
+    const { owner, repo, baseBranch } = (bound?.payload ?? {}) as { owner?: string; repo?: string; baseBranch?: string };
+    if (!owner || !repo || !baseBranch) return undefined;
+    return { adapter: this.lanePrAdapter(), owner, repo, baseBranch };
+  }
+
+  private recordLandingEvent(workId: string, type: string, reason: string, dedupe = false): void {
+    if (dedupe) {
+      const last = this.ctx.store.listEvents(workId).filter((event) => event.type === type).at(-1);
+      if (last?.payload.reason === reason) return;
+    }
+    this.ctx.store.appendEvent({ workId, type, payload: { reason } });
+  }
+
+  /** The single worktree is still exactly at the accepted head; a moved head means the acceptance is stale. */
+  private worktreeAtHead(workId: string, headSha: string): boolean {
+    const repos = this.repoStates(workId);
+    if (repos.length !== 1 || !existsSync(repos[0]!.worktreePath)) return false;
+    try {
+      return observe(repos).repos[0]?.headCommit === headSha;
+    } catch {
+      return false;
+    }
+  }
+
+  private queueAcceptedPr(work: WorkPackage, authority = this.acceptanceAuthority(work.id)): void {
+    if (authority.kind === 'none') return;
+    if (authority.kind === 'stale') {
+      this.recordLandingEvent(work.id, 'lane.pr-automation-discarded', authority.reason);
       return;
     }
-    const target = this.resolveLanePrTarget();
+    if (authority.kind === 'blocked') {
+      this.recordLandingEvent(work.id, 'lane.pr-automation-blocked', authority.reason, true);
+      return;
+    }
+    const policy = authority.kind === 'policy' ? authority.policy : undefined;
+    // Human acceptance only opens a PR when the project opted in; a policy path stays strict.
+    if (!policy && !configAllows(this.ctx.config.tools, 'pr.create')) {
+      this.recordLandingEvent(work.id, 'lane.pr-automation-skipped', 'pr.create is not allowed by project config');
+      return;
+    }
     const repos = this.repoStates(work.id);
     // A multi-repo change set id is a hash, not a commit; one PR cannot carry it.
     if (repos.length > 1) {
-      this.ctx.store.appendEvent({
-        workId: work.id,
-        type: 'lane.pr-automation-skipped',
-        payload: { reason: `PR automation supports one repo; this task changes ${repos.length}` },
-      });
+      this.recordLandingEvent(work.id, 'lane.pr-automation-skipped', `PR automation supports one repo; this task changes ${repos.length}`);
       return;
     }
+    // A policy acceptance lands on the target its protection was evaluated against; origin is not consulted again.
+    const target = policy ? this.boundLanePrTarget(work.id, authority.decision.id) : this.resolveLanePrTarget();
     const headSha = this.currentCommit(work.id);
+    if (policy && !target) {
+      this.recordLandingEvent(work.id, 'lane.pr-automation-blocked', 'the PR target evaluated for this policy acceptance was not recorded', true);
+      return;
+    }
     if (!target || !headSha) return;
+    // The gate result is read now, together with the commit it evaluated, and travels with the job.
+    const gatePassSha = this.gateDecision(work.id).decision === 'PASS' ? headSha : undefined;
+    const acceptedRevision = work.currentRevision;
+    const decisionId = authority.decision.id;
     this.pendingLanePrs.push(async () => {
-      const gate = this.gateDecision(work.id);
+      // Queued jobs outlive the call that queued them: act only if this exact acceptance is still current.
+      const live = this.acceptanceAuthority(work.id);
+      const current = this.ctx.store.getWork(work.id);
+      if (live.kind === 'blocked') {
+        this.recordLandingEvent(work.id, 'lane.pr-automation-blocked', live.reason, true);
+        return;
+      }
+      const stale =
+        live.kind === 'none' || live.kind === 'stale'
+          ? live.kind === 'stale' ? live.reason : 'no acceptance decision'
+          : live.decision.id !== decisionId
+            ? 'the acceptance decision was replaced'
+            : current.currentRevision !== acceptedRevision
+              ? 'the accepted revision is no longer current'
+              : this.currentCommit(work.id) !== headSha || !this.worktreeAtHead(work.id, headSha)
+                ? 'the accepted head moved'
+                : undefined;
+      if (stale) {
+        this.recordLandingEvent(work.id, 'lane.pr-automation-discarded', stale);
+        return;
+      }
       try {
         await ensureAcceptedPr({
           store: this.ctx.store,
-          work,
+          work: current,
           headSha,
+          authorizationId: decisionId,
           target,
           tools: this.ctx.config.tools,
-          policy,
-          gatePassSha: gate.decision === 'PASS' ? headSha : undefined,
+          policy: live.kind === 'policy' ? live.policy : undefined,
+          gatePassSha,
         });
       } catch (e) {
         this.ctx.store.appendEvent({
@@ -345,17 +446,40 @@ export class Engine {
     });
   }
 
-  /** Durable resume: an ACCEPTED task whose PR automation never finished is queued again on the next sync. */
+  /**
+   * Durable resume: an ACCEPTED task whose PR work is incomplete is queued again on the next sync. The same head
+   * is not enough to call it done: a gate status that never reached GitHub, or a PR closed unmerged, still owes work.
+   */
   private resumeAcceptedPr(work: WorkPackage): boolean {
     if (work.currentState !== 'ACCEPTED' || this.repoStates(work.id).length !== 1) return false;
+    const authority = this.acceptanceAuthority(work.id);
+    if (authority.kind === 'blocked') {
+      this.recordLandingEvent(work.id, 'lane.pr-automation-blocked', authority.reason, true);
+      return false;
+    }
+    if (authority.kind !== 'human' && authority.kind !== 'policy') return false;
+    const policy = authority.kind === 'policy';
     const head = this.currentCommit(work.id);
-    const policy = this.policyForAcceptedWork(work.id);
     if (!head || (!policy && !configAllows(this.ctx.config.tools, 'pr.create'))) return false;
+    // The recorded head can lag the worktree; only the accepted head, still at the worktree, may be landed.
+    if (!this.worktreeAtHead(work.id, head)) return false;
+    const gatePassSha = this.gateDecision(work.id).decision === 'PASS' ? head : undefined;
     const record = this.ctx.store.getLanePrRecord(work.id);
-    if (record?.queueState === 'merged') return false;
-    if (record && record.headSha === head && !(policy && record.queueState === 'not-enabled')) return false;
-    this.queueAcceptedPr(work, policy);
+    if (!landingIncomplete(record, { headSha: head, authorizationId: authority.decision.id, gatePassSha, policy })) return false;
+    this.queueAcceptedPr(work, authority);
     return true;
+  }
+
+  /** Poll the recorded PR of an ACCEPTED task during sync; a failed poll is recorded, never fatal to sync. */
+  private async pollAcceptedPr(work: WorkPackage): Promise<void> {
+    if (work.currentState !== 'ACCEPTED') return;
+    const record = this.ctx.store.getLanePrRecord(work.id);
+    if (!record || record.queueState === 'merged') return;
+    try {
+      await this.refreshLanePullRequest(work.id);
+    } catch (e) {
+      this.recordLandingEvent(work.id, 'lane.pr-refresh-failed', (e as Error).message, true);
+    }
   }
 
   /** Poll the recorded PR. Queue ejection starts a fix round; merge writes Part G's merge store. */
@@ -363,21 +487,27 @@ export class Engine {
     const work = this.ctx.store.getWork(idOrAlias);
     const target = this.resolveLanePrTarget();
     if (!target) throw err('E_INVALID_CONFIG', 'Cannot determine the GitHub repository for lane PR automation');
+    const authority = work.currentState === 'ACCEPTED' ? this.acceptanceAuthority(work.id) : undefined;
     const result = await refreshLanePr({
       store: this.ctx.store,
       workId: work.id,
       target,
-      policy: this.policyForAcceptedWork(work.id),
+      policy: authority?.kind === 'policy' ? authority.policy : undefined,
     });
-    if (result.kind === 'ejected' && work.currentState === 'ACCEPTED') {
-      const fixRound = this.ctx.store.listEvents(work.id).filter((event) => event.type === 'lane.queue-ejected').length + 1;
-      const next = this.toChangesRequested(work, 'queue-ejected');
-      this.ctx.store.appendEvent({
-        workId: work.id,
-        type: 'lane.queue-ejected',
-        payload: { reason: result.reason, fixRound, prNumber: result.record.number },
-      });
-      return { ...result, work: next, fixRound };
+    if (result.kind === 'ejected' && work.currentState === 'ACCEPTED' && result.removalId) {
+      const removals = this.ctx.store.listEvents(work.id).filter((event) => event.type === 'lane.queue-ejected');
+      // One fix round per removal: a removal that already started one is never counted again.
+      if (!removals.some((event) => event.payload.removalId === result.removalId)) {
+        const fixRound = removals.length + 1;
+        const next = this.toChangesRequested(work, 'queue-ejected');
+        this.ctx.store.appendEvent({
+          workId: work.id,
+          type: 'lane.queue-ejected',
+          payload: { reason: result.reason, fixRound, prNumber: result.record.number, removalId: result.removalId },
+        });
+        this.ctx.store.saveLanePrRecord({ ...result.record, handledQueueRemovalId: result.removalId });
+        return { ...result, work: next, fixRound };
+      }
     }
     return { ...result, work };
   }
@@ -3371,7 +3501,10 @@ export class Engine {
     actorId = 'local-user',
   ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
     let pending = this.ctx.store.getWork(idOrAlias);
+    // Landing resumes only for the accepted head still in the worktree; a moved head is handled by the sync step.
     if (this.resumeAcceptedPr(pending)) await this.waitForLanePr();
+    await this.pollAcceptedPr(this.ctx.store.getWork(pending.id));
+    pending = this.ctx.store.getWork(pending.id);
     if (pending.currentState === 'AI_REVIEW') {
       pending = this.refreshHeads(pending.id).work;
       const lane = await this.tryLanePass(pending.id);
@@ -4017,8 +4150,10 @@ export class Engine {
         };
       }
       const facts = this.laneFacts(work, gate);
+      // The PR target whose protection is evaluated is the one the acceptance lands on.
+      let acceptanceTarget: LanePrTarget | undefined;
       if (gate === 'acceptance') {
-        const target = this.resolveLanePrTarget();
+        const target = (acceptanceTarget = this.resolveLanePrTarget());
         const protection = target
           ? await confirmMergeQueueProtection(target, work.id)
           : {
@@ -4086,11 +4221,11 @@ export class Engine {
         }
       }
       this.laneBeforeSave?.();
-      const saved = this.savePolicyPass(work, facts, winner, evaluations[winnerIdx]!);
+      const saved = this.savePolicyPass(work, facts, winner, evaluations[winnerIdx]!, acceptanceTarget);
       if ('work' in saved) {
         this.render(work.id, [`${LANE_GATE_LABEL[gate]} ${saved.decision.rationale}.`]);
         if (saved.work.currentState === 'ACCEPTED') {
-          this.queueAcceptedPr(saved.work, winner);
+          this.queueAcceptedPr(saved.work);
           await this.waitForLanePr();
         }
         return { status: 'passed', work: saved.work, gate, policy: winner.name, decision: saved.decision, reasons: [] };
@@ -4181,6 +4316,8 @@ export class Engine {
     facts: LaneFacts,
     policy: ApprovedLanePolicy,
     evaluation: LaneEvaluation,
+    /** For the acceptance gate: the PR target whose protection was evaluated; it is recorded with the decision. */
+    acceptanceTarget?: LanePrTarget,
   ): { work: WorkPackage; decision: Decision } | { moved: string } | { ineligible: string } {
     const approval = this.ctx.store
       .listDecisions(policyDecisionSubject(policy.name))
@@ -4371,6 +4508,7 @@ export class Engine {
           return { work: next, decision };
         }
         if (facts.gate === 'acceptance') {
+          if (!acceptanceTarget) throw new LaneIneligible('the PR target whose protection was evaluated is missing');
           try {
             this.assertPrApproval(work.id, commitNow);
           } catch (e) {
@@ -4389,6 +4527,18 @@ export class Engine {
             commitSha: this.currentCommit(work.id),
           };
           this.ctx.store.saveDecision(decision);
+          // Landing uses exactly this target; a later resume must not re-resolve origin.
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: 'lane.acceptance-target-bound',
+            payload: {
+              decisionId: decision.id,
+              owner: acceptanceTarget.owner,
+              repo: acceptanceTarget.repo,
+              baseBranch: acceptanceTarget.baseBranch,
+              protection: facts.lanePr?.protection,
+            },
+          });
           // With the decision recorded every required obligation must hold, without waivers; otherwise roll back.
           const gateNow = this.gateDecision(work.id);
           if (gateNow.blocking.length) {

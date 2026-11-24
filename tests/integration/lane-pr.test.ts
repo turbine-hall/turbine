@@ -1,10 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createGitHubAdapter } from '../../packages/adapter-github/dist/index.js';
 import { confirmMergeQueueProtection, ensureAcceptedPr, refreshLanePr } from '../../apps/cli/src/engine/lane-pr.js';
-import { cleanup, git } from './fixture.js';
-import { acceptByHuman, laneProject, ROUTINE_POLICY } from './lane-fixture.js';
+import { spawnSync } from 'node:child_process';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type { Engine } from '../../apps/cli/src/engine/engine.js';
+import { suspendPolicy } from '../../apps/cli/src/engine/lane-policy.js';
+import { cleanup, commitIn, git } from './fixture.js';
+import { acceptByHuman, approve, laneProject, ROUTINE_POLICY, toCodeReview, writePolicy } from './lane-fixture.js';
 
 const dirs: string[] = [];
+const AUTH = 'dec_auth_1';
 afterEach(() => {
   vi.unstubAllGlobals();
   cleanup(dirs);
@@ -17,7 +23,7 @@ describe('Part C PR automation', () => {
     const headSha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
     const policy = engine.ctx.store.getLanePolicy('routine')!;
 
-    const record = await ensureAcceptedPr({
+    const record = await ensureAcceptedPr({ authorizationId: AUTH,
       store: engine.ctx.store,
       work,
       headSha,
@@ -51,7 +57,7 @@ describe('Part C PR automation', () => {
     const work = engine.createTask({ title: 'Reset status', text: 'Reset status after a push.' });
     const oldSha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
     const policy = engine.ctx.store.getLanePolicy('routine')!;
-    await ensureAcceptedPr({
+    await ensureAcceptedPr({ authorizationId: AUTH,
       store: engine.ctx.store,
       work,
       headSha: oldSha,
@@ -61,7 +67,7 @@ describe('Part C PR automation', () => {
       gatePassSha: oldSha,
     });
     const newSha = `${oldSha.startsWith('a') ? 'b' : 'a'}${oldSha.slice(1)}`;
-    await ensureAcceptedPr({
+    await ensureAcceptedPr({ authorizationId: AUTH,
       store: engine.ctx.store,
       work,
       headSha: newSha,
@@ -89,7 +95,7 @@ describe('Part C PR automation', () => {
     const work = engine.createTask({ title: 'No policy grant', text: 'Config alone is insufficient.' });
     const headSha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
     await expect(
-      ensureAcceptedPr({
+      ensureAcceptedPr({ authorizationId: AUTH,
         store: engine.ctx.store,
         work,
         headSha,
@@ -134,6 +140,7 @@ describe('Part C PR automation', () => {
       state: 'open',
       mergeQueueState: 'ejected',
       queueReason: 'required check failed',
+      queueRemovalId: 'rm_1',
     }];
     const result = await engine.refreshLanePullRequest(work.id);
     expect(result.work.currentState).toBe('CHANGES_REQUESTED');
@@ -237,10 +244,10 @@ describe('Part C PR automation', () => {
     const { dir, engine, github } = laneProject(dirs);
     const work = engine.createTask({ title: 'Closed PR', text: 'Replace a closed PR.' });
     const headSha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
-    const input = { store: engine.ctx.store, work, headSha, target: engine.lanePrTarget!, tools: engine.ctx.config.tools, policy: policyNow(engine) };
+    const input = { authorizationId: AUTH, store: engine.ctx.store, work, headSha, target: engine.lanePrTarget!, tools: engine.ctx.config.tools, policy: policyNow(engine) };
     const first = await ensureAcceptedPr(input);
     github.pullRequests!['fixture/project']![0]!.state = 'closed';
-    const replacement = await ensureAcceptedPr({ ...input, gatePassSha: headSha });
+    const replacement = await ensureAcceptedPr({ authorizationId: AUTH, ...input, gatePassSha: headSha });
     expect(replacement.number).not.toBe(first.number);
     expect(github.pullRequests!['fixture/project']!.find((pr) => pr.number === replacement.number)).toMatchObject({ state: 'open', mergeQueueState: 'queued' });
     expect(engine.ctx.store.listEvents(work.id).find((event) => event.type === 'lane.pr-replaced')?.payload).toMatchObject({ closedNumber: first.number, number: replacement.number });
@@ -261,7 +268,7 @@ describe('Part C PR automation', () => {
     const work = engine.createTask({ title: 'Snapshot', text: 'Snapshot sampling terms.' });
     const headSha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
     const policy = policyNow(engine);
-    const record = await ensureAcceptedPr({ store: engine.ctx.store, work, headSha, target: engine.lanePrTarget!, tools: engine.ctx.config.tools, policy, gatePassSha: headSha });
+    const record = await ensureAcceptedPr({ authorizationId: AUTH, store: engine.ctx.store, work, headSha, target: engine.lanePrTarget!, tools: engine.ctx.config.tools, policy, gatePassSha: headSha });
     expect(record.authorizingPolicy).toEqual({ name: 'routine', samplingRate: policy.policy.sampling.rate });
     // The live policy says 0.1; the authorization snapshot says every merge is audited.
     engine.ctx.store.saveLanePrRecord({ ...record, authorizingPolicy: { name: 'routine', samplingRate: 1 } });
@@ -334,7 +341,7 @@ describe('Part C PR automation', () => {
     expect((await refreshLanePr({ store: engine.ctx.store, workId: work.id, target: switched })).kind).toBe('merged');
     const headSha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
     await expect(
-      ensureAcceptedPr({ store: engine.ctx.store, work, headSha, target: switched, tools: engine.ctx.config.tools }),
+      ensureAcceptedPr({ authorizationId: AUTH, store: engine.ctx.store, work, headSha, target: switched, tools: engine.ctx.config.tools }),
     ).rejects.toThrow(/targets fixture\/project:main/);
     engine.ctx.store.close();
   });
@@ -343,14 +350,14 @@ describe('Part C PR automation', () => {
     const { dir, engine, github } = laneProject(dirs);
     const work = engine.createTask({ title: 'Retargeted', text: 'Refuse a retargeted PR.' });
     const headSha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
-    const input = { store: engine.ctx.store, work, headSha, target: engine.lanePrTarget!, tools: engine.ctx.config.tools, policy: policyNow(engine) };
+    const input = { authorizationId: AUTH, store: engine.ctx.store, work, headSha, target: engine.lanePrTarget!, tools: engine.ctx.config.tools, policy: policyNow(engine) };
     await ensureAcceptedPr(input); // gate pending: no merge yet
     const pr = github.pullRequests!['fixture/project']![0]!;
     pr.base = 'release';
-    await expect(ensureAcceptedPr({ ...input, gatePassSha: headSha })).rejects.toThrow(/base is release/);
+    await expect(ensureAcceptedPr({ authorizationId: AUTH, ...input, gatePassSha: headSha })).rejects.toThrow(/base is release/);
     pr.base = 'main';
     pr.headSha = 'ffffffffffff';
-    await expect(ensureAcceptedPr({ ...input, gatePassSha: headSha })).rejects.toThrow(/is not accepted head/);
+    await expect(ensureAcceptedPr({ authorizationId: AUTH, ...input, gatePassSha: headSha })).rejects.toThrow(/is not accepted head/);
     expect(pr.mergeQueueState).toBeUndefined();
     expect(engine.ctx.store.getLanePrRecord(work.id)?.queueState).toBe('not-enabled');
     engine.ctx.store.close();
@@ -382,12 +389,297 @@ describe('Part C PR automation', () => {
         return result;
       },
     };
-    const record = await ensureAcceptedPr({ store: engine.ctx.store, work, headSha, target: engine.lanePrTarget!, tools: engine.ctx.config.tools, policy: policyNow(engine), gatePassSha: headSha });
+    const record = await ensureAcceptedPr({ authorizationId: AUTH, store: engine.ctx.store, work, headSha, target: engine.lanePrTarget!, tools: engine.ctx.config.tools, policy: policyNow(engine), gatePassSha: headSha });
     expect(record.queueState).toBe('not-enabled');
     github.pullRequests!['fixture/project']![0]!.mergeQueueState = 'queued';
     expect((await refreshLanePr({ store: engine.ctx.store, workId: work.id, target: engine.lanePrTarget! })).record.queueState).toBe('queued');
     engine.ctx.store.close();
   });
+
+  /** Policy-lane flow up to (but not including) the sync that accepts by policy. */
+  const readyForPolicyAcceptance = async (engine: Engine) => {
+    const work = await toCodeReview(engine, {
+      'README.md': '# fixture fixed\n',
+      'test/readme.test.mjs': "import test from 'node:test';\ntest('readme', () => {});\n",
+    });
+    const pending = engine.pendingApproval(work.id);
+    engine.decide(work.id, { action: 'approve', reviewer: 'Rae', confirmToken: pending.confirmToken, presence: 'test' });
+    engine.laneRetry(work.id, { actor: 'Rae', confirmToken: engine.pendingLaneRetry(work.id).confirmToken, presence: 'test' });
+    return work.id;
+  };
+  /** GitHub is unreachable for PR work (rules reads still work so the policy can accept). */
+  const flaky = (engine: Engine, failing: (capability: string) => boolean = (capability) => capability !== 'repo.rules.read') => {
+    const real = engine.lanePrTarget!.adapter;
+    const state = { down: true, requests: [] as Array<{ capability: string; arguments: Record<string, unknown> }> };
+    engine.lanePrTarget!.adapter = {
+      ...real,
+      invoke: async (request) => {
+        state.requests.push({ capability: request.capability, arguments: request.arguments });
+        if (state.down && failing(request.capability)) throw new Error('github down');
+        return real.invoke(request);
+      },
+    };
+    return state;
+  };
+  const acceptedWork = (engine: Engine, title: string) => {
+    const work = { ...engine.createTask({ title, text: `${title}.` }), currentState: 'ACCEPTED' as const };
+    engine.ctx.store.saveWork(work);
+    return work;
+  };
+  const events = (engine: Engine, workId: string, type: string) => engine.ctx.store.listEvents(workId).filter((event) => event.type === type);
+
+  it('FR-C3 resume authority: a newer approval of the same policy name cannot authorize a retry, and is not human acceptance', async () => {
+    const { dir, engine, github } = laneProject(dirs);
+    const net = flaky(engine);
+    const id = await readyForPolicyAcceptance(engine);
+    await expect(engine.syncFromMarkdown(id)).rejects.toThrow('github down');
+    expect(engine.ctx.store.getWork(id).currentState).toBe('ACCEPTED');
+    expect(engine.ctx.store.getLanePrRecord(id)).toBeUndefined();
+    writePolicy(dir, 'routine', ROUTINE_POLICY.replace('maxChangedLines: 40', 'maxChangedLines: 41'));
+    approve(engine, 'routine', 'Bo');
+    net.down = false;
+    await engine.syncFromMarkdown(id);
+    expect(engine.ctx.store.getLanePrRecord(id)).toBeUndefined();
+    expect(github.pullRequests?.['fixture/project'] ?? []).toHaveLength(0);
+    expect(events(engine, id, 'lane.pr-automation-blocked').at(-1)?.payload.reason).toMatch(/re-approved/);
+    expect(engine.ctx.store.listDecisions(id).filter((entry) => entry.gate === 'sqa-acceptance' && entry.actorType === 'human')).toHaveLength(0);
+    engine.ctx.store.close();
+  }, 120_000);
+
+  it('FR-C3 resume authority: a suspended policy blocks the retry of its acceptance', async () => {
+    const { engine, github } = laneProject(dirs);
+    const net = flaky(engine);
+    const id = await readyForPolicyAcceptance(engine);
+    await expect(engine.syncFromMarkdown(id)).rejects.toThrow('github down');
+    suspendPolicy(engine.ctx.store, 'routine', 'incident', 'agent');
+    net.down = false;
+    await engine.syncFromMarkdown(id);
+    expect(engine.ctx.store.getLanePrRecord(id)).toBeUndefined();
+    expect(github.pullRequests?.['fixture/project'] ?? []).toHaveLength(0);
+    expect(events(engine, id, 'lane.pr-automation-blocked').at(-1)?.payload.reason).toMatch(/suspended/);
+    engine.ctx.store.close();
+  }, 120_000);
+
+  it('FR-C4 target: a policy acceptance lands on the target its protection was evaluated against, not a re-resolved origin', async () => {
+    const { engine, github } = laneProject(dirs);
+    const net = flaky(engine);
+    const id = await readyForPolicyAcceptance(engine);
+    await expect(engine.syncFromMarkdown(id)).rejects.toThrow('github down');
+    expect(events(engine, id, 'lane.acceptance-target-bound').at(-1)?.payload).toMatchObject({ owner: 'fixture', repo: 'project', baseBranch: 'main' });
+    // Origin now resolves somewhere else; the resumed landing must not follow it.
+    Object.assign(engine.lanePrTarget!, { owner: 'other', repo: 'elsewhere', baseBranch: 'release' });
+    net.down = false;
+    await engine.syncFromMarkdown(id);
+    expect(engine.ctx.store.getLanePrRecord(id)).toMatchObject({ owner: 'fixture', repo: 'project', baseBranch: 'main', queueState: 'queued' });
+    expect(github.pullRequests?.['fixture/project']).toHaveLength(1);
+    expect(github.pullRequests?.['other/elsewhere']).toBeUndefined();
+    engine.ctx.store.close();
+  }, 120_000);
+
+  it('FR-C3 head: auto-merge is requested for exactly the accepted head', async () => {
+    const { dir, engine } = laneProject(dirs);
+    const net = flaky(engine, () => false);
+    net.down = false;
+    const work = engine.createTask({ title: 'Head oid', text: 'Pin the head on auto-merge.' });
+    const headSha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
+    await ensureAcceptedPr({ authorizationId: AUTH, store: engine.ctx.store, work, headSha, target: engine.lanePrTarget!, tools: engine.ctx.config.tools, policy: policyNow(engine), gatePassSha: headSha });
+    expect(net.requests.find((request) => request.capability === 'pr.merge')?.arguments).toMatchObject({ expectedHeadOid: headSha });
+    engine.ctx.store.close();
+  });
+
+  it('FR-C6 attempt: a removal GitHub already showed when the attempt began is not an ejection of the new acceptance', async () => {
+    const { engine, github } = laneProject(dirs);
+    const work = acceptedWork(engine, 'Old removal');
+    engine.ctx.store.saveLanePrRecord(prRecord(work.id, 7, { queueBaselineRemovalId: 'rm_1' }));
+    github.pullRequests!['fixture/project'] = [fixturePr(work.id, 7, { mergeQueueState: 'ejected', queueReason: 'required check failed', queueRemovalId: 'rm_1' })];
+    const stale = await engine.refreshLanePullRequest(work.id);
+    expect(stale.kind).toBe('open');
+    expect(stale.work.currentState).toBe('ACCEPTED');
+    expect(events(engine, work.id, 'lane.queue-ejected')).toHaveLength(0);
+    github.pullRequests!['fixture/project']![0]!.queueRemovalId = 'rm_2';
+    const fresh = await engine.refreshLanePullRequest(work.id);
+    expect(fresh.kind).toBe('ejected');
+    expect(fresh.work.currentState).toBe('CHANGES_REQUESTED');
+    expect(fresh.fixRound).toBe(1);
+    engine.ctx.store.close();
+  });
+
+  it('FR-C6 once: the same removal never starts a second fix round', async () => {
+    const { engine, github } = laneProject(dirs);
+    const work = acceptedWork(engine, 'One round');
+    engine.ctx.store.saveLanePrRecord(prRecord(work.id, 7));
+    github.pullRequests!['fixture/project'] = [fixturePr(work.id, 7, { mergeQueueState: 'ejected', queueReason: 'required check failed', queueRemovalId: 'rm_1' })];
+    expect((await engine.refreshLanePullRequest(work.id)).fixRound).toBe(1);
+    // The task is accepted again on the same PR while GitHub still shows that removal.
+    const again = engine.ctx.store.getWork(work.id);
+    engine.ctx.store.saveWork({ ...again, currentState: 'ACCEPTED' });
+    const second = await engine.refreshLanePullRequest(work.id);
+    expect(second.kind).toBe('open');
+    expect(second.work.currentState).toBe('ACCEPTED');
+    expect(events(engine, work.id, 'lane.queue-ejected')).toHaveLength(1);
+    expect(engine.ctx.store.getLanePrRecord(work.id)?.handledQueueRemovalId).toBe('rm_1');
+    engine.ctx.store.close();
+  });
+
+  it('FR-C6 attempt: a new head or acceptance on the same PR starts past the removal GitHub already showed', async () => {
+    const { dir, engine, github } = laneProject(dirs);
+    const work = engine.createTask({ title: 'Second attempt', text: 'Same PR, new acceptance.' });
+    const oldSha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
+    const input = { authorizationId: AUTH, store: engine.ctx.store, work, headSha: oldSha, target: engine.lanePrTarget!, tools: engine.ctx.config.tools, policy: policyNow(engine), gatePassSha: oldSha };
+    await ensureAcceptedPr(input);
+    Object.assign(github.pullRequests!['fixture/project']![0]!, { mergeQueueState: 'ejected', queueReason: 'conflict', queueRemovalId: 'rm_1' });
+    expect((await refreshLanePr({ store: engine.ctx.store, workId: work.id, target: engine.lanePrTarget! })).kind).toBe('ejected');
+    const newSha = `${oldSha.startsWith('a') ? 'b' : 'a'}${oldSha.slice(1)}`;
+    github.pullRequests!['fixture/project']![0]!.headSha = newSha;
+    const record = await ensureAcceptedPr({ ...input, authorizationId: 'dec_auth_2', headSha: newSha, gatePassSha: newSha });
+    expect(record).toMatchObject({ headSha: newSha, queueBaselineRemovalId: 'rm_1', queueState: 'queued' });
+    expect(record.handledQueueRemovalId).toBeUndefined();
+    // GitHub still lists only the old removal: it is not an ejection of this attempt.
+    github.pullRequests!['fixture/project']![0]!.mergeQueueState = 'ejected';
+    const result = await refreshLanePr({ store: engine.ctx.store, workId: work.id, target: engine.lanePrTarget! });
+    expect(result.kind).toBe('open');
+    expect(engine.ctx.store.getLanePrRecord(work.id)?.queueState).toBe('queued');
+    engine.ctx.store.close();
+  });
+
+  it('FR-G sampling: only a retry of the same authorization keeps the snapshot; a new acceptance or replacement PR re-snapshots', async () => {
+    const { dir, engine, github } = laneProject(dirs);
+    const work = engine.createTask({ title: 'Per attempt', text: 'Snapshot per landing attempt.' });
+    const headSha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
+    const policy = policyNow(engine);
+    const rated = (rate: number) => ({ ...policy, policy: { ...policy.policy, sampling: { ...policy.policy.sampling, rate } } });
+    const input = { authorizationId: AUTH, store: engine.ctx.store, work, headSha, target: engine.lanePrTarget!, tools: engine.ctx.config.tools, policy: rated(0.1), gatePassSha: headSha };
+    const first = await ensureAcceptedPr(input);
+    expect(first.authorizingPolicy).toEqual({ name: 'routine', samplingRate: 0.1 });
+    // Same authorization retried: the snapshot taken then is kept even if the policy now says otherwise.
+    const retried = await ensureAcceptedPr({ ...input, policy: rated(0.9) });
+    expect(retried.authorizingPolicy?.samplingRate).toBe(0.1);
+    // A new acceptance on the same PR snapshots its own policy...
+    const second = await ensureAcceptedPr({ ...input, authorizationId: 'dec_auth_2', policy: rated(0.5) });
+    expect(second.authorizingPolicy).toEqual({ name: 'routine', samplingRate: 0.5 });
+    // ...and a human acceptance inherits no policy at all.
+    const human = await ensureAcceptedPr({ ...input, authorizationId: 'dec_auth_3', policy: undefined });
+    expect(human.authorizingPolicy).toBeUndefined();
+    // A replacement PR takes a fresh snapshot rather than the closed PR's.
+    engine.ctx.store.saveLanePrRecord({ ...human, authorizingPolicy: { name: 'routine', samplingRate: 1 } });
+    github.pullRequests!['fixture/project']![0]!.state = 'closed';
+    const replacement = await ensureAcceptedPr({ ...input, authorizationId: 'dec_auth_3', policy: rated(0.3) });
+    expect(replacement.number).not.toBe(first.number);
+    expect(replacement.authorizingPolicy).toEqual({ name: 'routine', samplingRate: 0.3 });
+    engine.ctx.store.close();
+  });
+
+  it('FR-C2 resume: a gate status that never reached GitHub is retried although the head is unchanged', async () => {
+    const { engine, github } = laneProject(dirs, { approved: false });
+    const net = flaky(engine, (capability) => capability === 'commit.status');
+    const { work, head } = await acceptByHuman(engine, 'Status pending');
+    await expect(engine.waitForLanePr()).rejects.toThrow('github down');
+    expect(engine.ctx.store.getLanePrRecord(work.id)).toMatchObject({ headSha: head, prState: 'open' });
+    expect(engine.ctx.store.getLanePrRecord(work.id)?.statusPublished).toBeUndefined();
+    net.down = false;
+    await engine.syncFromMarkdown(work.id);
+    expect(engine.ctx.store.getLanePrRecord(work.id)?.statusPublished).toMatchObject({ sha: head });
+    expect(github.statuses?.[`fixture/project@${head}`]?.at(-1)).toMatchObject({ context: 'turbine/gate' });
+    const published = github.statuses![`fixture/project@${head}`]!.length;
+    await engine.syncFromMarkdown(work.id);
+    expect(github.statuses![`fixture/project@${head}`]).toHaveLength(published);
+    expect(github.pullRequests?.['fixture/project']).toHaveLength(1);
+    engine.ctx.store.close();
+  }, 120_000);
+
+  it('FR-C2 resume: a human-lane PR closed without merging is replaced on the next sync although the head is unchanged', async () => {
+    const { engine, github } = laneProject(dirs, { approved: false });
+    const { work } = await acceptByHuman(engine, 'Closed later');
+    await engine.waitForLanePr();
+    github.pullRequests!['fixture/project']![0]!.state = 'closed';
+    await engine.refreshLanePullRequest(work.id);
+    expect(engine.ctx.store.getLanePrRecord(work.id)).toMatchObject({ prState: 'closed', queueReason: 'PR was closed without merging' });
+    await engine.syncFromMarkdown(work.id);
+    expect(github.pullRequests?.['fixture/project']).toHaveLength(2);
+    expect(engine.ctx.store.getLanePrRecord(work.id)).toMatchObject({ number: 2, prState: 'open' });
+    expect(events(engine, work.id, 'lane.pr-replaced')).toHaveLength(1);
+    engine.ctx.store.close();
+  }, 120_000);
+
+  it('FR-C1 bound: a queued job is discarded when the accepted head or revision moved before it ran', async () => {
+    const { engine, github } = laneProject(dirs, { approved: false });
+    const moved = await acceptByHuman(engine, 'Head moves before drain');
+    const bumped = await acceptByHuman(engine, 'Revision moves before drain');
+    commitIn(engine.repoStates(moved.work.id)[0]!.worktreePath, 'late.txt');
+    const current = engine.ctx.store.getWork(bumped.work.id);
+    engine.ctx.store.saveWork({ ...current, currentRevision: current.currentRevision + 1 });
+    await engine.waitForLanePr();
+    expect(github.pullRequests?.['fixture/project'] ?? []).toHaveLength(0);
+    expect(engine.ctx.store.getLanePrRecord(moved.work.id)).toBeUndefined();
+    expect(events(engine, moved.work.id, 'lane.pr-automation-discarded').at(-1)?.payload.reason).toMatch(/head/);
+    expect(events(engine, bumped.work.id, 'lane.pr-automation-discarded').at(-1)?.payload.reason).toMatch(/revision/);
+    engine.ctx.store.close();
+  }, 180_000);
+
+  it('FR-C3 resume: a worktree that advanced past the accepted head is not landed; sync handles the new commit', async () => {
+    const { engine, github } = laneProject(dirs, { approved: false });
+    const net = flaky(engine, () => true);
+    const { work } = await acceptByHuman(engine, 'Advanced head');
+    await expect(engine.waitForLanePr()).rejects.toThrow('github down');
+    commitIn(engine.repoStates(work.id)[0]!.worktreePath, 'late.txt');
+    net.down = false;
+    const result = await engine.syncFromMarkdown(work.id);
+    expect(result.action).toBe('code.changed');
+    expect(engine.ctx.store.getLanePrRecord(work.id)).toBeUndefined();
+    expect(github.pullRequests?.['fixture/project'] ?? []).toHaveLength(0);
+    engine.ctx.store.close();
+  }, 120_000);
+
+  it('FR-G atomic: a merged PR, its merge facts and its audit sample commit together', async () => {
+    const { dir, engine, github } = laneProject(dirs);
+    const work = engine.createTask({ title: 'Atomic merge', text: 'Commit merge facts together.' });
+    const headSha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
+    const record = await ensureAcceptedPr({ authorizationId: AUTH, store: engine.ctx.store, work, headSha, target: engine.lanePrTarget!, tools: engine.ctx.config.tools, policy: policyNow(engine), gatePassSha: headSha });
+    engine.ctx.store.saveLanePrRecord({ ...record, authorizingPolicy: { name: 'routine', samplingRate: 1 } });
+    Object.assign(github.pullRequests!['fixture/project']![0]!, { state: 'merged', mergedAt: new Date().toISOString(), mergeSha: 'fedcba9876543210' });
+    const failing = vi.spyOn(engine.ctx.store, 'enqueueLaneAudit').mockImplementation(() => { throw new Error('queue write failed'); });
+    await expect(refreshLanePr({ store: engine.ctx.store, workId: work.id, target: engine.lanePrTarget! })).rejects.toThrow('queue write failed');
+    expect(engine.ctx.store.getLanePrRecord(work.id)?.queueState).toBe('queued');
+    expect(engine.ctx.store.listLaneMergeRecords().filter((entry) => entry.mergeState === 'merged')).toHaveLength(0);
+    failing.mockRestore();
+    // A suspension check that fails after the commit cannot undo the committed facts.
+    const unreadable = vi.spyOn(engine.ctx.store, 'getLanePolicy').mockImplementation(() => { throw new Error('policy store unreadable'); });
+    await expect(refreshLanePr({ store: engine.ctx.store, workId: work.id, target: engine.lanePrTarget! })).rejects.toThrow('policy store unreadable');
+    unreadable.mockRestore();
+    expect(engine.ctx.store.getLanePrRecord(work.id)?.queueState).toBe('merged');
+    expect(engine.ctx.store.listLaneMergeRecords().filter((entry) => entry.mergeState === 'merged')).toHaveLength(1);
+    expect(engine.ctx.store.listLaneAudits()).toHaveLength(1);
+    engine.ctx.store.close();
+  });
+
+  it('FR-C6 reachable: sync polls an ACCEPTED task\'s recorded PR, so a queue ejection returns it to CHANGES_REQUESTED', async () => {
+    const { engine, github } = laneProject(dirs, { approved: false });
+    const { work } = await acceptByHuman(engine, 'Ejected later');
+    await engine.waitForLanePr();
+    Object.assign(github.pullRequests!['fixture/project']![0]!, { mergeQueueState: 'ejected', queueReason: 'required check failed', queueRemovalId: 'rm_5' });
+    await engine.syncFromMarkdown(work.id);
+    expect(events(engine, work.id, 'lane.queue-ejected')[0]?.payload).toMatchObject({ reason: 'required check failed', fixRound: 1, removalId: 'rm_5' });
+    expect(engine.ctx.store.getWork(work.id).currentState).not.toBe('ACCEPTED');
+    engine.ctx.store.close();
+  }, 120_000);
+
+  it('FR-C6 reachable: `turbine task pr-refresh` is an operator command', async () => {
+    const { dir, engine } = laneProject(dirs);
+    const work = acceptedWork(engine, 'CLI refresh');
+    engine.ctx.store.close();
+    const here = dirname(fileURLToPath(import.meta.url));
+    const factory = resolve(here, '../..');
+    const run = (args: string[]) =>
+      spawnSync(join(factory, 'node_modules', '.bin', 'tsx'), [join(factory, 'apps', 'cli', 'src', 'index.ts'), ...args], {
+        cwd: dir, encoding: 'utf8', env: { ...process.env, INIT_CWD: dir, PWD: dir }, input: '',
+      });
+    const help = run(['task', 'pr-refresh', '--help']);
+    expect(help.status).toBe(0);
+    expect(help.stdout).toContain('Poll the recorded PR');
+    const refused = run(['task', 'pr-refresh', work.id]);
+    expect(refused.status).not.toBe(0);
+    expect(`${refused.stdout}${refused.stderr}`).toMatch(/GitHub repository|No PR recorded/);
+  }, 60_000);
 });
 
 type FetchRoute = (url: string) => unknown;
@@ -403,47 +695,78 @@ const invokeLive = (capability: 'repo.rules.read' | 'pr.read', args: Record<stri
   live().invoke({ capability, workId: 'w', arguments: { owner: 'o', repo: 'r', ...args }, correlationId: 'c' }) as Promise<{ data: Record<string, unknown> }>;
 
 describe('Part C GitHub adapter live rules and queue state', () => {
-  const rulesetRoutes = (include: string[], defaultBranch: string | Error, exclude: string[] = []) => (url: string) => {
-    if (url.includes('/rulesets?')) return [{ id: 1, enforcement: 'active' }];
-    if (url.includes('/rulesets/1')) {
-      return {
-        target: 'branch',
-        conditions: { ref_name: { include, exclude } },
-        rules: [{ type: 'merge_queue' }, { type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'turbine/gate' }] } }],
-      };
-    }
-    return defaultBranch instanceof Error ? defaultBranch : { default_branch: defaultBranch };
+  const queueRule = { type: 'merge_queue', parameters: {} };
+  const gateRule = { type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'turbine/gate' }] } };
+  const seen: string[] = [];
+  const rulesFor = (rules: unknown) => (url: string) => {
+    seen.push(url);
+    return rules;
   };
 
-  it('FR-C4: ~DEFAULT_BRANCH only counts for the repo default branch', async () => {
-    stubGitHub(rulesetRoutes(['~DEFAULT_BRANCH'], 'develop'));
+  it('FR-C4: the exact branch is evaluated by GitHub ("Get rules for a branch"), never by local pattern matching', async () => {
+    seen.length = 0;
+    stubGitHub(rulesFor([queueRule, gateRule]));
+    expect((await invokeLive('repo.rules.read', { branch: 'release/1.0' })).data).toMatchObject({ status: 'confirmed', mergeQueueRequired: true, turbineGateRequired: true });
+    expect(seen[0]).toContain('/repos/o/r/rules/branches/release%2F1.0?');
+    expect(seen.some((url) => url.includes('/rulesets'))).toBe(false);
+    stubGitHub(rulesFor([gateRule]));
+    expect((await invokeLive('repo.rules.read', { branch: 'main' })).data).toMatchObject({ status: 'confirmed', mergeQueueRequired: false, turbineGateRequired: true });
+    stubGitHub(rulesFor([]));
     expect((await invokeLive('repo.rules.read', { branch: 'main' })).data).toMatchObject({ status: 'confirmed', mergeQueueRequired: false, turbineGateRequired: false });
-    expect((await invokeLive('repo.rules.read', { branch: 'develop' })).data).toMatchObject({ mergeQueueRequired: true, turbineGateRequired: true });
   });
 
-  it('FR-C4: an unreadable default branch or an unevaluable pattern is unknown, not a match', async () => {
-    stubGitHub(rulesetRoutes(['~DEFAULT_BRANCH'], new Error('forbidden')));
+  it('FR-C4: an unreadable, malformed or oversized rules answer is unknown, not a guess', async () => {
+    stubGitHub(rulesFor(new Error('forbidden')));
     expect((await invokeLive('repo.rules.read', { branch: 'main' })).data).toMatchObject({ status: 'unknown' });
-    stubGitHub(rulesetRoutes(['refs/heads/[mn]ain'], 'main'));
+    stubGitHub(rulesFor({ message: 'not a list' }));
+    expect((await invokeLive('repo.rules.read', { branch: 'main' })).data).toMatchObject({ status: 'unknown' });
+    stubGitHub(rulesFor([queueRule, 'garbage']));
+    expect((await invokeLive('repo.rules.read', { branch: 'main' })).data).toMatchObject({ status: 'unknown' });
+    stubGitHub(rulesFor([{ type: 'required_status_checks', parameters: {} }]));
+    expect((await invokeLive('repo.rules.read', { branch: 'main' })).data).toMatchObject({ status: 'unknown' });
+    // A full page every time never ends: the page budget stops the walk and reports unknown.
+    const full = Array.from({ length: 100 }, () => ({ type: 'deletion' }));
+    stubGitHub(rulesFor(full));
     expect((await invokeLive('repo.rules.read', { branch: 'main' })).data).toMatchObject({ status: 'unknown' });
   });
 
-  it('FR-C4: globs and excludes apply to the exact base branch', async () => {
-    stubGitHub(rulesetRoutes(['refs/heads/release/*'], 'main'));
-    expect((await invokeLive('repo.rules.read', { branch: 'main' })).data).toMatchObject({ status: 'confirmed', mergeQueueRequired: false });
-    stubGitHub(rulesetRoutes(['refs/heads/ma*'], 'main'));
-    expect((await invokeLive('repo.rules.read', { branch: 'main' })).data).toMatchObject({ mergeQueueRequired: true });
-    stubGitHub(rulesetRoutes(['~ALL'], 'main', ['refs/heads/main']));
-    expect((await invokeLive('repo.rules.read', { branch: 'main' })).data).toMatchObject({ mergeQueueRequired: false });
+  it('FR-C4: rules on a later page still count', async () => {
+    const full = Array.from({ length: 100 }, () => ({ type: 'deletion' }));
+    stubGitHub((url) => (new URL(url).searchParams.get('page') === '1' ? full : [queueRule, gateRule]));
+    expect((await invokeLive('repo.rules.read', { branch: 'main' })).data).toMatchObject({ status: 'confirmed', mergeQueueRequired: true, turbineGateRequired: true });
+  });
+
+  it('FR-C3: auto-merge is enabled for exactly the accepted head (expectedHeadOid)', async () => {
+    const bodies: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    vi.stubGlobal('fetch', async (_url: string | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ data: { enablePullRequestAutoMerge: { pullRequest: { number: 3 } } } }), { status: 200 });
+    });
+    await live().invoke({ capability: 'pr.merge', workId: 'w', arguments: { owner: 'o', repo: 'r', number: 3, nodeId: 'PR_3', expectedHeadOid: 'abc1234' }, correlationId: 'c' });
+    expect(bodies[0]!.query).toContain('expectedHeadOid:$oid');
+    expect(bodies[0]!.variables).toMatchObject({ id: 'PR_3', oid: 'abc1234' });
+    await expect(
+      live().invoke({ capability: 'pr.merge', workId: 'w', arguments: { owner: 'o', repo: 'r', number: 3, nodeId: 'PR_3' }, correlationId: 'c' }),
+    ).rejects.toThrow(/expectedHeadOid is required/);
+    expect(bodies).toHaveLength(1);
+  });
+
+  it('FR-C3: the fixture adapter also refuses auto-merge when the head is not the expected one', async () => {
+    const github = { pullRequests: { 'o/r': [{ number: 3, nodeId: 'PR_3', url: 'https://github.com/o/r/pull/3', head: 'h', headSha: 'aaaaaaa', base: 'main', state: 'open' as const }] } };
+    const adapter = createGitHubAdapter({ fixtures: github });
+    await expect(
+      adapter.invoke({ capability: 'pr.merge', workId: 'w', arguments: { owner: 'o', repo: 'r', number: 3, expectedHeadOid: 'bbbbbbb' }, correlationId: 'c' }),
+    ).rejects.toThrow(/not the expected head/);
+    expect((github.pullRequests['o/r'][0] as { mergeQueueState?: string }).mergeQueueState).toBeUndefined();
   });
 
   const prJson = { number: 3, node_id: 'PR_3', html_url: 'https://github.com/o/r/pull/3', state: 'open', merged: false, head: { sha: 'abc1234', ref: 'turbine/w' }, base: { ref: 'main' } };
   const prRoutes = (graphql: unknown) => (url: string) => (url.endsWith('/graphql') ? graphql : prJson);
 
   it('FR-C6: pr.read reports ejection only with a GitHub removal reason, else nothing', async () => {
-    const removed = (reason: string | null) => ({ data: { node: { mergeQueueEntry: null, timelineItems: { nodes: [{ __typename: 'RemovedFromMergeQueueEvent', reason }] } } } });
+    const removed = (reason: string | null) => ({ data: { node: { mergeQueueEntry: null, timelineItems: { nodes: [{ __typename: 'RemovedFromMergeQueueEvent', id: 'rm_9', reason }] } } } });
     stubGitHub(prRoutes(removed('required check failed')));
-    expect((await invokeLive('pr.read', { number: 3 })).data).toMatchObject({ mergeQueueState: 'ejected', queueReason: 'required check failed' });
+    expect((await invokeLive('pr.read', { number: 3 })).data).toMatchObject({ mergeQueueState: 'ejected', queueReason: 'required check failed', queueRemovalId: 'rm_9' });
     stubGitHub(prRoutes(removed(null)));
     expect((await invokeLive('pr.read', { number: 3 })).data.mergeQueueState).toBeUndefined();
     stubGitHub(prRoutes({ data: { node: { mergeQueueEntry: null, timelineItems: { nodes: [{ __typename: 'AddedToMergeQueueEvent' }] } } } }));
@@ -452,5 +775,13 @@ describe('Part C GitHub adapter live rules and queue state', () => {
     expect((await invokeLive('pr.read', { number: 3 })).data.mergeQueueState).toBeUndefined();
     stubGitHub(prRoutes({ data: { node: { mergeQueueEntry: { id: 'e' }, timelineItems: { nodes: [] } } } }));
     expect((await invokeLive('pr.read', { number: 3 })).data.mergeQueueState).toBe('queued');
+  });
+
+  it('FR-C6: pr.read names the newest removal even while re-queued, so an old removal can be told from a new one', async () => {
+    stubGitHub(prRoutes({ data: { node: { mergeQueueEntry: { id: 'e' }, timelineItems: { nodes: [{ __typename: 'RemovedFromMergeQueueEvent', id: 'rm_1', reason: 'conflict' }, { __typename: 'AddedToMergeQueueEvent' }] } } } }));
+    expect((await invokeLive('pr.read', { number: 3 })).data).toMatchObject({ mergeQueueState: 'queued', queueRemovalId: 'rm_1' });
+    // A removal without an event id cannot be told apart from an old one: nothing is reported.
+    stubGitHub(prRoutes({ data: { node: { mergeQueueEntry: null, timelineItems: { nodes: [{ __typename: 'RemovedFromMergeQueueEvent', reason: 'conflict' }] } } } }));
+    expect((await invokeLive('pr.read', { number: 3 })).data.mergeQueueState).toBeUndefined();
   });
 });

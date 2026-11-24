@@ -1661,6 +1661,36 @@ task
     }
   });
 
+task
+  .command('pr-refresh')
+  .argument('<id>')
+  .option('--json')
+  .description('Poll the recorded PR: record a merge, or return an ejected task to CHANGES_REQUESTED (also runs on sync)')
+  .action(async (id, opts) => {
+    try {
+      const engine = withEngine();
+      try {
+        const result = await engine.refreshLanePullRequest(id);
+        printResult(
+          {
+            id: result.work.id,
+            state: result.work.currentState,
+            pr: result.record.number,
+            result: result.kind,
+            queueState: result.record.queueState,
+            ...(result.reason ? { reason: result.reason } : {}),
+            ...('fixRound' in result ? { fixRound: result.fixRound } : {}),
+          },
+          !!opts.json,
+        );
+      } finally {
+        engine.ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
 program
   .command('metrics')
   .option('--policy <name>', 'Policy name, or "human"')

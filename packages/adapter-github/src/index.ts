@@ -24,6 +24,8 @@ export type GitHubPullRequest = {
   state: 'open' | 'merged' | 'closed';
   mergeQueueState?: 'queued' | 'ejected';
   queueReason?: string;
+  /** Identity of the newest merge-queue removal GitHub shows; an ejection counts only if it is a new one. */
+  queueRemovalId?: string;
   mergedAt?: string;
   mergeSha?: string;
 };
@@ -44,6 +46,9 @@ export type GitHubConfig = {
 };
 
 const issueKey = (owner: string, repo: string, number: number) => `${owner}/${repo}#${number}`;
+
+const RULES_PAGE_SIZE = 100;
+const MAX_RULE_PAGES = 10;
 
 const MARKER_RE = /<!-- turbine-packet-mirror:([^\s]+) -->/;
 
@@ -106,44 +111,34 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
         if (!token) throw err('E_ADAPTER', 'GitHub token missing (GITHUB_TOKEN)');
         const api = httpsApiBase(config);
         const headers = liveHeaders(token);
-        const list = await fetch(`${api}/repos/${owner}/${repo}/rulesets?includes_parents=true&per_page=100`, { headers, ...liveFetchInit() });
-        if (!list.ok) return { data: { status: 'unknown', reason: `rulesets read failed: ${list.status}` } };
-        const summaries = (await list.json()) as Array<{ id: number; enforcement?: string }>;
-        let defaultBranch: string | undefined;
+        // GitHub evaluates the exact branch itself ("Get rules for a branch"): every active ruleset that
+        // applies, including parent/org rulesets, ~DEFAULT_BRANCH and fnmatch patterns. Never re-derive that locally.
+        const rules: unknown[] = [];
+        for (let page = 1; ; page++) {
+          if (page > MAX_RULE_PAGES) return { data: { status: 'unknown', reason: `rules for ${branch} exceed ${MAX_RULE_PAGES} pages` } };
+          const res = await fetch(
+            `${api}/repos/${owner}/${repo}/rules/branches/${encodeURIComponent(branch)}?per_page=${RULES_PAGE_SIZE}&page=${page}`,
+            { headers, ...liveFetchInit() },
+          );
+          if (!res.ok) return { data: { status: 'unknown', reason: `branch rules read failed: ${res.status}` } };
+          const body = (await res.json()) as unknown;
+          if (!Array.isArray(body)) return { data: { status: 'unknown', reason: 'branch rules response was not a list' } };
+          rules.push(...body);
+          if (body.length < RULES_PAGE_SIZE) break;
+        }
         let mergeQueueRequired = false;
         let turbineGateRequired = false;
-        for (const summary of summaries.filter((entry) => entry.enforcement === 'active')) {
-          const detail = await fetch(`${api}/repos/${owner}/${repo}/rulesets/${summary.id}`, { headers, ...liveFetchInit() });
-          if (!detail.ok) return { data: { status: 'unknown', reason: `ruleset ${summary.id} read failed: ${detail.status}` } };
-          const ruleset = (await detail.json()) as {
-            target?: string;
-            conditions?: { ref_name?: { include?: string[]; exclude?: string[] } };
-            rules?: Array<{ type?: string; parameters?: { required_status_checks?: Array<{ context?: string }> } }>;
-          };
-          if (ruleset.target && ruleset.target !== 'branch') continue;
-          const patterns = [...(ruleset.conditions?.ref_name?.include ?? []), ...(ruleset.conditions?.ref_name?.exclude ?? [])];
-          if (patterns.includes('~DEFAULT_BRANCH') && defaultBranch === undefined) {
-            try {
-              const info = (await liveJson(config, `/repos/${owner}/${repo}`, 'GET')) as { default_branch?: string };
-              defaultBranch = info.default_branch;
-            } catch (e) {
-              return { data: { status: 'unknown', reason: `default branch read failed: ${(e as Error).message}` } };
-            }
-            if (!defaultBranch) return { data: { status: 'unknown', reason: 'default branch could not be determined' } };
+        for (const rule of rules) {
+          const entry = rule as { type?: unknown; parameters?: { required_status_checks?: unknown } } | null;
+          if (!entry || typeof entry !== 'object' || typeof entry.type !== 'string') {
+            return { data: { status: 'unknown', reason: 'branch rules response contained an unreadable rule' } };
           }
-          const matches = (ref: string) => matchRulesetRef(ref, branch, defaultBranch);
-          const included = (ruleset.conditions?.ref_name?.include ?? []).map(matches);
-          const excluded = (ruleset.conditions?.ref_name?.exclude ?? []).map(matches);
-          if (included.includes('unknown') || excluded.includes('unknown')) {
-            return { data: { status: 'unknown', reason: `ruleset ${summary.id} ref pattern cannot be matched to ${branch}` } };
+          if (entry.type === 'merge_queue') mergeQueueRequired = true;
+          if (entry.type === 'required_status_checks') {
+            const checks = entry.parameters?.required_status_checks;
+            if (!Array.isArray(checks)) return { data: { status: 'unknown', reason: 'a required_status_checks rule had unreadable parameters' } };
+            if (checks.some((check) => (check as { context?: unknown } | null)?.context === 'turbine/gate')) turbineGateRequired = true;
           }
-          if (!included.includes('yes') || excluded.includes('yes')) continue;
-          mergeQueueRequired ||= ruleset.rules?.some((rule) => rule.type === 'merge_queue') ?? false;
-          turbineGateRequired ||= ruleset.rules?.some(
-            (rule) =>
-              rule.type === 'required_status_checks' &&
-              rule.parameters?.required_status_checks?.some((check) => check.context === 'turbine/gate'),
-          ) ?? false;
         }
         return { data: { status: 'confirmed', mergeQueueRequired, turbineGateRequired } };
       }
@@ -225,9 +220,15 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
       }
 
       if (capability === 'pr.merge') {
+        // GitHub enforces this: auto-merge is enabled for exactly the accepted head, never a head pushed meanwhile.
+        const expectedHeadOid = String(args.expectedHeadOid ?? '');
+        if (!expectedHeadOid) throw err('E_ADAPTER', 'expectedHeadOid is required for auto-merge');
         if (config.fixtures) {
           const pr = config.fixtures.pullRequests?.[repoKey]?.find((entry) => entry.number === number);
           if (!pr) throw err('E_ADAPTER', `fixture PR #${number} not found`);
+          if (pr.headSha !== expectedHeadOid) {
+            throw err('E_ADAPTER', `fixture PR #${number} head ${pr.headSha} is not the expected head ${expectedHeadOid}`);
+          }
           pr.mergeQueueState = 'queued';
           return { data: { number, queueState: 'queued' } };
         }
@@ -235,8 +236,8 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
         if (!nodeId) throw err('E_ADAPTER', 'PR nodeId is required for auto-merge');
         const data = await liveGraphql(
           config,
-          `mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id}){pullRequest{number}}}`,
-          { id: nodeId },
+          `mutation($id:ID!,$oid:GitObjectID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,expectedHeadOid:$oid}){pullRequest{number}}}`,
+          { id: nodeId, oid: expectedHeadOid },
         );
         return { data };
       }
@@ -405,38 +406,30 @@ async function liveGraphql(config: GitHubConfig, query: string, variables: Recor
 }
 
 /**
- * Match one ruleset ref pattern against the exact base branch. `~DEFAULT_BRANCH` only matches when
- * the repo's default branch is that branch; patterns we cannot evaluate are `unknown`, never a match.
- */
-function matchRulesetRef(pattern: string, branch: string, defaultBranch?: string): 'yes' | 'no' | 'unknown' {
-  if (pattern === '~ALL') return 'yes';
-  if (pattern === '~DEFAULT_BRANCH') return defaultBranch === undefined ? 'unknown' : defaultBranch === branch ? 'yes' : 'no';
-  if (pattern.includes('[')) return 'unknown';
-  const source = pattern
-    .split('**')
-    .map((part) => part.split('*').map((piece) => piece.replace(/[.+^${}()|\\?]/g, (ch) => (ch === '?' ? '[^/]' : `\\${ch}`))).join('[^/]*'))
-    .join('.*');
-  return new RegExp(`^${source}$`).test(`refs/heads/${branch}`) ? 'yes' : 'no';
-}
-
-/**
- * Merge-queue state from GitHub itself. Ejected needs a removal event with a reason that is newer than
- * any queue entry; anything unreadable or unexplained reports nothing so the caller preserves state.
+ * Merge-queue state from GitHub itself. Ejected needs the newest queue event to be a removal with a reason;
+ * `queueRemovalId` names the newest removal so callers can tell an old removal from the current attempt's.
+ * Anything unreadable or unexplained reports nothing so the caller preserves state.
  */
 async function liveQueueState(
   config: GitHubConfig,
   nodeId: string,
-): Promise<{ mergeQueueState?: 'queued' | 'ejected'; queueReason?: string }> {
+): Promise<{ mergeQueueState?: 'queued' | 'ejected'; queueReason?: string; queueRemovalId?: string }> {
   try {
     const data = (await liveGraphql(
       config,
-      `query($id:ID!){node(id:$id){... on PullRequest{mergeQueueEntry{id} timelineItems(last:10,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{__typename ... on RemovedFromMergeQueueEvent{reason}}}}}}`,
+      `query($id:ID!){node(id:$id){... on PullRequest{mergeQueueEntry{id} timelineItems(last:10,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{__typename ... on RemovedFromMergeQueueEvent{id reason}}}}}}`,
       { id: nodeId },
-    )) as { node?: { mergeQueueEntry?: { id: string } | null; timelineItems?: { nodes?: Array<{ __typename?: string; reason?: string | null }> } } | null };
-    if (data.node?.mergeQueueEntry) return { mergeQueueState: 'queued' };
-    const last = data.node?.timelineItems?.nodes?.at(-1);
+    )) as { node?: { mergeQueueEntry?: { id: string } | null; timelineItems?: { nodes?: Array<{ __typename?: string; id?: string; reason?: string | null }> } } | null };
+    const nodes = data.node?.timelineItems?.nodes ?? [];
+    const lastRemoval = [...nodes].reverse().find((node) => node.__typename === 'RemovedFromMergeQueueEvent' && node.id);
+    const queueRemovalId = lastRemoval?.id;
+    if (data.node?.mergeQueueEntry) return { mergeQueueState: 'queued', ...(queueRemovalId ? { queueRemovalId } : {}) };
+    const last = nodes.at(-1);
     const reason = last?.reason?.trim();
-    if (last?.__typename === 'RemovedFromMergeQueueEvent' && reason) return { mergeQueueState: 'ejected', queueReason: reason };
+    if (last?.__typename === 'RemovedFromMergeQueueEvent' && last.id && reason) {
+      return { mergeQueueState: 'ejected', queueReason: reason, queueRemovalId: last.id };
+    }
+    return queueRemovalId ? { queueRemovalId } : {};
   } catch {
     // Unconfirmed: preserve the recorded state.
   }

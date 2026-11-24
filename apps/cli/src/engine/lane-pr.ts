@@ -8,7 +8,8 @@ import {
 } from '@turbine-hall/turbine-contracts';
 import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import type { Capability, ToolAdapter } from '@turbine-hall/turbine-tools';
-import { recordPolicyMerge } from './lane-audit.js';
+import { savePolicyMergeFacts } from './lane-audit.js';
+import { evaluateSuspendWhen } from './lane-metrics.js';
 
 export type LanePrTarget = {
   adapter: ToolAdapter;
@@ -69,6 +70,7 @@ type LivePr = {
   base?: string;
   mergeQueueState?: 'queued' | 'ejected';
   queueReason?: string;
+  queueRemovalId?: string;
   mergedAt?: string;
   mergeSha?: string;
 };
@@ -96,16 +98,43 @@ function assertLivePrMatches(live: LivePr, record: LanePrRecord, target: LanePrT
   if (live.headSha !== headSha) throw err('E_STALE_REVISION', `PR #${record.number} head ${live.headSha} is not accepted head ${headSha}`);
 }
 
+export type GateState = 'pending' | 'success' | 'failure';
+
+/** The turbine/gate state that belongs on `headSha`: success only for a PASS bound to that exact commit. */
+export function desiredGateState(headSha: string, gatePassSha?: string): GateState {
+  return gatePassSha === headSha ? 'success' : gatePassSha ? 'failure' : 'pending';
+}
+
+/**
+ * Whether landing work for the accepted `headSha` is still owed, independent of the head changing: the
+ * record is missing, belongs to another head or authorization, its gate status never reached GitHub (or
+ * differs from what should be there), the PR was closed unmerged, or auto-merge was requested but unconfirmed.
+ */
+export function landingIncomplete(
+  record: LanePrRecord | undefined,
+  input: { headSha: string; authorizationId: string; gatePassSha?: string; policy: boolean },
+): boolean {
+  if (!record) return true;
+  if (record.queueState === 'merged') return false;
+  if (record.headSha !== input.headSha || record.authorizationId !== input.authorizationId) return true;
+  if (record.prState === 'closed') return true;
+  const gate = desiredGateState(input.headSha, input.gatePassSha);
+  if (record.statusPublished?.sha !== input.headSha || record.statusPublished.state !== gate) return true;
+  return input.policy && gate === 'success' && record.queueState === 'not-enabled';
+}
+
 export async function ensureAcceptedPr(input: {
   store: WorkStore;
   work: WorkPackage;
   headSha: string;
+  /** The sqa-acceptance Decision authorizing this landing attempt. */
+  authorizationId: string;
   target: LanePrTarget;
   tools: { allow: string[]; denied: string[] };
   policy?: ApprovedLanePolicy;
   gatePassSha?: string;
 }): Promise<LanePrRecord> {
-  const { store, work, headSha, target, tools, policy } = input;
+  const { store, work, headSha, authorizationId, target, tools, policy } = input;
   if (!configAllows(tools, 'pr.create')) throw err('E_MISSING_CAPABILITY', 'pr.create is not allowed by project config');
   if (policy && !policy.policy.tools.includes('pr.create')) {
     throw err('E_MISSING_CAPABILITY', `Lane policy ${policy.name} does not grant pr.create`);
@@ -113,16 +142,19 @@ export async function ensureAcceptedPr(input: {
   const timestamp = new Date().toISOString();
   const previous = store.getLanePrRecord(work.id);
   let record = previous;
+  let live: LivePr | undefined;
   if (record) {
     assertRecordedTarget(record, target);
-    const live = (await readPr(target, work.id, record.number)).data;
+    live = (await readPr(target, work.id, record.number)).data;
     if (live.state === 'merged') return record;
     // A PR closed without merging cannot land; find or create an open replacement.
     if (live.state === 'closed') record = undefined;
   }
-  // Snapshot the terms that authorized landing; later policy edits must not change how the merge is sampled.
+  // The authorizing policy terms belong to ONE landing attempt. Only a retry of the same authorization on the
+  // same PR keeps its snapshot; a new acceptance or a replacement PR snapshots the policy it was authorized by.
+  const snapshot = policy ? { name: policy.name, samplingRate: policy.policy.sampling.rate } : undefined;
   const authorizingPolicy =
-    previous?.authorizingPolicy ?? (policy ? { name: policy.name, samplingRate: policy.policy.sampling.rate } : undefined);
+    record && record.authorizationId === authorizationId && record.authorizingPolicy ? record.authorizingPolicy : snapshot;
   if (!record) {
     const created = await invoke<{
       number: number;
@@ -151,6 +183,8 @@ export async function ensureAcceptedPr(input: {
       headSha,
       gateState: 'pending',
       queueState: 'not-enabled',
+      prState: 'open',
+      authorizationId,
       authorizingPolicy,
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -163,7 +197,9 @@ export async function ensureAcceptedPr(input: {
           type: 'lane.pr-replaced',
           payload: { closedNumber: previous.number, number: saved.number },
         });
-      } else {
+      }
+      // One merge record per task; the open one is reused, never duplicated, when the PR is replaced.
+      if (!store.listLaneMergeRecords().some((entry) => entry.workId === work.id && entry.mergeState === 'open')) {
         store.saveLaneMergeRecord({
           id: createId('merge'),
           workId: work.id,
@@ -176,32 +212,53 @@ export async function ensureAcceptedPr(input: {
       }
       return saved;
     });
-  } else if (record.headSha !== headSha || (policy && !record.authorizingPolicy)) {
+  } else if (record.headSha !== headSha || record.authorizationId !== authorizationId) {
+    // A new head or a new acceptance is a new attempt: nothing from the previous attempt (gate state, queue
+    // state, a removal GitHub already showed) may carry over.
     record = store.saveLanePrRecord({
       ...record,
-      ...(record.headSha !== headSha
-        ? { headSha, gateState: 'pending' as const, queueState: 'not-enabled' as const, queueReason: undefined }
-        : {}),
+      headSha,
+      gateState: 'pending',
+      queueState: 'not-enabled',
+      queueReason: undefined,
+      statusPublished: undefined,
+      handledQueueRemovalId: undefined,
+      queueBaselineRemovalId: live?.queueRemovalId,
+      prState: 'open',
+      authorizationId,
       authorizingPolicy,
       updatedAt: timestamp,
     });
   }
 
-  const gateState = input.gatePassSha === headSha ? 'success' : input.gatePassSha ? 'failure' : 'pending';
+  const gateState = desiredGateState(headSha, input.gatePassSha);
   await invoke(target, 'commit.status', work.id, {
     sha: headSha,
     context: 'turbine/gate',
     state: gateState,
     description: gateState === 'success' ? 'Turbine gate passed at this commit' : 'Turbine gate is not passed at this commit',
   });
-  record = store.saveLanePrRecord({ ...record, gateState, updatedAt: new Date().toISOString() });
+  // Recorded only after GitHub accepted it, so a failed publication stays visible as incomplete work.
+  record = store.saveLanePrRecord({
+    ...record,
+    gateState,
+    statusPublished: { sha: headSha, state: gateState },
+    prState: 'open',
+    updatedAt: new Date().toISOString(),
+  });
 
   if (policy) {
     if (!configAllows(tools, 'pr.merge')) throw err('E_MISSING_CAPABILITY', 'pr.merge is not allowed by project config');
     if (!policy.policy.tools.includes('pr.merge')) throw err('E_MISSING_CAPABILITY', `Lane policy ${policy.name} does not grant pr.merge`);
     if (gateState !== 'success') return record;
     assertLivePrMatches((await readPr(target, work.id, record.number)).data, record, target, headSha);
-    await invoke(target, 'pr.merge', work.id, { number: record.number, nodeId: record.nodeId, mode: 'auto-merge-only', admin: false });
+    await invoke(target, 'pr.merge', work.id, {
+      number: record.number,
+      nodeId: record.nodeId,
+      mode: 'auto-merge-only',
+      admin: false,
+      expectedHeadOid: headSha,
+    });
     // Enabling auto-merge is a request; only GitHub reporting queue membership makes the task "queued".
     const confirmed = (await readPr(target, work.id, record.number)).data.mergeQueueState === 'queued';
     record = store.saveLanePrRecord({
@@ -219,53 +276,69 @@ export async function refreshLanePr(input: {
   workId: string;
   target: LanePrTarget;
   policy?: ApprovedLanePolicy;
-}): Promise<{ kind: 'open' | 'ejected' | 'merged'; record: LanePrRecord; reason?: string }> {
-  const current = input.store.getLanePrRecord(input.workId);
+}): Promise<{ kind: 'open' | 'ejected' | 'merged'; record: LanePrRecord; reason?: string; removalId?: string }> {
+  const { store } = input;
+  const current = store.getLanePrRecord(input.workId);
   if (!current) throw err('E_NOT_FOUND', `No PR recorded for ${input.workId}`);
   // Poll the repo the PR was created in, even if origin has since changed.
   const result = await readPr({ ...input.target, owner: current.owner, repo: current.repo }, input.workId, current.number);
   const at = new Date().toISOString();
   if (result.data.state === 'merged' && result.data.mergedAt && result.data.mergeSha) {
-    const record = input.store.saveLanePrRecord({ ...current, queueState: 'merged', updatedAt: at });
-    const priorRecords = input.store.listLaneMergeRecords().filter((entry) => entry.workId === input.workId);
-    const alreadyRecorded = priorRecords.find(
-      (entry) => entry.mergeState === 'merged' && entry.mergeSha === result.data.mergeSha,
-    );
-    if (alreadyRecorded) return { kind: 'merged', record };
-    const opened = priorRecords.find((entry) => entry.mergeState === 'open');
-    const merge = {
-      id: opened?.id ?? createId('merge'),
-      workId: input.workId,
-      policyId: current.authorizingPolicy?.name ?? input.policy?.name ?? null,
-      openedAt: opened?.openedAt ?? current.createdAt,
-      mergeState: 'merged' as const,
-      mergedAt: result.data.mergedAt,
-      mergeSha: result.data.mergeSha,
-      reverted: 'unknown' as const,
-      fixRounds: input.store.listEvents(input.workId).filter((event) => event.type === 'lane.queue-ejected').length,
-      recordedAt: at,
-    };
-    if (merge.policyId) recordPolicyMerge(input.store, merge, { rate: current.authorizingPolicy?.samplingRate });
-    else input.store.saveLaneMergeRecord(merge);
-    return { kind: 'merged', record };
+    const { mergedAt, mergeSha } = result.data;
+    // The merged PR record, the Part G merge facts and the audit sample commit together or not at all.
+    const outcome = store.transaction(() => {
+      const record = store.saveLanePrRecord({ ...current, queueState: 'merged', updatedAt: at });
+      const priorRecords = store.listLaneMergeRecords().filter((entry) => entry.workId === input.workId);
+      if (priorRecords.some((entry) => entry.mergeState === 'merged' && entry.mergeSha === mergeSha)) {
+        return { record, policyId: null as string | null };
+      }
+      const opened = priorRecords.find((entry) => entry.mergeState === 'open');
+      const merge = {
+        id: opened?.id ?? createId('merge'),
+        workId: input.workId,
+        policyId: current.authorizingPolicy?.name ?? input.policy?.name ?? null,
+        openedAt: opened?.openedAt ?? current.createdAt,
+        mergeState: 'merged' as const,
+        mergedAt,
+        mergeSha,
+        reverted: 'unknown' as const,
+        fixRounds: store.listEvents(input.workId).filter((event) => event.type === 'lane.queue-ejected').length,
+        recordedAt: at,
+      };
+      if (merge.policyId) savePolicyMergeFacts(store, merge, { rate: current.authorizingPolicy?.samplingRate });
+      else store.saveLaneMergeRecord(merge);
+      return { record, policyId: merge.policyId };
+    });
+    // Suspension is a consequence of committed facts; it must never roll them back.
+    if (outcome.policyId) evaluateSuspendWhen(store, outcome.policyId);
+    return { kind: 'merged', record: outcome.record };
   }
   if (result.data.state === 'closed') {
-    const record = input.store.saveLanePrRecord({
+    const record = store.saveLanePrRecord({
       ...current,
       queueState: 'not-enabled',
       queueReason: 'PR was closed without merging',
+      prState: 'closed',
       updatedAt: at,
     });
     return { kind: 'open', record };
   }
-  // Ejection needs GitHub's own removal reason; an unexplained signal preserves the recorded state.
+  // Ejection needs GitHub's own removal reason AND a removal that belongs to this attempt: one GitHub already
+  // showed when the attempt began, or one that already started a fix round, is not a new ejection.
   const reason = result.data.queueReason?.trim();
-  if (result.data.mergeQueueState === 'ejected' && reason) {
-    const record = input.store.saveLanePrRecord({ ...current, queueState: 'ejected', queueReason: reason, updatedAt: at });
-    return { kind: 'ejected', record, reason };
+  const removalId = result.data.queueRemovalId;
+  if (
+    result.data.mergeQueueState === 'ejected' &&
+    reason &&
+    removalId &&
+    removalId !== current.queueBaselineRemovalId &&
+    removalId !== current.handledQueueRemovalId
+  ) {
+    const record = store.saveLanePrRecord({ ...current, queueState: 'ejected', queueReason: reason, updatedAt: at });
+    return { kind: 'ejected', record, reason, removalId };
   }
   if (result.data.mergeQueueState === 'queued' && current.queueState !== 'queued') {
-    return { kind: 'open', record: input.store.saveLanePrRecord({ ...current, queueState: 'queued', queueReason: undefined, updatedAt: at }) };
+    return { kind: 'open', record: store.saveLanePrRecord({ ...current, queueState: 'queued', queueReason: undefined, updatedAt: at }) };
   }
   return { kind: 'open', record: current };
 }
