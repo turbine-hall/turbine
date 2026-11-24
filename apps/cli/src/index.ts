@@ -26,7 +26,10 @@ import {
 import { splitFrontmatter } from './engine/knowledge/frontmatter.js';
 import { Engine } from './engine/engine.js';
 import { initProject, openContext } from './engine/project.js';
+import { ensureBoard } from './board/launch.js';
 import { handleError, printResult } from './output.js';
+import { callerCwd, factoryRoot, findProjectRoot, resolveProjectPath } from './paths.js';
+import { HUMAN_PRESENCE, ask, askReviewer, assertHumanTerminal } from './human-gate.js';
 import { callerCwd, factoryRoot, findProjectRoot } from './paths.js';
 import { HUMAN_PRESENCE, ask, askReviewer, assertHumanTerminal, gitUserName } from './human-gate.js';
 import { repoToplevel } from './engine/context/git-read.js';
@@ -75,16 +78,38 @@ program
       } finally {
         store.close();
       }
+      let boardUrl: string | undefined;
+      try {
+        const board = await ensureBoard(result.paths.root);
+        boardUrl = board.url;
+      } catch (e) {
+        process.stderr.write(`Warning: task board did not start: ${(e as Error).message}\n`);
+      }
       printResult(
         {
           message: 'Initialized Turbine Hall project',
           createdOrEnsured: result.created,
           config: result.paths.configPath,
           note: 'Re-running init is idempotent and does not overwrite edited project.yaml',
+          ...(boardUrl ? { board: boardUrl } : {}),
           ...(context ? { context } : {}),
         },
         false,
       );
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+program
+  .command('board')
+  .option('--project <path>', 'Project path')
+  .description('Open the task board, starting it if this project does not have one yet')
+  .action(async (opts) => {
+    try {
+      const projectRoot = resolveProjectPath(opts.project);
+      const board = await ensureBoard(projectRoot);
+      printResult({ url: board.url, started: board.started }, false);
     } catch (e) {
       handleError(e);
     }
