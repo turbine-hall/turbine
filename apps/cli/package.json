@@ -1,13 +1,38 @@
 {
   "name": "@turbine-hall/turbine-cli",
   "version": "0.5.0",
+  "description": "Turbine Hall CLI — governed human/AI software workflow",
   "type": "module",
   "bin": {
     "turbine": "./dist/index.js"
   },
   "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "frameworks",
+    "roles",
+    "skills"
+  ],
+  "engines": {
+    "node": "^22.13.0 || ^24.0.0 || >=26.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/turbine-hall/turbine.git",
+    "directory": "apps/cli"
+  },
+  "homepage": "https://github.com/turbine-hall/turbine#readme",
+  "bugs": {
+    "url": "https://github.com/turbine-hall/turbine/issues"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "copy-factory": "node ./scripts/copy-factory.mjs",
+    "build": "tsc -p tsconfig.json && pnpm run copy-factory",
+    "prepack": "pnpm run copy-factory",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx src/index.ts"
   },

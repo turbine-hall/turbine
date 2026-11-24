@@ -1,0 +1,28 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@3.1.1/schema.json",
+  "changelog": "@changesets/cli/changelog",
+  "commit": false,
+  "fixed": [
+    [
+      "@turbine-hall/turbine-cli",
+      "@turbine-hall/turbine-adapter-git",
+      "@turbine-hall/turbine-adapter-github",
+      "@turbine-hall/turbine-adapter-jira",
+      "@turbine-hall/turbine-adapter-tests",
+      "@turbine-hall/turbine-contracts",
+      "@turbine-hall/turbine-core",
+      "@turbine-hall/turbine-evidence-contract",
+      "@turbine-hall/turbine-executor",
+      "@turbine-hall/turbine-lineage-impact",
+      "@turbine-hall/turbine-models",
+      "@turbine-hall/turbine-skills",
+      "@turbine-hall/turbine-storage-sqlite",
+      "@turbine-hall/turbine-tools"
+    ]
+  ],
+  "linked": [],
+  "access": "public",
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "ignore": []
+}

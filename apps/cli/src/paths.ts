@@ -23,18 +23,26 @@ export function resolveProjectPath(projectPath?: string): string {
   return resolve(callerCwd(), projectPath);
 }
 
-/** Monorepo root containing frameworks/, roles/, skills/, packages/ */
+/**
+ * Root that holds frameworks/, roles/, and skills/.
+ * After `copy-factory`, both the monorepo root and apps/cli have those dirs; prefer the
+ * workspace root (pnpm-workspace.yaml) so monorepo fixtures like examples/ still resolve.
+ * A published install only has the package root, so that wins there.
+ */
 export function factoryRoot(): string {
+  const marker = join('frameworks', 'turbine', '0.5.0', 'framework.json');
   const candidates = [
-    resolve(here, '../../..'),
+    resolve(here, '..'), // apps/cli or installed package root (dist/ → ..)
+    resolve(here, '../..'),
+    resolve(here, '../../..'), // monorepo root from apps/cli/src|dist
     resolve(here, '../../../..'),
     process.cwd(),
     callerCwd(),
   ];
-  for (const c of candidates) {
-    if (existsSync(join(c, 'frameworks', 'turbine', '0.5.0', 'framework.json'))) return c;
-  }
-  return resolve(here, '../../..');
+  const matches = candidates.filter((c) => existsSync(join(c, marker)));
+  if (matches.length === 0) return resolve(here, '../../..');
+  const workspace = matches.find((c) => existsSync(join(c, 'pnpm-workspace.yaml')));
+  return workspace ?? matches[0]!;
 }
 
 export function projectPaths(projectRoot: string) {
