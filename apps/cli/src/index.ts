@@ -1535,6 +1535,7 @@ async function decideCommand(id: string, action: 'approve' | 'reject', reason?: 
       reason: why,
       presence: HUMAN_PRESENCE,
     });
+    await engine.waitForLanePr();
     out.write('\nRecorded as a local attestation (identity not cryptographically verified).\n');
     const work = (result as { work: { id: string; currentState: string } }).work;
     printResult({ id: work.id, state: work.currentState }, false);

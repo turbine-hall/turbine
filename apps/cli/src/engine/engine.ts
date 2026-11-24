@@ -140,6 +140,13 @@ import { measuredTurbineTokens, summarizeUsage } from './usage.js';
 import { policyStatuses, readPolicyFiles, resolvePolicyReviewers, type PolicyStatus } from './lane-policy.js';
 import { evaluateLaneEligibility, LANE_GATE_FOR_STATE, type LaneEvaluation, type LaneFacts } from './lane-eligibility.js';
 import { evaluateSuspendWhen, policyForReviewPair } from './lane-metrics.js';
+import {
+  configAllows,
+  confirmMergeQueueProtection,
+  ensureAcceptedPr,
+  refreshLanePr,
+  type LanePrTarget,
+} from './lane-pr.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -233,6 +240,11 @@ export class Engine {
    */
   mirrorFixtureMode = false;
   private mirrorJob: Promise<MirrorRunResult | undefined> = Promise.resolve(undefined);
+  /** Fixture seam for Part C. Live mode derives owner/repo from origin. */
+  lanePrTarget?: LanePrTarget;
+  private lanePrJob: Promise<unknown> = Promise.resolve();
+  private pendingLanePr?: () => Promise<void>;
+  private lanePrError?: Error;
 
   constructor(readonly ctx: EngineContext) {
     ensureDefaultMock();
@@ -242,6 +254,96 @@ export class Engine {
   /** Await the latest packet-mirror attempt (tests / sync). */
   async waitForMirror(): Promise<MirrorRunResult | undefined> {
     return this.mirrorJob;
+  }
+
+  async waitForLanePr(): Promise<void> {
+    const pending = this.pendingLanePr;
+    this.pendingLanePr = undefined;
+    if (pending) {
+      this.lanePrError = undefined;
+      this.lanePrJob = this.lanePrJob.then(pending).catch((e) => {
+        this.lanePrError = e as Error;
+      });
+    }
+    await this.lanePrJob;
+    if (this.lanePrError) throw this.lanePrError;
+  }
+
+  private resolveLanePrTarget(): LanePrTarget | undefined {
+    if (this.lanePrTarget) return this.lanePrTarget;
+    const remote = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: this.ctx.projectRoot, encoding: 'utf8' });
+    if (remote.status !== 0) return undefined;
+    const value = remote.stdout.trim().replace(/\.git$/, '');
+    const match = value.match(/github\.com[/:]([^/]+)\/([^/]+)$/i);
+    if (!match) return undefined;
+    return {
+      adapter: createGitHubAdapter({ apiBaseUrl: process.env.GITHUB_API_BASE_URL }),
+      owner: match[1]!,
+      repo: match[2]!,
+      baseBranch: (this.ctx.config as { git?: { defaultBaseBranch?: string } }).git?.defaultBaseBranch ?? 'main',
+    };
+  }
+
+  private policyForAcceptedWork(workId: string): ApprovedLanePolicy | undefined {
+    const decision = this.ctx.store
+      .listDecisions(workId)
+      .filter((entry) => entry.gate === 'sqa-acceptance' && entry.action === 'approve' && !entry.invalidatedAt)
+      .sort((a, b) => a.decidedAt.localeCompare(b.decidedAt) || a.id.localeCompare(b.id))
+      .at(-1);
+    return decision?.actorType === 'policy' && decision.policyId
+      ? (this.ctx.store.getLanePolicy(decision.policyId) ?? undefined)
+      : undefined;
+  }
+
+  private queueAcceptedPr(work: WorkPackage, policy = this.policyForAcceptedWork(work.id)): void {
+    const target = this.resolveLanePrTarget();
+    const headSha = this.currentCommit(work.id);
+    if (!target || !headSha) return;
+    this.pendingLanePr = async () => {
+      const gate = this.gateDecision(work.id);
+      try {
+        await ensureAcceptedPr({
+          store: this.ctx.store,
+          work,
+          headSha,
+          target,
+          tools: this.ctx.config.tools,
+          policy,
+          gatePassSha: gate.decision === 'PASS' ? headSha : undefined,
+        });
+      } catch (e) {
+        this.ctx.store.appendEvent({
+          workId: work.id,
+          type: 'lane.pr-automation-failed',
+          payload: { reason: (e as Error).message },
+        });
+        throw e;
+      }
+    };
+  }
+
+  /** Poll the recorded PR. Queue ejection starts a fix round; merge writes Part G's merge store. */
+  async refreshLanePullRequest(idOrAlias: string) {
+    const work = this.ctx.store.getWork(idOrAlias);
+    const target = this.resolveLanePrTarget();
+    if (!target) throw err('E_INVALID_CONFIG', 'Cannot determine the GitHub repository for lane PR automation');
+    const result = await refreshLanePr({
+      store: this.ctx.store,
+      workId: work.id,
+      target,
+      policy: this.policyForAcceptedWork(work.id),
+    });
+    if (result.kind === 'ejected' && work.currentState === 'ACCEPTED') {
+      const fixRound = this.ctx.store.listEvents(work.id).filter((event) => event.type === 'lane.queue-ejected').length + 1;
+      const next = this.toChangesRequested(work, 'queue-ejected');
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'lane.queue-ejected',
+        payload: { reason: result.reason, fixRound, prNumber: result.record.number },
+      });
+      return { ...result, work: next, fixRound };
+    }
+    return { ...result, work };
   }
 
   /** Turbine role_runs + external usage_records summary for a task. */
@@ -642,7 +744,7 @@ export class Engine {
   }
 
   /** Enters CHANGES_REQUESTED and records it: each entry starts a new review cycle with a fresh file selection. */
-  private toChangesRequested(work: WorkPackage, cause: 'code-review' | 'verification-failed' | 'acceptance-failed'): WorkPackage {
+  private toChangesRequested(work: WorkPackage, cause: 'code-review' | 'verification-failed' | 'acceptance-failed' | 'queue-ejected'): WorkPackage {
     const next = transition(work, 'CHANGES_REQUESTED');
     // The event and the state are saved together: a failed state write must not leave an event that would count as
     // a review cycle, and a retried transition must add exactly one.
@@ -3216,6 +3318,7 @@ export class Engine {
       });
     });
     this.render(work.id, ['Accepted (not deployed). Task complete for R0/R1.']);
+    this.queueAcceptedPr(work);
     return { work, accepted: true };
   }
 
@@ -3877,6 +3980,22 @@ export class Engine {
         };
       }
       const facts = this.laneFacts(work, gate);
+      if (gate === 'acceptance') {
+        const target = this.resolveLanePrTarget();
+        const protection = target
+          ? await confirmMergeQueueProtection(target, work.id)
+          : {
+              status: 'unknown' as const,
+              mergeQueueRequired: false,
+              turbineGateRequired: false,
+              reason: 'GitHub repository or adapter is unavailable',
+            };
+        facts.lanePr = {
+          configAllowsCreate: configAllows(this.ctx.config.tools, 'pr.create'),
+          configAllowsMerge: configAllows(this.ctx.config.tools, 'pr.merge'),
+          protection,
+        };
+      }
       let evaluations = active.map((p) => evaluateLaneEligibility(p, facts));
       const winnerIdx = evaluations.findIndex((e) => e.status === 'eligible');
       if (winnerIdx < 0) return this.laneFallback(work, gate, evaluations, unusable);
@@ -3933,6 +4052,10 @@ export class Engine {
       const saved = this.savePolicyPass(work, facts, winner, evaluations[winnerIdx]!);
       if ('work' in saved) {
         this.render(work.id, [`${LANE_GATE_LABEL[gate]} ${saved.decision.rationale}.`]);
+        if (saved.work.currentState === 'ACCEPTED') {
+          this.queueAcceptedPr(saved.work, winner);
+          await this.waitForLanePr();
+        }
         return { status: 'passed', work: saved.work, gate, policy: winner.name, decision: saved.decision, reasons: [] };
       }
       if ('ineligible' in saved) {

@@ -12,6 +12,7 @@ import type {
   Evidence,
   LaneAuditRecord,
   LaneMergeRecord,
+  LanePrRecord,
   RecoveryPlan,
   RepoSnapshot,
   RoleRun,
@@ -37,6 +38,7 @@ import {
   GitObjectIdSchema,
   LaneAuditRecordSchema,
   LaneMergeRecordSchema,
+  LanePrRecordSchema,
   RecoveryPlanSchema,
   RepoSnapshotSchema,
   RoleRunSchema,
@@ -911,7 +913,14 @@ export class WorkStore {
     this.db
       .prepare(
         `INSERT INTO lane_merge_records(id, work_id, policy_id, opened_at, merged_at, data, recorded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           work_id = excluded.work_id,
+           policy_id = excluded.policy_id,
+           opened_at = excluded.opened_at,
+           merged_at = excluded.merged_at,
+           data = excluded.data,
+           recorded_at = excluded.recorded_at`,
       )
       .run(
         parsed.id,
@@ -937,6 +946,34 @@ export class WorkStore {
         throw err('E_INVALID_CONFIG', `Stored lane merge record ${row.id} is unreadable: ${(e as Error).message}`);
       }
     });
+  }
+
+  saveLanePrRecord(record: LanePrRecord): LanePrRecord {
+    const parsed = LanePrRecordSchema.parse(record);
+    this.db
+      .prepare(
+        `INSERT INTO lane_pr_records(work_id, number, head_sha, data, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(work_id) DO UPDATE SET
+           number = excluded.number,
+           head_sha = excluded.head_sha,
+           data = excluded.data,
+           updated_at = excluded.updated_at`,
+      )
+      .run(parsed.workId, parsed.number, parsed.headSha, JSON.stringify(parsed), parsed.updatedAt);
+    return parsed;
+  }
+
+  getLanePrRecord(workId: string): LanePrRecord | undefined {
+    const row = this.db.prepare(`SELECT data FROM lane_pr_records WHERE work_id = ?`).get(workId) as
+      | { data: string }
+      | undefined;
+    if (!row) return undefined;
+    try {
+      return LanePrRecordSchema.parse(JSON.parse(row.data));
+    } catch (e) {
+      throw err('E_INVALID_CONFIG', `Stored lane PR record for ${workId} is unreadable: ${(e as Error).message}`);
+    }
   }
 
   enqueueLaneAudit(record: LaneAuditRecord): LaneAuditRecord {

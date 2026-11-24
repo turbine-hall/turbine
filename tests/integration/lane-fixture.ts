@@ -4,6 +4,7 @@ import { openContext } from '../../apps/cli/src/engine/project.js';
 import { Engine } from '../../apps/cli/src/engine/engine.js';
 import { approvePolicy, pendingPolicyApproval } from '../../apps/cli/src/engine/lane-policy.js';
 import { createMockModelAdapter, registerModel } from '../../packages/models/dist/index.js';
+import { createGitHubAdapter, type GitHubFixtureState } from '../../packages/adapter-github/dist/index.js';
 import { commitIn, tempProject } from './fixture.js';
 
 export const ROUTINE_POLICY = [
@@ -21,6 +22,7 @@ export const ROUTINE_POLICY = [
   '  - ".github/**"',
   '  - ".turbine/**"',
   'gates: [requirements, plan, acceptance]',
+  'tools: [pr.create, pr.merge]',
   '',
 ].join('\n');
 
@@ -57,9 +59,22 @@ export function laneProject(dirs: string[], opts: { policy?: string; approved?: 
   engine.ctx.config.models.profiles['review-secondary'] = { provider: 'mock', model: 'mock-review-secondary', maxOutputTokens: 3000 };
   registerModel(createMockModelAdapter('mock-review-primary'));
   registerModel(createMockModelAdapter('mock-review-secondary'));
+  engine.ctx.config.tools.allow.push('pr.create', 'pr.merge');
+  engine.ctx.config.tools.denied = engine.ctx.config.tools.denied.filter((capability) => capability !== 'pr.merge');
+  const github: GitHubFixtureState = {
+    pullRequests: {},
+    statuses: {},
+    protections: { 'fixture/project:main': { mergeQueueRequired: true, requiredStatuses: ['turbine/gate'] } },
+  };
+  engine.lanePrTarget = {
+    adapter: createGitHubAdapter({ fixtures: github }),
+    owner: 'fixture',
+    repo: 'project',
+    baseBranch: 'main',
+  };
   writePolicy(dir, 'routine', opts.policy ?? ROUTINE_POLICY);
   if (opts.approved !== false) approve(engine, 'routine');
-  return { dir, engine };
+  return { dir, engine, github };
 }
 
 export const P0 = [{ id: 'FR-001', statement: 'The README heading reads "fixture fixed"', kind: 'behavioral' as const, status: 'confirmed' as const, priority: 'P0' as const }];

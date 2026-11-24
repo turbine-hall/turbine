@@ -75,7 +75,7 @@
 
 ### 1.2 Hard non-goals in R0/R1
 
-No custom IDE, autonomous multi-agent corporation, agent marketplace, Jira replacement, project-management UI, foundation-model training, arbitrary shell execution from untrusted inputs, self-modifying policy, remote skill auto-install, automatic production deployments, auto-merge, cross-tenant hosted service, enterprise identity claims, unsupported “security certification,” or guaranteed development productivity improvements.
+No custom IDE, autonomous multi-agent corporation, agent marketplace, Jira replacement, project-management UI, foundation-model training, arbitrary shell execution from untrusted inputs, self-modifying policy, remote skill auto-install, automatic production deployments, direct/admin-bypass auto-merge outside the guarded autonomous lane, cross-tenant hosted service, enterprise identity claims, unsupported “security certification,” or guaranteed development productivity improvements.
 
 ### 1.3 Build-vs-reuse
 
@@ -769,6 +769,12 @@ A policy merge is sampled reproducibly at `sampling.rate` (default `0.1`). The m
 
 After policy passes, merge records and audit outcomes, Turbine evaluates `suspendWhen`. Omitted thresholds use the safety defaults: revert rate above 2% over the last 50 known merges, at least two problems in the last 20 completed audits, or reviewer disagreement above 30%. Unknown revert facts cannot trigger a rate suspension. Crossing a threshold records an engine reason through `policy suspend`; the policy stays suspended until a human explicitly resumes it, and subsequent eligible tasks follow the human flow.
 
+### 8.3C Autonomous lane PR and merge-queue landing (#32 part C)
+
+When a task reaches `ACCEPTED`, the GitHub adapter creates or reuses the PR for `turbine/<work-id>` when project config allows `pr.create`; a lane task additionally requires that exact capability in its approved policy. The store records the PR number and head SHA. Turbine publishes `turbine/gate` on that SHA: only a PASS bound to the exact head is `success`; a changed head resets it to `pending`.
+
+Before policy acceptance, GitHub rulesets must confirm that the base branch requires both merge queue and `turbine/gate`. Missing rules, API errors or insufficient permissions are `unknown` and leave acceptance to a human. Lane landing requires `pr.merge` in both project config and the approved policy, and only enables GitHub auto-merge into the queue. It never pushes to the base, invokes direct merge or requests admin bypass. Queue ejection returns the task to `CHANGES_REQUESTED` with the reason and increments its fix-round record. A successful merge writes merged SHA/time to the Part G store; later revert detection and stacked PRs remain deferred.
+
 ### 8.4 R2+ commands (not implemented in R0/R1)
 
 ```bash
@@ -849,7 +855,7 @@ Interactive approval shows: work ID, stage, actor/identity assurance, proposed a
 | Suspend a lane policy | Anyone, agents included | Anyone |
 | Approve code/SQA | Local human attestations, or a recorded eligible lane-policy pass (dual AI evidence for code review) | Independent authenticated human roles |
 | Sync Jira/edit remote | Disabled until explicit R2 feature | Permission + diff-bound approval |
-| Push/merge/deploy | **Forbidden in R0/R1 engine** | Separate guarded workflows |
+| Push/merge/deploy | Base push, direct/admin merge and deploy are forbidden; an approved lane may enable merge-queue auto-merge under §8.3C | Separate guarded workflows |
 
 ### 9.3 Evidence and invalidation rules
 
@@ -858,7 +864,7 @@ Interactive approval shows: work ID, stage, actor/identity assurance, proposed a
 - If source commit changes after review/verification, affected checks and approvals must rerun.
 - A rejected review links findings to the commit and moves to `CHANGES_REQUESTED` with a valid return target.
 - Passing tests do not override a failed manual acceptance criterion. An LLM statement does not count as a test run.
-- `ACCEPTED` requires completed requirements, plan, implementation, applicable independent review, target checks, human SQA evidence and explicit human acceptance for the current revision. **Exception (autonomous lane, #26/#28):** an active, human-approved lane policy that lists `acceptance` may replace the human SQA evidence and acceptance decision with a `policy` decision for that revision, only when every P0 requirement has FULL traceability, every configured quality check passed at the current commit, no required obligation is unmet or waived, code review for that commit was passed either by a human or by the policy's complete clean dual-review evidence, and (with `humanGates.requirePrApproval`) the PR is approved at that commit. The human approval behind it covers the policy file, not this revision's evidence; any failed condition sends the task to a human.
+- `ACCEPTED` requires completed requirements, plan, implementation, applicable independent review, target checks, human SQA evidence and explicit human acceptance for the current revision. **Exception (autonomous lane, #26/#28/#32):** an active, human-approved lane policy that lists `acceptance` may replace the human SQA evidence and acceptance decision with a `policy` decision for that revision, only when every P0 requirement has FULL traceability, every configured quality check passed at the current commit, no required obligation is unmet or waived, code review for that commit was passed either by a human or by the policy's complete clean dual-review evidence, project config and policy both grant `pr.create`/`pr.merge`, and GitHub confirms the base requires merge queue plus `turbine/gate`. The human approval behind it covers the policy file, not this revision's evidence; any failed or unknown condition sends the task to a human.
 
 ### 9.3A EEC gate and recovery UX
 

@@ -14,14 +14,33 @@ export type GitHubComment = {
   updatedAt: string;
 };
 
+export type GitHubPullRequest = {
+  number: number;
+  nodeId: string;
+  url: string;
+  head: string;
+  headSha: string;
+  base: string;
+  state: 'open' | 'merged' | 'closed';
+  mergeQueueState?: 'queued' | 'ejected';
+  queueReason?: string;
+  mergedAt?: string;
+  mergeSha?: string;
+};
+
+export type GitHubFixtureState = {
+  comments?: Record<string, GitHubComment[]>;
+  pullRequests?: Record<string, GitHubPullRequest[]>;
+  statuses?: Record<string, Array<{ context: string; state: 'pending' | 'success' | 'failure'; description?: string }>>;
+  protections?: Record<string, { mergeQueueRequired: boolean; requiredStatuses: string[] } | { error: string }>;
+};
+
 export type GitHubConfig = {
   /** e.g. https://api.github.com — unused in fixture mode */
   apiBaseUrl?: string;
   token?: string;
   /** Offline / CI: in-memory comments keyed by `owner/repo#number` */
-  fixtures?: {
-    comments?: Record<string, GitHubComment[]>;
-  };
+  fixtures?: GitHubFixtureState;
 };
 
 const issueKey = (owner: string, repo: string, number: number) => `${owner}/${repo}#${number}`;
@@ -50,7 +69,7 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
 
   return {
     id: 'github',
-    capabilities: ['issue.read', 'issue.comment'] as Capability[],
+    capabilities: ['issue.read', 'issue.comment', 'pr.create', 'pr.read', 'pr.merge', 'commit.status', 'repo.rules.read'] as Capability[],
     async healthCheck() {
       if (config.fixtures) return { ok: true, details: 'fixture-mode' };
       if (!resolveToken(config)) return { ok: false, details: 'Missing GITHUB_TOKEN / token' };
@@ -62,15 +81,183 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
       return { ok: true, details: 'configured' };
     },
     async invoke({ capability, arguments: args }) {
+      const owner = String(args.owner ?? '');
+      const repo = String(args.repo ?? '');
+      if (!owner || !repo) throw err('E_ADAPTER', 'GitHub owner and repo are required');
+      const repoKey = `${owner}/${repo}`;
+
+      if (capability === 'repo.rules.read') {
+        const branch = String(args.branch ?? '');
+        if (!branch) throw err('E_ADAPTER', 'branch is required');
+        if (config.fixtures) {
+          const value = config.fixtures.protections?.[`${repoKey}:${branch}`];
+          if (!value || 'error' in value) {
+            return { data: { status: 'unknown', reason: value && 'error' in value ? value.error : 'protection fixture missing' } };
+          }
+          return {
+            data: {
+              status: 'confirmed',
+              mergeQueueRequired: value.mergeQueueRequired,
+              turbineGateRequired: value.requiredStatuses.includes('turbine/gate'),
+            },
+          };
+        }
+        const token = resolveToken(config);
+        if (!token) throw err('E_ADAPTER', 'GitHub token missing (GITHUB_TOKEN)');
+        const api = httpsApiBase(config);
+        const headers = liveHeaders(token);
+        const list = await fetch(`${api}/repos/${owner}/${repo}/rulesets?includes_parents=true`, { headers, ...liveFetchInit() });
+        if (!list.ok) return { data: { status: 'unknown', reason: `rulesets read failed: ${list.status}` } };
+        const summaries = (await list.json()) as Array<{ id: number; enforcement?: string }>;
+        let mergeQueueRequired = false;
+        let turbineGateRequired = false;
+        for (const summary of summaries.filter((entry) => entry.enforcement === 'active')) {
+          const detail = await fetch(`${api}/repos/${owner}/${repo}/rulesets/${summary.id}`, { headers, ...liveFetchInit() });
+          if (!detail.ok) return { data: { status: 'unknown', reason: `ruleset ${summary.id} read failed: ${detail.status}` } };
+          const ruleset = (await detail.json()) as {
+            conditions?: { ref_name?: { include?: string[]; exclude?: string[] } };
+            rules?: Array<{ type?: string; parameters?: { required_status_checks?: Array<{ context?: string }> } }>;
+          };
+          const includes = ruleset.conditions?.ref_name?.include ?? [];
+          const excludes = ruleset.conditions?.ref_name?.exclude ?? [];
+          const branchRef = `refs/heads/${branch}`;
+          if (
+            !includes.some((ref) => ref === branchRef || ref === '~DEFAULT_BRANCH' || ref === '~ALL') ||
+            excludes.some((ref) => ref === branchRef || ref === '~DEFAULT_BRANCH' || ref === '~ALL')
+          ) continue;
+          mergeQueueRequired ||= ruleset.rules?.some((rule) => rule.type === 'merge_queue') ?? false;
+          turbineGateRequired ||= ruleset.rules?.some(
+            (rule) =>
+              rule.type === 'required_status_checks' &&
+              rule.parameters?.required_status_checks?.some((check) => check.context === 'turbine/gate'),
+          ) ?? false;
+        }
+        return { data: { status: 'confirmed', mergeQueueRequired, turbineGateRequired } };
+      }
+
+      if (capability === 'pr.create') {
+        const head = String(args.head ?? '');
+        const headSha = String(args.headSha ?? '');
+        const base = String(args.base ?? '');
+        const title = String(args.title ?? '');
+        const body = String(args.body ?? '');
+        if (!head || !headSha || !base || !title) throw err('E_ADAPTER', 'PR head, headSha, base, and title are required');
+        if (config.fixtures) {
+          const list = (config.fixtures.pullRequests ??= {})[repoKey] ??= [];
+          const existing = list.find((pr) => pr.head === head && pr.state === 'open');
+          if (existing) return { data: existing, externalOperationId: String(existing.number) };
+          const number = Math.max(0, ...list.map((pr) => pr.number)) + 1;
+          const created: GitHubPullRequest = {
+            number,
+            nodeId: `PR_${number}`,
+            url: `https://github.com/${repoKey}/pull/${number}`,
+            head,
+            headSha,
+            base,
+            state: 'open',
+          };
+          list.push(created);
+          return { data: created, externalOperationId: String(number) };
+        }
+        const open = await liveJson(
+          config,
+          `/repos/${owner}/${repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}`,
+          'GET',
+        ) as Array<{ number: number; node_id: string; html_url: string; head: { sha: string; ref: string }; base: { ref: string } }>;
+        const existing = open[0];
+        if (existing) {
+          return {
+            data: {
+              number: existing.number,
+              nodeId: existing.node_id,
+              url: existing.html_url,
+              head: existing.head.ref,
+              headSha: existing.head.sha,
+              base: existing.base.ref,
+              state: 'open',
+            },
+            externalOperationId: String(existing.number),
+          };
+        }
+        const json = await liveJson(config, `/repos/${owner}/${repo}/pulls`, 'POST', { title, head, base, body }) as {
+          number: number; node_id: string; html_url: string; head: { sha: string; ref: string }; base: { ref: string };
+        };
+        return {
+          data: { number: json.number, nodeId: json.node_id, url: json.html_url, head: json.head.ref, headSha: json.head.sha, base: json.base.ref, state: 'open' },
+          externalOperationId: String(json.number),
+        };
+      }
+
+      const number = Number(args.number ?? args.issueNumber);
+      if ((capability === 'pr.read' || capability === 'pr.merge') && (!Number.isInteger(number) || number <= 0)) {
+        throw err('E_ADAPTER', 'positive PR number is required');
+      }
+
+      if (capability === 'commit.status') {
+        const sha = String(args.sha ?? '');
+        const state = String(args.state ?? '');
+        const context = String(args.context ?? '');
+        if (!sha || !['pending', 'success', 'failure'].includes(state) || !context) throw err('E_ADAPTER', 'valid status sha, state, and context are required');
+        if (config.fixtures) {
+          const list = (config.fixtures.statuses ??= {})[`${repoKey}@${sha}`] ??= [];
+          list.push({ context, state: state as 'pending' | 'success' | 'failure', description: args.description == null ? undefined : String(args.description) });
+          return { data: { sha, state, context } };
+        }
+        const data = await liveJson(config, `/repos/${owner}/${repo}/statuses/${encodeURIComponent(sha)}`, 'POST', {
+          state,
+          context,
+          description: args.description,
+        });
+        return { data };
+      }
+
+      if (capability === 'pr.merge') {
+        if (config.fixtures) {
+          const pr = config.fixtures.pullRequests?.[repoKey]?.find((entry) => entry.number === number);
+          if (!pr) throw err('E_ADAPTER', `fixture PR #${number} not found`);
+          pr.mergeQueueState = 'queued';
+          return { data: { number, queueState: 'queued' } };
+        }
+        const nodeId = String(args.nodeId ?? '');
+        if (!nodeId) throw err('E_ADAPTER', 'PR nodeId is required for auto-merge');
+        const data = await liveGraphql(
+          config,
+          `mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id}){pullRequest{number}}}`,
+          { id: nodeId },
+        );
+        return { data };
+      }
+
+      if (capability === 'pr.read') {
+        if (config.fixtures) {
+          const pr = config.fixtures.pullRequests?.[repoKey]?.find((entry) => entry.number === number);
+          if (!pr) throw err('E_ADAPTER', `fixture PR #${number} not found`);
+          return { data: { ...pr } };
+        }
+        const json = await liveJson(config, `/repos/${owner}/${repo}/pulls/${number}`, 'GET') as {
+          number: number; node_id: string; html_url: string; state: string; merged: boolean; merged_at?: string; merge_commit_sha?: string;
+          head: { sha: string; ref: string }; base: { ref: string };
+        };
+        return {
+          data: {
+            number: json.number,
+            nodeId: json.node_id,
+            url: json.html_url,
+            head: json.head.ref,
+            headSha: json.head.sha,
+            base: json.base.ref,
+            state: json.merged ? 'merged' : json.state,
+            mergedAt: json.merged_at,
+            mergeSha: json.merge_commit_sha,
+          },
+        };
+      }
+
       if (capability !== 'issue.comment' && capability !== 'issue.read') {
         throw err('E_MISSING_CAPABILITY', `GitHub adapter does not support ${capability}`);
       }
-
-      const owner = String(args.owner ?? '');
-      const repo = String(args.repo ?? '');
-      const number = Number(args.number ?? args.issueNumber);
-      if (!owner || !repo || !Number.isFinite(number) || number <= 0) {
-        throw err('E_ADAPTER', 'GitHub owner, repo, and issue number are required');
+      if (!Number.isInteger(number) || number <= 0) {
+        throw err('E_ADAPTER', 'GitHub issue number is required');
       }
       const key = issueKey(owner, repo, number);
 
@@ -163,6 +350,43 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
       }
     },
   };
+}
+
+function liveHeaders(token: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github+json',
+    'Content-Type': 'application/json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+}
+
+async function liveJson(config: GitHubConfig, path: string, method: 'GET' | 'POST', body?: unknown): Promise<unknown> {
+  const token = resolveToken(config);
+  if (!token) throw err('E_ADAPTER', 'GitHub token missing (GITHUB_TOKEN)');
+  const response = await fetch(`${httpsApiBase(config)}${path}`, {
+    method,
+    headers: liveHeaders(token),
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    ...liveFetchInit(),
+  });
+  if (!response.ok) throw err('E_ADAPTER', `GitHub ${method} ${path} failed: ${response.status} ${response.statusText}`);
+  return response.json();
+}
+
+async function liveGraphql(config: GitHubConfig, query: string, variables: Record<string, unknown>): Promise<unknown> {
+  const token = resolveToken(config);
+  if (!token) throw err('E_ADAPTER', 'GitHub token missing (GITHUB_TOKEN)');
+  const response = await fetch(`${httpsApiBase(config).replace(/\/api\/v3$/, '/api')}/graphql`, {
+    method: 'POST',
+    headers: liveHeaders(token),
+    body: JSON.stringify({ query, variables }),
+    ...liveFetchInit(),
+  });
+  if (!response.ok) throw err('E_ADAPTER', `GitHub GraphQL failed: ${response.status} ${response.statusText}`);
+  const json = await response.json() as { data?: unknown; errors?: Array<{ message?: string }> };
+  if (json.errors?.length) throw err('E_ADAPTER', `GitHub GraphQL failed: ${json.errors.map((entry) => entry.message).join('; ')}`);
+  return json.data;
 }
 
 /** List fixture comments for tests. */

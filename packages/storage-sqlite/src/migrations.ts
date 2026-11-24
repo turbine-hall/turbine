@@ -266,4 +266,17 @@ CREATE INDEX IF NOT EXISTS idx_lane_audit_next ON lane_audit_queue(outcome, queu
 CREATE INDEX IF NOT EXISTS idx_lane_audit_policy ON lane_audit_queue(policy_id, queued_at);
 `,
   },
+  {
+    version: 12,
+    sql: `
+-- Part C PR state. One task has one current PR; head/status changes replace the row atomically.
+CREATE TABLE IF NOT EXISTS lane_pr_records (
+  work_id TEXT PRIMARY KEY,
+  number INTEGER NOT NULL,
+  head_sha TEXT NOT NULL,
+  data TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`,
+  },
 ];
