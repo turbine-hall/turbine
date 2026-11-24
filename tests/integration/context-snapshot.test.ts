@@ -1564,6 +1564,74 @@ describe('review round 3 (PR #9): the second batch of review items stays closed'
       writeFileSync(join(dir, '.turbine', '.gitignore'), `${readFileSync(join(dir, '.turbine', '.gitignore'), 'utf8')}!context/\n`);
       expect(lintProjectContext(dir)).toContainEqual(expect.objectContaining({ level: 'error', file: '.turbine/.gitignore' }));
     });
+
+    it('notes saved while PROJECT.md is regenerated are kept, not overwritten', () => {
+      const dir = newRepo(appFiles());
+      const s = buildSnapshot(dir, head(dir));
+      writeContextFiles(dir, s);
+      const project = contextPaths(dir).project;
+      const seed = `${readFileSync(project, 'utf8')}\n## Notes\n\nseed note\n`;
+      writeFileSync(project, seed);
+      let injected = false;
+      writeContextFiles(dir, s, () => true, undefined, () => {
+        if (injected) return;
+        injected = true;
+        writeFileSync(project, `${readFileSync(project, 'utf8')}\nconcurrent note written during regenerate\n`);
+      });
+      const out = readFileSync(project, 'utf8');
+      expect(out).toContain('seed note');
+      expect(out).toContain('concurrent note written during regenerate');
+      expect(out).toContain('<!-- turbine:facts begin');
+    });
+
+    it('PROJECT.md that keeps changing during regenerate is not replaced', () => {
+      const dir = newRepo(appFiles());
+      const s = buildSnapshot(dir, head(dir));
+      writeContextFiles(dir, s);
+      const project = contextPaths(dir).project;
+      const before = readFileSync(project, 'utf8');
+      const snapshotAttr = before.match(/snapshot=\S+/)![0]!;
+      expect(() =>
+        writeContextFiles(dir, s, () => true, undefined, () => {
+          writeFileSync(project, `${readFileSync(project, 'utf8')}\nchanged again\n`);
+        }),
+      ).toThrow(/kept changing while it was regenerated/);
+      const after = readFileSync(project, 'utf8');
+      // Hook mutated the file on each attempt, but publish never ran — prior Facts marker remains.
+      expect(after).toContain(snapshotAttr);
+      expect(after).toContain('changed again');
+    });
+
+    it('stale publish temp files are removed on the next run, and ignore probes cover a stage-temp name', () => {
+      const dir = newRepo(appFiles());
+      const s = buildSnapshot(dir, head(dir));
+      const p = contextPaths(dir);
+      mkdirSync(p.dir, { recursive: true });
+      const staleStage = join(p.dir, '.12345-1700000000000-00000000-0000-0000-0000-000000000001.tmp');
+      const staleLockTmp = join(p.dir, '.publish.lock.999999.00000000-0000-0000-0000-000000000002.tmp');
+      const staleAside = join(p.dir, '.publish.lock.stale.999999.00000000-0000-0000-0000-000000000003');
+      writeFileSync(staleStage, 'leftover');
+      writeFileSync(staleLockTmp, 'leftover');
+      writeFileSync(staleAside, 'leftover');
+      writeContextFiles(dir, s);
+      expect(existsSync(staleStage)).toBe(false);
+      expect(existsSync(staleLockTmp)).toBe(false);
+      expect(existsSync(staleAside)).toBe(false);
+      expect(readdirSync(p.dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+      // A rule that ignores only the two named outputs still fails the temp probe until context/ is last.
+      writeFileSync(join(dir, '.turbine', '.gitignore'), 'context/snapshot.json\ncontext/PROJECT.md\n');
+      expect(lintProjectContext(dir)).toContainEqual(
+        expect.objectContaining({
+          level: 'error',
+          file: '.turbine/.gitignore',
+          message: expect.stringContaining('.tmp'),
+        }),
+      );
+      writeContextFiles(dir, s); // ensureContextIgnored appends context/
+      expect(readFileSync(join(dir, '.turbine', '.gitignore'), 'utf8').trimEnd().split('\n').at(-1)).toBe('knowledge/');
+      expect(git(dir, 'check-ignore', '-q', '.turbine/context/.0-0-00000000-0000-0000-0000-000000000000.tmp').status).toBe(0);
+      expect(lintProjectContext(dir).filter((i) => i.level === 'error')).toEqual([]);
+    });
   });
 
   describe('storage', () => {
