@@ -55,6 +55,22 @@ function policyForWork(store: WorkStore, workId: string): string | null {
   return decisions.at(-1)?.policyId ?? null;
 }
 
+function agreementsForPolicy(store: WorkStore, policyId: string) {
+  return store
+    .listWork()
+    .flatMap((work) => store.listReviewerAgreements(work.id))
+    .filter((agreement) => agreement.policyId === policyId);
+}
+
+export function policyForReviewPair(store: WorkStore, workId: string, changeSetId: string): string | null {
+  const agreements = store.listReviewerAgreements(workId, changeSetId);
+  const policyIds = new Set(agreements.map((agreement) => agreement.policyId));
+  if (policyIds.size > 1) {
+    throw err('E_INVALID_CONFIG', `Reviewer agreements for ${workId} at ${changeSetId} name conflicting policies`);
+  }
+  return policyIds.values().next().value ?? null;
+}
+
 function recordsForLane(records: LaneMergeRecord[], policy: string | null): LaneMergeRecord[] {
   return records.filter((record) => record.policyId === policy);
 }
@@ -92,7 +108,14 @@ export function computeLaneMetrics(
   const rows = lanes.map((policy): LaneMetricsRow => {
     const laneWork = work.filter((item) => policyForWork(store, item.id) === policy);
     const laneRecords = recordsForLane(records, policy);
-    const taskIds = new Set([...laneWork.map((item) => item.id), ...laneRecords.map((record) => record.workId)]);
+    const agreements = policy === null
+      ? []
+      : agreementsForPolicy(store, policy).filter((agreement) => agreement.recordedAt >= since && agreement.recordedAt <= generatedAt);
+    const taskIds = new Set([
+      ...laneWork.map((item) => item.id),
+      ...laneRecords.map((record) => record.workId),
+      ...agreements.map((agreement) => agreement.workId),
+    ]);
     const latestByTask = new Map<string, LaneMergeRecord>();
     for (const record of laneRecords) latestByTask.set(record.workId, record);
     const merged = [...latestByTask.values()].filter((record) => record.mergeState === 'merged');
@@ -102,7 +125,6 @@ export function computeLaneMetrics(
     const knownFixRounds = merged.filter((record) => record.fixRounds !== undefined);
     const knownCosts = merged.filter((record) => record.costUsd !== undefined);
 
-    const agreements = laneWork.flatMap((item) => store.listReviewerAgreements(item.id));
     const disagreements = agreements.filter((agreement) => !agreement.agreed).length;
     const fallbackEvents = work.flatMap((item) =>
       store
@@ -190,8 +212,7 @@ export function evaluateSuspendWhen(store: WorkStore, policyId: string): { suspe
     reasons.push(`${problems} audit problems reached ${thresholds.auditProblems.atLeast} in last ${audits.length} audits`);
   }
 
-  const policyWork = store.listWork().filter((work) => policyForWork(store, work.id) === policyId);
-  const agreements = policyWork.flatMap((work) => store.listReviewerAgreements(work.id));
+  const agreements = agreementsForPolicy(store, policyId);
   if (agreements.length) {
     const disagreement = agreements.filter((agreement) => !agreement.agreed).length / agreements.length;
     if (disagreement > thresholds.reviewerDisagreement.above) {

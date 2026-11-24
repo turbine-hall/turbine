@@ -96,6 +96,8 @@ export type ReviewerAgreement = {
   id: string;
   workId: string;
   changeSetId: string;
+  policyId: string;
+  policyHash: string;
   lens: string;
   reviewerProfiles: [string, string];
   blocking: [boolean, boolean];
@@ -851,8 +853,15 @@ export class WorkStore {
   }
 
   saveReviewerAgreement(input: Omit<ReviewerAgreement, 'id' | 'recordedAt'>): ReviewerAgreement {
-    if (!input.workId || !input.changeSetId || !input.lens || input.reviewerProfiles.some((x) => !x)) {
-      throw err('E_INVALID_CONFIG', 'Reviewer agreement is missing an identity, lens, or change set');
+    if (
+      !input.workId ||
+      !input.changeSetId ||
+      !input.policyId ||
+      !input.policyHash ||
+      !input.lens ||
+      input.reviewerProfiles.some((x) => !x)
+    ) {
+      throw err('E_INVALID_CONFIG', 'Reviewer agreement is missing a work, policy, lens, or change-set identity');
     }
     const record: ReviewerAgreement = { ...input, id: createId('agreement'), recordedAt: now() };
     this.db
@@ -878,6 +887,8 @@ export class WorkStore {
         !value ||
         value.workId !== workId ||
         !value.changeSetId ||
+        !value.policyId ||
+        !value.policyHash ||
         !value.lens ||
         !Array.isArray(value.reviewerProfiles) ||
         value.reviewerProfiles.length !== 2 ||

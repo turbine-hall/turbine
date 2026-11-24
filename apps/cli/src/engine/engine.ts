@@ -139,7 +139,7 @@ import {
 import { measuredTurbineTokens, summarizeUsage } from './usage.js';
 import { policyStatuses, readPolicyFiles, resolvePolicyReviewers, type PolicyStatus } from './lane-policy.js';
 import { evaluateLaneEligibility, LANE_GATE_FOR_STATE, type LaneEvaluation, type LaneFacts } from './lane-eligibility.js';
-import { evaluateSuspendWhen } from './lane-metrics.js';
+import { evaluateSuspendWhen, policyForReviewPair } from './lane-metrics.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -2834,6 +2834,8 @@ export class Engine {
         this.ctx.store.saveReviewerAgreement({
           workId: work.id,
           changeSetId: expectedChangeSetId,
+          policyId: policy.name,
+          policyHash: policy.contentHash,
           lens,
           reviewerProfiles: [profiles[0].name, profiles[1].name],
           blocking: lensBlocking,
@@ -3253,8 +3255,15 @@ export class Engine {
     const laneDetail = { status: lane.status, gate: lane.gate, policy: lane.policy, decisionId: lane.decision?.id, reasons: lane.reasons };
     const detail = { ...(result.detail && typeof result.detail === 'object' ? result.detail : {}), lane: laneDetail };
     try {
+      const evaluatedPolicy =
+        lane.policy ??
+        (lane.evaluatedChangeSetId
+          ? policyForReviewPair(this.ctx.store, lane.work.id, lane.evaluatedChangeSetId)
+          : null);
+      if ((lane.status === 'passed' || lane.status === 'fallback') && evaluatedPolicy) {
+        evaluateSuspendWhen(this.ctx.store, evaluatedPolicy);
+      }
       if (lane.status === 'passed') {
-        if (lane.policy) evaluateSuspendWhen(this.ctx.store, lane.policy);
         return { action: 'lane.passed', work: lane.work, detail };
       }
       if (
@@ -3917,7 +3926,7 @@ export class Engine {
           index === winnerIdx ? evaluateLaneEligibility(p, facts, { requireDualReview: true }) : evaluations[index]!,
         );
         if (evaluations[winnerIdx]!.status !== 'eligible') {
-          return this.laneFallback(work, gate, evaluations, unusable, facts.commit);
+          return this.laneFallback(work, gate, evaluations, unusable, facts.commit, winner.name);
         }
       }
       this.laneBeforeSave?.();
@@ -3927,7 +3936,7 @@ export class Engine {
         return { status: 'passed', work: saved.work, gate, policy: winner.name, decision: saved.decision, reasons: [] };
       }
       if ('ineligible' in saved) {
-        return this.laneFallback(work, gate, evaluations, [saved.ineligible], reviewedChangeSet);
+        return this.laneFallback(work, gate, evaluations, [saved.ineligible], reviewedChangeSet, winner.name);
       }
       moved = saved.moved;
       if (gate === 'codeReview') this.refreshHeads(work.id);
@@ -3956,6 +3965,7 @@ export class Engine {
     evaluations: LaneEvaluation[],
     extra: string[],
     evaluatedChangeSetId?: string,
+    evaluatedPolicy?: string,
   ): LaneOutcome {
     const reasons = [
       ...extra,
@@ -3994,7 +4004,7 @@ export class Engine {
           evaluations: evaluations.map((e) => ({ policy: e.policy, policyHash: e.policyHash, status: e.status, evaluationHash: e.evaluationHash })),
         },
       });
-      return { status: 'fallback' as const, work: current, gate, reasons, evaluatedChangeSetId };
+      return { status: 'fallback' as const, work: current, gate, reasons, evaluatedChangeSetId, policy: evaluatedPolicy };
     });
     if (outcome.status === 'fallback') {
       this.render(work.id, [`Autonomous lane: a human decides the ${gate} gate — ${reasons.slice(0, 3).join('; ')}${reasons.length > 3 ? '; …' : ''}`]);

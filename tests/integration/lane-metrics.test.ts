@@ -82,6 +82,8 @@ describe('autonomous lane metrics and audits (Part G)', () => {
     engine.ctx.store.saveReviewerAgreement({
       workId: known.id,
       changeSetId: 'abc123',
+      policyId: 'routine',
+      policyHash: engine.ctx.store.getLanePolicy('routine')!.contentHash,
       lens: 'tests',
       reviewerProfiles: ['a', 'b'],
       blocking: [true, false],
@@ -174,6 +176,33 @@ describe('autonomous lane metrics and audits (Part G)', () => {
     const work = engine.createTask({ title: 'Signals', text: 'signals', type: 'bug', labels: ['bug'] });
     markPolicyWork(engine, work.id);
     engine.ctx.store.saveLaneMergeRecord(merge(work.id, { reverted: 'yes', revertedAt: new Date().toISOString() }));
+    expect(evaluateSuspendWhen(engine.ctx.store, 'routine')).toMatchObject({ suspended: true });
+  });
+
+  it('FR-G4: attributes failed review agreements without a policy approval decision', () => {
+    const policy = ROUTINE_POLICY.replace(
+      'gates: [requirements, plan, acceptance]',
+      'suspendWhen:\n  reviewerDisagreement: { above: 0 }\ngates: [requirements, plan, acceptance]',
+    );
+    const { engine } = laneProject(dirs, { policy });
+    const work = engine.createTask({ title: 'Review fallback', text: 'signals', type: 'bug', labels: ['bug'] });
+    const approved = engine.ctx.store.getLanePolicy('routine')!;
+    engine.ctx.store.saveReviewerAgreement({
+      workId: work.id,
+      changeSetId: 'failed-review',
+      policyId: approved.name,
+      policyHash: approved.contentHash,
+      lens: 'tests',
+      reviewerProfiles: ['review-primary', 'review-secondary'],
+      blocking: [true, false],
+      agreed: false,
+    });
+
+    expect(engine.ctx.store.listDecisions(work.id).filter((decision) => decision.actorType === 'policy')).toEqual([]);
+    expect(computeLaneMetrics(engine.ctx.store, { policy: 'routine' }).rows[0]).toMatchObject({
+      tasks: 1,
+      reviewerDisagreementRate: { value: 1, numerator: 1, denominator: 1 },
+    });
     expect(evaluateSuspendWhen(engine.ctx.store, 'routine')).toMatchObject({ suspended: true });
   });
 

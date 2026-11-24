@@ -458,6 +458,27 @@ describe('autonomous dual review', () => {
     engine.ctx.store.close();
   }, 60_000);
 
+  it('FR-G4: disagreement fallback evaluates suspension for the reviewed policy', async () => {
+    const policy = DUAL_ROUTINE_POLICY.replace(
+      'gates: [requirements, plan, codeReview, acceptance]',
+      [
+        'suspendWhen:',
+        '  reviewerDisagreement: { above: 0 }',
+        'gates: [requirements, plan, codeReview, acceptance]',
+      ].join('\n'),
+    );
+    const { engine } = laneProject(dirs, { policy });
+    useReviewers('clean', 'blocking');
+    const work = await toCodeReview(engine);
+
+    expect(work.currentState).toBe('HUMAN_CODE_REVIEW');
+    expect(engine.ctx.store.getLanePolicy('routine')).toMatchObject({
+      status: 'suspended',
+      suspendedReason: expect.stringMatching(/reviewer disagreement/i),
+    });
+    engine.ctx.store.close();
+  }, 60_000);
+
   it('FR-B5: a new commit stales both reviews and requires both again', async () => {
     const { engine } = laneProject(dirs, { policy: DUAL_ROUTINE_POLICY });
     useReviewers('clean', 'clean');
@@ -483,6 +504,7 @@ describe('autonomous dual review', () => {
     const agreements = engine.ctx.store.listReviewerAgreements(work.id, engine.currentCommit(work.id)!);
     expect(agreements.map((entry) => entry.lens)).toEqual(['spec-compliance', 'tests']);
     expect(agreements.every((entry) => entry.agreed && entry.blocking.every((value) => value === false))).toBe(true);
+    expect(agreements.every((entry) => entry.policyId === 'routine' && !!entry.policyHash)).toBe(true);
     engine.ctx.store.close();
   }, 60_000);
 });
