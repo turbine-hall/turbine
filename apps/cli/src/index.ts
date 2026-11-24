@@ -41,6 +41,8 @@ import {
   resumePolicy,
   suspendPolicy,
 } from './engine/lane-policy.js';
+import { computeLaneMetrics, type LaneMetric } from './engine/lane-metrics.js';
+import { nextLaneAudit, recordLaneAuditOutcome } from './engine/lane-audit.js';
 
 function isAgentSession(): boolean {
   return ['TURBINE_AGENT', 'CLAUDECODE', 'CURSOR_AGENT'].some((k) => process.env[k] && process.env[k] !== '0');
@@ -53,6 +55,11 @@ function parseTokenArg(raw: string): number | 'unknown' {
     throw err('E_INVALID_CONFIG', `token count must be a non-negative integer or "unknown" (got ${raw})`);
   }
   return n;
+}
+
+function formatLaneMetric(name: string, value: LaneMetric): string {
+  const rendered = value.value === 'unknown' ? 'unknown' : String(value.value);
+  return `  ${name}: ${rendered} (numerator ${value.numerator}; denominator ${value.denominator}; unknown ${value.unknown}; period ${value.period.since}..${value.period.until})`;
 }
 
 const program = new Command();
@@ -1647,6 +1654,98 @@ task
         await engine.waitForMirror();
       } finally {
         engine.ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+program
+  .command('metrics')
+  .option('--policy <name>', 'Policy name, or "human"')
+  .option('--since <date>', 'Start of reporting period (ISO date/time)')
+  .option('--json', 'Machine-readable JSON')
+  .description('Lane safety and delivery metrics with explicit denominators and unknown counts')
+  .action((opts) => {
+    try {
+      const ctx = openContext();
+      try {
+        const report = computeLaneMetrics(ctx.store, { policy: opts.policy, since: opts.since });
+        if (opts.json) {
+          printResult(report, true);
+          return;
+        }
+        process.stdout.write(`Metrics period: ${report.period.since}..${report.period.until}\n`);
+        for (const row of report.rows) {
+          process.stdout.write(`\n${row.lane === 'human' ? 'Human lane' : `Policy ${row.policy}`} (${row.tasks} tasks)\n`);
+          process.stdout.write(`${formatLaneMetric('merged PRs/week', row.mergedPrsPerWeek)}\n`);
+          process.stdout.write(`${formatLaneMetric('merge rate', row.mergeRate)}\n`);
+          process.stdout.write(`${formatLaneMetric('revert rate', row.revertRate)}\n`);
+          process.stdout.write(`${formatLaneMetric('fix rounds/merged PR', row.fixRoundsPerMergedPr)}\n`);
+          process.stdout.write(`${formatLaneMetric('cost/merged PR (USD)', row.costPerMergedPrUsd)}\n`);
+          process.stdout.write(`${formatLaneMetric('reviewer disagreement rate', row.reviewerDisagreementRate)}\n`);
+          process.stdout.write(`${formatLaneMetric('fallback share', row.fallbackShare)}\n`);
+          const reasons = Object.entries(row.fallbackShare.reasons);
+          process.stdout.write(`  fallback reasons: ${reasons.length ? reasons.map(([reason, count]) => `${reason} (${count})`).join('; ') : 'none recorded'}\n`);
+        }
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+const auditCmd = program.command('audit').description('Human audit queue for sampled autonomous policy merges');
+auditCmd
+  .command('next')
+  .option('--json')
+  .description('Show the oldest queued audit')
+  .action((opts) => {
+    try {
+      const ctx = openContext();
+      try {
+        const audit = nextLaneAudit(ctx.store);
+        printResult(audit ?? { status: 'empty', message: 'No queued lane audits' }, !!opts.json);
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+auditCmd
+  .command('record')
+  .argument('<id>')
+  .option('--ok', 'Record that the sampled merge is satisfactory')
+  .option('--problem <text>', 'Record a problem and its explanation')
+  .description('HUMAN ONLY: record an audit outcome')
+  .action(async (id, opts) => {
+    try {
+      assertHumanTerminal('turbine audit record');
+      if (!!opts.ok === !!opts.problem) throw err('E_INVALID_CONFIG', 'Choose exactly one of --ok or --problem "<text>"');
+      const ctx = openContext();
+      try {
+        const reviewer = await askReviewer(ctx.projectRoot);
+        const result = recordLaneAuditOutcome(ctx.store, {
+          id,
+          outcome: opts.ok ? 'ok' : 'problem',
+          note: opts.problem,
+          reviewer,
+        });
+        printResult(
+          {
+            audit: result.audit.id,
+            outcome: result.audit.outcome,
+            policy: result.audit.policyId,
+            autoSuspended: result.suspended,
+            reasons: result.reasons,
+          },
+          false,
+        );
+      } finally {
+        ctx.store.close();
       }
     } catch (e) {
       handleError(e);

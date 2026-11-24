@@ -139,6 +139,7 @@ import {
 import { measuredTurbineTokens, summarizeUsage } from './usage.js';
 import { policyStatuses, readPolicyFiles, resolvePolicyReviewers, type PolicyStatus } from './lane-policy.js';
 import { evaluateLaneEligibility, LANE_GATE_FOR_STATE, type LaneEvaluation, type LaneFacts } from './lane-eligibility.js';
+import { evaluateSuspendWhen } from './lane-metrics.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -3252,7 +3253,10 @@ export class Engine {
     const laneDetail = { status: lane.status, gate: lane.gate, policy: lane.policy, decisionId: lane.decision?.id, reasons: lane.reasons };
     const detail = { ...(result.detail && typeof result.detail === 'object' ? result.detail : {}), lane: laneDetail };
     try {
-      if (lane.status === 'passed') return { action: 'lane.passed', work: lane.work, detail };
+      if (lane.status === 'passed') {
+        if (lane.policy) evaluateSuspendWhen(this.ctx.store, lane.policy);
+        return { action: 'lane.passed', work: lane.work, detail };
+      }
       if (
         lane.gate === 'codeReview' &&
         lane.evaluatedChangeSetId &&

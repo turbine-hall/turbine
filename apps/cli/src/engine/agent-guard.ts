@@ -16,6 +16,8 @@ export const HUMAN_ONLY_PATTERNS: string[] = [
   String.raw`\bcontext\s+(approve|attest)\b`,
   // lane policies: approving or resuming widens autonomy (suspend stays open to agents)
   String.raw`\bpolicy\s+(approve|resume)\b`,
+  // recording audit outcomes is a human attestation
+  String.raw`\baudit\s+record\b`,
   // putting a task back in the autonomous lane
   String.raw`\btask\s+lane\b[^|;&]*--retry\b`,
   // writing the engine state directly
@@ -54,7 +56,7 @@ process.stdin.on('end', () => {
         permission: 'deny',
         user_message: 'Blocked: this Turbine Hall command is a human decision. Run it yourself in your own terminal.',
         agent_message:
-          'You must not run approval, rejection, waiver, cancel, policy approve/resume or lane retry commands, or modify .turbine/state. Summarise what the human is approving and ask them to run it themselves.',
+          'You must not run approval, rejection, waiver, cancel, policy approve/resume, audit record or lane retry commands, or modify .turbine/state. Summarise what the human is deciding and ask them to run it themselves.',
       }),
     );
     process.exit(0);
