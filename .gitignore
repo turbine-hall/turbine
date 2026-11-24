@@ -1,5 +1,9 @@
 node_modules/
 dist/
+# Copied into the CLI package by apps/cli/scripts/copy-factory.mjs for npm publish
+apps/cli/frameworks/
+apps/cli/roles/
+apps/cli/skills/
 coverage/
 *.log
 .DS_Store

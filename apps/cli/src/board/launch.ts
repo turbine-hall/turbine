@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdirSync, openSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { factoryRoot } from '../paths.js';
@@ -27,13 +27,20 @@ async function boardForProject(record: BoardRecord | undefined, projectRoot: str
 function serveCommand(): { command: string; args: string[] } {
   const serveTs = fileURLToPath(new URL('./serve.ts', import.meta.url));
   const serveJs = fileURLToPath(new URL('./serve.js', import.meta.url));
-  if (import.meta.url.endsWith('.ts')) {
-    return {
-      command: process.execPath,
-      args: [join(factoryRoot(), 'node_modules/tsx/dist/cli.mjs'), serveTs],
-    };
+  // Published installs always run compiled .js (no tsx). Dev runs .ts via tsx.
+  if (!import.meta.url.endsWith('.ts')) {
+    return { command: process.execPath, args: [serveJs] };
   }
-  return { command: process.execPath, args: [serveJs] };
+  // board/ → .. → src|dist → .. → CLI package root (apps/cli or installed package)
+  const cliRoot = fileURLToPath(new URL('../..', import.meta.url));
+  const tsx = [
+    join(cliRoot, 'node_modules/tsx/dist/cli.mjs'),
+    join(factoryRoot(), 'node_modules/tsx/dist/cli.mjs'),
+  ].find((p) => existsSync(p));
+  if (!tsx) {
+    throw new Error('tsx is required to launch the board from TypeScript sources; build the CLI or install tsx');
+  }
+  return { command: process.execPath, args: [tsx, serveTs] };
 }
 
 function sleep(ms: number): Promise<void> {
