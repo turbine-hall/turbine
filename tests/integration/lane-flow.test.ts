@@ -233,4 +233,44 @@ describe('one commit per evaluation (FR-A5, AC6)', () => {
     expect(next.work.currentState).toBe('REQUIREMENTS_APPROVED');
     engine.ctx.store.close();
   });
+
+  it('discards the pass when risk rises after evaluation (revision may be unchanged)', async () => {
+    const { engine } = laneProject(dirs, {
+      policy: ROUTINE_POLICY.replace('maxRiskProfile: standard', 'maxRiskProfile: lightweight'),
+    });
+    const work = await toRequirementsGate(engine);
+    expect(engine.ctx.store.getWork(work.id).risk.profile).toBe('lightweight');
+    engine.laneBeforeSave = () => {
+      engine.raiseRisk(work.id, 'standard', 'raised mid-evaluation');
+    };
+    const res = await engine.syncFromMarkdown(work.id);
+    expect(res.work.currentState).toBe('REQUIREMENTS_REVIEW');
+    expect(policyDecisions(engine, work.id)).toHaveLength(0);
+    const discarded = laneEvents(engine, work.id).filter((e) => e.type === 'lane.discarded');
+    expect(discarded.some((e) => String(e.payload.reason).includes('risk changed'))).toBe(true);
+    expect(lastReasons(engine, work.id).join('\n')).toMatch(/risk profile standard is above the policy maximum lightweight/);
+    engine.ctx.store.close();
+  });
+
+  it('does not save a policy pass after a concurrent lane.fallback', async () => {
+    const { engine } = laneProject(dirs);
+    const work = await toRequirementsGate(engine);
+    engine.laneBeforeSave = () => {
+      engine.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'lane.fallback',
+        payload: {
+          gate: 'requirements',
+          reasons: ['injected concurrent fallback'],
+          evaluationHash: 'sha256:deadbeefdeadbeef',
+        },
+      });
+    };
+    const res = await engine.syncFromMarkdown(work.id);
+    expect(policyDecisions(engine, work.id)).toHaveLength(0);
+    expect(res.work.currentState).toBe('REQUIREMENTS_REVIEW');
+    expect(engine.laneState(work.id).inLane).toBe(false);
+    expect((res.detail as { lane: { status: string } }).lane.status).toBe('out-of-lane');
+    engine.ctx.store.close();
+  });
 });

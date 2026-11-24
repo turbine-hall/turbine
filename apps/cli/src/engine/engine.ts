@@ -3349,21 +3349,27 @@ export class Engine {
 
   /** Human-only (callers establish presence): put a task that fell back to the human flow back in the lane. */
   laneRetry(idOrAlias: string, input: { actor: string; confirmToken: string; presence: string }) {
-    const work = this.ctx.store.getWork(idOrAlias);
-    const state = this.laneState(work.id);
-    if (state.inLane || !state.fallback) throw err('E_INVALID_TRANSITION', `${work.id} has not fallen back to the human flow; it is still in the lane`);
-    const token = state.fallback.evaluationHash.replace(/^sha256:/, '').slice(0, 8);
-    if (input.confirmToken.trim() !== token) {
-      throw err('E_STALE_REVISION', `Confirmation "${input.confirmToken}" does not match the fallback being retried (${token}).`);
-    }
-    if (!input.actor.trim()) throw err('E_UNTRUSTED_IDENTITY', 'Reviewer name is required');
-    this.ctx.store.appendEvent({
-      workId: work.id,
-      type: 'lane.retry',
-      payload: { by: input.actor.trim(), presence: input.presence, fallbackEvaluationHash: state.fallback.evaluationHash },
+    // Read, token check, and append under one write lock so a newer fallback cannot slip in between.
+    const result = this.ctx.store.transaction(() => {
+      const work = this.ctx.store.getWork(idOrAlias);
+      const state = this.laneState(work.id);
+      if (state.inLane || !state.fallback) {
+        throw err('E_INVALID_TRANSITION', `${work.id} has not fallen back to the human flow; it is still in the lane`);
+      }
+      const token = state.fallback.evaluationHash.replace(/^sha256:/, '').slice(0, 8);
+      if (input.confirmToken.trim() !== token) {
+        throw err('E_STALE_REVISION', `Confirmation "${input.confirmToken}" does not match the fallback being retried (${token}).`);
+      }
+      if (!input.actor.trim()) throw err('E_UNTRUSTED_IDENTITY', 'Reviewer name is required');
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'lane.retry',
+        payload: { by: input.actor.trim(), presence: input.presence, fallbackEvaluationHash: state.fallback.evaluationHash },
+      });
+      return { work, retried: state.fallback, actor: input.actor.trim() };
     });
-    this.render(work.id, [`Put back in the autonomous lane by ${input.actor.trim()}. Next: turbine task sync ${work.id}`]);
-    return { work, retried: state.fallback };
+    this.render(result.work.id, [`Put back in the autonomous lane by ${result.actor}. Next: turbine task sync ${result.work.id}`]);
+    return { work: result.work, retried: result.retried };
   }
 
   /** The confirmation code `task lane --retry` asks for, with the fallback it retries. */
@@ -3518,6 +3524,11 @@ export class Engine {
         work = this.ctx.store.getWork(work.id);
         if (LANE_GATE_FOR_STATE[work.currentState] !== gate) return { status: 'retry', work, gate, reasons: [moved] };
       }
+      // Re-check membership each attempt: a concurrent sync may have recorded lane.fallback after evaluation.
+      const membership = this.laneState(work.id);
+      if (!membership.inLane) {
+        return { status: 'out-of-lane', work, gate, reasons: membership.fallback?.reasons ?? [moved || 'task left the lane during evaluation'] };
+      }
       const facts = this.laneFacts(work, gate);
       const evaluations = active.map((p) => evaluateLaneEligibility(p, facts));
       const winnerIdx = evaluations.findIndex((e) => e.status === 'eligible');
@@ -3583,6 +3594,27 @@ export class Engine {
         const current = this.ctx.store.getWork(work.id);
         if (current.currentState !== facts.state || current.currentRevision !== facts.workRevision) {
           return { moved: `${work.id} changed (${facts.state} r${facts.workRevision} → ${current.currentState} r${current.currentRevision}) during evaluation` };
+        }
+        // raiseRisk / reselectRoles can change eligibility without bumping currentRevision.
+        if (current.risk.profile !== facts.riskProfile) {
+          return { moved: `risk changed from ${facts.riskProfile} to ${current.risk.profile} during evaluation` };
+        }
+        const labelsNow = [...new Set(current.sourceRefs.flatMap((s) => s.labels ?? []))].sort();
+        if (JSON.stringify(labelsNow) !== JSON.stringify(facts.labels)) {
+          return { moved: 'source labels changed during evaluation' };
+        }
+        if (1 + (current.repositories?.length ?? 0) !== facts.repoCount) {
+          return { moved: 'repository set changed during evaluation' };
+        }
+        if (JSON.stringify(current.unknowns) !== JSON.stringify(facts.unknowns)) {
+          return { moved: 'open questions changed during evaluation' };
+        }
+        if (current.acceptanceCriteria.length !== facts.criteriaCount) {
+          return { moved: 'acceptance criteria changed during evaluation' };
+        }
+        const laneNow = this.laneState(work.id);
+        if (!laneNow.inLane) {
+          return { moved: 'task fell back to the human flow during evaluation' };
         }
         let commitNow: string;
         try {
