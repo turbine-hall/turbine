@@ -63,6 +63,10 @@ export type PacketData = {
   contextFile?: boolean;
   /** Token/model usage from role_runs + usage_records (generated; never hand-edited). */
   usage?: UsageSummary;
+  /** Policy decision id → the human who approved that policy, and when. */
+  policyApprovals?: Record<string, { by: string; on: string }>;
+  /** Set when the task fell back from the autonomous lane to the human flow. */
+  laneFallback?: { gate: string; reasons: string[]; at: string };
 };
 
 function renderUsageSection(usage: UsageSummary | undefined): string[] {
@@ -101,8 +105,8 @@ function latestDecision(decisions: Decision[], gate: Decision['gate']): Decision
     .sort((a, b) => b.decidedAt.localeCompare(a.decidedAt))[0];
 }
 
-function decisionFor(decisions: Decision[], gate: Decision['gate'], label: string, revision?: string): string {
-  const d = latestDecision(decisions, gate);
+function decisionFor(data: PacketData, gate: Decision['gate'], label: string, revision?: string): string {
+  const d = latestDecision(data.decisions, gate);
   const bound = d && revision && !(d.artifactHashes.includes(revision) || d.commitSha === revision) ? undefined : d;
   return [
     `### ${label}`,
@@ -114,6 +118,10 @@ function decisionFor(decisions: Decision[], gate: Decision['gate'], label: strin
       date: bound?.decidedAt.slice(0, 10),
       notes: bound?.rationale && !/^Local attestation/.test(bound.rationale) ? bound.rationale : undefined,
       contentHash: revision,
+      policy:
+        bound?.actorType === 'policy' && bound.policyId
+          ? { name: bound.policyId, approvedBy: data.policyApprovals?.[bound.id]?.by, approvedOn: data.policyApprovals?.[bound.id]?.on }
+          : undefined,
     }),
   ].join('\n');
 }
@@ -185,6 +193,18 @@ export function renderStatus(d: PacketData): string {
     gateFlow(d.work.currentState),
   ];
   if (d.notes.length) lines.push('', '## What just happened', '', ...d.notes.map((n) => `- ${n}`));
+  if (d.laneFallback && d.work.currentState !== 'ACCEPTED') {
+    lines.push(
+      '',
+      '## Autonomous lane: a human decides',
+      '',
+      `At the ${d.laneFallback.gate} gate (${d.laneFallback.at.slice(0, 10)}) no approved lane policy could pass this task:`,
+      '',
+      ...capped(d.laneFallback.reasons, 8, (r) => `- ${esc(r)}`, 'see `turbine task history`'),
+      '',
+      `_The task stays in the human flow. A human may put it back in the lane with \`turbine task lane ${d.work.id} --retry\`._`,
+    );
+  }
   const blocking = d.analysis.filter((a) => a.severity === 'CRITICAL' || a.severity === 'HIGH');
   if (blocking.length) {
     lines.push('', '## Problems to fix', '', '| Severity | Where | Problem |', '|---|---|---|');
@@ -311,9 +331,9 @@ export function renderSpec(d: PacketData): string {
     '',
     DECIDE_HINT,
     '',
-    decisionFor(d.decisions, 'requirements', 'Requirements', d.spec?.hash),
+    decisionFor(d, 'requirements', 'Requirements', d.spec?.hash),
   );
-  if (d.plan) lines.push('', decisionFor(d.decisions, 'plan', 'Plan', d.plan.hash));
+  if (d.plan) lines.push('', decisionFor(d, 'plan', 'Plan', d.plan.hash));
   lines.push('', '<details><summary>Original request</summary>', '', d.sourceText.trim().slice(0, 4000), '', '</details>');
   return lines.join('\n');
 }
@@ -449,9 +469,9 @@ export function renderReview(d: PacketData, previousChecks: AcceptanceCheck[]): 
     '',
     DECIDE_HINT,
     '',
-    decisionFor(d.decisions, 'code-review', 'Code review', d.changeSetId),
+    decisionFor(d, 'code-review', 'Code review', d.changeSetId),
     '',
-    decisionFor(d.decisions, 'sqa-acceptance', 'Acceptance', d.changeSetId),
+    decisionFor(d, 'sqa-acceptance', 'Acceptance', d.changeSetId),
   );
   if (d.evidenceFiles.length) lines.push('', `Raw evidence: ${d.evidenceFiles.map((f) => `[${f}](evidence/${f})`).join(' · ')}`);
   return lines.join('\n');

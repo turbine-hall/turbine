@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import {
+  NON_DISABLEABLE_HUMAN_GATES,
   ProjectConfigSchema,
   type ProjectConfig,
   err,
@@ -216,18 +217,55 @@ export function loadConfig(configPath: string): ProjectConfig {
   if (!existsSync(configPath)) {
     throw err('E_INVALID_CONFIG', `Missing project config at ${configPath}. Run: turbine init`);
   }
-  const raw = parseYaml(readFileSync(configPath, 'utf8'));
+  return parseProjectConfig(parseYaml(readFileSync(configPath, 'utf8')));
+}
+
+/**
+ * Validate a project config. A human gate set to false fails with E_CONFIG (it would otherwise look
+ * like it turned the gate off); any other problem is E_INVALID_CONFIG.
+ */
+export function parseProjectConfig(raw: unknown): ProjectConfig {
+  // Detect literal false on protected gates from the raw input so a sibling type error
+  // (e.g. requirePrApproval: "false") cannot skip the E_CONFIG diagnostic.
+  const rawGateOff: Array<{ path: string; message: string }> = [];
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    const hg = (raw as Record<string, unknown>).humanGates;
+    if (hg && typeof hg === 'object' && !Array.isArray(hg)) {
+      const gates = hg as Record<string, unknown>;
+      for (const g of NON_DISABLEABLE_HUMAN_GATES) {
+        if (gates[g] === false) {
+          rawGateOff.push({
+            path: `humanGates.${g}`,
+            message: `humanGates.${g} cannot be false: human gates are relaxed only through lane policies approved with \`turbine policy approve\` (.turbine/policies/*.yaml)`,
+          });
+        }
+      }
+    }
+  }
   const parsed = ProjectConfigSchema.safeParse(raw);
   if (!parsed.success) {
-    throw err('E_INVALID_CONFIG', 'Invalid project.yaml', {
-      issues: parsed.error.issues.map((i) => ({ path: i.path.join('.'), message: i.message })),
-    });
+    const issues = parsed.error.issues.map((i) => ({ path: i.path.join('.'), message: i.message }));
+    const gateOffFromSchema = issues.filter((i) =>
+      NON_DISABLEABLE_HUMAN_GATES.some((g) => i.path === `humanGates.${g}` && /cannot be false/.test(i.message)),
+    );
+    const gateOff = [
+      ...rawGateOff,
+      ...gateOffFromSchema.filter((i) => !rawGateOff.some((r) => r.path === i.path)),
+    ];
+    if (gateOff.length) {
+      throw err(
+        'E_CONFIG',
+        `${gateOff.map((i) => i.path).join(', ')} = false is not allowed. Human gates are relaxed only through lane policies a human approved (turbine policy approve <name>); remove the line or set it to true.`,
+        { issues: [...gateOff, ...issues.filter((i) => !gateOff.some((g) => g.path === i.path && g.message === i.message))] },
+      );
+    }
+    throw err('E_INVALID_CONFIG', 'Invalid project.yaml', { issues });
   }
   return parsed.data;
 }
 
 export function saveConfig(configPath: string, config: ProjectConfig): void {
-  writeFileSync(configPath, stringifyYaml(ProjectConfigSchema.parse(config)), 'utf8');
+  writeFileSync(configPath, stringifyYaml(parseProjectConfig(config)), 'utf8');
 }
 
 export function openContext(cwd = callerCwd()): EngineContext {

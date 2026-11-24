@@ -738,6 +738,20 @@ sf task recover <id-or-alias> --apply  # only approved, safely executable affect
 
 Token usage: every Turbine model call records `modelProvider`, `modelId`, and input/output tokens on its `role_run` (`unknown` when the adapter omits usage — never silent 0). Coding-agent usage is append-only via `turbine task usage add` (`usage_records`, migration v8). Packet STATUS/REVIEW (including ACCEPTED) render a Usage section from the store; `turbine task export` includes usage. Optional `budgets.perTask.maxTokens` is a retrospective cap: subsequent checked Turbine model calls are refused with `E_BUDGET_EXCEEDED` once measured Turbine input+output tokens have already reached the limit (unknown counts do not count toward the cap); a single in-flight call may still finish above the remaining allowance because the check uses completed usage, not a prediction of the next call. Agents may add records but there is no edit/delete API for human-entered rows.
 
+### 8.3A Autonomous lane commands (#26 part A)
+
+```bash
+turbine policy list                       # active / suspended / pending / unapproved / invalid
+turbine policy show <name>                # content, state, and approved → file diff when pending
+turbine policy approve <name>             # HUMAN ONLY: TTY + typed short hash of the file content
+turbine policy suspend <name> --reason T  # anyone, agents included (only removes autonomy)
+turbine policy resume <name>              # HUMAN ONLY: re-activates the approved snapshot
+turbine task lane <id>                    # is the task in the lane, or why it fell back
+turbine task lane <id> --retry            # HUMAN ONLY: put a fallen-back task back in the lane
+```
+
+Policies are `.turbine/policies/<name>.yaml` (schema `LanePolicySchema` in `packages/contracts/src/lane-policy.ts`). Policy passes are `Decision`s with `actorType: 'policy'` and render as "Passed by policy `<name>` (approved by `<human>` on `<date>`)". `humanGates.{requirements,plan,codeReview,sqaAcceptance}` cannot be `false` (`E_CONFIG`); gates are relaxed only through approved lane policies.
+
 ### 8.4 R2+ commands (not implemented in R0/R1)
 
 ```bash
@@ -814,6 +828,8 @@ Interactive approval shows: work ID, stage, actor/identity assurance, proposed a
 | Approve requirements/plan | Local **attestation**, clearly labeled | Authenticated PM/tech role |
 | Execute code | Explicit authorized local project | Authenticated bounded worker |
 | Approve own AI output | **Forbidden for AI** | Forbidden |
+| Approve / resume a lane policy, retry the lane | Local human attestation (TTY + typed hash) | Authenticated role |
+| Suspend a lane policy | Anyone, agents included | Anyone |
 | Approve code/SQA | Local human attestations | Independent authenticated human roles |
 | Sync Jira/edit remote | Disabled until explicit R2 feature | Permission + diff-bound approval |
 | Push/merge/deploy | **Forbidden in R0/R1 engine** | Separate guarded workflows |
@@ -825,7 +841,7 @@ Interactive approval shows: work ID, stage, actor/identity assurance, proposed a
 - If source commit changes after review/verification, affected checks and approvals must rerun.
 - A rejected review links findings to the commit and moves to `CHANGES_REQUESTED` with a valid return target.
 - Passing tests do not override a failed manual acceptance criterion. An LLM statement does not count as a test run.
-- `ACCEPTED` requires completed requirements, plan, implementation, applicable independent review, target checks, human SQA evidence and explicit human acceptance for the current revision.
+- `ACCEPTED` requires completed requirements, plan, implementation, applicable independent review, target checks, human SQA evidence and explicit human acceptance for the current revision. **Exception (autonomous lane, #26):** an active, human-approved lane policy that lists `acceptance` may replace the human SQA evidence and acceptance decision with a `policy` decision for that revision, only when every P0 requirement has FULL traceability, every configured quality check passed at the current commit, no required obligation is unmet or waived, the code review for that commit was decided by a human, and (with `humanGates.requirePrApproval`) the PR is approved at that commit. The human approval behind it covers the policy file, not this revision's evidence; any failed condition sends the task to a human.
 
 ### 9.3A EEC gate and recovery UX
 
@@ -948,7 +964,7 @@ execution:
   allowNetwork: false
 quality:
   checks: []                    # determined from repo and approved by human
-humanGates:
+humanGates:                     # these four cannot be false (E_CONFIG); relax gates only via approved lane policies
   requirements: true
   plan: true
   codeReview: true

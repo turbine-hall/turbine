@@ -245,6 +245,7 @@ export function activeWaivers(
   return decisions.filter(
     (d) =>
       d.gate === 'exception' &&
+      d.actorType === 'human' &&
       d.action === 'approve' &&
       !d.invalidatedAt &&
       (d.obligationIds?.length ?? 0) > 0 &&

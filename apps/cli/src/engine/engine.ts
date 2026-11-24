@@ -6,10 +6,14 @@ import {
   contentHashText,
   createId,
   err,
+  LANE_TRIGGER_NAMES,
+  policyDecisionSubject,
   RepoRefSchema,
   parseTaskContext,
   type AcceptanceCriterion,
+  type ApprovedLanePolicy,
   type Artifact,
+  type LaneGate,
   type Decision,
   type Evidence,
   type RiskProfile,
@@ -22,7 +26,19 @@ import {
   type WorkState,
   type WorkType,
 } from '@turbine-hall/turbine-contracts';
-import { assertTransition, contextBudgetFor, getRole, listFrameworks, loadFramework, loadRoles, maxProfile, selectRoles } from '@turbine-hall/turbine-core';
+import {
+  assertTransition,
+  contextBudgetFor,
+  detectHardRiskTriggers,
+  detectSoftTriggers,
+  getRole,
+  listFrameworks,
+  loadFramework,
+  loadRoles,
+  maxProfile,
+  selectRoles,
+} from '@turbine-hall/turbine-core';
+import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import {
   bumpEecRevision,
   createDraftEec,
@@ -120,6 +136,8 @@ import {
   writeFileAtomic,
 } from './packet.js';
 import { measuredTurbineTokens, summarizeUsage } from './usage.js';
+import { policyStatuses, readPolicyFiles, type PolicyStatus } from './lane-policy.js';
+import { evaluateLaneEligibility, LANE_GATE_FOR_STATE, type LaneEvaluation, type LaneFacts } from './lane-eligibility.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -133,6 +151,26 @@ function transition(work: WorkPackage, to: WorkState): WorkPackage {
 function normalizeAcceptanceCriteria(raw: unknown): AcceptanceCriterion[] {
   return normalizeRequirements(raw);
 }
+
+export type LaneFallback = { gate: LaneGate; reasons: string[]; evaluationHash: string; at: string };
+export type LaneOutcome = {
+  status: 'passed' | 'fallback' | 'out-of-lane' | 'retry';
+  work: WorkPackage;
+  gate: LaneGate;
+  reasons: string[];
+  policy?: string;
+  decision?: Decision;
+};
+
+const LANE_GATE_LABEL: Record<LaneGate, string> = {
+  requirements: 'Requirements',
+  plan: 'Plan',
+  codeReview: 'Code review',
+  acceptance: 'Acceptance',
+};
+
+/** Thrown inside the policy-pass transaction to roll it back when a final check fails. */
+class LaneIneligible extends Error {}
 
 export type PrApprovalResult = { approved: boolean; detail: string; url?: string };
 export type PrApprovalChecker = (input: {
@@ -319,6 +357,8 @@ export class Engine {
     file?: string;
     text?: string;
     accountableHuman?: string;
+    /** Labels of the source issue, read by an intake adapter (lane policy eligibility). */
+    labels?: string[];
   }): WorkPackage {
     const sourceText =
       input.text ??
@@ -340,6 +380,7 @@ export class Engine {
           provider: input.file ? 'file' : 'text',
           externalId: input.file,
           snapshotHash,
+          ...(input.labels?.length ? { labels: [...new Set(input.labels)] } : {}),
         },
         ...ghLinks.map((l) => ({ ...l.sourceRef, snapshotHash })),
       ],
@@ -446,6 +487,7 @@ export class Engine {
           sourceUpdatedAt: issue.updatedAt,
           sourceVersion: issue.id,
           snapshotHash: work.sourceRefs[0]!.snapshotHash,
+          ...(issue.labels?.length ? { labels: [...new Set(issue.labels)] } : {}),
         },
       ],
       acceptanceCriteria: (issue.acceptanceCriteria ?? []).map((statement, i) => ({
@@ -2124,9 +2166,19 @@ export class Engine {
         this.ctx.store.appendEvent({ workId: work.id, type: 'context.render-failed', payload: { message: (e as Error).message.split('\n')[0] } });
       }
     }
+    const decisions = this.ctx.store.listDecisions(work.id);
+    const policyApprovals: Record<string, { by: string; on: string }> = {};
+    for (const d of decisions) {
+      if (d.actorType !== 'policy' || !d.policyId || !d.policyApprovalDecisionId) continue;
+      const approval = this.ctx.store.listDecisions(policyDecisionSubject(d.policyId)).find((a) => a.id === d.policyApprovalDecisionId);
+      if (approval) policyApprovals[d.id] = { by: approval.actorId, on: approval.decidedAt.slice(0, 10) };
+    }
+    const lane = this.laneState(work.id);
     const data: PacketData = {
       projectRoot: this.ctx.projectRoot,
       work,
+      policyApprovals,
+      laneFallback: lane.fallback,
       track: trackFor(work),
       next: computeNextStep({ projectRoot: this.ctx.projectRoot, work }),
       notes: renderNotes,
@@ -2140,7 +2192,7 @@ export class Engine {
       changeFacts,
       review: review?.content,
       runs: report && report.content.changeSetId === cs ? report.content.runs : undefined,
-      decisions: this.ctx.store.listDecisions(work.id),
+      decisions,
       gate,
       trace: this.traceFor(work.id),
       analysis: this.analyzeWork(work.id),
@@ -2957,9 +3009,26 @@ export class Engine {
    * acceptance observations) and advances AI/tool stages. It never records a human
    * decision: Decision blocks in markdown are display-only, because any agent with file
    * access could write "Approved: yes". Humans approve with `turbine task approve` in their
-   * own terminal.
+   * own terminal. When the step leaves the task at a human gate, an approved lane policy may pass it
+   * (recorded as a policy decision, never as a human one).
    */
   async syncFromMarkdown(
+    idOrAlias: string,
+    actorId = 'local-user',
+  ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
+    const result = await this.syncStep(idOrAlias, actorId);
+    const lane = this.tryLanePass(result.work.id);
+    if (!lane) return result;
+    const laneDetail = { status: lane.status, gate: lane.gate, policy: lane.policy, decisionId: lane.decision?.id, reasons: lane.reasons };
+    const detail = { ...(result.detail && typeof result.detail === 'object' ? result.detail : {}), lane: laneDetail };
+    try {
+      return lane.status === 'passed' ? { action: 'lane.passed', work: lane.work, detail } : { ...result, work: lane.work, detail };
+    } finally {
+      await this.waitForMirror();
+    }
+  }
+
+  private async syncStep(
     idOrAlias: string,
     _actorId = 'local-user',
   ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
@@ -3255,6 +3324,439 @@ export class Engine {
     }
   }
 
+  /**
+   * Lane membership from the event log: a `lane.fallback` takes the task out of the lane until a human's
+   * `lane.retry` (turbine task lane <id> --retry) puts it back.
+   */
+  laneState(idOrAlias: string): { inLane: boolean; fallback?: LaneFallback } {
+    const work = this.ctx.store.getWork(idOrAlias);
+    const last = this.ctx.store
+      .listEvents(work.id)
+      .filter((e) => e.type === 'lane.fallback' || e.type === 'lane.retry')
+      .at(-1);
+    if (!last || last.type === 'lane.retry') return { inLane: true };
+    const p = last.payload as Partial<LaneFallback>;
+    return {
+      inLane: false,
+      fallback: {
+        gate: p.gate ?? 'requirements',
+        reasons: Array.isArray(p.reasons) ? p.reasons.map(String) : ['(reasons not recorded)'],
+        evaluationHash: typeof p.evaluationHash === 'string' ? p.evaluationHash : contentHash(last.payload),
+        at: last.createdAt,
+      },
+    };
+  }
+
+  /** Human-only (callers establish presence): put a task that fell back to the human flow back in the lane. */
+  laneRetry(idOrAlias: string, input: { actor: string; confirmToken: string; presence: string }) {
+    // Read, token check, and append under one write lock so a newer fallback cannot slip in between.
+    const result = this.ctx.store.transaction(() => {
+      const work = this.ctx.store.getWork(idOrAlias);
+      const state = this.laneState(work.id);
+      if (state.inLane || !state.fallback) {
+        throw err('E_INVALID_TRANSITION', `${work.id} has not fallen back to the human flow; it is still in the lane`);
+      }
+      const token = state.fallback.evaluationHash.replace(/^sha256:/, '').slice(0, 8);
+      if (input.confirmToken.trim() !== token) {
+        throw err('E_STALE_REVISION', `Confirmation "${input.confirmToken}" does not match the fallback being retried (${token}).`);
+      }
+      if (!input.actor.trim()) throw err('E_UNTRUSTED_IDENTITY', 'Reviewer name is required');
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'lane.retry',
+        payload: { by: input.actor.trim(), presence: input.presence, fallbackEvaluationHash: state.fallback.evaluationHash },
+      });
+      return { work, retried: state.fallback, actor: input.actor.trim() };
+    });
+    this.render(result.work.id, [`Put back in the autonomous lane by ${result.actor}. Next: turbine task sync ${result.work.id}`]);
+    return { work: result.work, retried: result.retried };
+  }
+
+  /** The confirmation code `task lane --retry` asks for, with the fallback it retries. */
+  pendingLaneRetry(idOrAlias: string) {
+    const state = this.laneState(idOrAlias);
+    if (state.inLane || !state.fallback) throw err('E_INVALID_TRANSITION', 'This task has not fallen back to the human flow; it is still in the lane');
+    return { fallback: state.fallback, confirmToken: state.fallback.evaluationHash.replace(/^sha256:/, '').slice(0, 8) };
+  }
+
+  /** Every fact the eligibility evaluation needs, read at one commit. Read failures become `readErrors`. */
+  private laneFacts(work: WorkPackage, gate: LaneGate): LaneFacts {
+    const readErrors: string[] = [];
+    const attempt = <T>(label: string, fn: () => T, fallback: T): T => {
+      try {
+        return fn();
+      } catch (e) {
+        readErrors.push(`${label}: ${(e as Error).message.split('\n')[0]}`);
+        return fallback;
+      }
+    };
+    const codeGate = gate === 'codeReview' || gate === 'acceptance';
+    const repos = codeGate ? this.repoStates(work.id) : [];
+    const commit = attempt('commit', () => this.laneCommit(work.id, codeGate), '');
+    const subject = codeGate
+      ? commit
+      : (this.ctx.store.getLatestArtifact(work.id, gate === 'requirements' ? 'specification' : 'plan')?.contentHash ?? '');
+    if (!subject) readErrors.push(`no ${gate === 'requirements' ? 'specification' : gate === 'plan' ? 'plan' : 'change set'} to decide on`);
+    // The same preconditions a human approval checks (synced SPEC.md, clean worktree, current AI review).
+    attempt('approval preconditions', () => this.pendingApproval(work.id), undefined);
+    const lintErrors = attempt('task lint', () => this.lintWork(work.id).filter((i) => i.level === 'error').map((i) => `${i.file}: ${i.message}`), []);
+    const analysisGate = gate === 'acceptance' ? undefined : gate === 'codeReview' ? 'code-review' : gate;
+    const criticalFindings = attempt(
+      'task analyze',
+      () => this.analyzeWork(work.id).filter((a) => a.severity === 'CRITICAL' && a.gate === analysisGate).map((a) => a.message),
+      [],
+    );
+    let change: LaneFacts['change'];
+    if (codeGate) {
+      change = attempt(
+        'change facts',
+        () => {
+          if (!repos.length) throw new Error('no worktrees recorded');
+          const facts = computeFacts(repos);
+          return {
+            files: facts.flatMap((f) => f.files.map((x) => x.path)),
+            changedLines: facts.reduce((n, f) => n + f.insertions + f.deletions, 0),
+            dependencyChanges: facts.flatMap((f) => [...f.dependencies.added, ...f.dependencies.changed, ...f.dependencies.removed].map((d) => `${f.repo}:${d.name}`)),
+          };
+        },
+        undefined,
+      );
+    }
+    const triggers = [
+      ...work.risk.reasons,
+      ...detectHardRiskTriggers(work),
+      ...detectSoftTriggers(work),
+      ...(change?.dependencyChanges.length ? ['new-dependency'] : []),
+    ].filter((t) => LANE_TRIGGER_NAMES.includes(t));
+    let acceptance: LaneFacts['acceptance'];
+    if (gate === 'acceptance') {
+      acceptance = attempt(
+        'acceptance evidence',
+        () => {
+          const p0 = this.traceFor(work.id)
+            .filter((r) => r.priority === 'P0')
+            .map((r) => ({ id: r.requirementId, status: r.status ?? ('unknown' as const) }));
+          const evidence = this.ctx.store.listEvidence(work.id).filter((e) => e.commitSha === commit);
+          const checks = repos.flatMap((r) =>
+            (r.primary ? this.ctx.config.quality.checks : r.checks).map((cmd) => {
+              const label = checkLabel(r.name, cmd);
+              const latest = evidence
+                .filter((e) => e.commandOrCheck === label)
+                .sort((a, b) => b.observedAt.localeCompare(a.observedAt))[0];
+              return { command: label, result: latest?.result ?? 'not-run' };
+            }),
+          );
+          // Waivers are a human's risk acceptance: a policy pass needs the obligations actually satisfied.
+          const gateBlocking = this.gateDecision(work.id, ['obl_manual_sqa']).blocking.map((b) => `${b.id} (${b.status})`);
+          return { p0, checks, gateBlocking };
+        },
+        undefined,
+      );
+    }
+    return {
+      gate,
+      workId: work.id,
+      workRevision: work.currentRevision,
+      state: work.currentState,
+      commit,
+      subject,
+      riskProfile: work.risk.profile,
+      triggers: [...new Set(triggers)].sort(),
+      labels: [...new Set(work.sourceRefs.flatMap((s) => s.labels ?? []))].sort(),
+      repoCount: 1 + (work.repositories?.length ?? 0),
+      unknowns: work.unknowns,
+      criteriaCount: work.acceptanceCriteria.length,
+      lintErrors,
+      criticalFindings,
+      change,
+      acceptance,
+      readErrors,
+    };
+  }
+
+  /** Project HEAD before code exists; the observed change set id (every worktree HEAD) after. */
+  private laneCommit(workId: string, codeGate: boolean): string {
+    if (!codeGate) {
+      const h = repoHead(this.ctx.projectRoot);
+      if ('error' in h) throw new Error(`project HEAD is unreadable (${h.error})`);
+      return h.head;
+    }
+    const repos = this.repoStates(workId);
+    if (!repos.length) throw new Error('no worktrees recorded');
+    const seen = observe(repos).repos;
+    if (changeSetId(seen) !== changeSetId(repos)) throw new Error('a worktree has commits that are not captured yet; run sync');
+    return changeSetId(seen);
+  }
+
+  /**
+   * At a gate that waits for a human, try to pass it with an approved, active lane policy. Never records a
+   * human decision. Returns undefined when no lane policy has ever been approved (the lane is not in use).
+   */
+  tryLanePass(idOrAlias: string): LaneOutcome | undefined {
+    let work = this.ctx.store.getWork(idOrAlias);
+    const gate = LANE_GATE_FOR_STATE[work.currentState];
+    if (!gate) return undefined;
+    let stored: ReturnType<WorkStore['listLanePolicies']>;
+    try {
+      stored = this.ctx.store.listLanePolicies();
+    } catch (e) {
+      return this.laneFallback(work, gate, [], [`lane policy store unreadable: ${(e as Error).message}`]);
+    }
+    if (!stored.length) return undefined;
+    const lane = this.laneState(work.id);
+    if (!lane.inLane) return { status: 'out-of-lane', work, gate, reasons: lane.fallback?.reasons ?? [] };
+
+    let statuses: PolicyStatus[];
+    try {
+      statuses = policyStatuses(this.ctx.store, this.ctx.projectRoot).policies;
+    } catch (e) {
+      return this.laneFallback(work, gate, [], [`lane policies unreadable: ${(e as Error).message}`]);
+    }
+    const unusable = statuses
+      .filter((s) => s.approved || s.state === 'invalid')
+      .filter((s) => s.state !== 'active')
+      .map((s) => `policy ${s.name} is ${s.state}${s.reason ? `: ${s.reason}` : ''}`);
+    const active = statuses.filter((s) => s.state === 'active').map((s) => s.approved!);
+
+    let moved = '';
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) {
+        work = this.ctx.store.getWork(work.id);
+        if (LANE_GATE_FOR_STATE[work.currentState] !== gate) return { status: 'retry', work, gate, reasons: [moved] };
+      }
+      // Re-check membership each attempt: a concurrent sync may have recorded lane.fallback after evaluation.
+      const membership = this.laneState(work.id);
+      if (!membership.inLane) {
+        return { status: 'out-of-lane', work, gate, reasons: membership.fallback?.reasons ?? [moved || 'task left the lane during evaluation'] };
+      }
+      const facts = this.laneFacts(work, gate);
+      const evaluations = active.map((p) => evaluateLaneEligibility(p, facts));
+      const winnerIdx = evaluations.findIndex((e) => e.status === 'eligible');
+      if (winnerIdx < 0) return this.laneFallback(work, gate, evaluations, unusable);
+      this.laneBeforeSave?.();
+      const winner = active[winnerIdx]!;
+      const saved = this.savePolicyPass(work, facts, winner, evaluations[winnerIdx]!);
+      if ('work' in saved) {
+        this.render(work.id, [`${LANE_GATE_LABEL[gate]} ${saved.decision.rationale}.`]);
+        return { status: 'passed', work: saved.work, gate, policy: winner.name, decision: saved.decision, reasons: [] };
+      }
+      if ('ineligible' in saved) return this.laneFallback(work, gate, evaluations, [saved.ineligible]);
+      moved = saved.moved;
+      this.ctx.store.appendEvent({ workId: work.id, type: 'lane.discarded', payload: { gate, reason: moved, evaluationHash: evaluations[winnerIdx]!.evaluationHash } });
+    }
+    // Facts kept moving: nothing was saved and the task stays in the lane, so the next sync evaluates again.
+    this.render(work.id, [`Autonomous lane: ${moved}; no policy decision was saved. Run sync again.`]);
+    return { status: 'retry', work: this.ctx.store.getWork(work.id), gate, reasons: [moved] };
+  }
+
+  /** Test seam: runs after a lane evaluation and before its decision is saved. */
+  laneBeforeSave?: () => void;
+
+  private laneFallback(work: WorkPackage, gate: LaneGate, evaluations: LaneEvaluation[], extra: string[]): LaneOutcome {
+    const reasons = [
+      ...extra,
+      ...evaluations.flatMap((e) => e.reasons.map((r) => `${e.policy}: ${r}`)),
+    ];
+    if (!reasons.length) reasons.push('no active lane policy');
+    const evaluationHash = contentHash({ workId: work.id, revision: work.currentRevision, gate, evaluations: evaluations.map((e) => e.evaluationHash), extra });
+    // Recheck gate / revision / membership under the same write lock as the append so a human
+    // approval that lands mid-sync cannot leave a stale fallback blocking the next gate.
+    const outcome = this.ctx.store.transaction(() => {
+      const current = this.ctx.store.getWork(work.id);
+      if (current.currentState !== work.currentState || current.currentRevision !== work.currentRevision) {
+        return { status: 'retry' as const, work: current, gate, reasons: ['task moved before the fallback was recorded'] };
+      }
+      if (LANE_GATE_FOR_STATE[current.currentState] !== gate) {
+        return { status: 'retry' as const, work: current, gate, reasons: ['gate changed before the fallback was recorded'] };
+      }
+      const membership = this.laneState(work.id);
+      if (!membership.inLane) {
+        return {
+          status: 'out-of-lane' as const,
+          work: current,
+          gate,
+          reasons: membership.fallback?.reasons ?? ['task left the lane before the fallback was recorded'],
+        };
+      }
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'lane.fallback',
+        payload: {
+          gate,
+          workRevision: current.currentRevision,
+          reasons,
+          evaluationHash,
+          evaluations: evaluations.map((e) => ({ policy: e.policy, policyHash: e.policyHash, status: e.status, evaluationHash: e.evaluationHash })),
+        },
+      });
+      return { status: 'fallback' as const, work: current, gate, reasons };
+    });
+    if (outcome.status === 'fallback') {
+      this.render(work.id, [`Autonomous lane: a human decides the ${gate} gate — ${reasons.slice(0, 3).join('; ')}${reasons.length > 3 ? '; …' : ''}`]);
+    }
+    return outcome;
+  }
+
+  /**
+   * Save the policy decision and the transition in ONE transaction that first re-reads the task state, the
+   * commit, the subject hash and the policy snapshot. Anything that moved discards the evaluation (rule 5).
+   */
+  private savePolicyPass(
+    work: WorkPackage,
+    facts: LaneFacts,
+    policy: ApprovedLanePolicy,
+    evaluation: LaneEvaluation,
+  ): { work: WorkPackage; decision: Decision } | { moved: string } | { ineligible: string } {
+    const approval = this.ctx.store
+      .listDecisions(policyDecisionSubject(policy.name))
+      .find((d) => d.id === policy.approvedDecisionId && d.actorType === 'human' && d.gate === 'policy');
+    if (!approval) return { ineligible: `policy ${policy.name}: its approval decision ${policy.approvedDecisionId} cannot be read` };
+    const codeGate = facts.gate === 'codeReview' || facts.gate === 'acceptance';
+    try {
+      return this.ctx.store.transaction(() => {
+        const current = this.ctx.store.getWork(work.id);
+        if (current.currentState !== facts.state || current.currentRevision !== facts.workRevision) {
+          return { moved: `${work.id} changed (${facts.state} r${facts.workRevision} → ${current.currentState} r${current.currentRevision}) during evaluation` };
+        }
+        // raiseRisk / reselectRoles can change eligibility without bumping currentRevision.
+        if (current.risk.profile !== facts.riskProfile) {
+          return { moved: `risk changed from ${facts.riskProfile} to ${current.risk.profile} during evaluation` };
+        }
+        // Dependency triggers for code gates come from the pinned commit's change facts, not live HEAD.
+        const triggersNow = [
+          ...current.risk.reasons,
+          ...detectHardRiskTriggers(current),
+          ...detectSoftTriggers(current),
+          ...(facts.change?.dependencyChanges.length ? ['new-dependency'] : []),
+        ].filter((t) => LANE_TRIGGER_NAMES.includes(t));
+        const triggersSorted = [...new Set(triggersNow)].sort();
+        if (JSON.stringify(triggersSorted) !== JSON.stringify(facts.triggers)) {
+          return { moved: 'risk triggers changed during evaluation' };
+        }
+        const labelsNow = [...new Set(current.sourceRefs.flatMap((s) => s.labels ?? []))].sort();
+        if (JSON.stringify(labelsNow) !== JSON.stringify(facts.labels)) {
+          return { moved: 'source labels changed during evaluation' };
+        }
+        if (1 + (current.repositories?.length ?? 0) !== facts.repoCount) {
+          return { moved: 'repository set changed during evaluation' };
+        }
+        if (JSON.stringify(current.unknowns) !== JSON.stringify(facts.unknowns)) {
+          return { moved: 'open questions changed during evaluation' };
+        }
+        if (current.acceptanceCriteria.length !== facts.criteriaCount) {
+          return { moved: 'acceptance criteria changed during evaluation' };
+        }
+        const laneNow = this.laneState(work.id);
+        if (!laneNow.inLane) {
+          return { moved: 'task fell back to the human flow during evaluation' };
+        }
+        let commitNow: string;
+        try {
+          commitNow = this.laneCommit(work.id, codeGate);
+        } catch (e) {
+          return { moved: `commit unreadable before save: ${(e as Error).message}` };
+        }
+        if (commitNow !== facts.commit) return { moved: `HEAD moved from ${facts.commit.slice(0, 12)} to ${commitNow.slice(0, 12)} during evaluation` };
+        let snap: ReturnType<WorkStore['getLanePolicy']>;
+        let file: ReturnType<typeof readPolicyFiles>['files'][number] | undefined;
+        try {
+          snap = this.ctx.store.getLanePolicy(policy.name);
+          file = readPolicyFiles(this.ctx.projectRoot).files.find((f) => f.name === policy.name);
+        } catch (e) {
+          throw new LaneIneligible(`policy ${policy.name} cannot be read: ${(e as Error).message}`);
+        }
+        if (!snap || snap.status !== 'active' || snap.contentHash !== policy.contentHash || file?.hash !== policy.contentHash) {
+          return { moved: `policy ${policy.name} changed during evaluation` };
+        }
+        const base = {
+          id: createId('dec'),
+          workId: work.id,
+          action: 'approve' as const,
+          workRevision: current.currentRevision,
+          actorId: `policy:${policy.name}`,
+          actorType: 'policy' as const,
+          identityAssurance: 'local-attestation' as const,
+          rationale: `Passed by policy ${policy.name} (approved by ${approval.actorId} on ${approval.decidedAt.slice(0, 10)})`,
+          decidedAt: now(),
+          presence: 'lane-policy',
+          policyId: policy.name,
+          policyHash: policy.contentHash,
+          policyApprovalDecisionId: approval.id,
+          evaluationHash: evaluation.evaluationHash,
+        };
+        if (facts.gate === 'requirements') {
+          const spec = this.ctx.store.getLatestArtifact(work.id, 'specification');
+          if (spec?.contentHash !== facts.subject) return { moved: 'the requirements changed during evaluation' };
+          const decision: Decision = { ...base, gate: 'requirements', artifactIds: [spec.id], artifactHashes: [spec.contentHash] };
+          const next = transition(
+            { ...current, acceptanceCriteria: current.acceptanceCriteria.map((c) => ({ ...c, status: 'confirmed' as const })) },
+            'REQUIREMENTS_APPROVED',
+          );
+          this.ctx.store.saveDecision(decision);
+          this.ctx.store.saveWork(next);
+          this.ctx.store.appendEvent({ workId: work.id, type: 'requirements.passed-by-policy', payload: { decisionId: decision.id, hash: spec.contentHash, policy: policy.name } });
+          const eec = this.ctx.store.getLatestEec(work.id)!;
+          this.ctx.store.saveEec(bumpEecRevision(eec, { approvedSpecHash: spec.contentHash, approvalDecisionIds: [...eec.approvalDecisionIds, decision.id] }));
+          return { work: next, decision };
+        }
+        if (facts.gate === 'plan') {
+          const plan = this.ctx.store.getLatestArtifact(work.id, 'plan');
+          if (plan?.contentHash !== facts.subject) return { moved: 'the plan changed during evaluation' };
+          const spec = this.ctx.store.getLatestArtifact(work.id, 'specification');
+          const req = this.ctx.store
+            .listDecisions(work.id)
+            .find((d) => d.gate === 'requirements' && d.action === 'approve' && !d.invalidatedAt && !!spec && d.artifactHashes.includes(spec.contentHash));
+          if (!req) throw new LaneIneligible('requirements approval missing or not bound to the current specification');
+          const decision: Decision = { ...base, gate: 'plan', artifactIds: [plan.id], artifactHashes: [plan.contentHash] };
+          const next = transition(current, 'PLAN_APPROVED');
+          this.ctx.store.saveDecision(decision);
+          this.ctx.store.saveWork(next);
+          this.ctx.store.appendEvent({ workId: work.id, type: 'plan.passed-by-policy', payload: { decisionId: decision.id, hash: plan.contentHash, policy: policy.name } });
+          const eec = this.ctx.store.getLatestEec(work.id)!;
+          this.ctx.store.saveEec(bumpEecRevision(eec, { approvedPlanHash: plan.contentHash, approvalDecisionIds: [...eec.approvalDecisionIds, decision.id] }));
+          return { work: next, decision };
+        }
+        if (facts.gate === 'acceptance') {
+          try {
+            this.assertPrApproval(work.id, commitNow);
+          } catch (e) {
+            throw new LaneIneligible((e as Error).message);
+          }
+          // assertPrApproval can block on a network call; a worktree may advance meanwhile.
+          if (changeSetId(observe(this.repoStates(work.id)).repos) !== commitNow) {
+            return { moved: 'a worktree advanced during the PR check' };
+          }
+          const change = this.ctx.store.getLatestArtifact(work.id, 'change-report');
+          const decision: Decision = {
+            ...base,
+            gate: 'sqa-acceptance',
+            artifactIds: change ? [change.id] : [],
+            artifactHashes: change ? [change.contentHash] : [],
+            commitSha: this.currentCommit(work.id),
+          };
+          this.ctx.store.saveDecision(decision);
+          // With the decision recorded every required obligation must hold, without waivers; otherwise roll back.
+          const gateNow = this.gateDecision(work.id);
+          if (gateNow.blocking.length) {
+            throw new LaneIneligible(`evidence gate ${gateNow.decision} after the policy decision: ${gateNow.blocking.map((b) => b.id).join(', ')}`);
+          }
+          const next = transition(current, 'ACCEPTED');
+          this.ctx.store.saveWork(next);
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: 'acceptance.decided',
+            payload: { actorId: base.actorId, policy: policy.name, commitSha: decision.commitSha, gateDecision: gateNow.decision, note: 'ACCEPTED does not mean deployed' },
+          });
+          return { work: next, decision };
+        }
+        throw new LaneIneligible('code review is not passed by policy until two-reviewer review (part B) exists');
+      });
+    } catch (e) {
+      if (e instanceof LaneIneligible) return { ineligible: e.message };
+      throw e;
+    }
+  }
+
   /** With humanGates.requirePrApproval, every repo's PR must be approved at its current head. */
   private assertPrApproval(workId: string, _changeSetId: string): void {
     if (!this.ctx.config.humanGates.requirePrApproval) return;
@@ -3414,7 +3916,8 @@ export class Engine {
   }
 
   setConfig(key: string, value: string) {
-    const cfg = this.ctx.config as any;
+    // Edit a copy: a value the schema refuses must not linger in the live config.
+    const cfg = structuredClone(this.ctx.config) as any;
     const parts = key.split('.');
     let cur = cfg;
     for (let i = 0; i < parts.length - 1; i += 1) {
@@ -3428,6 +3931,7 @@ export class Engine {
     else if (!Number.isNaN(Number(value)) && value.trim() !== '') parsed = Number(value);
     cur[last] = parsed;
     saveConfig(this.ctx.paths.configPath, cfg);
+    this.ctx.config = cfg;
     return cfg;
   }
 

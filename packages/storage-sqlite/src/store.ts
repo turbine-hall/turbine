@@ -1,4 +1,5 @@
 import type {
+  ApprovedLanePolicy,
   Artifact,
   ArtifactDependencyEdge,
   BriefState,
@@ -17,6 +18,7 @@ import type {
   WorkPackage,
 } from '@turbine-hall/turbine-contracts';
 import {
+  ApprovedLanePolicySchema,
   ArtifactDependencyEdgeSchema,
   ArtifactSchema,
   BriefStateSchema,
@@ -787,6 +789,52 @@ export class WorkStore {
     return rows.map((r) => UsageRecordSchema.parse(JSON.parse(r.data)));
   }
 
+  /** Save the approved snapshot of a lane policy (approve / suspend / resume all write the whole row). */
+  saveLanePolicy(policy: ApprovedLanePolicy): void {
+    const parsed = ApprovedLanePolicySchema.parse(policy);
+    this.db
+      .prepare(
+        `INSERT INTO lane_policies(name, content_hash, data, approved_decision_id, status, suspended_reason, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(name) DO UPDATE SET content_hash=excluded.content_hash, data=excluded.data,
+           approved_decision_id=excluded.approved_decision_id, status=excluded.status,
+           suspended_reason=excluded.suspended_reason, updated_at=excluded.updated_at`,
+      )
+      .run(
+        parsed.name,
+        parsed.contentHash,
+        JSON.stringify(parsed),
+        parsed.approvedDecisionId,
+        parsed.status,
+        parsed.suspendedReason ?? null,
+        parsed.updatedAt,
+      );
+  }
+
+  /** The approved snapshot, or null when none was ever approved. An unreadable row throws (fail closed). */
+  getLanePolicy(name: string): ApprovedLanePolicy | null {
+    const row = this.db.prepare(`SELECT name, data FROM lane_policies WHERE name = ?`).get(name) as
+      | { name: string; data: string }
+      | undefined;
+    if (!row) return null;
+    return parseLanePolicyRow(row);
+  }
+
+  /** Every approved snapshot. A row that cannot be read is returned with its error, never dropped. */
+  listLanePolicies(): Array<{ name: string; policy?: ApprovedLanePolicy; error?: string }> {
+    const rows = this.db.prepare(`SELECT name, data FROM lane_policies ORDER BY name ASC`).all() as Array<{
+      name: string;
+      data: string;
+    }>;
+    return rows.map((row) => {
+      try {
+        return { name: row.name, policy: parseLanePolicyRow(row) };
+      } catch (e) {
+        return { name: row.name, error: (e as Error).message };
+      }
+    });
+  }
+
   getBudget(workId: string): { modelCalls: number; estimatedCost: number } {
     const row = this.db
       .prepare(`SELECT model_calls, estimated_cost FROM budget_counters WHERE work_id = ?`)
@@ -807,6 +855,20 @@ export class WorkStore {
       )
       .run(workId, modelCalls, estimatedCost);
   }
+}
+
+function parseLanePolicyRow(row: { name: string; data: string }): ApprovedLanePolicy {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(row.data);
+  } catch {
+    throw err('E_INVALID_CONFIG', `Stored lane policy ${row.name} is not valid JSON`);
+  }
+  const parsed = ApprovedLanePolicySchema.safeParse(raw);
+  if (!parsed.success || parsed.data.name !== row.name) {
+    throw err('E_INVALID_CONFIG', `Stored lane policy ${row.name} is unreadable: ${parsed.success ? 'name mismatch' : parsed.error.issues[0]?.message}`);
+  }
+  return parsed.data;
 }
 
 /**

@@ -14,6 +14,10 @@ export const HUMAN_ONLY_PATTERNS: string[] = [
   String.raw`\btask\s+accept\b`,
   // layer 2 brief human gates
   String.raw`\bcontext\s+(approve|attest)\b`,
+  // lane policies: approving or resuming widens autonomy (suspend stays open to agents)
+  String.raw`\bpolicy\s+(approve|resume)\b`,
+  // putting a task back in the autonomous lane
+  String.raw`\btask\s+lane\b[^|;&]*--retry\b`,
   // writing the engine state directly
   String.raw`\b(sqlite3|rm|mv|cp|truncate|dd)\b[^|;&]*\.turbine/state\b`,
   String.raw`>\s*[^|;&]*\.turbine/state\b`,
@@ -50,7 +54,7 @@ process.stdin.on('end', () => {
         permission: 'deny',
         user_message: 'Blocked: this Turbine Hall command is a human decision. Run it yourself in your own terminal.',
         agent_message:
-          'You must not run approval, rejection, waiver or cancel commands, or modify .turbine/state. Summarise what the human is approving and ask them to run it themselves.',
+          'You must not run approval, rejection, waiver, cancel, policy approve/resume or lane retry commands, or modify .turbine/state. Summarise what the human is approving and ask them to run it themselves.',
       }),
     );
     process.exit(0);

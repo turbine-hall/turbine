@@ -11,4 +11,5 @@ export * from './brief.js';
 export * from './okf.js';
 export * from './okf-profile.js';
 export * from './usage.js';
+export * from './lane-policy.js';
 

@@ -44,6 +44,8 @@ export const SourceRefSchema = z.object({
   sourceUpdatedAt: z.string().optional(),
   sourceVersion: z.string().optional(),
   snapshotHash: z.string(),
+  /** Labels read from the source issue at intake (lane policy eligibility). Never edited afterwards. */
+  labels: z.array(z.string()).optional(),
 });
 export type SourceRef = z.infer<typeof SourceRefSchema>;
 
