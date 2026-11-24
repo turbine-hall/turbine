@@ -121,6 +121,8 @@ function removalBaseline(live: LivePr, number: number): string | undefined {
 function newEjection(live: LivePr, record: LanePrRecord): { reason: string; removalId: string } | undefined {
   const reason = live.queueReason?.trim();
   const removalId = live.queueRemovalId;
+  // A removal reported after the remote head moved past this attempt belongs to that newer head, not to us.
+  if (live.headSha && live.headSha !== record.headSha) return undefined;
   if (
     live.mergeQueueState === 'ejected' &&
     reason &&
@@ -150,7 +152,8 @@ export function landingIncomplete(
   input: { headSha: string; authorizationId: string; gatePassSha?: string; policy: boolean },
 ): boolean {
   if (!record) return true;
-  if (record.queueState === 'merged') return false;
+  // An earlier merge of a different head does not complete a later acceptance: that head needs its own PR.
+  if (record.queueState === 'merged') return record.headSha !== input.headSha;
   if (record.headSha !== input.headSha || record.authorizationId !== input.authorizationId) return true;
   if (record.prState === 'closed') return true;
   const gate = desiredGateState(input.headSha, input.gatePassSha);
@@ -196,22 +199,31 @@ export async function ensureAcceptedPr(input: {
   tools: { allow: string[]; denied: string[] };
   policy?: ApprovedLanePolicy;
   gatePassSha?: string;
+  /** Re-check that the acceptance still authorizes landing (e.g. policy not suspended) before each remote write. */
+  assertStillAuthorized?: () => void;
 }): Promise<LanePrRecord> {
   const { store, work, headSha, authorizationId, target, tools, policy } = input;
+  const assertAuth = () => input.assertStillAuthorized?.();
   if (!configAllows(tools, 'pr.create')) throw err('E_MISSING_CAPABILITY', 'pr.create is not allowed by project config');
   if (policy && !policy.policy.tools.includes('pr.create')) {
     throw err('E_MISSING_CAPABILITY', `Lane policy ${policy.name} does not grant pr.create`);
   }
   const timestamp = new Date().toISOString();
-  const previous = store.getLanePrRecord(work.id);
+  let previous = store.getLanePrRecord(work.id);
   let record = previous;
   let live: LivePr | undefined;
   if (record) {
     assertRecordedTarget(record, target);
     live = (await readPr(target, work.id, record.number)).data;
-    if (live.state === 'merged') return record;
-    // A PR closed without merging cannot land; find or create an open replacement.
-    if (live.state === 'closed') record = undefined;
+    if (live.state === 'merged') {
+      // Same head already merged: done. A later acceptance of a different head needs a new PR; keep A's facts.
+      if (record.headSha === headSha) return record;
+      previous = undefined;
+      record = undefined;
+    } else if (live.state === 'closed') {
+      // A PR closed without merging cannot land; find or create an open replacement.
+      record = undefined;
+    }
   }
   // The authorizing policy terms belong to ONE landing attempt. Only a retry of the same authorization on the
   // same PR keeps its snapshot; a new acceptance or a replacement PR snapshots the policy it was authorized by.
@@ -219,20 +231,30 @@ export async function ensureAcceptedPr(input: {
   const authorizingPolicy =
     record && record.authorizationId === authorizationId && record.authorizingPolicy ? record.authorizingPolicy : snapshot;
   if (!record) {
-    const created = await invoke<{
+    assertAuth();
+    let created: InvokeResult<{
       number: number;
       nodeId?: string;
       url: string;
       head: string;
       headSha: string;
       base: string;
-    }>(target, 'pr.create', work.id, {
-      head: `turbine/${work.id}`,
-      headSha,
-      base: target.baseBranch,
-      title: work.title,
-      body: `Turbine task ${work.id}`,
-    });
+    }>;
+    try {
+      created = await invoke(target, 'pr.create', work.id, {
+        head: `turbine/${work.id}`,
+        headSha,
+        base: target.baseBranch,
+        title: work.title,
+        body: `Turbine task ${work.id}`,
+      });
+    } catch (e) {
+      // Turbine never pushes: create fails closed when the accepted branch is not on the remote yet.
+      throw err(
+        'E_ADAPTER',
+        `${(e as Error).message}. Push branch turbine/${work.id} with the accepted commit to the remote, then sync again`,
+      );
+    }
     if (created.data.headSha !== headSha) throw err('E_STALE_REVISION', `Created PR head ${created.data.headSha} is not accepted head ${headSha}`);
     // The PR may be an existing open one that was adopted rather than created: whatever removals GitHub already
     // shows belong to earlier history. Read them BEFORE recording, so an unreadable history records nothing.
@@ -307,6 +329,7 @@ export async function ensureAcceptedPr(input: {
   if (shown.headSha !== headSha) return record;
 
   const gateState = desiredGateState(headSha, input.gatePassSha);
+  assertAuth();
   await invoke(target, 'commit.status', work.id, {
     sha: headSha,
     context: 'turbine/gate',
@@ -314,12 +337,15 @@ export async function ensureAcceptedPr(input: {
     description: gateState === 'success' ? 'Turbine gate passed at this commit' : 'Turbine gate is not passed at this commit',
   });
   // Recorded only after GitHub accepted it, so a failed publication stays visible as incomplete work.
-  record = saveIfCurrent(store, record, {
+  const published = saveIfCurrent(store, record, {
     gateState,
     statusPublished: { sha: headSha, state: gateState },
     prState: 'open',
     updatedAt: new Date().toISOString(),
-  }).record;
+  });
+  record = published.record;
+  // A newer attempt replaced the row (or it already merged) while status was publishing: do not enqueue that PR.
+  if (!published.applied) return record;
 
   if (policy) {
     if (!configAllows(tools, 'pr.merge')) throw err('E_MISSING_CAPABILITY', 'pr.merge is not allowed by project config');
@@ -327,6 +353,9 @@ export async function ensureAcceptedPr(input: {
     if (gateState !== 'success') return record;
     const beforeQueue = (await readPr(target, work.id, record.number)).data;
     assertLivePrMatches(beforeQueue, record, target, headSha);
+    if (beforeQueue.queueStateKnown !== true) {
+      throw err('E_ADAPTER', `Merge-queue history of PR #${record.number} could not be read; retry later`);
+    }
     // GitHub may already have removed this PR from the queue. Reconcile that first: re-enqueueing over an
     // unhandled ejection would hide it from the fix-round path.
     const ejection = newEjection(beforeQueue, record);
@@ -338,6 +367,7 @@ export async function ensureAcceptedPr(input: {
       }).record;
     }
     if (beforeQueue.mergeQueueState !== 'queued') {
+      assertAuth();
       // Queue-only: if GitHub cannot enqueue (no merge queue, PR not ready) this throws and stays retryable.
       await invoke(target, 'pr.merge', work.id, {
         number: record.number,

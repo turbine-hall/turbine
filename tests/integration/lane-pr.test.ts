@@ -1052,6 +1052,77 @@ describe('Part C PR automation', () => {
     expect(refused.status).not.toBe(0);
     expect(`${refused.stdout}${refused.stderr}`).toMatch(/GitHub repository|No PR recorded/);
   }, 60_000);
+
+  it('FR-C7 head: an earlier merge of head A does not complete a later acceptance of head B', async () => {
+    const { dir, engine, github } = laneProject(dirs);
+    const work = engine.createTask({ title: 'New head after merge', text: 'B needs its own PR.' });
+    const headA = git(dir, 'rev-parse', 'HEAD').stdout.trim();
+    const input = { authorizationId: AUTH, store: engine.ctx.store, work, headSha: headA, target: engine.lanePrTarget!, tools: engine.ctx.config.tools, policy: policyNow(engine), gatePassSha: headA };
+    const first = await ensureAcceptedPr(input);
+    Object.assign(github.pullRequests!['fixture/project']![0]!, { state: 'merged', mergedAt: new Date().toISOString(), mergeSha: 'fedcba9876543210', headSha: headA });
+    expect(await refreshLanePr({ store: engine.ctx.store, workId: work.id, target: engine.lanePrTarget! })).toMatchObject({ kind: 'merged' });
+    expect(landingIncomplete(engine.ctx.store.getLanePrRecord(work.id), { headSha: headA, authorizationId: AUTH, gatePassSha: headA, policy: true })).toBe(false);
+    const headB = `${headA.startsWith('a') ? 'b' : 'a'}${headA.slice(1)}`;
+    expect(landingIncomplete(engine.ctx.store.getLanePrRecord(work.id), { headSha: headB, authorizationId: 'dec_auth_2', gatePassSha: headB, policy: true })).toBe(true);
+    github.pullRequests!['fixture/project']![0]!.state = 'merged';
+    const next = await ensureAcceptedPr({ ...input, authorizationId: 'dec_auth_2', headSha: headB, gatePassSha: headB });
+    expect(next.number).not.toBe(first.number);
+    expect(next.headSha).toBe(headB);
+    expect(engine.ctx.store.listLaneMergeRecords().filter((entry) => entry.workId === work.id && entry.mergeState === 'merged')).toHaveLength(1);
+    engine.ctx.store.close();
+  });
+
+  it('FR-C6 head: a removal after the remote head moved past the attempt is not an ejection of that attempt', async () => {
+    const { engine, github } = laneProject(dirs);
+    const work = acceptedWork(engine, 'Remote advanced');
+    engine.ctx.store.saveLanePrRecord(prRecord(work.id, 7));
+    github.pullRequests!['fixture/project'] = [
+      fixturePr(work.id, 7, { ...ejectedPr('rm_9'), headSha: 'bbbbbbbbbbbbbbbb' }),
+    ];
+    const result = await refreshLanePr({ store: engine.ctx.store, workId: work.id, target: engine.lanePrTarget! });
+    expect(result.kind).toBe('open');
+    expect(engine.ctx.store.getLanePrRecord(work.id)?.queueState).toBe('queued');
+    engine.ctx.store.close();
+  });
+
+  it('FR-C3 auth: a mid-flight authority failure aborts before enqueue', async () => {
+    const { dir, engine, github } = laneProject(dirs);
+    const work = engine.createTask({ title: 'Suspended mid-flight', text: 'Stop before enqueue.' });
+    const headSha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
+    let calls = 0;
+    await expect(
+      ensureAcceptedPr({
+        authorizationId: AUTH,
+        store: engine.ctx.store,
+        work,
+        headSha,
+        target: engine.lanePrTarget!,
+        tools: engine.ctx.config.tools,
+        policy: policyNow(engine),
+        gatePassSha: headSha,
+        assertStillAuthorized: () => {
+          calls += 1;
+          if (calls > 1) throw Object.assign(new Error('policy suspended'), { code: 'E_INVALID_CONFIG' });
+        },
+      }),
+    ).rejects.toThrow(/policy suspended/);
+    expect(github.pullRequests?.['fixture/project'] ?? []).toHaveLength(1);
+    expect(github.pullRequests!['fixture/project']![0]!.mergeQueueState).toBeUndefined();
+    engine.ctx.store.close();
+  });
+
+  it('FR-C1 refresh: polling uses the stored repository, not a retargeted origin', async () => {
+    const { engine, github } = laneProject(dirs);
+    const work = acceptedWork(engine, 'Origin moved');
+    engine.ctx.store.saveLanePrRecord(prRecord(work.id, 7));
+    github.pullRequests!['fixture/project'] = [fixturePr(work.id, 7, ejectedPr())];
+    // Origin now points elsewhere: refresh must still poll the recorded fixture/project PR.
+    engine.lanePrTarget = { ...engine.lanePrTarget!, owner: 'other', repo: 'elsewhere' };
+    const result = await engine.refreshLanePullRequest(work.id);
+    expect(result.kind).toBe('ejected');
+    expect(result.work.currentState).toBe('CHANGES_REQUESTED');
+    engine.ctx.store.close();
+  });
 });
 
 type FetchRoute = (url: string) => unknown;

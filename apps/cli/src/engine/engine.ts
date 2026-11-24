@@ -452,6 +452,15 @@ export class Engine {
           tools: this.ctx.config.tools,
           policy: live.kind === 'policy' ? live.policy : undefined,
           gatePassSha,
+          // Re-check before every remote write: a suspension mid-flight must not still enqueue.
+          assertStillAuthorized: () => {
+            const now = this.acceptanceAuthority(work.id);
+            if (now.kind === 'blocked') throw err('E_INVALID_CONFIG', now.reason);
+            if (now.kind === 'stale') throw err('E_STALE_REVISION', now.reason);
+            if (now.kind === 'none' || now.decision.id !== decisionId) {
+              throw err('E_STALE_REVISION', 'the acceptance decision no longer authorizes landing');
+            }
+          },
         });
       } catch (e) {
         this.ctx.store.appendEvent({
@@ -520,8 +529,15 @@ export class Engine {
   /** Poll the recorded PR. Queue ejection starts a fix round; merge writes Part G's merge store. */
   async refreshLanePullRequest(idOrAlias: string) {
     const work = this.ctx.store.getWork(idOrAlias);
-    const target = this.resolveLanePrTarget();
-    if (!target) throw err('E_INVALID_CONFIG', 'Cannot determine the GitHub repository for lane PR automation');
+    const recorded = this.ctx.store.getLanePrRecord(work.id);
+    if (!recorded) throw err('E_NOT_FOUND', `No PR recorded for ${work.id}`);
+    // Poll the repository stored on the PR — never re-resolve origin (it may be gone or retargeted).
+    const target: LanePrTarget = {
+      adapter: this.lanePrAdapter(),
+      owner: recorded.owner,
+      repo: recorded.repo,
+      baseBranch: recorded.baseBranch,
+    };
     const authority = work.currentState === 'ACCEPTED' ? this.acceptanceAuthority(work.id) : undefined;
     const result = await refreshLanePr({
       store: this.ctx.store,
