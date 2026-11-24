@@ -754,6 +754,21 @@ Policies are `.turbine/policies/<name>.yaml` (schema `LanePolicySchema` in `pack
 
 For `codeReview`, a policy must name exactly two model profiles that resolve to different provider/model identities. Approval and evaluation both fail closed if either profile is missing or the resolved identities collide. Each reviewer runs every selected lens over the same pinned diff/change-set and is triaged independently. A policy decision may pass code review only when both outputs are complete and parseable and neither has a kept blocking finding. Timeout, refusal, parse or budget failure, disagreement, blocking findings, or a changed HEAD leaves the gate for a human. REVIEW.md renders completed dual reviews side by side, a new commit stales both, and per-lens agreement is retained for later metrics. The ordinary human lane keeps its single advisory AI review.
 
+### 8.3B Autonomous lane metrics and audits (#30 part G)
+
+```bash
+turbine metrics [--policy <name|human>] [--since <date>] [--json]
+turbine audit next
+turbine audit record <id> --ok                         # HUMAN ONLY
+turbine audit record <id> --problem "what went wrong" # HUMAN ONLY
+```
+
+Metrics cover every approved policy plus the human lane: merged PRs/week, merge/revert rates, fix rounds and cost per merged PR, reviewer disagreement, and fallback share with reasons. Every value carries its period, denominator and unknown count. Until Part C records merge/revert facts, merge-dependent values remain `unknown`; reviewer agreement and `lane.fallback` evidence are still reported.
+
+A policy merge is sampled reproducibly at `sampling.rate` (default `0.1`). The merge record stores the SHA-256 seed, numeric draw, rate and selection result; selected merges enter `lane_audit_queue` (migration v11). `audit next` is read-only. `audit record` requires a real TTY, rejects agent markers, is blocked by the installed Cursor guard, and records the human reviewer.
+
+After policy passes, merge records and audit outcomes, Turbine evaluates `suspendWhen`. Omitted thresholds use the safety defaults: revert rate above 2% over the last 50 known merges, at least two problems in the last 20 completed audits, or reviewer disagreement above 30%. Unknown revert facts cannot trigger a rate suspension. Crossing a threshold records an engine reason through `policy suspend`; the policy stays suspended until a human explicitly resumes it, and subsequent eligible tasks follow the human flow.
+
 ### 8.4 R2+ commands (not implemented in R0/R1)
 
 ```bash

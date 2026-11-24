@@ -235,4 +235,35 @@ CREATE TABLE IF NOT EXISTS reviewer_agreements (
 CREATE INDEX IF NOT EXISTS idx_reviewer_agreements_work ON reviewer_agreements(work_id, change_set_id);
 `,
   },
+  {
+    version: 11,
+    sql: `
+-- Merge facts are deliberately optional until Part C. Absence means unknown, never "not merged".
+CREATE TABLE IF NOT EXISTS lane_merge_records (
+  id TEXT PRIMARY KEY,
+  work_id TEXT NOT NULL,
+  policy_id TEXT,
+  opened_at TEXT NOT NULL,
+  merged_at TEXT,
+  data TEXT NOT NULL,
+  recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lane_merge_policy ON lane_merge_records(policy_id, opened_at);
+CREATE INDEX IF NOT EXISTS idx_lane_merge_work ON lane_merge_records(work_id);
+
+-- Only selected draws enter this queue. The seed, draw and rate make every selection reproducible.
+CREATE TABLE IF NOT EXISTS lane_audit_queue (
+  id TEXT PRIMARY KEY,
+  merge_record_id TEXT NOT NULL UNIQUE REFERENCES lane_merge_records(id),
+  work_id TEXT NOT NULL,
+  policy_id TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN ('queued', 'ok', 'problem')),
+  data TEXT NOT NULL,
+  queued_at TEXT NOT NULL,
+  recorded_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_lane_audit_next ON lane_audit_queue(outcome, queued_at);
+CREATE INDEX IF NOT EXISTS idx_lane_audit_policy ON lane_audit_queue(policy_id, queued_at);
+`,
+  },
 ];
