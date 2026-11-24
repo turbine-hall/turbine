@@ -21,5 +21,3 @@ for (const name of dirs) {
   rmSync(dest, { recursive: true, force: true });
   cpSync(src, dest, { recursive: true });
 }
-
-console.log(`copy-factory: copied ${dirs.join(', ')} → ${cliRoot}`);
