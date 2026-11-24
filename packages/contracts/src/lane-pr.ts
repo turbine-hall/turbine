@@ -14,6 +14,11 @@ export const LanePrRecordSchema = z
     gateState: z.enum(['pending', 'success', 'failure']),
     queueState: z.enum(['not-enabled', 'queued', 'ejected', 'merged']),
     queueReason: z.string().optional(),
+    /** Policy terms in force when landing was authorized; Part G must sample with this snapshot, not the live policy. */
+    authorizingPolicy: z
+      .object({ name: z.string().min(1), samplingRate: z.number().min(0).max(1) })
+      .strict()
+      .optional(),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
   })

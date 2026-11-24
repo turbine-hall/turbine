@@ -105,3 +105,24 @@ export async function toCodeReview(engine: Engine, files: Record<string, string>
 
 export const laneEvents = (engine: Engine, workId: string) =>
   engine.ctx.store.listEvents(workId).filter((e) => e.type.startsWith('lane.'));
+
+/** Human-lane flow to ACCEPTED through the engine API (no lane policy involved). */
+export async function acceptByHuman(engine: Engine, title: string) {
+  const work = engine.createTask({ title, text: `${title}\n\nImplement with auth permissions checks.`, type: 'feature' });
+  await engine.assess(work.id);
+  engine.editRequirements(work.id, {
+    acceptanceCriteria: [{ id: 'ac_1', statement: 'Feature works', kind: 'behavioral', status: 'confirmed' }],
+    unknowns: [],
+  });
+  engine.approveRequirements(work.id, engine.ctx.store.getLatestArtifact(work.id, 'specification')!.contentHash, 'tester');
+  await engine.plan(work.id);
+  engine.approvePlan(work.id, engine.ctx.store.getLatestArtifact(work.id, 'plan')!.contentHash, 'tester');
+  const executed = await engine.execute(work.id);
+  const head = commitIn(executed.result.worktreePath!, `${work.id}.txt`);
+  await engine.syncFromMarkdown(work.id);
+  await engine.aiReview(work.id);
+  engine.humanReview(work.id, 'tester', 'approve', undefined, { commit: head.slice(0, 8) });
+  await engine.verify(work.id);
+  const accepted = engine.accept(work.id, 'tester', { expected: 'works', actual: 'works', result: 'passed' }, { commit: head });
+  return { work: accepted.work, head };
+}

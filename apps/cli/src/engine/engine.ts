@@ -242,9 +242,9 @@ export class Engine {
   private mirrorJob: Promise<MirrorRunResult | undefined> = Promise.resolve(undefined);
   /** Fixture seam for Part C. Live mode derives owner/repo from origin. */
   lanePrTarget?: LanePrTarget;
-  private lanePrJob: Promise<unknown> = Promise.resolve();
-  private pendingLanePr?: () => Promise<void>;
-  private lanePrError?: Error;
+  /** Accepted tasks wait here in order; none is dropped when another is accepted before the drain. */
+  private pendingLanePrs: Array<() => Promise<void>> = [];
+  private lanePrDrain: Promise<void> = Promise.resolve();
 
   constructor(readonly ctx: EngineContext) {
     ensureDefaultMock();
@@ -257,16 +257,20 @@ export class Engine {
   }
 
   async waitForLanePr(): Promise<void> {
-    const pending = this.pendingLanePr;
-    this.pendingLanePr = undefined;
-    if (pending) {
-      this.lanePrError = undefined;
-      this.lanePrJob = this.lanePrJob.then(pending).catch((e) => {
-        this.lanePrError = e as Error;
-      });
-    }
-    await this.lanePrJob;
-    if (this.lanePrError) throw this.lanePrError;
+    const jobs = this.pendingLanePrs;
+    this.pendingLanePrs = [];
+    const errors: Error[] = [];
+    this.lanePrDrain = this.lanePrDrain.then(async () => {
+      for (const job of jobs) {
+        try {
+          await job();
+        } catch (e) {
+          errors.push(e as Error);
+        }
+      }
+    });
+    await this.lanePrDrain;
+    if (errors.length) throw errors[0];
   }
 
   private resolveLanePrTarget(): LanePrTarget | undefined {
@@ -296,10 +300,29 @@ export class Engine {
   }
 
   private queueAcceptedPr(work: WorkPackage, policy = this.policyForAcceptedWork(work.id)): void {
+    // Human acceptance only opens a PR when the project opted in; a policy path stays strict.
+    if (!policy && !configAllows(this.ctx.config.tools, 'pr.create')) {
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'lane.pr-automation-skipped',
+        payload: { reason: 'pr.create is not allowed by project config' },
+      });
+      return;
+    }
     const target = this.resolveLanePrTarget();
+    const repos = this.repoStates(work.id);
+    // A multi-repo change set id is a hash, not a commit; one PR cannot carry it.
+    if (repos.length > 1) {
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'lane.pr-automation-skipped',
+        payload: { reason: `PR automation supports one repo; this task changes ${repos.length}` },
+      });
+      return;
+    }
     const headSha = this.currentCommit(work.id);
     if (!target || !headSha) return;
-    this.pendingLanePr = async () => {
+    this.pendingLanePrs.push(async () => {
       const gate = this.gateDecision(work.id);
       try {
         await ensureAcceptedPr({
@@ -319,7 +342,20 @@ export class Engine {
         });
         throw e;
       }
-    };
+    });
+  }
+
+  /** Durable resume: an ACCEPTED task whose PR automation never finished is queued again on the next sync. */
+  private resumeAcceptedPr(work: WorkPackage): boolean {
+    if (work.currentState !== 'ACCEPTED' || this.repoStates(work.id).length !== 1) return false;
+    const head = this.currentCommit(work.id);
+    const policy = this.policyForAcceptedWork(work.id);
+    if (!head || (!policy && !configAllows(this.ctx.config.tools, 'pr.create'))) return false;
+    const record = this.ctx.store.getLanePrRecord(work.id);
+    if (record?.queueState === 'merged') return false;
+    if (record && record.headSha === head && !(policy && record.queueState === 'not-enabled')) return false;
+    this.queueAcceptedPr(work, policy);
+    return true;
   }
 
   /** Poll the recorded PR. Queue ejection starts a fix round; merge writes Part G's merge store. */
@@ -3335,6 +3371,7 @@ export class Engine {
     actorId = 'local-user',
   ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
     let pending = this.ctx.store.getWork(idOrAlias);
+    if (this.resumeAcceptedPr(pending)) await this.waitForLanePr();
     if (pending.currentState === 'AI_REVIEW') {
       pending = this.refreshHeads(pending.id).work;
       const lane = await this.tryLanePass(pending.id);

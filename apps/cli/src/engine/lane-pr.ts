@@ -62,6 +62,40 @@ export async function confirmMergeQueueProtection(target: LanePrTarget, workId: 
   }
 }
 
+type LivePr = {
+  state: 'open' | 'closed' | 'merged';
+  head?: string;
+  headSha: string;
+  base?: string;
+  mergeQueueState?: 'queued' | 'ejected';
+  queueReason?: string;
+  mergedAt?: string;
+  mergeSha?: string;
+};
+
+function readPr(target: LanePrTarget, workId: string, number: number): Promise<InvokeResult<LivePr>> {
+  return invoke<LivePr>(target, 'pr.read', workId, { number });
+}
+
+/** The recorded PR belongs to one repo and base; an origin or base switch must not silently retarget it. */
+function assertRecordedTarget(record: LanePrRecord, target: LanePrTarget): void {
+  if (record.owner !== target.owner || record.repo !== target.repo || record.baseBranch !== target.baseBranch) {
+    throw err(
+      'E_INVALID_CONFIG',
+      `Recorded PR #${record.number} targets ${record.owner}/${record.repo}:${record.baseBranch}, but the configured target is ${target.owner}/${target.repo}:${target.baseBranch}`,
+    );
+  }
+}
+
+/** Refuse auto-merge unless the live PR is still the recorded, open, exact-head PR. */
+function assertLivePrMatches(live: LivePr, record: LanePrRecord, target: LanePrTarget, headSha: string): void {
+  assertRecordedTarget(record, target);
+  if (live.state !== 'open') throw err('E_STALE_REVISION', `PR #${record.number} is ${live.state}, not open`);
+  if (live.base !== record.baseBranch) throw err('E_STALE_REVISION', `PR #${record.number} base is ${live.base ?? 'unknown'}, expected ${record.baseBranch}`);
+  if (live.head !== record.headBranch) throw err('E_STALE_REVISION', `PR #${record.number} head is ${live.head ?? 'unknown'}, expected ${record.headBranch}`);
+  if (live.headSha !== headSha) throw err('E_STALE_REVISION', `PR #${record.number} head ${live.headSha} is not accepted head ${headSha}`);
+}
+
 export async function ensureAcceptedPr(input: {
   store: WorkStore;
   work: WorkPackage;
@@ -77,7 +111,18 @@ export async function ensureAcceptedPr(input: {
     throw err('E_MISSING_CAPABILITY', `Lane policy ${policy.name} does not grant pr.create`);
   }
   const timestamp = new Date().toISOString();
-  let record = store.getLanePrRecord(work.id);
+  const previous = store.getLanePrRecord(work.id);
+  let record = previous;
+  if (record) {
+    assertRecordedTarget(record, target);
+    const live = (await readPr(target, work.id, record.number)).data;
+    if (live.state === 'merged') return record;
+    // A PR closed without merging cannot land; find or create an open replacement.
+    if (live.state === 'closed') record = undefined;
+  }
+  // Snapshot the terms that authorized landing; later policy edits must not change how the merge is sampled.
+  const authorizingPolicy =
+    previous?.authorizingPolicy ?? (policy ? { name: policy.name, samplingRate: policy.policy.sampling.rate } : undefined);
   if (!record) {
     const created = await invoke<{
       number: number;
@@ -106,29 +151,38 @@ export async function ensureAcceptedPr(input: {
       headSha,
       gateState: 'pending',
       queueState: 'not-enabled',
+      authorizingPolicy,
       createdAt: timestamp,
       updatedAt: timestamp,
     };
     record = store.transaction(() => {
       const saved = store.saveLanePrRecord(createdRecord);
-      store.saveLaneMergeRecord({
-        id: createId('merge'),
-        workId: work.id,
-        policyId: policy?.name ?? null,
-        openedAt: timestamp,
-        mergeState: 'open',
-        reverted: 'unknown',
-        recordedAt: timestamp,
-      });
+      if (previous) {
+        store.appendEvent({
+          workId: work.id,
+          type: 'lane.pr-replaced',
+          payload: { closedNumber: previous.number, number: saved.number },
+        });
+      } else {
+        store.saveLaneMergeRecord({
+          id: createId('merge'),
+          workId: work.id,
+          policyId: policy?.name ?? null,
+          openedAt: timestamp,
+          mergeState: 'open',
+          reverted: 'unknown',
+          recordedAt: timestamp,
+        });
+      }
       return saved;
     });
-  } else if (record.headSha !== headSha) {
+  } else if (record.headSha !== headSha || (policy && !record.authorizingPolicy)) {
     record = store.saveLanePrRecord({
       ...record,
-      headSha,
-      gateState: 'pending',
-      queueState: 'not-enabled',
-      queueReason: undefined,
+      ...(record.headSha !== headSha
+        ? { headSha, gateState: 'pending' as const, queueState: 'not-enabled' as const, queueReason: undefined }
+        : {}),
+      authorizingPolicy,
       updatedAt: timestamp,
     });
   }
@@ -146,8 +200,16 @@ export async function ensureAcceptedPr(input: {
     if (!configAllows(tools, 'pr.merge')) throw err('E_MISSING_CAPABILITY', 'pr.merge is not allowed by project config');
     if (!policy.policy.tools.includes('pr.merge')) throw err('E_MISSING_CAPABILITY', `Lane policy ${policy.name} does not grant pr.merge`);
     if (gateState !== 'success') return record;
+    assertLivePrMatches((await readPr(target, work.id, record.number)).data, record, target, headSha);
     await invoke(target, 'pr.merge', work.id, { number: record.number, nodeId: record.nodeId, mode: 'auto-merge-only', admin: false });
-    record = store.saveLanePrRecord({ ...record, queueState: 'queued', updatedAt: new Date().toISOString() });
+    // Enabling auto-merge is a request; only GitHub reporting queue membership makes the task "queued".
+    const confirmed = (await readPr(target, work.id, record.number)).data.mergeQueueState === 'queued';
+    record = store.saveLanePrRecord({
+      ...record,
+      queueState: confirmed ? 'queued' : 'not-enabled',
+      queueReason: confirmed ? undefined : 'auto-merge requested; GitHub has not confirmed merge-queue membership',
+      updatedAt: new Date().toISOString(),
+    });
   }
   return record;
 }
@@ -160,14 +222,8 @@ export async function refreshLanePr(input: {
 }): Promise<{ kind: 'open' | 'ejected' | 'merged'; record: LanePrRecord; reason?: string }> {
   const current = input.store.getLanePrRecord(input.workId);
   if (!current) throw err('E_NOT_FOUND', `No PR recorded for ${input.workId}`);
-  const result = await invoke<{
-    state: 'open' | 'closed' | 'merged';
-    headSha: string;
-    mergeQueueState?: 'queued' | 'ejected';
-    queueReason?: string;
-    mergedAt?: string;
-    mergeSha?: string;
-  }>(input.target, 'pr.read', input.workId, { number: current.number });
+  // Poll the repo the PR was created in, even if origin has since changed.
+  const result = await readPr({ ...input.target, owner: current.owner, repo: current.repo }, input.workId, current.number);
   const at = new Date().toISOString();
   if (result.data.state === 'merged' && result.data.mergedAt && result.data.mergeSha) {
     const record = input.store.saveLanePrRecord({ ...current, queueState: 'merged', updatedAt: at });
@@ -180,7 +236,7 @@ export async function refreshLanePr(input: {
     const merge = {
       id: opened?.id ?? createId('merge'),
       workId: input.workId,
-      policyId: input.policy?.name ?? null,
+      policyId: current.authorizingPolicy?.name ?? input.policy?.name ?? null,
       openedAt: opened?.openedAt ?? current.createdAt,
       mergeState: 'merged' as const,
       mergedAt: result.data.mergedAt,
@@ -189,14 +245,27 @@ export async function refreshLanePr(input: {
       fixRounds: input.store.listEvents(input.workId).filter((event) => event.type === 'lane.queue-ejected').length,
       recordedAt: at,
     };
-    if (input.policy) recordPolicyMerge(input.store, merge);
+    if (merge.policyId) recordPolicyMerge(input.store, merge, { rate: current.authorizingPolicy?.samplingRate });
     else input.store.saveLaneMergeRecord(merge);
     return { kind: 'merged', record };
   }
-  if (result.data.mergeQueueState === 'ejected') {
-    const reason = result.data.queueReason?.trim() || 'GitHub merge queue ejected the PR without a reason';
+  if (result.data.state === 'closed') {
+    const record = input.store.saveLanePrRecord({
+      ...current,
+      queueState: 'not-enabled',
+      queueReason: 'PR was closed without merging',
+      updatedAt: at,
+    });
+    return { kind: 'open', record };
+  }
+  // Ejection needs GitHub's own removal reason; an unexplained signal preserves the recorded state.
+  const reason = result.data.queueReason?.trim();
+  if (result.data.mergeQueueState === 'ejected' && reason) {
     const record = input.store.saveLanePrRecord({ ...current, queueState: 'ejected', queueReason: reason, updatedAt: at });
     return { kind: 'ejected', record, reason };
+  }
+  if (result.data.mergeQueueState === 'queued' && current.queueState !== 'queued') {
+    return { kind: 'open', record: input.store.saveLanePrRecord({ ...current, queueState: 'queued', queueReason: undefined, updatedAt: at }) };
   }
   return { kind: 'open', record: current };
 }

@@ -106,25 +106,38 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
         if (!token) throw err('E_ADAPTER', 'GitHub token missing (GITHUB_TOKEN)');
         const api = httpsApiBase(config);
         const headers = liveHeaders(token);
-        const list = await fetch(`${api}/repos/${owner}/${repo}/rulesets?includes_parents=true`, { headers, ...liveFetchInit() });
+        const list = await fetch(`${api}/repos/${owner}/${repo}/rulesets?includes_parents=true&per_page=100`, { headers, ...liveFetchInit() });
         if (!list.ok) return { data: { status: 'unknown', reason: `rulesets read failed: ${list.status}` } };
         const summaries = (await list.json()) as Array<{ id: number; enforcement?: string }>;
+        let defaultBranch: string | undefined;
         let mergeQueueRequired = false;
         let turbineGateRequired = false;
         for (const summary of summaries.filter((entry) => entry.enforcement === 'active')) {
           const detail = await fetch(`${api}/repos/${owner}/${repo}/rulesets/${summary.id}`, { headers, ...liveFetchInit() });
           if (!detail.ok) return { data: { status: 'unknown', reason: `ruleset ${summary.id} read failed: ${detail.status}` } };
           const ruleset = (await detail.json()) as {
+            target?: string;
             conditions?: { ref_name?: { include?: string[]; exclude?: string[] } };
             rules?: Array<{ type?: string; parameters?: { required_status_checks?: Array<{ context?: string }> } }>;
           };
-          const includes = ruleset.conditions?.ref_name?.include ?? [];
-          const excludes = ruleset.conditions?.ref_name?.exclude ?? [];
-          const branchRef = `refs/heads/${branch}`;
-          if (
-            !includes.some((ref) => ref === branchRef || ref === '~DEFAULT_BRANCH' || ref === '~ALL') ||
-            excludes.some((ref) => ref === branchRef || ref === '~DEFAULT_BRANCH' || ref === '~ALL')
-          ) continue;
+          if (ruleset.target && ruleset.target !== 'branch') continue;
+          const patterns = [...(ruleset.conditions?.ref_name?.include ?? []), ...(ruleset.conditions?.ref_name?.exclude ?? [])];
+          if (patterns.includes('~DEFAULT_BRANCH') && defaultBranch === undefined) {
+            try {
+              const info = (await liveJson(config, `/repos/${owner}/${repo}`, 'GET')) as { default_branch?: string };
+              defaultBranch = info.default_branch;
+            } catch (e) {
+              return { data: { status: 'unknown', reason: `default branch read failed: ${(e as Error).message}` } };
+            }
+            if (!defaultBranch) return { data: { status: 'unknown', reason: 'default branch could not be determined' } };
+          }
+          const matches = (ref: string) => matchRulesetRef(ref, branch, defaultBranch);
+          const included = (ruleset.conditions?.ref_name?.include ?? []).map(matches);
+          const excluded = (ruleset.conditions?.ref_name?.exclude ?? []).map(matches);
+          if (included.includes('unknown') || excluded.includes('unknown')) {
+            return { data: { status: 'unknown', reason: `ruleset ${summary.id} ref pattern cannot be matched to ${branch}` } };
+          }
+          if (!included.includes('yes') || excluded.includes('yes')) continue;
           mergeQueueRequired ||= ruleset.rules?.some((rule) => rule.type === 'merge_queue') ?? false;
           turbineGateRequired ||= ruleset.rules?.some(
             (rule) =>
@@ -144,7 +157,7 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
         if (!head || !headSha || !base || !title) throw err('E_ADAPTER', 'PR head, headSha, base, and title are required');
         if (config.fixtures) {
           const list = (config.fixtures.pullRequests ??= {})[repoKey] ??= [];
-          const existing = list.find((pr) => pr.head === head && pr.state === 'open');
+          const existing = list.find((pr) => pr.head === head && pr.base === base && pr.state === 'open');
           if (existing) return { data: existing, externalOperationId: String(existing.number) };
           const number = Math.max(0, ...list.map((pr) => pr.number)) + 1;
           const created: GitHubPullRequest = {
@@ -238,6 +251,7 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
           number: number; node_id: string; html_url: string; state: string; merged: boolean; merged_at?: string; merge_commit_sha?: string;
           head: { sha: string; ref: string }; base: { ref: string };
         };
+        const state = json.merged ? 'merged' : json.state;
         return {
           data: {
             number: json.number,
@@ -246,9 +260,10 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
             head: json.head.ref,
             headSha: json.head.sha,
             base: json.base.ref,
-            state: json.merged ? 'merged' : json.state,
+            state,
             mergedAt: json.merged_at,
             mergeSha: json.merge_commit_sha,
+            ...(state === 'open' ? await liveQueueState(config, json.node_id) : {}),
           },
         };
       }
@@ -387,6 +402,45 @@ async function liveGraphql(config: GitHubConfig, query: string, variables: Recor
   const json = await response.json() as { data?: unknown; errors?: Array<{ message?: string }> };
   if (json.errors?.length) throw err('E_ADAPTER', `GitHub GraphQL failed: ${json.errors.map((entry) => entry.message).join('; ')}`);
   return json.data;
+}
+
+/**
+ * Match one ruleset ref pattern against the exact base branch. `~DEFAULT_BRANCH` only matches when
+ * the repo's default branch is that branch; patterns we cannot evaluate are `unknown`, never a match.
+ */
+function matchRulesetRef(pattern: string, branch: string, defaultBranch?: string): 'yes' | 'no' | 'unknown' {
+  if (pattern === '~ALL') return 'yes';
+  if (pattern === '~DEFAULT_BRANCH') return defaultBranch === undefined ? 'unknown' : defaultBranch === branch ? 'yes' : 'no';
+  if (pattern.includes('[')) return 'unknown';
+  const source = pattern
+    .split('**')
+    .map((part) => part.split('*').map((piece) => piece.replace(/[.+^${}()|\\?]/g, (ch) => (ch === '?' ? '[^/]' : `\\${ch}`))).join('[^/]*'))
+    .join('.*');
+  return new RegExp(`^${source}$`).test(`refs/heads/${branch}`) ? 'yes' : 'no';
+}
+
+/**
+ * Merge-queue state from GitHub itself. Ejected needs a removal event with a reason that is newer than
+ * any queue entry; anything unreadable or unexplained reports nothing so the caller preserves state.
+ */
+async function liveQueueState(
+  config: GitHubConfig,
+  nodeId: string,
+): Promise<{ mergeQueueState?: 'queued' | 'ejected'; queueReason?: string }> {
+  try {
+    const data = (await liveGraphql(
+      config,
+      `query($id:ID!){node(id:$id){... on PullRequest{mergeQueueEntry{id} timelineItems(last:10,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{__typename ... on RemovedFromMergeQueueEvent{reason}}}}}}`,
+      { id: nodeId },
+    )) as { node?: { mergeQueueEntry?: { id: string } | null; timelineItems?: { nodes?: Array<{ __typename?: string; reason?: string | null }> } } | null };
+    if (data.node?.mergeQueueEntry) return { mergeQueueState: 'queued' };
+    const last = data.node?.timelineItems?.nodes?.at(-1);
+    const reason = last?.reason?.trim();
+    if (last?.__typename === 'RemovedFromMergeQueueEvent' && reason) return { mergeQueueState: 'ejected', queueReason: reason };
+  } catch {
+    // Unconfirmed: preserve the recorded state.
+  }
+  return {};
 }
 
 /** List fixture comments for tests. */

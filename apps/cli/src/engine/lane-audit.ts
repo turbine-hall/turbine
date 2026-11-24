@@ -21,14 +21,19 @@ export function samplingDraw(record: Pick<LaneMergeRecord, 'id' | 'workId' | 'po
 export function recordPolicyMerge(
   store: WorkStore,
   input: Omit<LaneMergeRecord, 'sampling'>,
+  /** Sampling rate snapshotted when landing was authorized; omitted falls back to the live policy. */
+  opts: { rate?: number } = {},
 ): { merge: LaneMergeRecord; audit: LaneAuditRecord | null } {
   if (input.mergeState !== 'merged' || !input.policyId) {
     throw err('E_INVALID_CONFIG', 'Audit sampling requires a merged policy record');
   }
-  const approved = store.getLanePolicy(input.policyId);
-  if (!approved) throw err('E_NOT_FOUND', `No approved policy named ${input.policyId}`);
+  let rate = opts.rate;
+  if (rate === undefined) {
+    const approved = store.getLanePolicy(input.policyId);
+    if (!approved) throw err('E_NOT_FOUND', `No approved policy named ${input.policyId}`);
+    rate = approved.policy.sampling.rate;
+  }
   const { seed, draw } = samplingDraw(input);
-  const rate = approved.policy.sampling.rate;
   const selected = draw < rate;
   const result = store.transaction(() => {
     const merge = store.saveLaneMergeRecord({ ...input, sampling: { seed, draw, rate, selected } });
