@@ -140,6 +140,9 @@ export function evaluateLaneEligibility(
   }
 
   if (facts.gate === 'acceptance') {
+    // One PR cannot carry a multi-repo change set, so landing would be skipped after the policy already
+    // accepted. Route it to a human now (multi-repo review under `maxRepos` is unaffected).
+    if (facts.repoCount > 1) reasons.push(`PR landing supports one repository; the task changes ${facts.repoCount}`);
     if (!facts.lanePr || facts.lanePr.protection.status !== 'confirmed') {
       reasons.push(`merge-queue protection is unknown${facts.lanePr?.protection.reason ? `: ${facts.lanePr.protection.reason}` : ''}`);
     } else {

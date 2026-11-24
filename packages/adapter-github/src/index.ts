@@ -26,6 +26,13 @@ export type GitHubPullRequest = {
   queueReason?: string;
   /** Identity of the newest merge-queue removal GitHub shows; an ejection counts only if it is a new one. */
   queueRemovalId?: string;
+  /**
+   * Whether the merge-queue history behind `mergeQueueState` / `queueRemovalId` could be read. Absent history
+   * proves "no removal" only when this is true; an unreadable history proves nothing.
+   */
+  queueStateKnown?: boolean;
+  /** Fixture only: enqueueing is refused with this reason (the PR is not ready for the queue). */
+  queueRejection?: string;
   mergedAt?: string;
   mergeSha?: string;
 };
@@ -220,33 +227,42 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
       }
 
       if (capability === 'pr.merge') {
-        // GitHub enforces this: auto-merge is enabled for exactly the accepted head, never a head pushed meanwhile.
+        // Queue-only: the PR is added to the merge queue, which merges it. There is no direct merge, no admin
+        // bypass and no ordinary auto-merge fallback (that would land without the queue's own checks).
+        if (args.mode !== 'queue-only') throw err('E_ADAPTER', 'pr.merge only supports mode "queue-only"');
+        // GitHub enforces this: the PR is enqueued for exactly the accepted head, never a head pushed meanwhile.
         const expectedHeadOid = String(args.expectedHeadOid ?? '');
-        if (!expectedHeadOid) throw err('E_ADAPTER', 'expectedHeadOid is required for auto-merge');
+        if (!expectedHeadOid) throw err('E_ADAPTER', 'expectedHeadOid is required to enqueue a pull request');
         if (config.fixtures) {
           const pr = config.fixtures.pullRequests?.[repoKey]?.find((entry) => entry.number === number);
           if (!pr) throw err('E_ADAPTER', `fixture PR #${number} not found`);
           if (pr.headSha !== expectedHeadOid) {
             throw err('E_ADAPTER', `fixture PR #${number} head ${pr.headSha} is not the expected head ${expectedHeadOid}`);
           }
+          if (pr.queueRejection) throw err('E_ADAPTER', `GitHub did not enqueue PR #${number}: ${pr.queueRejection}`);
           pr.mergeQueueState = 'queued';
           return { data: { number, queueState: 'queued' } };
         }
         const nodeId = String(args.nodeId ?? '');
-        if (!nodeId) throw err('E_ADAPTER', 'PR nodeId is required for auto-merge');
-        const data = await liveGraphql(
+        if (!nodeId) throw err('E_ADAPTER', 'PR nodeId is required to enqueue a pull request');
+        // `enqueuePullRequest` (GraphQL, "Add a pull request to the merge queue") takes the PR node id and an
+        // optional expectedHeadOid; it fails when the repository has no merge queue or the PR is not ready.
+        const data = (await liveGraphql(
           config,
-          `mutation($id:ID!,$oid:GitObjectID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,expectedHeadOid:$oid}){pullRequest{number}}}`,
+          `mutation($id:ID!,$oid:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$oid}){mergeQueueEntry{id}}}`,
           { id: nodeId, oid: expectedHeadOid },
-        );
-        return { data };
+        )) as { enqueuePullRequest?: { mergeQueueEntry?: { id?: string } | null } | null } | null;
+        const entryId = data?.enqueuePullRequest?.mergeQueueEntry?.id;
+        // No entry means GitHub did not queue it: fail closed so the landing stays retryable.
+        if (!entryId) throw err('E_ADAPTER', `GitHub did not return a merge-queue entry for PR #${number}`);
+        return { data: { number, queueState: 'queued', mergeQueueEntryId: entryId } };
       }
 
       if (capability === 'pr.read') {
         if (config.fixtures) {
           const pr = config.fixtures.pullRequests?.[repoKey]?.find((entry) => entry.number === number);
           if (!pr) throw err('E_ADAPTER', `fixture PR #${number} not found`);
-          return { data: { ...pr } };
+          return { data: { queueStateKnown: true, ...pr } };
         }
         const json = await liveJson(config, `/repos/${owner}/${repo}/pulls/${number}`, 'GET') as {
           number: number; node_id: string; html_url: string; state: string; merged: boolean; merged_at?: string; merge_commit_sha?: string;
@@ -408,32 +424,34 @@ async function liveGraphql(config: GitHubConfig, query: string, variables: Recor
 /**
  * Merge-queue state from GitHub itself. Ejected needs the newest queue event to be a removal with a reason;
  * `queueRemovalId` names the newest removal so callers can tell an old removal from the current attempt's.
- * Anything unreadable or unexplained reports nothing so the caller preserves state.
+ * `queueStateKnown` is false when the history could not be read at all: then nothing else is reported, and the
+ * absence of a removal id proves nothing (a caller needing a removal baseline must fail closed).
  */
 async function liveQueueState(
   config: GitHubConfig,
   nodeId: string,
-): Promise<{ mergeQueueState?: 'queued' | 'ejected'; queueReason?: string; queueRemovalId?: string }> {
+): Promise<{ mergeQueueState?: 'queued' | 'ejected'; queueReason?: string; queueRemovalId?: string; queueStateKnown: boolean }> {
   try {
     const data = (await liveGraphql(
       config,
       `query($id:ID!){node(id:$id){... on PullRequest{mergeQueueEntry{id} timelineItems(last:10,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{__typename ... on RemovedFromMergeQueueEvent{id reason}}}}}}`,
       { id: nodeId },
     )) as { node?: { mergeQueueEntry?: { id: string } | null; timelineItems?: { nodes?: Array<{ __typename?: string; id?: string; reason?: string | null }> } } | null };
-    const nodes = data.node?.timelineItems?.nodes ?? [];
+    if (!data?.node || !Array.isArray(data.node.timelineItems?.nodes)) return { queueStateKnown: false };
+    const nodes = data.node.timelineItems.nodes;
     const lastRemoval = [...nodes].reverse().find((node) => node.__typename === 'RemovedFromMergeQueueEvent' && node.id);
     const queueRemovalId = lastRemoval?.id;
-    if (data.node?.mergeQueueEntry) return { mergeQueueState: 'queued', ...(queueRemovalId ? { queueRemovalId } : {}) };
+    if (data.node.mergeQueueEntry) return { queueStateKnown: true, mergeQueueState: 'queued', ...(queueRemovalId ? { queueRemovalId } : {}) };
     const last = nodes.at(-1);
     const reason = last?.reason?.trim();
     if (last?.__typename === 'RemovedFromMergeQueueEvent' && last.id && reason) {
-      return { mergeQueueState: 'ejected', queueReason: reason, queueRemovalId: last.id };
+      return { queueStateKnown: true, mergeQueueState: 'ejected', queueReason: reason, queueRemovalId: last.id };
     }
-    return queueRemovalId ? { queueRemovalId } : {};
+    return { queueStateKnown: true, ...(queueRemovalId ? { queueRemovalId } : {}) };
   } catch {
     // Unconfirmed: preserve the recorded state.
   }
-  return {};
+  return { queueStateKnown: false };
 }
 
 /** List fixture comments for tests. */
