@@ -1,6 +1,6 @@
 import { contentHash, type ApprovedLanePolicy, type LaneGate, type RiskProfile, type WorkState } from '@turbine-hall/turbine-contracts';
 import { compileGlob } from './context/snapshot.js';
-import { deniedBy } from './lane-policy.js';
+import { deniedBy, resolvePolicyReviewers, type ModelProfiles } from './lane-policy.js';
 
 /** Work states where a gate waits for a human, and the lane gate each one is. */
 export const LANE_GATE_FOR_STATE: Partial<Record<WorkState, LaneGate>> = {
@@ -47,6 +47,14 @@ export type LaneFacts = {
     gateBlocking: string[];
   };
   readErrors: string[];
+  reviewerProfiles: ModelProfiles;
+  dualReview?: {
+    changeSetId: string;
+    complete: boolean;
+    clean: boolean;
+    disagreement: boolean;
+    reason?: string;
+  };
 };
 
 export type LaneEvaluation = {
@@ -62,11 +70,26 @@ export type LaneEvaluation = {
  * Deterministic: the same policy snapshot and facts always give the same result and hash. Every check runs
  * (reasons are complete), and any read error makes the result `unknown`.
  */
-export function evaluateLaneEligibility(policy: ApprovedLanePolicy, facts: LaneFacts): LaneEvaluation {
+export function evaluateLaneEligibility(
+  policy: ApprovedLanePolicy,
+  facts: LaneFacts,
+  options: { requireDualReview?: boolean } = {},
+): LaneEvaluation {
   const p = policy.policy;
   const reasons: string[] = [];
   if (facts.gate === 'codeReview') {
-    reasons.push('code review is not passed by policy yet: two-reviewer AI review (part B) is not implemented, so a human reviews');
+    try {
+      resolvePolicyReviewers(p, facts.reviewerProfiles);
+    } catch (e) {
+      reasons.push((e as Error).message);
+    }
+    if (options.requireDualReview) {
+      const review = facts.dualReview;
+      if (!review || review.changeSetId !== facts.commit) reasons.push('dual review is missing or stale for the current change set');
+      else if (!review.complete) reasons.push(review.reason ?? 'both reviewers did not complete with parseable output');
+      else if (review.disagreement) reasons.push('the two reviewers disagree about blocking findings');
+      else if (!review.clean) reasons.push('dual review has kept blocking findings');
+    }
   }
   if (!p.gates.includes(facts.gate)) reasons.push(`policy ${policy.name} does not list the ${facts.gate} gate`);
   if (RISK_RANK[facts.riskProfile] > RISK_RANK[p.maxRiskProfile]) {

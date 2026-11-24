@@ -78,9 +78,6 @@ export const DecisionSchema = z
       if (d.gate === 'policy' || d.gate === 'exception') {
         ctx.addIssue({ code: 'custom', path: ['gate'], message: `a policy cannot decide the ${d.gate} gate` });
       }
-      if (d.gate === 'code-review') {
-        ctx.addIssue({ code: 'custom', path: ['gate'], message: 'code review is not passed by policy until two-reviewer review exists' });
-      }
       if (d.action !== 'approve') ctx.addIssue({ code: 'custom', path: ['action'], message: 'a policy only records passes' });
     }
     if (d.gate === 'policy' && d.actorType !== 'human') {

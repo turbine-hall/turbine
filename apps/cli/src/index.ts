@@ -1729,7 +1729,7 @@ policyCmd
       assertHumanTerminal('turbine policy approve');
       const ctx = openContext();
       try {
-        const pending = pendingPolicyApproval(ctx.store, ctx.projectRoot, name);
+        const pending = pendingPolicyApproval(ctx.store, ctx.projectRoot, name, ctx.config.models.profiles);
         const out = process.stdout;
         out.write(`\nAPPROVE LANE POLICY — ${name}\n  File: ${pending.status.file!.path}\n  Hash: ${pending.hash}\n\n`);
         if (pending.diff) {
@@ -1740,7 +1740,13 @@ policyCmd
         out.write(`\nTasks that meet this policy will pass its gates without a human. Type the code ${pending.confirmToken} to confirm.\n`);
         const token = await ask('Code: ');
         const reviewer = await askReviewer(ctx.projectRoot);
-        const result = approvePolicy(ctx.store, ctx.projectRoot, { name, confirmToken: token, reviewer, presence: HUMAN_PRESENCE });
+        const result = approvePolicy(ctx.store, ctx.projectRoot, {
+          name,
+          confirmToken: token,
+          reviewer,
+          presence: HUMAN_PRESENCE,
+          profiles: ctx.config.models.profiles,
+        });
         out.write('\nRecorded as a local attestation (identity not cryptographically verified).\n');
         printResult({ policy: name, state: 'active', hash: result.policy.contentHash, decision: result.decision.id }, false);
       } finally {

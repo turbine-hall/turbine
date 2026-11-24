@@ -203,6 +203,8 @@ export function validateCoverage(
 
 export type ReviewResult = {
   changeSetId: string;
+  /** Present for one side of an autonomous dual review; absent for the human-lane advisory review. */
+  reviewer?: { profile: string; provider: string; model: string };
   lenses: Lens[];
   findings: Finding[];
   discarded: DiscardedFinding[];
@@ -216,4 +218,21 @@ export type ReviewResult = {
 
 export function disposition(findings: Finding[], mismatches: ClaimMismatch[]): ReviewResult['disposition'] {
   return findings.some((f) => f.severity === 'high') || mismatches.length > 0 ? 'needs-attention' : 'no-blocking-findings';
+}
+
+/** Structured output must be complete before it may contribute to an autonomous pass. */
+export function reviewOutputIsParseable(raw: unknown): raw is {
+  findings: unknown[];
+  claims: { dependenciesAdded: unknown; testFilesChanged: unknown };
+  coverage?: unknown[];
+  summary: string;
+} {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const value = raw as Record<string, unknown>;
+  if (!Array.isArray(value.findings) || typeof value.summary !== 'string') return false;
+  if (!value.claims || typeof value.claims !== 'object' || Array.isArray(value.claims)) return false;
+  const claims = value.claims as Record<string, unknown>;
+  if (!Array.isArray(claims.dependenciesAdded) || !Array.isArray(claims.testFilesChanged)) return false;
+  if (value.coverage !== undefined && !Array.isArray(value.coverage)) return false;
+  return !('refusal' in value) && !('error' in value);
 }

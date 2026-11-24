@@ -8,7 +8,7 @@ export const LANE_HARD_TRIGGER_NAMES = ['auth-permissions', 'data-migration', 'p
 export const LANE_SOFT_TRIGGER_NAMES = ['untrusted-input', 'data-deletion', 'new-dependency'] as const;
 export const LANE_TRIGGER_NAMES: readonly string[] = [...LANE_HARD_TRIGGER_NAMES, ...LANE_SOFT_TRIGGER_NAMES];
 
-/** Gates a lane policy may name. `codeReview` is accepted by the schema but not passed by policy until part B. */
+/** Gates a lane policy may name. */
 export const LaneGateSchema = z.enum(['requirements', 'plan', 'codeReview', 'acceptance']);
 export type LaneGate = z.infer<typeof LaneGateSchema>;
 
@@ -52,7 +52,7 @@ export const LanePolicySchema = z
     deniedPaths: z.array(LanePathPatternSchema).max(200).default([]),
     maxRepos: z.number().int().min(1).default(1),
     gates: z.array(LaneGateSchema).min(1),
-    /** Two model profile names (used by part B). */
+    /** Two distinct model profile names used for autonomous code review. */
     reviewers: z.array(z.string().min(1)).length(2).optional(),
     /** Tool capabilities the lane may use (used by part C). */
     tools: z.array(z.string().min(1)).max(32).default([]),
@@ -67,7 +67,25 @@ export const LanePolicySchema = z
       .strict()
       .default({}),
   })
-  .strict();
+  .strict()
+  .superRefine((policy, ctx) => {
+    if (!policy.gates.includes('codeReview')) return;
+    if (!policy.reviewers) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['reviewers'],
+        message: 'reviewers must name exactly two model profiles when gates includes codeReview',
+      });
+      return;
+    }
+    if (policy.reviewers[0] === policy.reviewers[1]) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['reviewers'],
+        message: 'reviewers must name two different model profiles',
+      });
+    }
+  });
 export type LanePolicy = z.infer<typeof LanePolicySchema>;
 
 export const LanePolicyStatusSchema = z.enum(['active', 'suspended']);

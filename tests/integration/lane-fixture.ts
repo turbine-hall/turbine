@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { openContext } from '../../apps/cli/src/engine/project.js';
 import { Engine } from '../../apps/cli/src/engine/engine.js';
 import { approvePolicy, pendingPolicyApproval } from '../../apps/cli/src/engine/lane-policy.js';
+import { createMockModelAdapter, registerModel } from '../../packages/models/dist/index.js';
 import { commitIn, tempProject } from './fixture.js';
 
 export const ROUTINE_POLICY = [
@@ -19,9 +20,14 @@ export const ROUTINE_POLICY = [
   '  - ".cursor/**"',
   '  - ".github/**"',
   '  - ".turbine/**"',
-  'gates: [requirements, plan, codeReview, acceptance]',
+  'gates: [requirements, plan, acceptance]',
   '',
 ].join('\n');
+
+export const DUAL_ROUTINE_POLICY = ROUTINE_POLICY.replace(
+  'gates: [requirements, plan, acceptance]',
+  'gates: [requirements, plan, codeReview, acceptance]\nreviewers: [review-primary, review-secondary]',
+);
 
 export function writePolicy(dir: string, name: string, yaml: string): string {
   const policies = join(dir, '.turbine', 'policies');
@@ -32,14 +38,25 @@ export function writePolicy(dir: string, name: string, yaml: string): string {
 }
 
 export function approve(engine: Engine, name: string, reviewer = 'Ana') {
-  const pending = pendingPolicyApproval(engine.ctx.store, engine.ctx.projectRoot, name);
-  return approvePolicy(engine.ctx.store, engine.ctx.projectRoot, { name, confirmToken: pending.confirmToken, reviewer, presence: 'test' });
+  const profiles = engine.ctx.config.models.profiles;
+  const pending = pendingPolicyApproval(engine.ctx.store, engine.ctx.projectRoot, name, profiles);
+  return approvePolicy(engine.ctx.store, engine.ctx.projectRoot, {
+    name,
+    confirmToken: pending.confirmToken,
+    reviewer,
+    presence: 'test',
+    profiles,
+  });
 }
 
 /** A project with the routine policy on disk; approved unless `approved: false`. */
 export function laneProject(dirs: string[], opts: { policy?: string; approved?: boolean } = {}) {
   const dir = tempProject('turbine-lane-', dirs);
   const engine = new Engine(openContext(dir));
+  engine.ctx.config.models.profiles['review-primary'] = { provider: 'mock', model: 'mock-review-primary', maxOutputTokens: 3000 };
+  engine.ctx.config.models.profiles['review-secondary'] = { provider: 'mock', model: 'mock-review-secondary', maxOutputTokens: 3000 };
+  registerModel(createMockModelAdapter('mock-review-primary'));
+  registerModel(createMockModelAdapter('mock-review-secondary'));
   writePolicy(dir, 'routine', opts.policy ?? ROUTINE_POLICY);
   if (opts.approved !== false) approve(engine, 'routine');
   return { dir, engine };
@@ -61,7 +78,7 @@ export async function toCodeReview(engine: Engine, files: Record<string, string>
   const work = await toRequirementsGate(engine, opts);
   for (let i = 0; i < 8; i++) {
     const w = engine.ctx.store.getWork(work.id);
-    if (w.currentState === 'HUMAN_CODE_REVIEW') break;
+    if (w.currentState === 'HUMAN_CODE_REVIEW' || w.currentState === 'VERIFYING') break;
     if (w.currentState === 'IMPLEMENTING') {
       const wt = engine.repoStates(work.id)[0]!.worktreePath;
       for (const [file, content] of Object.entries(files)) commitIn(wt, file, content);

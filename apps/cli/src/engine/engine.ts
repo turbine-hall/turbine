@@ -99,6 +99,7 @@ import {
   crossCheckClaims,
   disposition,
   factsBlock,
+  reviewOutputIsParseable,
   selectLenses,
   triage,
   validateCoverage,
@@ -136,7 +137,7 @@ import {
   writeFileAtomic,
 } from './packet.js';
 import { measuredTurbineTokens, summarizeUsage } from './usage.js';
-import { policyStatuses, readPolicyFiles, type PolicyStatus } from './lane-policy.js';
+import { policyStatuses, readPolicyFiles, resolvePolicyReviewers, type PolicyStatus } from './lane-policy.js';
 import { evaluateLaneEligibility, LANE_GATE_FOR_STATE, type LaneEvaluation, type LaneFacts } from './lane-eligibility.js';
 
 function now(): string {
@@ -2115,6 +2116,16 @@ export class Engine {
     const repos = this.repoStates(work.id);
     const implemented = repos.length > 0 && changeSetId(repos) !== baseSetId(repos);
     const cs = repos.length ? changeSetId(repos) : undefined;
+    const dualReviews: ReviewResult[] = [];
+    for (const artifact of this.ctx.store.listArtifacts(work.id, 'review')) {
+      if (artifact.relatedCommit !== cs) continue;
+      try {
+        const parsed = JSON.parse(this.ctx.store.getArtifactContent(artifact.id)) as ReviewResult;
+        if (parsed.reviewer && parsed.changeSetId === cs) dualReviews.push(parsed);
+      } catch (e) {
+        notes.push(`Dual review artifact ${artifact.id} is unreadable: ${(e as Error).message}`);
+      }
+    }
     const changeFacts = implemented ? this.factsFor(work.id, repos) : [];
     let gate: PacketData['gate'];
     try {
@@ -2144,6 +2155,7 @@ export class Engine {
       ['plan.json', plan?.content],
       ['change.json', implemented ? { repos, facts: changeFacts } : undefined],
       ['review.json', review?.content],
+      ['dual-reviews.json', dualReviews.length ? dualReviews : undefined],
       ['checks.json', report?.content],
     ];
     const evidenceFiles: string[] = [];
@@ -2191,6 +2203,7 @@ export class Engine {
       implemented,
       changeFacts,
       review: review?.content,
+      dualReviews,
       runs: report && report.content.changeSetId === cs ? report.content.runs : undefined,
       decisions,
       gate,
@@ -2528,6 +2541,81 @@ export class Engine {
     return repos.length ? observe(repos).uncommitted : [];
   }
 
+  private async runReviewWithModel(input: {
+    work: WorkPackage;
+    facts: RepoFacts[];
+    diffText: string;
+    changeSetId: string;
+    model: ModelAdapter;
+    maxOutputTokens: number;
+    reviewer?: ReviewResult['reviewer'];
+    requireParseable?: boolean;
+  }): Promise<ReviewResult> {
+    const { work, facts, diffText } = input;
+    const spec = this.ctx.store.getLatestArtifact(work.id, 'specification');
+    const plan = this.ctx.store.getLatestArtifact(work.id, 'plan');
+    const skill = getSkill(this.ctx.factoryRoot, 'core/review-change');
+    const lenses = selectLenses(work, facts);
+    const findings: Finding[] = [];
+    const discarded: DiscardedFinding[] = [];
+    const claimMismatches: ClaimMismatch[] = [];
+    const summaries: Array<{ lens: Lens; summary: string }> = [];
+    const coverage: CoverageLink[] = [];
+    for (const lens of lenses) {
+      this.checkBudget(work.id);
+      let result: Awaited<ReturnType<Engine['runAsRole']>>;
+      try {
+        result = await this.runAsRole({
+          skill,
+          model: input.model,
+          workId: work.id,
+          roleId: lens === 'security' ? 'security-reviewer' : 'code-reviewer',
+          context: [
+            LENS_INSTRUCTIONS[lens],
+            REVIEW_OUTPUT_CONTRACT,
+            `REQUIREMENTS:\n${work.acceptanceCriteria.map((c) => `- ${c.id} (${c.priority ?? 'P1'}): ${c.statement}`).join('\n')}`,
+            `SPEC:\n${spec ? this.ctx.store.getArtifactContent(spec.id).slice(0, 6000) : '(none)'}`,
+            `PLAN:\n${plan ? this.ctx.store.getArtifactContent(plan.id).slice(0, 4000) : '(none)'}`,
+            `FACTS (from git):\n${factsBlock(facts)}`,
+            `DIFF:\n${diffText}`,
+          ].join('\n\n'),
+          schemaId: 'review',
+          maxOutputTokens: input.maxOutputTokens,
+        });
+      } finally {
+        this.ctx.store.incrementBudget(work.id, 1);
+      }
+      if (input.requireParseable && !reviewOutputIsParseable(result.content)) {
+        throw new LaneIneligible(`${input.reviewer?.profile ?? input.model.id} returned incomplete or unparseable review output for ${lens}`);
+      }
+      const t = triage({ lens, raw: result.content, facts, diffText, startIndex: findings.length });
+      findings.push(...t.findings);
+      discarded.push(...t.discarded);
+      for (const mismatch of crossCheckClaims(result.content, facts)) {
+        if (!claimMismatches.some((x) => x.claim === mismatch.claim)) claimMismatches.push(mismatch);
+      }
+      if (lens === 'tests') {
+        const checked = validateCoverage(result.content, facts, work.acceptanceCriteria.map((c) => c.id));
+        coverage.push(...checked.links);
+        discarded.push(...checked.rejected);
+      }
+      const summary = (result.content as { summary?: unknown })?.summary;
+      if (typeof summary === 'string' && summary.trim()) summaries.push({ lens, summary: summary.trim().slice(0, 400) });
+    }
+    return {
+      changeSetId: input.changeSetId,
+      reviewer: input.reviewer,
+      lenses,
+      findings,
+      discarded,
+      claimMismatches,
+      summaries,
+      truncatedRepos: [],
+      coverage,
+      disposition: disposition(findings, claimMismatches),
+    };
+  }
+
   /**
    * Diff-grounded AI review: one model run per lens over the real diff and git facts, then
    * deterministic triage (findings must cite a changed file; quotes must be in the diff;
@@ -2551,62 +2639,16 @@ export class Engine {
     }
     const facts = computeFacts(repos);
     const diff = collectDiffs(repos);
-    const spec = this.ctx.store.getLatestArtifact(work.id, 'specification');
-    const plan = this.ctx.store.getLatestArtifact(work.id, 'plan');
     const model = getModel(this.ctx.config.models.profiles.analysis?.model ?? 'mock-default');
-    const skill = getSkill(this.ctx.factoryRoot, 'core/review-change');
-    const lenses = selectLenses(work, facts);
-
-    const findings: Finding[] = [];
-    const discarded: DiscardedFinding[] = [];
-    const claimMismatches: ClaimMismatch[] = [];
-    const summaries: Array<{ lens: Lens; summary: string }> = [];
-    const coverage: CoverageLink[] = [];
-    for (const lens of lenses) {
-      this.checkBudget(work.id);
-      const result = await this.runAsRole({
-        skill,
-        model,
-        workId: work.id,
-        roleId: lens === 'security' ? 'security-reviewer' : 'code-reviewer',
-        context: [
-          LENS_INSTRUCTIONS[lens],
-          REVIEW_OUTPUT_CONTRACT,
-          `REQUIREMENTS:\n${work.acceptanceCriteria.map((c) => `- ${c.id} (${c.priority ?? 'P1'}): ${c.statement}`).join('\n')}`,
-          `SPEC:\n${spec ? this.ctx.store.getArtifactContent(spec.id).slice(0, 6000) : '(none)'}`,
-          `PLAN:\n${plan ? this.ctx.store.getArtifactContent(plan.id).slice(0, 4000) : '(none)'}`,
-          `FACTS (from git):\n${factsBlock(facts)}`,
-          `DIFF:\n${diff.text}`,
-        ].join('\n\n'),
-        schemaId: 'review',
-        maxOutputTokens: 3000,
-      });
-      this.ctx.store.incrementBudget(work.id, 1);
-      const t = triage({ lens, raw: result.content, facts, diffText: diff.text, startIndex: findings.length });
-      findings.push(...t.findings);
-      discarded.push(...t.discarded);
-      for (const m of crossCheckClaims(result.content, facts)) {
-        if (!claimMismatches.some((x) => x.claim === m.claim)) claimMismatches.push(m);
-      }
-      if (lens === 'tests') {
-        const cov = validateCoverage(result.content, facts, work.acceptanceCriteria.map((c) => c.id));
-        coverage.push(...cov.links);
-        discarded.push(...cov.rejected);
-      }
-      const summary = (result.content as { summary?: unknown })?.summary;
-      if (typeof summary === 'string' && summary.trim()) summaries.push({ lens, summary: summary.trim().slice(0, 400) });
-    }
-    const review: ReviewResult = {
+    const review = await this.runReviewWithModel({
+      work,
+      facts,
+      diffText: diff.text,
       changeSetId: changeSet,
-      lenses,
-      findings,
-      discarded,
-      claimMismatches,
-      summaries,
-      truncatedRepos: diff.truncated,
-      coverage,
-      disposition: disposition(findings, claimMismatches),
-    };
+      model,
+      maxOutputTokens: this.ctx.config.models.profiles.analysis?.maxOutputTokens ?? 3000,
+    });
+    review.truncatedRepos = diff.truncated;
 
     const change = this.ctx.store.getLatestArtifact(work.id, 'change-report');
     const reviewArt = this.saveArtifact({
@@ -2651,14 +2693,14 @@ export class Engine {
           reviewArtifactId: reviewArt.id,
           mode: 'ai',
           disposition: review.disposition,
-          kept: findings.length,
-          discarded: discarded.length,
-          claimMismatches: claimMismatches.length,
+          kept: review.findings.length,
+          discarded: review.discarded.length,
+          claimMismatches: review.claimMismatches.length,
         },
       });
     });
     this.render(work.id, [
-        `AI review: ${review.disposition} (${findings.length} finding(s) kept, ${discarded.length} discarded as unverifiable).`,
+        `AI review: ${review.disposition} (${review.findings.length} finding(s) kept, ${review.discarded.length} discarded as unverifiable).`,
         'Read REVIEW.md sections 1–3 and the diff',
         'Then a human runs, in their own terminal: turbine task approve <id>',
       ]);
@@ -2668,6 +2710,121 @@ export class Engine {
       packetDir: packetPaths(this.ctx.projectRoot, work.id).dir,
       openFile: packetPaths(this.ctx.projectRoot, work.id).review,
     };
+  }
+
+  private async runDualLaneReview(
+    work: WorkPackage,
+    policy: ApprovedLanePolicy,
+    expectedChangeSetId: string,
+  ): Promise<{ reviews: [ReviewResult, ReviewResult]; clean: boolean; disagreement: boolean }> {
+    const profiles = resolvePolicyReviewers(policy.policy, this.ctx.config.models.profiles);
+    if (!profiles) throw new LaneIneligible(`policy ${policy.name} does not configure codeReview`);
+    const repos = this.repoStates(work.id);
+    if (!repos.length || changeSetId(repos) !== expectedChangeSetId) {
+      throw new LaneIneligible('the change set moved before dual review started');
+    }
+    const facts = computeFacts(repos);
+    const diff = collectDiffs(repos);
+    const reviews: ReviewResult[] = [];
+    for (const profile of profiles) {
+      const review = await this.runReviewWithModel({
+        work,
+        facts,
+        diffText: diff.text,
+        changeSetId: expectedChangeSetId,
+        model: getModel(profile.model),
+        maxOutputTokens: profile.maxOutputTokens,
+        reviewer: { profile: profile.name, provider: profile.provider, model: profile.model },
+        requireParseable: true,
+      });
+      review.truncatedRepos = diff.truncated;
+      reviews.push(review);
+      const observed = observe(this.repoStates(work.id));
+      if (observed.uncommitted.length || changeSetId(observed.repos) !== expectedChangeSetId) {
+        throw new LaneIneligible('the change set moved while dual review was running');
+      }
+    }
+    const pair = reviews as [ReviewResult, ReviewResult];
+    const blocking = pair.map((r) => r.disposition === 'needs-attention') as [boolean, boolean];
+    const disagreement = blocking[0] !== blocking[1];
+    const clean = !blocking[0] && !blocking[1];
+    const change = this.ctx.store.getLatestArtifact(work.id, 'change-report');
+    this.ctx.store.transaction(() => {
+      const artifacts = pair.map((review) =>
+        this.saveArtifact({
+          workId: work.id,
+          type: 'review',
+          content: review,
+          createdBy: { kind: 'agent', identifier: `code-reviewer:${review.reviewer!.profile}` },
+          parentArtifactIds: change ? [change.id] : [],
+          relatedCommit: expectedChangeSetId,
+        }),
+      );
+      if (change) {
+        for (const artifact of artifacts) {
+          this.ctx.store.saveEdge(
+            createEdge({
+              workId: work.id,
+              upstreamArtifactId: change.id,
+              upstreamRevisionHash: change.contentHash,
+              downstreamArtifactId: artifact.id,
+              downstreamRevisionHash: artifact.contentHash,
+              reason: 'change-to-dual-review',
+              affectedObligationIds: ['obl_code_review'],
+            }),
+          );
+        }
+      }
+      pair[0].lenses.forEach((lens) => {
+        const lensBlocking = pair.map(
+          (review) =>
+            review.findings.some((finding) => finding.lens === lens && finding.severity === 'high') ||
+            (lens === 'spec-compliance' && review.claimMismatches.length > 0),
+        ) as [boolean, boolean];
+        this.ctx.store.saveReviewerAgreement({
+          workId: work.id,
+          changeSetId: expectedChangeSetId,
+          lens,
+          reviewerProfiles: [profiles[0].name, profiles[1].name],
+          blocking: lensBlocking,
+          agreed: lensBlocking[0] === lensBlocking[1],
+        });
+      });
+      artifacts.forEach((artifact, index) => {
+        const review = pair[index]!;
+        this.ctx.store.saveEvidence({
+          id: createId('ev'),
+          workId: work.id,
+          kind: 'review',
+          reviewerId: review.reviewer!.profile,
+          result: review.disposition === 'no-blocking-findings' ? 'passed' : 'failed',
+          commitSha: expectedChangeSetId,
+          observedAt: now(),
+          logArtifactId: artifact.id,
+          limitations: ['Autonomous AI reviewer; policy pass requires both configured reviewers to complete cleanly'],
+        });
+      });
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'review.dual-completed',
+        payload: {
+          policy: policy.name,
+          changeSetId: expectedChangeSetId,
+          reviewers: profiles.map((p) => ({ profile: p.name, provider: p.provider, model: p.model })),
+          artifacts: artifacts.map((a) => a.id),
+          dispositions: pair.map((r) => r.disposition),
+          disagreement,
+        },
+      });
+    });
+    this.render(work.id, [
+      disagreement
+        ? 'Dual reviewers disagree; a human decides code review.'
+        : clean
+          ? `Dual review completed cleanly for policy ${policy.name}.`
+          : 'Both autonomous reviewers found blocking issues; a human decides code review.',
+    ]);
+    return { reviews: pair, clean, disagreement };
   }
 
   /** Throws unless `expected` (full sha or >=7-char prefix) names the commit currently under review. */
@@ -3017,7 +3174,7 @@ export class Engine {
     actorId = 'local-user',
   ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
     const result = await this.syncStep(idOrAlias, actorId);
-    const lane = this.tryLanePass(result.work.id);
+    const lane = await this.tryLanePass(result.work.id);
     if (!lane) return result;
     const laneDetail = { status: lane.status, gate: lane.gate, policy: lane.policy, decisionId: lane.decision?.id, reasons: lane.reasons };
     const detail = { ...(result.detail && typeof result.detail === 'object' ? result.detail : {}), lane: laneDetail };
@@ -3471,6 +3628,7 @@ export class Engine {
       change,
       acceptance,
       readErrors,
+      reviewerProfiles: this.ctx.config.models.profiles,
     };
   }
 
@@ -3492,7 +3650,7 @@ export class Engine {
    * At a gate that waits for a human, try to pass it with an approved, active lane policy. Never records a
    * human decision. Returns undefined when no lane policy has ever been approved (the lane is not in use).
    */
-  tryLanePass(idOrAlias: string): LaneOutcome | undefined {
+  async tryLanePass(idOrAlias: string): Promise<LaneOutcome | undefined> {
     let work = this.ctx.store.getWork(idOrAlias);
     const gate = LANE_GATE_FOR_STATE[work.currentState];
     if (!gate) return undefined;
@@ -3530,11 +3688,34 @@ export class Engine {
         return { status: 'out-of-lane', work, gate, reasons: membership.fallback?.reasons ?? [moved || 'task left the lane during evaluation'] };
       }
       const facts = this.laneFacts(work, gate);
-      const evaluations = active.map((p) => evaluateLaneEligibility(p, facts));
+      let evaluations = active.map((p) => evaluateLaneEligibility(p, facts));
       const winnerIdx = evaluations.findIndex((e) => e.status === 'eligible');
       if (winnerIdx < 0) return this.laneFallback(work, gate, evaluations, unusable);
-      this.laneBeforeSave?.();
       const winner = active[winnerIdx]!;
+      if (gate === 'codeReview') {
+        try {
+          const dual = await this.runDualLaneReview(work, winner, facts.commit);
+          facts.dualReview = {
+            changeSetId: facts.commit,
+            complete: true,
+            clean: dual.clean,
+            disagreement: dual.disagreement,
+          };
+        } catch (e) {
+          facts.dualReview = {
+            changeSetId: facts.commit,
+            complete: false,
+            clean: false,
+            disagreement: false,
+            reason: `dual review incomplete: ${(e as Error).message}`,
+          };
+        }
+        evaluations = active.map((p, index) =>
+          index === winnerIdx ? evaluateLaneEligibility(p, facts, { requireDualReview: true }) : evaluations[index]!,
+        );
+        if (evaluations[winnerIdx]!.status !== 'eligible') return this.laneFallback(work, gate, evaluations, unusable);
+      }
+      this.laneBeforeSave?.();
       const saved = this.savePolicyPass(work, facts, winner, evaluations[winnerIdx]!);
       if ('work' in saved) {
         this.render(work.id, [`${LANE_GATE_LABEL[gate]} ${saved.decision.rationale}.`]);
@@ -3716,6 +3897,62 @@ export class Engine {
           this.ctx.store.saveEec(bumpEecRevision(eec, { approvedPlanHash: plan.contentHash, approvalDecisionIds: [...eec.approvalDecisionIds, decision.id] }));
           return { work: next, decision };
         }
+        if (facts.gate === 'codeReview') {
+          const profiles = resolvePolicyReviewers(policy.policy, this.ctx.config.models.profiles);
+          if (!profiles) throw new LaneIneligible(`policy ${policy.name} does not configure codeReview`);
+          const currentReviews = this.ctx.store
+            .listArtifacts(work.id, 'review')
+            .filter((artifact) => artifact.relatedCommit === commitNow)
+            .map((artifact) => {
+              try {
+                return { artifact, review: JSON.parse(this.ctx.store.getArtifactContent(artifact.id)) as ReviewResult };
+              } catch {
+                throw new LaneIneligible(`review artifact ${artifact.id} is unreadable`);
+              }
+            })
+            .filter(({ review }) => review.changeSetId === commitNow && review.reviewer);
+          const selected = profiles.map((profile) =>
+            currentReviews
+              .filter(
+                ({ review }) =>
+                  review.reviewer?.profile === profile.name &&
+                  review.reviewer.provider === profile.provider &&
+                  review.reviewer.model === profile.model,
+              )
+              .at(-1),
+          );
+          if (selected.some((entry) => !entry)) throw new LaneIneligible('both configured reviewer artifacts are required at the current change set');
+          if (selected.some((entry) => entry!.review.disposition !== 'no-blocking-findings')) {
+            throw new LaneIneligible('both configured reviewers must have no kept blocking findings');
+          }
+          const decision: Decision = {
+            ...base,
+            gate: 'code-review',
+            artifactIds: selected.map((entry) => entry!.artifact.id),
+            artifactHashes: selected.map((entry) => entry!.artifact.contentHash),
+            commitSha: commitNow,
+          };
+          const next = transition(current, 'VERIFYING');
+          this.ctx.store.saveDecision(decision);
+          this.ctx.store.saveWork(next);
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: 'code-review.passed-by-policy',
+            payload: {
+              decisionId: decision.id,
+              commitSha: commitNow,
+              policy: policy.name,
+              reviewers: profiles.map((profile) => profile.name),
+            },
+          });
+          const eec = this.ctx.store.getLatestEec(work.id)!;
+          this.ctx.store.saveEec(
+            bumpEecRevision(eec, {
+              approvalDecisionIds: [...eec.approvalDecisionIds, decision.id],
+            }),
+          );
+          return { work: next, decision };
+        }
         if (facts.gate === 'acceptance') {
           try {
             this.assertPrApproval(work.id, commitNow);
@@ -3749,7 +3986,7 @@ export class Engine {
           });
           return { work: next, decision };
         }
-        throw new LaneIneligible('code review is not passed by policy until two-reviewer review (part B) exists');
+        throw new LaneIneligible(`unsupported lane gate ${facts.gate}`);
       });
     } catch (e) {
       if (e instanceof LaneIneligible) return { ineligible: e.message };

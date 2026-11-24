@@ -53,6 +53,7 @@ export type PacketData = {
   implemented: boolean;
   changeFacts: RepoFacts[];
   review?: ReviewResult;
+  dualReviews?: ReviewResult[];
   runs?: CheckRun[];
   decisions: Decision[];
   gate?: GateDecision;
@@ -419,6 +420,32 @@ export function renderReview(d: PacketData, previousChecks: AcceptanceCheck[]): 
       for (const x of r.discarded.slice(0, 25)) lines.push(`- (${x.lens}) ${x.claim}${x.file ? ` [\`${x.file}\`]` : ''} — _${x.reason}_`);
       lines.push('', '</details>');
     }
+  }
+  const dual = (d.dualReviews ?? []).filter((review) => review.changeSetId === d.changeSetId && review.reviewer);
+  if (dual.length) {
+    lines.push(
+      '',
+      '### Autonomous dual review',
+      '',
+      '_Each reviewer ran every selected lens on this exact change set. These are evidence for a policy decision, not approvals._',
+      '',
+      '| Reviewer 1 | Reviewer 2 |',
+      '|---|---|',
+    );
+    const cells = [0, 1].map((index) => {
+      const review = dual[index];
+      if (!review) return '**Incomplete** — no parseable review was recorded.';
+      const findings = review.findings.length
+        ? review.findings.map((finding) => `${SEVERITY_ICON[finding.severity] ?? finding.severity} ${esc(finding.claim)}`).join('<br>')
+        : 'No kept findings';
+      return [
+        `**${esc(review.reviewer!.profile)}**`,
+        `\`${esc(review.reviewer!.provider)}/${esc(review.reviewer!.model)}\``,
+        review.disposition === 'no-blocking-findings' ? '**No blocking findings**' : '**⚠️ Needs attention**',
+        findings,
+      ].join('<br>');
+    });
+    lines.push(`| ${cells[0]} | ${cells[1]} |`);
   }
   const codeFindings = d.analysis.filter((a) => a.gate === 'code-review');
   if (codeFindings.length) {
