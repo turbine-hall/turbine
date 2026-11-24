@@ -13,6 +13,8 @@ import { HARD_TRIGGERS, SOFT_TRIGGERS } from '../../packages/core/dist/index.js'
 import { isHumanOnlyCommand } from '../../apps/cli/src/engine/agent-guard.js';
 import {
   MAX_POLICY_BYTES,
+  MAX_POLICY_DIR_ENTRIES,
+  MAX_POLICY_FILES,
   approvePolicy,
   parsePolicyYaml,
   pendingPolicyApproval,
@@ -151,6 +153,20 @@ describe('loading .turbine/policies (FR-A1)', () => {
     expect(() => pendingPolicyApproval(engine.ctx.store, dir, 'bad-key')).toThrow(/invalid/);
     engine.ctx.store.close();
   });
+
+  it('stops after the directory entry budget, including non-yaml files', () => {
+    const { dir, engine } = laneProject(dirs, { approved: false });
+    const policies = join(dir, '.turbine', 'policies');
+    for (let i = 0; i < MAX_POLICY_DIR_ENTRIES; i++) {
+      writeFileSync(join(policies, `noise-${String(i).padStart(4, '0')}.txt`), 'x');
+    }
+    writePolicy(dir, 'late', ROUTINE_POLICY.replace('name: routine', 'name: late'));
+    const { files, errors } = readPolicyFiles(dir);
+    expect(errors.join('\n')).toMatch(new RegExp(`more than ${MAX_POLICY_DIR_ENTRIES} entries`));
+    // Bound walk may omit later entries entirely; it must not silently load past the budget.
+    expect(files.length).toBeLessThanOrEqual(MAX_POLICY_FILES);
+    engine.ctx.store.close();
+  });
 });
 
 describe('approval and drift (FR-A3, FR-A4)', () => {
@@ -249,6 +265,15 @@ describe('suspend and resume (FR-A9)', () => {
     expect(resumed.policy.status).toBe('active');
     expect(resumed.decision).toMatchObject({ gate: 'policy', actorType: 'human' });
     expect(policyStatuses(engine.ctx.store, dir).policies[0]!.state).toBe('active');
+
+    // Suspend → edit YAML → resume: stored status is active, but effective state stays pending until re-approve.
+    suspendPolicy(engine.ctx.store, 'routine', 'edit incoming', 'agent');
+    writePolicy(dir, 'routine', ROUTINE_POLICY.replace('maxChangedLines: 40', 'maxChangedLines: 99'));
+    const again = pendingPolicyResume(engine.ctx.store, 'routine');
+    resumePolicy(engine.ctx.store, { name: 'routine', confirmToken: again.confirmToken, reviewer: 'Ana', presence: 'test' });
+    const effective = policyStatuses(engine.ctx.store, dir).policies.find((p) => p.name === 'routine')!;
+    expect(effective.state).toBe('pending');
+    expect(engine.ctx.store.getLanePolicy('routine')!.status).toBe('active');
     engine.ctx.store.close();
   });
 });

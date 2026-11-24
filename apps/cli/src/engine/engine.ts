@@ -3559,19 +3559,42 @@ export class Engine {
     ];
     if (!reasons.length) reasons.push('no active lane policy');
     const evaluationHash = contentHash({ workId: work.id, revision: work.currentRevision, gate, evaluations: evaluations.map((e) => e.evaluationHash), extra });
-    this.ctx.store.appendEvent({
-      workId: work.id,
-      type: 'lane.fallback',
-      payload: {
-        gate,
-        workRevision: work.currentRevision,
-        reasons,
-        evaluationHash,
-        evaluations: evaluations.map((e) => ({ policy: e.policy, policyHash: e.policyHash, status: e.status, evaluationHash: e.evaluationHash })),
-      },
+    // Recheck gate / revision / membership under the same write lock as the append so a human
+    // approval that lands mid-sync cannot leave a stale fallback blocking the next gate.
+    const outcome = this.ctx.store.transaction(() => {
+      const current = this.ctx.store.getWork(work.id);
+      if (current.currentState !== work.currentState || current.currentRevision !== work.currentRevision) {
+        return { status: 'retry' as const, work: current, gate, reasons: ['task moved before the fallback was recorded'] };
+      }
+      if (LANE_GATE_FOR_STATE[current.currentState] !== gate) {
+        return { status: 'retry' as const, work: current, gate, reasons: ['gate changed before the fallback was recorded'] };
+      }
+      const membership = this.laneState(work.id);
+      if (!membership.inLane) {
+        return {
+          status: 'out-of-lane' as const,
+          work: current,
+          gate,
+          reasons: membership.fallback?.reasons ?? ['task left the lane before the fallback was recorded'],
+        };
+      }
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'lane.fallback',
+        payload: {
+          gate,
+          workRevision: current.currentRevision,
+          reasons,
+          evaluationHash,
+          evaluations: evaluations.map((e) => ({ policy: e.policy, policyHash: e.policyHash, status: e.status, evaluationHash: e.evaluationHash })),
+        },
+      });
+      return { status: 'fallback' as const, work: current, gate, reasons };
     });
-    this.render(work.id, [`Autonomous lane: a human decides the ${gate} gate — ${reasons.slice(0, 3).join('; ')}${reasons.length > 3 ? '; …' : ''}`]);
-    return { status: 'fallback', work, gate, reasons };
+    if (outcome.status === 'fallback') {
+      this.render(work.id, [`Autonomous lane: a human decides the ${gate} gate — ${reasons.slice(0, 3).join('; ')}${reasons.length > 3 ? '; …' : ''}`]);
+    }
+    return outcome;
   }
 
   /**
@@ -3599,6 +3622,17 @@ export class Engine {
         if (current.risk.profile !== facts.riskProfile) {
           return { moved: `risk changed from ${facts.riskProfile} to ${current.risk.profile} during evaluation` };
         }
+        // Dependency triggers for code gates come from the pinned commit's change facts, not live HEAD.
+        const triggersNow = [
+          ...current.risk.reasons,
+          ...detectHardRiskTriggers(current),
+          ...detectSoftTriggers(current),
+          ...(facts.change?.dependencyChanges.length ? ['new-dependency'] : []),
+        ].filter((t) => LANE_TRIGGER_NAMES.includes(t));
+        const triggersSorted = [...new Set(triggersNow)].sort();
+        if (JSON.stringify(triggersSorted) !== JSON.stringify(facts.triggers)) {
+          return { moved: 'risk triggers changed during evaluation' };
+        }
         const labelsNow = [...new Set(current.sourceRefs.flatMap((s) => s.labels ?? []))].sort();
         if (JSON.stringify(labelsNow) !== JSON.stringify(facts.labels)) {
           return { moved: 'source labels changed during evaluation' };
@@ -3623,8 +3657,14 @@ export class Engine {
           return { moved: `commit unreadable before save: ${(e as Error).message}` };
         }
         if (commitNow !== facts.commit) return { moved: `HEAD moved from ${facts.commit.slice(0, 12)} to ${commitNow.slice(0, 12)} during evaluation` };
-        const snap = this.ctx.store.getLanePolicy(policy.name);
-        const file = readPolicyFiles(this.ctx.projectRoot).files.find((f) => f.name === policy.name);
+        let snap: ReturnType<WorkStore['getLanePolicy']>;
+        let file: ReturnType<typeof readPolicyFiles>['files'][number] | undefined;
+        try {
+          snap = this.ctx.store.getLanePolicy(policy.name);
+          file = readPolicyFiles(this.ctx.projectRoot).files.find((f) => f.name === policy.name);
+        } catch (e) {
+          throw new LaneIneligible(`policy ${policy.name} cannot be read: ${(e as Error).message}`);
+        }
         if (!snap || snap.status !== 'active' || snap.contentHash !== policy.contentHash || file?.hash !== policy.contentHash) {
           return { moved: `policy ${policy.name} changed during evaluation` };
         }
@@ -3681,6 +3721,10 @@ export class Engine {
             this.assertPrApproval(work.id, commitNow);
           } catch (e) {
             throw new LaneIneligible((e as Error).message);
+          }
+          // assertPrApproval can block on a network call; a worktree may advance meanwhile.
+          if (changeSetId(observe(this.repoStates(work.id)).repos) !== commitNow) {
+            return { moved: 'a worktree advanced during the PR check' };
           }
           const change = this.ctx.store.getLatestArtifact(work.id, 'change-report');
           const decision: Decision = {

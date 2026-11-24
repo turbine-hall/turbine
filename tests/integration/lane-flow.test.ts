@@ -273,4 +273,24 @@ describe('one commit per evaluation (FR-A5, AC6)', () => {
     expect((res.detail as { lane: { status: string } }).lane.status).toBe('out-of-lane');
     engine.ctx.store.close();
   });
+
+  it('discards the pass when risk.reasons gain a denied trigger without a profile change', async () => {
+    const { engine } = laneProject(dirs);
+    const work = await toRequirementsGate(engine);
+    engine.laneBeforeSave = () => {
+      const cur = engine.ctx.store.getWork(work.id);
+      engine.ctx.store.saveWork({
+        ...cur,
+        risk: { ...cur.risk, reasons: [...cur.risk.reasons, 'new-dependency'] },
+        updatedAt: new Date().toISOString(),
+      });
+    };
+    const res = await engine.syncFromMarkdown(work.id);
+    expect(policyDecisions(engine, work.id)).toHaveLength(0);
+    expect(res.work.currentState).toBe('REQUIREMENTS_REVIEW');
+    const discarded = laneEvents(engine, work.id).filter((e) => e.type === 'lane.discarded');
+    expect(discarded.some((e) => String(e.payload.reason).includes('risk triggers changed'))).toBe(true);
+    expect(lastReasons(engine, work.id).join('\n')).toMatch(/new-dependency/);
+    engine.ctx.store.close();
+  });
 });

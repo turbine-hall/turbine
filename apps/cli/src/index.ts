@@ -1788,7 +1788,18 @@ policyCmd
         const token = await ask('Code: ');
         const reviewer = await askReviewer(ctx.projectRoot);
         const result = resumePolicy(ctx.store, { name, confirmToken: token, reviewer, presence: HUMAN_PRESENCE });
-        printResult({ policy: name, state: result.policy.status, decision: result.decision.id }, false);
+        // Stored status is "active" after resume, but a drifted file is still pending until re-approved.
+        const effective = policyStatuses(ctx.store, ctx.projectRoot).policies.find((p) => p.name === name);
+        const out: Record<string, unknown> = {
+          policy: name,
+          state: effective?.state ?? result.policy.status,
+          decision: result.decision.id,
+        };
+        if (effective?.reason) out.reason = effective.reason;
+        if (effective?.state === 'pending') {
+          out.next = `turbine policy approve ${name}`;
+        }
+        printResult(out, false);
       } finally {
         ctx.store.close();
       }

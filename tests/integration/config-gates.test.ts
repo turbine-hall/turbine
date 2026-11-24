@@ -45,4 +45,24 @@ describe('humanGates cannot be switched off (FR-A10, AC3)', () => {
     expect(loadConfig(join(dir, '.turbine', 'project.yaml')).humanGates.codeReview).toBe(true);
     engine.ctx.store.close();
   });
+
+  it('reports disabled gates even when a sibling gate value has the wrong type', () => {
+    const dir = tempProject('turbine-gates-cfg-', dirs);
+    const configPath = join(dir, '.turbine', 'project.yaml');
+    let yaml = readFileSync(configPath, 'utf8').replace(/(\n\s+requirements:) true/, '$1 false');
+    yaml = yaml.replace(/(\n\s+requirePrApproval:) false/, '$1 "false"');
+    expect(yaml).toMatch(/requirements: false/);
+    expect(yaml).toMatch(/requirePrApproval: ["']false["']/);
+    writeFileSync(configPath, yaml);
+    let caught: { code?: string; message?: string; details?: { issues?: Array<{ path: string }> } } | undefined;
+    try {
+      loadConfig(configPath);
+    } catch (e) {
+      caught = e as typeof caught;
+    }
+    expect(caught?.code).toBe('E_CONFIG');
+    expect(caught?.message).toMatch(/humanGates\.requirements/);
+    const paths = (caught?.details?.issues ?? []).map((i) => i.path);
+    expect(paths.some((p) => p.includes('requirePrApproval'))).toBe(true);
+  });
 });

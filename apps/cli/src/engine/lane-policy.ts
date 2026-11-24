@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync } from 'node:fs';
+import { existsSync, lstatSync, opendirSync } from 'node:fs';
 import { join } from 'node:path';
 import { isAlias, isMap, isSeq, parseDocument } from 'yaml';
 import {
@@ -18,6 +18,8 @@ import { readBoundedUtf8 } from './knowledge/paths.js';
 /** Budgets for reading `.turbine/policies/` (rule 2 / rule 17). */
 export const MAX_POLICY_FILES = 50;
 export const MAX_POLICY_BYTES = 64 * 1024;
+/** Total directory entries (yaml and otherwise) before the walk stops. */
+export const MAX_POLICY_DIR_ENTRIES = 200;
 const MAX_POLICY_YAML_DEPTH = 8;
 const MAX_DIFF_LINES = 2000;
 
@@ -102,7 +104,23 @@ export function readPolicyFiles(projectRoot: string): { files: PolicyFile[]; err
     errors.push(`${dir} is not a directory (symlinks are refused)`);
     return { files, errors };
   }
-  const names = readdirSync(dir).sort();
+  // Bound enumeration of every entry (not only .yaml) so a large dir cannot bypass the budget.
+  const names: string[] = [];
+  const handle = opendirSync(dir);
+  try {
+    for (;;) {
+      const ent = handle.readSync();
+      if (ent === null) break;
+      if (names.length >= MAX_POLICY_DIR_ENTRIES) {
+        errors.push(`policies directory has more than ${MAX_POLICY_DIR_ENTRIES} entries; stopped reading`);
+        break;
+      }
+      names.push(ent.name);
+    }
+  } finally {
+    handle.closeSync();
+  }
+  names.sort();
   let seen = 0;
   for (const entry of names) {
     if (!entry.endsWith('.yaml')) {
