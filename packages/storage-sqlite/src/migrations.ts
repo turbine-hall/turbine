@@ -204,4 +204,20 @@ CREATE TABLE IF NOT EXISTS usage_records (
 CREATE INDEX IF NOT EXISTS idx_usage_records_work ON usage_records(work_id);
 `,
   },
+  {
+    version: 9,
+    sql: `
+-- Approved lane policy snapshots. The file in .turbine/policies/ may change; only this approved copy can pass a gate.
+-- "pending" (file drift) is derived by comparing the file's hash with content_hash; it is never stored.
+CREATE TABLE IF NOT EXISTS lane_policies (
+  name TEXT PRIMARY KEY,
+  content_hash TEXT NOT NULL,
+  data TEXT NOT NULL,
+  approved_decision_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('active', 'suspended')),
+  suspended_reason TEXT,
+  updated_at TEXT NOT NULL
+);
+`,
+  },
 ];

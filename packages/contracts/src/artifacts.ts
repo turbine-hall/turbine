@@ -37,29 +37,56 @@ export const ArtifactSchema = z.object({
 });
 export type Artifact = z.infer<typeof ArtifactSchema>;
 
-export const DecisionSchema = z.object({
-  id: z.string(),
-  workId: z.string(),
-  gate: z.enum(['requirements', 'plan', 'code-review', 'sqa-acceptance', 'exception']),
-  action: z.enum(['approve', 'reject', 'request-changes']),
-  artifactIds: z.array(z.string()),
-  artifactHashes: z.array(z.string()),
-  workRevision: z.number().int(),
-  commitSha: z.string().optional(),
-  actorId: z.string(),
-  actorType: z.literal('human'),
-  identityAssurance: z.enum(['local-attestation', 'authenticated']),
-  rationale: z.string().optional(),
-  decidedAt: z.string(),
-  invalidatedAt: z.string().optional(),
-  invalidationReason: z.string().optional(),
-  /** Waivers only (gate=exception): which obligations this waiver covers. */
-  obligationIds: z.array(z.string()).optional(),
-  /** Waivers only: ISO timestamp after which the waiver no longer applies. */
-  expiresAt: z.string().optional(),
-  /** How the human was confirmed present (e.g. tty-hash-confirmation, github-pr-review). */
-  presence: z.string().optional(),
-});
+export const DecisionSchema = z
+  .object({
+    id: z.string(),
+    workId: z.string(),
+    /** `policy` = a human approving (or resuming) a lane policy; workId is then `policy:<name>`. */
+    gate: z.enum(['requirements', 'plan', 'code-review', 'sqa-acceptance', 'exception', 'policy']),
+    action: z.enum(['approve', 'reject', 'request-changes']),
+    artifactIds: z.array(z.string()),
+    artifactHashes: z.array(z.string()),
+    workRevision: z.number().int(),
+    commitSha: z.string().optional(),
+    actorId: z.string(),
+    /** `policy` = the gate was passed by an approved lane policy, never by a person. */
+    actorType: z.enum(['human', 'policy']),
+    identityAssurance: z.enum(['local-attestation', 'authenticated']),
+    /** Policy decisions only: which approved policy snapshot passed the gate. */
+    policyId: z.string().optional(),
+    policyHash: z.string().optional(),
+    /** Policy decisions only: the human Decision that approved that exact policy hash. */
+    policyApprovalDecisionId: z.string().optional(),
+    /** Policy decisions only: hash of the eligibility evaluation the decision relied on. */
+    evaluationHash: z.string().optional(),
+    rationale: z.string().optional(),
+    decidedAt: z.string(),
+    invalidatedAt: z.string().optional(),
+    invalidationReason: z.string().optional(),
+    /** Waivers only (gate=exception): which obligations this waiver covers. */
+    obligationIds: z.array(z.string()).optional(),
+    /** Waivers only: ISO timestamp after which the waiver no longer applies. */
+    expiresAt: z.string().optional(),
+    /** How the human was confirmed present (e.g. tty-hash-confirmation, github-pr-review). */
+    presence: z.string().optional(),
+  })
+  .superRefine((d, ctx) => {
+    if (d.actorType === 'policy') {
+      for (const key of ['policyId', 'policyHash', 'policyApprovalDecisionId', 'evaluationHash'] as const) {
+        if (!d[key]) ctx.addIssue({ code: 'custom', path: [key], message: `${key} is required when actorType is policy` });
+      }
+      if (d.gate === 'policy' || d.gate === 'exception') {
+        ctx.addIssue({ code: 'custom', path: ['gate'], message: `a policy cannot decide the ${d.gate} gate` });
+      }
+      if (d.gate === 'code-review') {
+        ctx.addIssue({ code: 'custom', path: ['gate'], message: 'code review is not passed by policy until two-reviewer review exists' });
+      }
+      if (d.action !== 'approve') ctx.addIssue({ code: 'custom', path: ['action'], message: 'a policy only records passes' });
+    }
+    if (d.gate === 'policy' && d.actorType !== 'human') {
+      ctx.addIssue({ code: 'custom', path: ['actorType'], message: 'only a human approves a lane policy' });
+    }
+  });
 export type Decision = z.infer<typeof DecisionSchema>;
 
 export const RoleRunSchema = z.object({

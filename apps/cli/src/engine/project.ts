@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import {
+  NON_DISABLEABLE_HUMAN_GATES,
   ProjectConfigSchema,
   type ProjectConfig,
   err,
@@ -216,18 +217,34 @@ export function loadConfig(configPath: string): ProjectConfig {
   if (!existsSync(configPath)) {
     throw err('E_INVALID_CONFIG', `Missing project config at ${configPath}. Run: turbine init`);
   }
-  const raw = parseYaml(readFileSync(configPath, 'utf8'));
+  return parseProjectConfig(parseYaml(readFileSync(configPath, 'utf8')));
+}
+
+/**
+ * Validate a project config. A human gate set to false fails with E_CONFIG (it would otherwise look
+ * like it turned the gate off); any other problem is E_INVALID_CONFIG.
+ */
+export function parseProjectConfig(raw: unknown): ProjectConfig {
   const parsed = ProjectConfigSchema.safeParse(raw);
   if (!parsed.success) {
-    throw err('E_INVALID_CONFIG', 'Invalid project.yaml', {
-      issues: parsed.error.issues.map((i) => ({ path: i.path.join('.'), message: i.message })),
-    });
+    const issues = parsed.error.issues.map((i) => ({ path: i.path.join('.'), message: i.message }));
+    const gateOff = issues.filter((i) =>
+      NON_DISABLEABLE_HUMAN_GATES.some((g) => i.path === `humanGates.${g}` && /cannot be false/.test(i.message)),
+    );
+    if (gateOff.length) {
+      throw err(
+        'E_CONFIG',
+        `${gateOff.map((i) => i.path).join(', ')} = false is not allowed. Human gates are relaxed only through lane policies a human approved (turbine policy approve <name>); remove the line or set it to true.`,
+        { issues },
+      );
+    }
+    throw err('E_INVALID_CONFIG', 'Invalid project.yaml', { issues });
   }
   return parsed.data;
 }
 
 export function saveConfig(configPath: string, config: ProjectConfig): void {
-  writeFileSync(configPath, stringifyYaml(ProjectConfigSchema.parse(config)), 'utf8');
+  writeFileSync(configPath, stringifyYaml(parseProjectConfig(config)), 'utf8');
 }
 
 export function openContext(cwd = callerCwd()): EngineContext {

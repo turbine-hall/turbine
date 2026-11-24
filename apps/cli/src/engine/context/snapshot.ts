@@ -222,9 +222,9 @@ function expandBraces(p: string, depth = 0): string[] | null {
 }
 
 /** `*` and `?` inside one path segment. Single back-tracking point, so cost is O(pattern x segment). */
-function segmentMatches(pat: string, text: string): boolean {
+function segmentMatches(pat: string, text: string, dot = false): boolean {
   // A wildcard never matches a leading dot (hidden directories); only a pattern that starts with the dot does.
-  if (text.startsWith('.') && !pat.startsWith('.')) return false;
+  if (!dot && text.startsWith('.') && !pat.startsWith('.')) return false;
   let p = 0;
   let i = 0;
   let star = -1;
@@ -246,7 +246,7 @@ function segmentMatches(pat: string, text: string): boolean {
 }
 
 /** Segment-wise match where a `**` segment is any number (including zero) of directories; memoised. */
-function pathMatches(pat: string[], segs: string[]): boolean {
+function pathMatches(pat: string[], segs: string[], dot = false): boolean {
   const memo = new Map<number, boolean>();
   const go = (pi: number, si: number): boolean => {
     const k = pi * (segs.length + 1) + si;
@@ -254,8 +254,8 @@ function pathMatches(pat: string[], segs: string[]): boolean {
     if (known !== undefined) return known;
     let r: boolean;
     if (pi === pat.length) r = si === segs.length;
-    else if (pat[pi] === '**') r = go(pi + 1, si) || (si < segs.length && !segs[si]!.startsWith('.') && go(pi, si + 1));
-    else r = si < segs.length && segmentMatches(pat[pi]!, segs[si]!) && go(pi + 1, si + 1);
+    else if (pat[pi] === '**') r = go(pi + 1, si) || (si < segs.length && (dot || !segs[si]!.startsWith('.')) && go(pi, si + 1));
+    else r = si < segs.length && segmentMatches(pat[pi]!, segs[si]!, dot) && go(pi + 1, si + 1);
     memo.set(k, r);
     return r;
   };
@@ -266,15 +266,16 @@ function pathMatches(pat: string[], segs: string[]): boolean {
  * Compile a workspace pattern (`*`, `?`, `**`, `{a,b}`) into a matcher with bounded cost, or null for
  * syntax that is not supported (character classes, extglobs, escapes, too many alternatives). There is
  * no regular expression here, so a repository-controlled pattern cannot cause catastrophic backtracking.
+ * With `dot`, wildcards also match hidden segments (deny lists must not miss `.env` under `**`).
  */
-function compileGlob(glob: string): ((dir: string) => boolean) | null {
+export function compileGlob(glob: string, opts: { dot?: boolean } = {}): ((dir: string) => boolean) | null {
   if (!glob || glob.length > MAX_GLOB_LENGTH || /[[\]()\\!]/.test(glob)) return null;
   const expanded = expandBraces(glob);
   if (!expanded) return null;
   const patterns = expanded.map((e) => e.split('/').filter((x) => x !== '' && x !== '.'));
   return (dir) => {
     const segs = dir.split('/');
-    return patterns.some((pat) => pathMatches(pat, segs));
+    return patterns.some((pat) => pathMatches(pat, segs, opts.dot ?? false));
   };
 }
 

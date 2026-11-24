@@ -1,5 +1,8 @@
 import { z } from 'zod';
 
+/** Human gates that cannot be switched off in config; they are relaxed only through approved lane policies. */
+export const NON_DISABLEABLE_HUMAN_GATES = ['requirements', 'plan', 'codeReview', 'sqaAcceptance'] as const;
+
 export const ProjectConfigSchema = z.object({
   schemaVersion: z.literal(1),
   project: z.object({
@@ -147,6 +150,10 @@ export const ProjectConfigSchema = z.object({
     .default({ checks: [], setup: [], timeoutMs: 600_000, dependencyAudit: 'auto' }),
   humanGates: z
     .object({
+      /**
+       * Must be true (or omitted). A false value is refused rather than silently ignored: gates are
+       * relaxed only through lane policies a human approved (`turbine policy approve`).
+       */
       requirements: z.boolean().default(true),
       plan: z.boolean().default(true),
       codeReview: z.boolean().default(true),
@@ -157,6 +164,17 @@ export const ProjectConfigSchema = z.object({
        * A PR author cannot approve their own PR, so an agent account cannot self-approve.
        */
       requirePrApproval: z.boolean().default(false),
+    })
+    .superRefine((g, ctx) => {
+      for (const key of NON_DISABLEABLE_HUMAN_GATES) {
+        if (g[key] === false) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [key],
+            message: `humanGates.${key} cannot be false: human gates are relaxed only through lane policies approved with \`turbine policy approve\` (.turbine/policies/*.yaml)`,
+          });
+        }
+      }
     })
     .default({
       requirements: true,
