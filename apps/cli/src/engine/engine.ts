@@ -153,7 +153,13 @@ function normalizeAcceptanceCriteria(raw: unknown): AcceptanceCriterion[] {
   return normalizeRequirements(raw);
 }
 
-export type LaneFallback = { gate: LaneGate; reasons: string[]; evaluationHash: string; at: string };
+export type LaneFallback = {
+  gate: LaneGate;
+  reasons: string[];
+  evaluationHash: string;
+  evaluatedChangeSetId?: string;
+  at: string;
+};
 export type LaneOutcome = {
   status: 'passed' | 'fallback' | 'out-of-lane' | 'retry';
   work: WorkPackage;
@@ -161,6 +167,7 @@ export type LaneOutcome = {
   reasons: string[];
   policy?: string;
   decision?: Decision;
+  evaluatedChangeSetId?: string;
 };
 
 const LANE_GATE_LABEL: Record<LaneGate, string> = {
@@ -3225,40 +3232,50 @@ export class Engine {
     if (pending.currentState === 'AI_REVIEW') {
       pending = this.refreshHeads(pending.id).work;
       const lane = await this.tryLanePass(pending.id);
-      if (lane?.status === 'passed') {
-        const detail = {
-          lane: {
-            status: lane.status,
-            gate: lane.gate,
-            policy: lane.policy,
-            decisionId: lane.decision?.id,
-            reasons: lane.reasons,
-          },
-        };
-        await this.waitForMirror();
-        return { action: 'lane.passed', work: lane.work, detail };
-      }
       if (
-        lane?.status === 'fallback' &&
-        (lane.reasons.some((reason) => reason.includes('dual review')) ||
-          this.hasCurrentDualReview(pending.id))
+        lane &&
+        (lane.status === 'passed' || lane.status === 'retry' || !!lane.evaluatedChangeSetId)
       ) {
-        const handedOff = this.handoffDualReviewToHuman(pending, lane.reasons);
-        await this.waitForMirror();
-        return {
-          action: 'review.human',
-          work: handedOff,
-          detail: { openFile: packetPaths(this.ctx.projectRoot, handedOff.id).review, reasons: lane.reasons },
-        };
+        return this.finishLaneSync({ action: 'status', work: pending }, lane);
       }
     }
     const result = await this.syncStep(idOrAlias, actorId);
     const lane = await this.tryLanePass(result.work.id);
     if (!lane) return result;
+    return this.finishLaneSync(result, lane);
+  }
+
+  private async finishLaneSync(
+    result: { action: string; work: WorkPackage; detail?: unknown },
+    lane: LaneOutcome,
+  ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
     const laneDetail = { status: lane.status, gate: lane.gate, policy: lane.policy, decisionId: lane.decision?.id, reasons: lane.reasons };
     const detail = { ...(result.detail && typeof result.detail === 'object' ? result.detail : {}), lane: laneDetail };
     try {
-      return lane.status === 'passed' ? { action: 'lane.passed', work: lane.work, detail } : { ...result, work: lane.work, detail };
+      if (lane.status === 'passed') return { action: 'lane.passed', work: lane.work, detail };
+      if (
+        lane.gate === 'codeReview' &&
+        lane.evaluatedChangeSetId &&
+        lane.work.currentState === 'AI_REVIEW' &&
+        (lane.status === 'fallback' || lane.status === 'out-of-lane')
+      ) {
+        this.laneBeforeHandoff?.();
+        const refreshed = this.refreshHeads(lane.work.id).work;
+        const handedOff = this.handoffDualReviewToHuman(
+          refreshed,
+          lane.evaluatedChangeSetId,
+          lane.reasons,
+        );
+        if (handedOff.currentState === 'HUMAN_CODE_REVIEW') {
+          return {
+            action: 'review.human',
+            work: handedOff,
+            detail: { ...detail, openFile: packetPaths(this.ctx.projectRoot, handedOff.id).review },
+          };
+        }
+        return { ...result, work: handedOff, detail };
+      }
+      return { ...result, work: lane.work, detail };
     } finally {
       await this.waitForMirror();
     }
@@ -3576,12 +3593,18 @@ export class Engine {
       .at(-1);
     if (!last || last.type === 'lane.retry') return { inLane: true };
     const p = last.payload as Partial<LaneFallback>;
+    if (typeof p.evaluatedChangeSetId === 'string') {
+      const repos = this.repoStates(work.id);
+      if (!repos.length || changeSetId(repos) !== p.evaluatedChangeSetId) return { inLane: true };
+    }
     return {
       inLane: false,
       fallback: {
         gate: p.gate ?? 'requirements',
         reasons: Array.isArray(p.reasons) ? p.reasons.map(String) : ['(reasons not recorded)'],
         evaluationHash: typeof p.evaluationHash === 'string' ? p.evaluationHash : contentHash(last.payload),
+        evaluatedChangeSetId:
+          typeof p.evaluatedChangeSetId === 'string' ? p.evaluatedChangeSetId : undefined,
         at: last.createdAt,
       },
     };
@@ -3741,27 +3764,25 @@ export class Engine {
     return changeSetId(seen);
   }
 
-  private hasCurrentDualReview(workId: string): boolean {
-    const repos = this.repoStates(workId);
-    if (!repos.length) return false;
-    const commit = changeSetId(repos);
-    return this.ctx.store
-      .listArtifacts(workId, 'review')
-      .filter((artifact) => artifact.relatedCommit === commit)
-      .some((artifact) => {
-        try {
-          return !!(JSON.parse(this.ctx.store.getArtifactContent(artifact.id)) as ReviewResult).reviewer;
-        } catch {
-          return false;
-        }
-      });
-  }
-
-  /** Move a failed autonomous review to the human gate without requiring another model call. */
-  private handoffDualReviewToHuman(work: WorkPackage, reasons: string[]): WorkPackage {
+  /** Move a failed autonomous review to the human gate only for the change set it evaluated. */
+  private handoffDualReviewToHuman(
+    work: WorkPackage,
+    evaluatedChangeSetId: string,
+    reasons: string[],
+  ): WorkPackage {
     const next = this.ctx.store.transaction(() => {
       const current = this.ctx.store.getWork(work.id);
       if (current.currentState !== 'AI_REVIEW' || current.currentRevision !== work.currentRevision) {
+        return current;
+      }
+      const repos = this.repoStates(work.id);
+      const observed = repos.length ? observe(repos) : undefined;
+      if (
+        !observed ||
+        observed.uncommitted.length ||
+        changeSetId(repos) !== evaluatedChangeSetId ||
+        changeSetId(observed.repos) !== evaluatedChangeSetId
+      ) {
         return current;
       }
       const transitioned = transition(current, 'HUMAN_CODE_REVIEW');
@@ -3771,7 +3792,7 @@ export class Engine {
         type: 'review.handed-off',
         payload: {
           mode: 'dual-review-failed-closed',
-          changeSetId: changeSetId(this.repoStates(work.id)),
+          changeSetId: evaluatedChangeSetId,
           reasons,
         },
       });
@@ -3800,7 +3821,15 @@ export class Engine {
     }
     if (!stored.length) return undefined;
     const lane = this.laneState(work.id);
-    if (!lane.inLane) return { status: 'out-of-lane', work, gate, reasons: lane.fallback?.reasons ?? [] };
+    if (!lane.inLane) {
+      return {
+        status: 'out-of-lane',
+        work,
+        gate,
+        reasons: lane.fallback?.reasons ?? [],
+        evaluatedChangeSetId: lane.fallback?.evaluatedChangeSetId,
+      };
+    }
 
     let statuses: PolicyStatus[];
     try {
@@ -3815,15 +3844,24 @@ export class Engine {
     const active = statuses.filter((s) => s.state === 'active').map((s) => s.approved!);
 
     let moved = '';
+    let reviewedChangeSet: string | undefined;
     for (let attempt = 0; attempt < 2; attempt++) {
       if (attempt > 0) {
         work = this.ctx.store.getWork(work.id);
         if (LANE_GATE_FOR_STATE[work.currentState] !== gate) return { status: 'retry', work, gate, reasons: [moved] };
       }
+      let reviewClaim: string | undefined;
+      try {
       // Re-check membership each attempt: a concurrent sync may have recorded lane.fallback after evaluation.
       const membership = this.laneState(work.id);
       if (!membership.inLane) {
-        return { status: 'out-of-lane', work, gate, reasons: membership.fallback?.reasons ?? [moved || 'task left the lane during evaluation'] };
+        return {
+          status: 'out-of-lane',
+          work,
+          gate,
+          reasons: membership.fallback?.reasons ?? [moved || 'task left the lane during evaluation'],
+          evaluatedChangeSetId: membership.fallback?.evaluatedChangeSetId,
+        };
       }
       const facts = this.laneFacts(work, gate);
       let evaluations = active.map((p) => evaluateLaneEligibility(p, facts));
@@ -3831,6 +3869,18 @@ export class Engine {
       if (winnerIdx < 0) return this.laneFallback(work, gate, evaluations, unusable);
       const winner = active[winnerIdx]!;
       if (gate === 'codeReview') {
+        reviewedChangeSet = facts.commit;
+        try {
+          reviewClaim = this.ctx.store.claimWork(work.id, 'dual review');
+        } catch (e) {
+          return {
+            status: 'retry',
+            work: this.ctx.store.getWork(work.id),
+            gate,
+            reasons: [(e as Error).message],
+            evaluatedChangeSetId: facts.commit,
+          };
+        }
         try {
           const dual = await this.runDualLaneReview(work, winner, facts.commit);
           facts.dualReview = {
@@ -3862,7 +3912,9 @@ export class Engine {
         evaluations = active.map((p, index) =>
           index === winnerIdx ? evaluateLaneEligibility(p, facts, { requireDualReview: true }) : evaluations[index]!,
         );
-        if (evaluations[winnerIdx]!.status !== 'eligible') return this.laneFallback(work, gate, evaluations, unusable);
+        if (evaluations[winnerIdx]!.status !== 'eligible') {
+          return this.laneFallback(work, gate, evaluations, unusable, facts.commit);
+        }
       }
       this.laneBeforeSave?.();
       const saved = this.savePolicyPass(work, facts, winner, evaluations[winnerIdx]!);
@@ -3870,10 +3922,15 @@ export class Engine {
         this.render(work.id, [`${LANE_GATE_LABEL[gate]} ${saved.decision.rationale}.`]);
         return { status: 'passed', work: saved.work, gate, policy: winner.name, decision: saved.decision, reasons: [] };
       }
-      if ('ineligible' in saved) return this.laneFallback(work, gate, evaluations, [saved.ineligible]);
+      if ('ineligible' in saved) {
+        return this.laneFallback(work, gate, evaluations, [saved.ineligible], reviewedChangeSet);
+      }
       moved = saved.moved;
       if (gate === 'codeReview') this.refreshHeads(work.id);
       this.ctx.store.appendEvent({ workId: work.id, type: 'lane.discarded', payload: { gate, reason: moved, evaluationHash: evaluations[winnerIdx]!.evaluationHash } });
+      } finally {
+        if (reviewClaim) this.ctx.store.releaseClaim(work.id, reviewClaim);
+      }
     }
     // Facts kept moving: nothing was saved and the task stays in the lane, so the next sync evaluates again.
     this.render(work.id, [`Autonomous lane: ${moved}; no policy decision was saved. Run sync again.`]);
@@ -3886,7 +3943,16 @@ export class Engine {
   /** Test seam: runs after model calls and before completed dual reviews are published. */
   dualReviewBeforePublish?: () => void;
 
-  private laneFallback(work: WorkPackage, gate: LaneGate, evaluations: LaneEvaluation[], extra: string[]): LaneOutcome {
+  /** Test seam: runs after lane fallback and before its human handoff. */
+  laneBeforeHandoff?: () => void;
+
+  private laneFallback(
+    work: WorkPackage,
+    gate: LaneGate,
+    evaluations: LaneEvaluation[],
+    extra: string[],
+    evaluatedChangeSetId?: string,
+  ): LaneOutcome {
     const reasons = [
       ...extra,
       ...evaluations.flatMap((e) => e.reasons.map((r) => `${e.policy}: ${r}`)),
@@ -3920,10 +3986,11 @@ export class Engine {
           workRevision: current.currentRevision,
           reasons,
           evaluationHash,
+          evaluatedChangeSetId,
           evaluations: evaluations.map((e) => ({ policy: e.policy, policyHash: e.policyHash, status: e.status, evaluationHash: e.evaluationHash })),
         },
       });
-      return { status: 'fallback' as const, work: current, gate, reasons };
+      return { status: 'fallback' as const, work: current, gate, reasons, evaluatedChangeSetId };
     });
     if (outcome.status === 'fallback') {
       this.render(work.id, [`Autonomous lane: a human decides the ${gate} gate — ${reasons.slice(0, 3).join('; ')}${reasons.length > 3 ? '; …' : ''}`]);

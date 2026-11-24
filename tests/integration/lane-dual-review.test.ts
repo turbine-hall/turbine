@@ -70,6 +70,16 @@ async function reachAiReview(engine: Engine) {
   throw new Error('task did not reach AI_REVIEW');
 }
 
+async function reachImplementing(engine: Engine) {
+  const initial = await toRequirementsGate(engine);
+  for (let i = 0; i < 8; i++) {
+    const work = engine.ctx.store.getWork(initial.id);
+    if (work.currentState === 'IMPLEMENTING') return work;
+    await engine.syncFromMarkdown(work.id);
+  }
+  throw new Error('task did not reach IMPLEMENTING');
+}
+
 describe('autonomous dual review', () => {
   it('FR-B1: approval and evaluation reject missing or identical resolved reviewer models', async () => {
     const missing = laneProject(dirs, { policy: DUAL_ROUTINE_POLICY, approved: false });
@@ -189,6 +199,89 @@ describe('autonomous dual review', () => {
       presence: 'test',
     });
     expect(engine.ctx.store.getWork(pending.id).currentState).toBe('VERIFYING');
+    engine.ctx.store.close();
+  }, 60_000);
+
+  it('hands off a failed dual review from the implementation-capture sync', async () => {
+    const { engine } = laneProject(dirs, { policy: DUAL_ROUTINE_POLICY });
+    useReviewers('clean', 'clean');
+    const implementing = await reachImplementing(engine);
+    commitIn(engine.repoStates(implementing.id)[0]!.worktreePath, 'README.md', '# fixture fixed\n');
+    const before = engine.ctx.store.getBudget(implementing.id).modelCalls;
+    engine.ctx.config.budgets.perTask.maxModelCalls = before + 1;
+    const result = await engine.syncFromMarkdown(implementing.id);
+    expect(result.action).toBe('review.human');
+    expect(result.work.currentState).toBe('HUMAN_CODE_REVIEW');
+    expect(engine.ctx.store.getBudget(implementing.id).modelCalls).toBe(before + 1);
+    engine.ctx.store.close();
+  }, 60_000);
+
+  it('finishes an already-recorded dual fallback on the next sync', async () => {
+    const { engine } = laneProject(dirs, { policy: DUAL_ROUTINE_POLICY });
+    useReviewers('malformed', 'clean');
+    const pending = await reachAiReview(engine);
+    engine.laneBeforeHandoff = () => {
+      engine.laneBeforeHandoff = undefined;
+      throw new Error('simulated interruption before handoff');
+    };
+    await expect(engine.syncFromMarkdown(pending.id)).rejects.toThrow(/simulated interruption/);
+    expect(engine.ctx.store.getWork(pending.id).currentState).toBe('AI_REVIEW');
+    const resumed = await engine.syncFromMarkdown(pending.id);
+    expect(resumed.action).toBe('review.human');
+    expect(resumed.work.currentState).toBe('HUMAN_CODE_REVIEW');
+    engine.ctx.store.close();
+  }, 60_000);
+
+  it('does not hand change set B to a human for a fallback evaluated on A', async () => {
+    const { engine } = laneProject(dirs, { policy: DUAL_ROUTINE_POLICY });
+    useReviewers('malformed', 'clean');
+    const pending = await reachAiReview(engine);
+    const evaluated = engine.currentCommit(pending.id);
+    engine.laneBeforeHandoff = () => {
+      commitIn(engine.repoStates(pending.id)[0]!.worktreePath, 'LATER.md', 'change set B\n');
+      engine.laneBeforeHandoff = undefined;
+    };
+    const result = await engine.syncFromMarkdown(pending.id);
+    expect(result.work.currentState).toBe('AI_REVIEW');
+    expect(engine.currentCommit(pending.id)).not.toBe(evaluated);
+    expect(
+      engine.ctx.store.listEvents(pending.id).filter((event) => event.type === 'review.handed-off'),
+    ).toHaveLength(0);
+    const retried = await engine.syncFromMarkdown(pending.id);
+    expect(retried.work.currentState).toBe('HUMAN_CODE_REVIEW');
+    engine.ctx.store.close();
+  }, 60_000);
+
+  it('claims a dual-review attempt before spending concurrent model calls', async () => {
+    const { engine } = laneProject(dirs, { policy: DUAL_ROUTINE_POLICY });
+    const blocked = reviewer('mock-review-primary', 'clean');
+    const run = blocked.run.bind(blocked);
+    let signalStarted!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    const wait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    blocked.run = async (request) => {
+      signalStarted();
+      await wait;
+      return run(request);
+    };
+    registerModel(blocked);
+    registerModel(reviewer('mock-review-secondary', 'clean'));
+    const pending = await reachAiReview(engine);
+    const first = engine.tryLanePass(pending.id);
+    await started;
+    const calls = engine.ctx.store.getBudget(pending.id).modelCalls;
+    const concurrent = await engine.tryLanePass(pending.id);
+    expect(concurrent?.status).toBe('retry');
+    expect(concurrent?.reasons.join('\n')).toMatch(/dual review is already in progress/);
+    expect(engine.ctx.store.getBudget(pending.id).modelCalls).toBe(calls);
+    expect(laneEvents(engine, pending.id).filter((event) => event.type === 'lane.fallback')).toHaveLength(0);
+    release();
+    expect((await first)?.status).toBe('passed');
     engine.ctx.store.close();
   }, 60_000);
 
