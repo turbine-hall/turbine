@@ -22,6 +22,7 @@ export const MAX_POLICY_BYTES = 64 * 1024;
 export const MAX_POLICY_DIR_ENTRIES = 200;
 const MAX_POLICY_YAML_DEPTH = 8;
 const MAX_DIFF_LINES = 2000;
+export type ModelProfiles = Record<string, { provider: string; model: string; maxOutputTokens?: number }>;
 
 /** Paths of Turbine's own gate machinery; approving a policy that does not deny them prints a warning. */
 const GATE_MACHINERY_SAMPLES = ['.cursor/hooks.json', '.github/workflows/ci.yml', '.turbine/project.yaml', 'apps/cli/src/human-gate.ts'];
@@ -214,6 +215,38 @@ export function undeniedMachinery(policy: LanePolicy): string[] {
   return GATE_MACHINERY_SAMPLES.filter((path) => !matchers.some((m) => deniedBy(m, path)));
 }
 
+/** Resolve the two autonomous reviewers and refuse missing or identical provider+model identities. */
+export function resolvePolicyReviewers(
+  policy: LanePolicy,
+  profiles: ModelProfiles,
+): [
+  { name: string; provider: string; model: string; maxOutputTokens: number },
+  { name: string; provider: string; model: string; maxOutputTokens: number },
+] | undefined {
+  if (!policy.gates.includes('codeReview')) return undefined;
+  if (!policy.reviewers || policy.reviewers.length !== 2) {
+    throw err('E_INVALID_CONFIG', `Policy ${policy.name}: codeReview requires exactly two reviewer profiles`);
+  }
+  const resolved = policy.reviewers.map((name) => {
+    if (!Object.prototype.hasOwnProperty.call(profiles, name)) {
+      throw err('E_INVALID_CONFIG', `Policy ${policy.name}: reviewer profile "${name}" is not configured`);
+    }
+    const profile = profiles[name];
+    if (!profile) throw err('E_INVALID_CONFIG', `Policy ${policy.name}: reviewer profile "${name}" is not configured`);
+    return { name, provider: profile.provider, model: profile.model, maxOutputTokens: profile.maxOutputTokens ?? 4000 };
+  }) as [
+    { name: string; provider: string; model: string; maxOutputTokens: number },
+    { name: string; provider: string; model: string; maxOutputTokens: number },
+  ];
+  if (resolved[0].provider === resolved[1].provider && resolved[0].model === resolved[1].model) {
+    throw err(
+      'E_INVALID_CONFIG',
+      `Policy ${policy.name}: reviewers ${resolved[0].name} and ${resolved[1].name} resolve to the same model ${resolved[0].provider}/${resolved[0].model}`,
+    );
+  }
+  return resolved;
+}
+
 /** A file is denied when the pattern matches it or any directory above it. */
 export function deniedBy(matcher: (path: string) => boolean, path: string): boolean {
   const segs = path.split('/');
@@ -222,13 +255,14 @@ export function deniedBy(matcher: (path: string) => boolean, path: string): bool
 }
 
 /** What `policy approve <name>` would approve: the file's exact content. */
-export function pendingPolicyApproval(store: WorkStore, projectRoot: string, name: string) {
+export function pendingPolicyApproval(store: WorkStore, projectRoot: string, name: string, profiles: ModelProfiles) {
   const status = policyStatuses(store, projectRoot).policies.find((p) => p.name === name);
   if (!status?.file) throw err('E_NOT_FOUND', `No policy file .turbine/policies/${name}.yaml`);
   if (status.file.error || !status.file.policy || !status.file.hash || status.file.yaml === undefined) {
     throw err('E_INVALID_CONFIG', `Policy ${name} is invalid: ${status.file.error ?? 'unreadable'}`);
   }
   if (status.state === 'invalid') throw err('E_INVALID_CONFIG', `Policy ${name}: ${status.reason}`);
+  resolvePolicyReviewers(status.file.policy, profiles);
   return {
     status,
     policy: status.file.policy,
@@ -262,9 +296,9 @@ function humanPolicyDecision(name: string, hash: string, reviewer: string, prese
 export function approvePolicy(
   store: WorkStore,
   projectRoot: string,
-  input: { name: string; confirmToken: string; reviewer: string; presence: string },
+  input: { name: string; confirmToken: string; reviewer: string; presence: string; profiles: ModelProfiles },
 ): { policy: ApprovedLanePolicy; decision: Decision; warnings: string[] } {
-  const pending = pendingPolicyApproval(store, projectRoot, input.name);
+  const pending = pendingPolicyApproval(store, projectRoot, input.name, input.profiles);
   if (input.confirmToken.trim() !== pending.confirmToken) {
     throw err('E_STALE_REVISION', `Confirmation "${input.confirmToken}" does not match policy ${input.name} (${pending.confirmToken}). Re-read it and try again.`);
   }
@@ -277,6 +311,8 @@ export function approvePolicy(
     if (again?.hash !== pending.hash) {
       throw err('E_STALE_REVISION', `Policy ${input.name} changed while it was being approved; nothing was saved. Re-read it and approve again.`);
     }
+    if (!again.policy) throw err('E_INVALID_CONFIG', `Policy ${input.name} became unreadable while it was being approved`);
+    resolvePolicyReviewers(again.policy, input.profiles);
     const snapshot: ApprovedLanePolicy = {
       name: input.name,
       contentHash: pending.hash,

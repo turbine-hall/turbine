@@ -107,16 +107,16 @@ describe('policy passes (FR-A6, FR-A11, AC4)', () => {
   }, 60_000);
 });
 
-describe('code review in part A (FR-A12)', () => {
-  it('codeReview not passed by policy in part A', async () => {
+describe('code review policy opt-in', () => {
+  it('codeReview stays human when the policy does not list the gate', async () => {
     const { dir, engine } = laneProject(dirs);
     const work = await toCodeReview(engine);
     expect(work.currentState).toBe('HUMAN_CODE_REVIEW');
     expect(engine.ctx.store.listDecisions(work.id).some((d) => d.gate === 'code-review')).toBe(false);
-    expect(lastReasons(engine, work.id).join('\n')).toMatch(/two-reviewer AI review \(part B\) is not implemented/);
+    expect(lastReasons(engine, work.id).join('\n')).toMatch(/does not list the codeReview gate/);
     const status = readFileSync(packetPaths(dir, work.id).status, 'utf8');
     expect(status).toContain('## Autonomous lane: a human decides');
-    expect(status).toMatch(/part B/);
+    expect(status).toMatch(/does not list the codeReview gate/);
     expect(status).toContain(`turbine task lane ${work.id} --retry`);
     engine.ctx.store.close();
   }, 60_000);

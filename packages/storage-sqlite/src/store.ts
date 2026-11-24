@@ -88,6 +88,17 @@ function now(): string {
   return new Date().toISOString();
 }
 
+export type ReviewerAgreement = {
+  id: string;
+  workId: string;
+  changeSetId: string;
+  lens: string;
+  reviewerProfiles: [string, string];
+  blocking: [boolean, boolean];
+  agreed: boolean;
+  recordedAt: string;
+};
+
 export class WorkStore {
   readonly db: SqliteDb;
 
@@ -832,6 +843,47 @@ export class WorkStore {
       } catch (e) {
         return { name: row.name, error: (e as Error).message };
       }
+    });
+  }
+
+  saveReviewerAgreement(input: Omit<ReviewerAgreement, 'id' | 'recordedAt'>): ReviewerAgreement {
+    if (!input.workId || !input.changeSetId || !input.lens || input.reviewerProfiles.some((x) => !x)) {
+      throw err('E_INVALID_CONFIG', 'Reviewer agreement is missing an identity, lens, or change set');
+    }
+    const record: ReviewerAgreement = { ...input, id: createId('agreement'), recordedAt: now() };
+    this.db
+      .prepare(
+        `INSERT INTO reviewer_agreements(id, work_id, change_set_id, lens, data, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(record.id, record.workId, record.changeSetId, record.lens, JSON.stringify(record), record.recordedAt);
+    return record;
+  }
+
+  listReviewerAgreements(workId: string, changeSetId?: string): ReviewerAgreement[] {
+    const rows = changeSetId
+      ? (this.db
+          .prepare(`SELECT data FROM reviewer_agreements WHERE work_id = ? AND change_set_id = ? ORDER BY lens ASC`)
+          .all(workId, changeSetId) as Array<{ data: string }>)
+      : (this.db
+          .prepare(`SELECT data FROM reviewer_agreements WHERE work_id = ? ORDER BY recorded_at ASC`)
+          .all(workId) as Array<{ data: string }>);
+    return rows.map((row) => {
+      const value = JSON.parse(row.data) as ReviewerAgreement;
+      if (
+        !value ||
+        value.workId !== workId ||
+        !value.changeSetId ||
+        !value.lens ||
+        !Array.isArray(value.reviewerProfiles) ||
+        value.reviewerProfiles.length !== 2 ||
+        !Array.isArray(value.blocking) ||
+        value.blocking.length !== 2 ||
+        typeof value.agreed !== 'boolean'
+      ) {
+        throw err('E_INVALID_CONFIG', `Stored reviewer agreement for ${workId} is unreadable`);
+      }
+      return value;
     });
   }
 

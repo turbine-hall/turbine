@@ -752,6 +752,8 @@ turbine task lane <id> --retry            # HUMAN ONLY: put a fallen-back task b
 
 Policies are `.turbine/policies/<name>.yaml` (schema `LanePolicySchema` in `packages/contracts/src/lane-policy.ts`). Policy passes are `Decision`s with `actorType: 'policy'` and render as "Passed by policy `<name>` (approved by `<human>` on `<date>`)". `humanGates.{requirements,plan,codeReview,sqaAcceptance}` cannot be `false` (`E_CONFIG`); gates are relaxed only through approved lane policies.
 
+For `codeReview`, a policy must name exactly two model profiles that resolve to different provider/model identities. Approval and evaluation both fail closed if either profile is missing or the resolved identities collide. Each reviewer runs every selected lens over the same pinned diff/change-set and is triaged independently. A policy decision may pass code review only when both outputs are complete and parseable and neither has a kept blocking finding. Timeout, refusal, parse or budget failure, disagreement, blocking findings, or a changed HEAD leaves the gate for a human. REVIEW.md renders completed dual reviews side by side, a new commit stales both, and per-lens agreement is retained for later metrics. The ordinary human lane keeps its single advisory AI review.
+
 ### 8.4 R2+ commands (not implemented in R0/R1)
 
 ```bash
@@ -830,7 +832,7 @@ Interactive approval shows: work ID, stage, actor/identity assurance, proposed a
 | Approve own AI output | **Forbidden for AI** | Forbidden |
 | Approve / resume a lane policy, retry the lane | Local human attestation (TTY + typed hash) | Authenticated role |
 | Suspend a lane policy | Anyone, agents included | Anyone |
-| Approve code/SQA | Local human attestations | Independent authenticated human roles |
+| Approve code/SQA | Local human attestations, or a recorded eligible lane-policy pass (dual AI evidence for code review) | Independent authenticated human roles |
 | Sync Jira/edit remote | Disabled until explicit R2 feature | Permission + diff-bound approval |
 | Push/merge/deploy | **Forbidden in R0/R1 engine** | Separate guarded workflows |
 
@@ -841,7 +843,7 @@ Interactive approval shows: work ID, stage, actor/identity assurance, proposed a
 - If source commit changes after review/verification, affected checks and approvals must rerun.
 - A rejected review links findings to the commit and moves to `CHANGES_REQUESTED` with a valid return target.
 - Passing tests do not override a failed manual acceptance criterion. An LLM statement does not count as a test run.
-- `ACCEPTED` requires completed requirements, plan, implementation, applicable independent review, target checks, human SQA evidence and explicit human acceptance for the current revision. **Exception (autonomous lane, #26):** an active, human-approved lane policy that lists `acceptance` may replace the human SQA evidence and acceptance decision with a `policy` decision for that revision, only when every P0 requirement has FULL traceability, every configured quality check passed at the current commit, no required obligation is unmet or waived, the code review for that commit was decided by a human, and (with `humanGates.requirePrApproval`) the PR is approved at that commit. The human approval behind it covers the policy file, not this revision's evidence; any failed condition sends the task to a human.
+- `ACCEPTED` requires completed requirements, plan, implementation, applicable independent review, target checks, human SQA evidence and explicit human acceptance for the current revision. **Exception (autonomous lane, #26/#28):** an active, human-approved lane policy that lists `acceptance` may replace the human SQA evidence and acceptance decision with a `policy` decision for that revision, only when every P0 requirement has FULL traceability, every configured quality check passed at the current commit, no required obligation is unmet or waived, code review for that commit was passed either by a human or by the policy's complete clean dual-review evidence, and (with `humanGates.requirePrApproval`) the PR is approved at that commit. The human approval behind it covers the policy file, not this revision's evidence; any failed condition sends the task to a human.
 
 ### 9.3A EEC gate and recovery UX
 

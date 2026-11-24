@@ -118,8 +118,8 @@ export function fileAt(path: string, commit: string, file: string): string | und
   return r.status === 0 ? r.stdout : undefined;
 }
 
-export function diffWorktree(worktreePath: string, baseCommit: string): string {
-  const result = git(worktreePath, ['diff', `${baseCommit}...HEAD`]);
+export function diffWorktree(worktreePath: string, baseCommit: string, headCommit = 'HEAD'): string {
+  const result = git(worktreePath, ['diff', `${baseCommit}...${headCommit}`]);
   if (result.status !== 0) throw err('E_ADAPTER', result.stderr || 'git diff failed');
   return result.stdout;
 }
@@ -143,7 +143,11 @@ export function createGitAdapter(repoRoot: string): ToolAdapter {
       if (capability === 'git.diff') {
         return {
           data: {
-            diff: diffWorktree(String(args.worktreePath), String(args.baseCommit)),
+            diff: diffWorktree(
+              String(args.worktreePath),
+              String(args.baseCommit),
+              args.headCommit === undefined ? 'HEAD' : String(args.headCommit),
+            ),
           },
         };
       }

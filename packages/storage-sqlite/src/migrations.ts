@@ -220,4 +220,19 @@ CREATE TABLE IF NOT EXISTS lane_policies (
 );
 `,
   },
+  {
+    version: 10,
+    sql: `
+-- Per-lens agreement from completed autonomous dual reviews, retained for later metrics.
+CREATE TABLE IF NOT EXISTS reviewer_agreements (
+  id TEXT PRIMARY KEY,
+  work_id TEXT NOT NULL,
+  change_set_id TEXT NOT NULL,
+  lens TEXT NOT NULL,
+  data TEXT NOT NULL,
+  recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reviewer_agreements_work ON reviewer_agreements(work_id, change_set_id);
+`,
+  },
 ];

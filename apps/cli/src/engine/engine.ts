@@ -99,6 +99,7 @@ import {
   crossCheckClaims,
   disposition,
   factsBlock,
+  reviewOutputIsParseable,
   selectLenses,
   triage,
   validateCoverage,
@@ -136,7 +137,7 @@ import {
   writeFileAtomic,
 } from './packet.js';
 import { measuredTurbineTokens, summarizeUsage } from './usage.js';
-import { policyStatuses, readPolicyFiles, type PolicyStatus } from './lane-policy.js';
+import { policyStatuses, readPolicyFiles, resolvePolicyReviewers, type PolicyStatus } from './lane-policy.js';
 import { evaluateLaneEligibility, LANE_GATE_FOR_STATE, type LaneEvaluation, type LaneFacts } from './lane-eligibility.js';
 
 function now(): string {
@@ -152,7 +153,13 @@ function normalizeAcceptanceCriteria(raw: unknown): AcceptanceCriterion[] {
   return normalizeRequirements(raw);
 }
 
-export type LaneFallback = { gate: LaneGate; reasons: string[]; evaluationHash: string; at: string };
+export type LaneFallback = {
+  gate: LaneGate;
+  reasons: string[];
+  evaluationHash: string;
+  evaluatedChangeSetId?: string;
+  at: string;
+};
 export type LaneOutcome = {
   status: 'passed' | 'fallback' | 'out-of-lane' | 'retry';
   work: WorkPackage;
@@ -160,6 +167,7 @@ export type LaneOutcome = {
   reasons: string[];
   policy?: string;
   decision?: Decision;
+  evaluatedChangeSetId?: string;
 };
 
 const LANE_GATE_LABEL: Record<LaneGate, string> = {
@@ -2115,6 +2123,16 @@ export class Engine {
     const repos = this.repoStates(work.id);
     const implemented = repos.length > 0 && changeSetId(repos) !== baseSetId(repos);
     const cs = repos.length ? changeSetId(repos) : undefined;
+    const dualReviews: ReviewResult[] = [];
+    for (const artifact of this.ctx.store.listArtifacts(work.id, 'review')) {
+      if (artifact.relatedCommit !== cs) continue;
+      try {
+        const parsed = JSON.parse(this.ctx.store.getArtifactContent(artifact.id)) as ReviewResult;
+        if (parsed.reviewer && parsed.changeSetId === cs) dualReviews.push(parsed);
+      } catch (e) {
+        notes.push(`Dual review artifact ${artifact.id} is unreadable: ${(e as Error).message}`);
+      }
+    }
     const changeFacts = implemented ? this.factsFor(work.id, repos) : [];
     let gate: PacketData['gate'];
     try {
@@ -2144,6 +2162,7 @@ export class Engine {
       ['plan.json', plan?.content],
       ['change.json', implemented ? { repos, facts: changeFacts } : undefined],
       ['review.json', review?.content],
+      ['dual-reviews.json', dualReviews.length ? dualReviews : undefined],
       ['checks.json', report?.content],
     ];
     const evidenceFiles: string[] = [];
@@ -2191,6 +2210,7 @@ export class Engine {
       implemented,
       changeFacts,
       review: review?.content,
+      dualReviews,
       runs: report && report.content.changeSetId === cs ? report.content.runs : undefined,
       decisions,
       gate,
@@ -2522,10 +2542,99 @@ export class Engine {
     return review?.content.changeSetId === changeSetId(repos);
   }
 
+  /** A failed-closed dual-review handoff is valid only for the exact recorded change set. */
+  private dualReviewHandoffIsCurrent(workId: string): boolean {
+    const repos = this.repoStates(workId);
+    if (!repos.length) return false;
+    const handoff = this.ctx.store
+      .listEvents(workId)
+      .filter((event) => event.type === 'review.handed-off')
+      .at(-1);
+    return (
+      handoff?.payload.mode === 'dual-review-failed-closed' &&
+      handoff.payload.changeSetId === changeSetId(repos)
+    );
+  }
+
   /** Uncommitted files in any worktree (approving code with uncommitted work is refused). */
   uncommitted(workId: string): Array<{ repo: string; paths: string[] }> {
     const repos = this.repoStates(workId).filter((r) => existsSync(r.worktreePath));
     return repos.length ? observe(repos).uncommitted : [];
+  }
+
+  private async runReviewWithModel(input: {
+    work: WorkPackage;
+    facts: RepoFacts[];
+    diffText: string;
+    changeSetId: string;
+    model: ModelAdapter;
+    maxOutputTokens: number;
+    reviewer?: ReviewResult['reviewer'];
+    requireParseable?: boolean;
+  }): Promise<ReviewResult> {
+    const { work, facts, diffText } = input;
+    const spec = this.ctx.store.getLatestArtifact(work.id, 'specification');
+    const plan = this.ctx.store.getLatestArtifact(work.id, 'plan');
+    const skill = getSkill(this.ctx.factoryRoot, 'core/review-change');
+    const lenses = selectLenses(work, facts);
+    const findings: Finding[] = [];
+    const discarded: DiscardedFinding[] = [];
+    const claimMismatches: ClaimMismatch[] = [];
+    const summaries: Array<{ lens: Lens; summary: string }> = [];
+    const coverage: CoverageLink[] = [];
+    for (const lens of lenses) {
+      this.checkBudget(work.id);
+      let result: Awaited<ReturnType<Engine['runAsRole']>>;
+      try {
+        result = await this.runAsRole({
+          skill,
+          model: input.model,
+          workId: work.id,
+          roleId: lens === 'security' ? 'security-reviewer' : 'code-reviewer',
+          context: [
+            LENS_INSTRUCTIONS[lens],
+            REVIEW_OUTPUT_CONTRACT,
+            `REQUIREMENTS:\n${work.acceptanceCriteria.map((c) => `- ${c.id} (${c.priority ?? 'P1'}): ${c.statement}`).join('\n')}`,
+            `SPEC:\n${spec ? this.ctx.store.getArtifactContent(spec.id).slice(0, 6000) : '(none)'}`,
+            `PLAN:\n${plan ? this.ctx.store.getArtifactContent(plan.id).slice(0, 4000) : '(none)'}`,
+            `FACTS (from git):\n${factsBlock(facts)}`,
+            `DIFF:\n${diffText}`,
+          ].join('\n\n'),
+          schemaId: 'review',
+          maxOutputTokens: input.maxOutputTokens,
+        });
+      } finally {
+        this.ctx.store.incrementBudget(work.id, 1);
+      }
+      if (input.requireParseable && !reviewOutputIsParseable(result.content)) {
+        throw new LaneIneligible(`${input.reviewer?.profile ?? input.model.id} returned incomplete or unparseable review output for ${lens}`);
+      }
+      const t = triage({ lens, raw: result.content, facts, diffText, startIndex: findings.length });
+      findings.push(...t.findings);
+      discarded.push(...t.discarded);
+      for (const mismatch of crossCheckClaims(result.content, facts)) {
+        if (!claimMismatches.some((x) => x.claim === mismatch.claim)) claimMismatches.push(mismatch);
+      }
+      if (lens === 'tests') {
+        const checked = validateCoverage(result.content, facts, work.acceptanceCriteria.map((c) => c.id));
+        coverage.push(...checked.links);
+        discarded.push(...checked.rejected);
+      }
+      const summary = (result.content as { summary?: unknown })?.summary;
+      if (typeof summary === 'string' && summary.trim()) summaries.push({ lens, summary: summary.trim().slice(0, 400) });
+    }
+    return {
+      changeSetId: input.changeSetId,
+      reviewer: input.reviewer,
+      lenses,
+      findings,
+      discarded,
+      claimMismatches,
+      summaries,
+      truncatedRepos: [],
+      coverage,
+      disposition: disposition(findings, claimMismatches),
+    };
   }
 
   /**
@@ -2551,62 +2660,16 @@ export class Engine {
     }
     const facts = computeFacts(repos);
     const diff = collectDiffs(repos);
-    const spec = this.ctx.store.getLatestArtifact(work.id, 'specification');
-    const plan = this.ctx.store.getLatestArtifact(work.id, 'plan');
     const model = getModel(this.ctx.config.models.profiles.analysis?.model ?? 'mock-default');
-    const skill = getSkill(this.ctx.factoryRoot, 'core/review-change');
-    const lenses = selectLenses(work, facts);
-
-    const findings: Finding[] = [];
-    const discarded: DiscardedFinding[] = [];
-    const claimMismatches: ClaimMismatch[] = [];
-    const summaries: Array<{ lens: Lens; summary: string }> = [];
-    const coverage: CoverageLink[] = [];
-    for (const lens of lenses) {
-      this.checkBudget(work.id);
-      const result = await this.runAsRole({
-        skill,
-        model,
-        workId: work.id,
-        roleId: lens === 'security' ? 'security-reviewer' : 'code-reviewer',
-        context: [
-          LENS_INSTRUCTIONS[lens],
-          REVIEW_OUTPUT_CONTRACT,
-          `REQUIREMENTS:\n${work.acceptanceCriteria.map((c) => `- ${c.id} (${c.priority ?? 'P1'}): ${c.statement}`).join('\n')}`,
-          `SPEC:\n${spec ? this.ctx.store.getArtifactContent(spec.id).slice(0, 6000) : '(none)'}`,
-          `PLAN:\n${plan ? this.ctx.store.getArtifactContent(plan.id).slice(0, 4000) : '(none)'}`,
-          `FACTS (from git):\n${factsBlock(facts)}`,
-          `DIFF:\n${diff.text}`,
-        ].join('\n\n'),
-        schemaId: 'review',
-        maxOutputTokens: 3000,
-      });
-      this.ctx.store.incrementBudget(work.id, 1);
-      const t = triage({ lens, raw: result.content, facts, diffText: diff.text, startIndex: findings.length });
-      findings.push(...t.findings);
-      discarded.push(...t.discarded);
-      for (const m of crossCheckClaims(result.content, facts)) {
-        if (!claimMismatches.some((x) => x.claim === m.claim)) claimMismatches.push(m);
-      }
-      if (lens === 'tests') {
-        const cov = validateCoverage(result.content, facts, work.acceptanceCriteria.map((c) => c.id));
-        coverage.push(...cov.links);
-        discarded.push(...cov.rejected);
-      }
-      const summary = (result.content as { summary?: unknown })?.summary;
-      if (typeof summary === 'string' && summary.trim()) summaries.push({ lens, summary: summary.trim().slice(0, 400) });
-    }
-    const review: ReviewResult = {
+    const review = await this.runReviewWithModel({
+      work,
+      facts,
+      diffText: diff.text,
       changeSetId: changeSet,
-      lenses,
-      findings,
-      discarded,
-      claimMismatches,
-      summaries,
-      truncatedRepos: diff.truncated,
-      coverage,
-      disposition: disposition(findings, claimMismatches),
-    };
+      model,
+      maxOutputTokens: this.ctx.config.models.profiles.analysis?.maxOutputTokens ?? 3000,
+    });
+    review.truncatedRepos = diff.truncated;
 
     const change = this.ctx.store.getLatestArtifact(work.id, 'change-report');
     const reviewArt = this.saveArtifact({
@@ -2651,14 +2714,14 @@ export class Engine {
           reviewArtifactId: reviewArt.id,
           mode: 'ai',
           disposition: review.disposition,
-          kept: findings.length,
-          discarded: discarded.length,
-          claimMismatches: claimMismatches.length,
+          kept: review.findings.length,
+          discarded: review.discarded.length,
+          claimMismatches: review.claimMismatches.length,
         },
       });
     });
     this.render(work.id, [
-        `AI review: ${review.disposition} (${findings.length} finding(s) kept, ${discarded.length} discarded as unverifiable).`,
+        `AI review: ${review.disposition} (${review.findings.length} finding(s) kept, ${review.discarded.length} discarded as unverifiable).`,
         'Read REVIEW.md sections 1–3 and the diff',
         'Then a human runs, in their own terminal: turbine task approve <id>',
       ]);
@@ -2667,6 +2730,155 @@ export class Engine {
       review,
       packetDir: packetPaths(this.ctx.projectRoot, work.id).dir,
       openFile: packetPaths(this.ctx.projectRoot, work.id).review,
+    };
+  }
+
+  private async runDualLaneReview(
+    work: WorkPackage,
+    policy: ApprovedLanePolicy,
+    expectedChangeSetId: string,
+  ): Promise<{
+    reviews: [ReviewResult, ReviewResult];
+    artifacts: Array<{ id: string; contentHash: string }>;
+    clean: boolean;
+    disagreement: boolean;
+  }> {
+    const profiles = resolvePolicyReviewers(policy.policy, this.ctx.config.models.profiles);
+    if (!profiles) throw new LaneIneligible(`policy ${policy.name} does not configure codeReview`);
+    const repos = this.repoStates(work.id);
+    if (!repos.length || changeSetId(repos) !== expectedChangeSetId) {
+      throw new LaneIneligible('the change set moved before dual review started');
+    }
+    const facts = computeFacts(repos);
+    const diff = collectDiffs(repos);
+    if (diff.truncated.length) {
+      throw new LaneIneligible(
+        `dual review cannot cover truncated diff content in: ${diff.truncated.join(', ')}`,
+      );
+    }
+    const reviews: ReviewResult[] = [];
+    for (const profile of profiles) {
+      const model = getModel(profile.model);
+      if (model.provider !== profile.provider) {
+        throw new LaneIneligible(
+          `reviewer profile ${profile.name} requires provider ${profile.provider}, but model ${profile.model} resolved to ${model.provider}`,
+        );
+      }
+      const review = await this.runReviewWithModel({
+        work,
+        facts,
+        diffText: diff.text,
+        changeSetId: expectedChangeSetId,
+        model,
+        maxOutputTokens: profile.maxOutputTokens,
+        reviewer: { profile: profile.name, provider: profile.provider, model: profile.model },
+        requireParseable: true,
+      });
+      review.truncatedRepos = diff.truncated;
+      reviews.push(review);
+      const observed = observe(this.repoStates(work.id));
+      if (observed.uncommitted.length || changeSetId(observed.repos) !== expectedChangeSetId) {
+        throw new LaneIneligible('the change set moved while dual review was running');
+      }
+    }
+    const pair = reviews as [ReviewResult, ReviewResult];
+    const blocking = pair.map((r) => r.disposition === 'needs-attention') as [boolean, boolean];
+    const disagreement = blocking[0] !== blocking[1];
+    const clean = !blocking[0] && !blocking[1];
+    const change = this.ctx.store.getLatestArtifact(work.id, 'change-report');
+    this.dualReviewBeforePublish?.();
+    const artifacts = this.ctx.store.transaction(() => {
+      const current = this.ctx.store.getWork(work.id);
+      if (current.currentState !== work.currentState || current.currentRevision !== work.currentRevision) {
+        throw new LaneIneligible('task state or revision changed while dual review was running');
+      }
+      if (!this.laneState(work.id).inLane) {
+        throw new LaneIneligible('task left the autonomous lane while dual review was running');
+      }
+      const observed = observe(this.repoStates(work.id));
+      if (observed.uncommitted.length || changeSetId(observed.repos) !== expectedChangeSetId) {
+        throw new LaneIneligible('the change set moved before dual review was published');
+      }
+      const artifacts = pair.map((review) =>
+        this.saveArtifact({
+          workId: work.id,
+          type: 'review',
+          content: review,
+          createdBy: { kind: 'agent', identifier: `code-reviewer:${review.reviewer!.profile}` },
+          parentArtifactIds: change ? [change.id] : [],
+          relatedCommit: expectedChangeSetId,
+        }),
+      );
+      if (change) {
+        for (const artifact of artifacts) {
+          this.ctx.store.saveEdge(
+            createEdge({
+              workId: work.id,
+              upstreamArtifactId: change.id,
+              upstreamRevisionHash: change.contentHash,
+              downstreamArtifactId: artifact.id,
+              downstreamRevisionHash: artifact.contentHash,
+              reason: 'change-to-dual-review',
+              affectedObligationIds: ['obl_code_review'],
+            }),
+          );
+        }
+      }
+      pair[0].lenses.forEach((lens) => {
+        const lensBlocking = pair.map(
+          (review) =>
+            review.findings.some((finding) => finding.lens === lens && finding.severity === 'high') ||
+            (lens === 'spec-compliance' && review.claimMismatches.length > 0),
+        ) as [boolean, boolean];
+        this.ctx.store.saveReviewerAgreement({
+          workId: work.id,
+          changeSetId: expectedChangeSetId,
+          lens,
+          reviewerProfiles: [profiles[0].name, profiles[1].name],
+          blocking: lensBlocking,
+          agreed: lensBlocking[0] === lensBlocking[1],
+        });
+      });
+      artifacts.forEach((artifact, index) => {
+        const review = pair[index]!;
+        this.ctx.store.saveEvidence({
+          id: createId('ev'),
+          workId: work.id,
+          kind: 'review',
+          reviewerId: review.reviewer!.profile,
+          result: review.disposition === 'no-blocking-findings' ? 'passed' : 'failed',
+          commitSha: expectedChangeSetId,
+          observedAt: now(),
+          logArtifactId: artifact.id,
+          limitations: ['Autonomous AI reviewer; policy pass requires both configured reviewers to complete cleanly'],
+        });
+      });
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'review.dual-completed',
+        payload: {
+          policy: policy.name,
+          changeSetId: expectedChangeSetId,
+          reviewers: profiles.map((p) => ({ profile: p.name, provider: p.provider, model: p.model })),
+          artifacts: artifacts.map((a) => a.id),
+          dispositions: pair.map((r) => r.disposition),
+          disagreement,
+        },
+      });
+      return artifacts;
+    });
+    this.render(work.id, [
+      disagreement
+        ? 'Dual reviewers disagree; a human decides code review.'
+        : clean
+          ? `Dual review completed cleanly for policy ${policy.name}.`
+          : 'Both autonomous reviewers found blocking issues; a human decides code review.',
+    ]);
+    return {
+      reviews: pair,
+      artifacts: artifacts.map((artifact) => ({ id: artifact.id, contentHash: artifact.contentHash })),
+      clean,
+      disagreement,
     };
   }
 
@@ -3016,13 +3228,54 @@ export class Engine {
     idOrAlias: string,
     actorId = 'local-user',
   ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
+    let pending = this.ctx.store.getWork(idOrAlias);
+    if (pending.currentState === 'AI_REVIEW') {
+      pending = this.refreshHeads(pending.id).work;
+      const lane = await this.tryLanePass(pending.id);
+      if (
+        lane &&
+        (lane.status === 'passed' || lane.status === 'retry' || !!lane.evaluatedChangeSetId)
+      ) {
+        return this.finishLaneSync({ action: 'status', work: pending }, lane);
+      }
+    }
     const result = await this.syncStep(idOrAlias, actorId);
-    const lane = this.tryLanePass(result.work.id);
+    const lane = await this.tryLanePass(result.work.id);
     if (!lane) return result;
+    return this.finishLaneSync(result, lane);
+  }
+
+  private async finishLaneSync(
+    result: { action: string; work: WorkPackage; detail?: unknown },
+    lane: LaneOutcome,
+  ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
     const laneDetail = { status: lane.status, gate: lane.gate, policy: lane.policy, decisionId: lane.decision?.id, reasons: lane.reasons };
     const detail = { ...(result.detail && typeof result.detail === 'object' ? result.detail : {}), lane: laneDetail };
     try {
-      return lane.status === 'passed' ? { action: 'lane.passed', work: lane.work, detail } : { ...result, work: lane.work, detail };
+      if (lane.status === 'passed') return { action: 'lane.passed', work: lane.work, detail };
+      if (
+        lane.gate === 'codeReview' &&
+        lane.evaluatedChangeSetId &&
+        lane.work.currentState === 'AI_REVIEW' &&
+        (lane.status === 'fallback' || lane.status === 'out-of-lane')
+      ) {
+        this.laneBeforeHandoff?.();
+        const refreshed = this.refreshHeads(lane.work.id).work;
+        const handedOff = this.handoffDualReviewToHuman(
+          refreshed,
+          lane.evaluatedChangeSetId,
+          lane.reasons,
+        );
+        if (handedOff.currentState === 'HUMAN_CODE_REVIEW') {
+          return {
+            action: 'review.human',
+            work: handedOff,
+            detail: { ...detail, openFile: packetPaths(this.ctx.projectRoot, handedOff.id).review },
+          };
+        }
+        return { ...result, work: handedOff, detail };
+      }
+      return { ...result, work: lane.work, detail };
     } finally {
       await this.waitForMirror();
     }
@@ -3142,7 +3395,11 @@ export class Engine {
       return { action: 'verify', work: verified.work, detail: verified };
     }
 
-    if (work.currentState === 'HUMAN_CODE_REVIEW' && !this.aiReviewIsCurrent(work.id)) {
+    if (
+      work.currentState === 'HUMAN_CODE_REVIEW' &&
+      !this.aiReviewIsCurrent(work.id) &&
+      !this.dualReviewHandoffIsCurrent(work.id)
+    ) {
       // Tasks stuck at code review with a review for an older commit (pre-fix behaviour).
       work = transition(work, 'AI_REVIEW');
       this.ctx.store.saveWork(work);
@@ -3230,7 +3487,7 @@ export class Engine {
       case 'HUMAN_CODE_REVIEW': {
         const head = this.currentCommit(work.id);
         if (!head) throw err('E_EEC_UNSATISFIED', 'No implementation commit recorded');
-        if (!this.aiReviewIsCurrent(work.id)) {
+        if (!this.aiReviewIsCurrent(work.id) && !this.dualReviewHandoffIsCurrent(work.id)) {
           throw err('E_EVIDENCE_STALE', `The AI review is for an older commit. Run: turbine task sync ${work.id} (re-runs the review), then approve.`);
         }
         return { work, gate: 'code-review', subject: head, confirmToken: head.slice(0, 8), openFile: paths.review };
@@ -3336,12 +3593,18 @@ export class Engine {
       .at(-1);
     if (!last || last.type === 'lane.retry') return { inLane: true };
     const p = last.payload as Partial<LaneFallback>;
+    if (typeof p.evaluatedChangeSetId === 'string') {
+      const repos = this.repoStates(work.id);
+      if (!repos.length || changeSetId(repos) !== p.evaluatedChangeSetId) return { inLane: true };
+    }
     return {
       inLane: false,
       fallback: {
         gate: p.gate ?? 'requirements',
         reasons: Array.isArray(p.reasons) ? p.reasons.map(String) : ['(reasons not recorded)'],
         evaluationHash: typeof p.evaluationHash === 'string' ? p.evaluationHash : contentHash(last.payload),
+        evaluatedChangeSetId:
+          typeof p.evaluatedChangeSetId === 'string' ? p.evaluatedChangeSetId : undefined,
         at: last.createdAt,
       },
     };
@@ -3397,8 +3660,20 @@ export class Engine {
       ? commit
       : (this.ctx.store.getLatestArtifact(work.id, gate === 'requirements' ? 'specification' : 'plan')?.contentHash ?? '');
     if (!subject) readErrors.push(`no ${gate === 'requirements' ? 'specification' : gate === 'plan' ? 'plan' : 'change set'} to decide on`);
-    // The same preconditions a human approval checks (synced SPEC.md, clean worktree, current AI review).
-    attempt('approval preconditions', () => this.pendingApproval(work.id), undefined);
+    // At AI_REVIEW there is intentionally no advisory review yet. Check the preconditions that
+    // do not depend on that advisory artifact; the lane's own dual pair supplies review evidence.
+    if (work.currentState === 'AI_REVIEW' && gate === 'codeReview') {
+      attempt(
+        'approval preconditions',
+        () => {
+          const dirty = this.uncommitted(work.id);
+          if (dirty.length) throw new Error('worktree has uncommitted changes');
+        },
+        undefined,
+      );
+    } else {
+      attempt('approval preconditions', () => this.pendingApproval(work.id), undefined);
+    }
     const lintErrors = attempt('task lint', () => this.lintWork(work.id).filter((i) => i.level === 'error').map((i) => `${i.file}: ${i.message}`), []);
     const analysisGate = gate === 'acceptance' ? undefined : gate === 'codeReview' ? 'code-review' : gate;
     const criticalFindings = attempt(
@@ -3471,6 +3746,7 @@ export class Engine {
       change,
       acceptance,
       readErrors,
+      reviewerProfiles: this.ctx.config.models.profiles,
     };
   }
 
@@ -3488,11 +3764,52 @@ export class Engine {
     return changeSetId(seen);
   }
 
+  /** Move a failed autonomous review to the human gate only for the change set it evaluated. */
+  private handoffDualReviewToHuman(
+    work: WorkPackage,
+    evaluatedChangeSetId: string,
+    reasons: string[],
+  ): WorkPackage {
+    const next = this.ctx.store.transaction(() => {
+      const current = this.ctx.store.getWork(work.id);
+      if (current.currentState !== 'AI_REVIEW' || current.currentRevision !== work.currentRevision) {
+        return current;
+      }
+      const repos = this.repoStates(work.id);
+      const observed = repos.length ? observe(repos) : undefined;
+      if (
+        !observed ||
+        observed.uncommitted.length ||
+        changeSetId(repos) !== evaluatedChangeSetId ||
+        changeSetId(observed.repos) !== evaluatedChangeSetId
+      ) {
+        return current;
+      }
+      const transitioned = transition(current, 'HUMAN_CODE_REVIEW');
+      this.ctx.store.saveWork(transitioned);
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'review.handed-off',
+        payload: {
+          mode: 'dual-review-failed-closed',
+          changeSetId: evaluatedChangeSetId,
+          reasons,
+        },
+      });
+      return transitioned;
+    });
+    this.render(work.id, [
+      'Autonomous dual review did not pass; a human decides code review.',
+      ...reasons.slice(0, 3),
+    ]);
+    return next;
+  }
+
   /**
    * At a gate that waits for a human, try to pass it with an approved, active lane policy. Never records a
    * human decision. Returns undefined when no lane policy has ever been approved (the lane is not in use).
    */
-  tryLanePass(idOrAlias: string): LaneOutcome | undefined {
+  async tryLanePass(idOrAlias: string): Promise<LaneOutcome | undefined> {
     let work = this.ctx.store.getWork(idOrAlias);
     const gate = LANE_GATE_FOR_STATE[work.currentState];
     if (!gate) return undefined;
@@ -3504,7 +3821,15 @@ export class Engine {
     }
     if (!stored.length) return undefined;
     const lane = this.laneState(work.id);
-    if (!lane.inLane) return { status: 'out-of-lane', work, gate, reasons: lane.fallback?.reasons ?? [] };
+    if (!lane.inLane) {
+      return {
+        status: 'out-of-lane',
+        work,
+        gate,
+        reasons: lane.fallback?.reasons ?? [],
+        evaluatedChangeSetId: lane.fallback?.evaluatedChangeSetId,
+      };
+    }
 
     let statuses: PolicyStatus[];
     try {
@@ -3519,30 +3844,93 @@ export class Engine {
     const active = statuses.filter((s) => s.state === 'active').map((s) => s.approved!);
 
     let moved = '';
+    let reviewedChangeSet: string | undefined;
     for (let attempt = 0; attempt < 2; attempt++) {
       if (attempt > 0) {
         work = this.ctx.store.getWork(work.id);
         if (LANE_GATE_FOR_STATE[work.currentState] !== gate) return { status: 'retry', work, gate, reasons: [moved] };
       }
+      let reviewClaim: string | undefined;
+      try {
       // Re-check membership each attempt: a concurrent sync may have recorded lane.fallback after evaluation.
       const membership = this.laneState(work.id);
       if (!membership.inLane) {
-        return { status: 'out-of-lane', work, gate, reasons: membership.fallback?.reasons ?? [moved || 'task left the lane during evaluation'] };
+        return {
+          status: 'out-of-lane',
+          work,
+          gate,
+          reasons: membership.fallback?.reasons ?? [moved || 'task left the lane during evaluation'],
+          evaluatedChangeSetId: membership.fallback?.evaluatedChangeSetId,
+        };
       }
       const facts = this.laneFacts(work, gate);
-      const evaluations = active.map((p) => evaluateLaneEligibility(p, facts));
+      let evaluations = active.map((p) => evaluateLaneEligibility(p, facts));
       const winnerIdx = evaluations.findIndex((e) => e.status === 'eligible');
       if (winnerIdx < 0) return this.laneFallback(work, gate, evaluations, unusable);
-      this.laneBeforeSave?.();
       const winner = active[winnerIdx]!;
+      if (gate === 'codeReview') {
+        reviewedChangeSet = facts.commit;
+        try {
+          reviewClaim = this.ctx.store.claimWork(work.id, 'dual review');
+        } catch (e) {
+          return {
+            status: 'retry',
+            work: this.ctx.store.getWork(work.id),
+            gate,
+            reasons: [(e as Error).message],
+            evaluatedChangeSetId: facts.commit,
+          };
+        }
+        try {
+          const dual = await this.runDualLaneReview(work, winner, facts.commit);
+          facts.dualReview = {
+            changeSetId: facts.commit,
+            complete: true,
+            clean: dual.clean,
+            disagreement: dual.disagreement,
+            artifacts: dual.artifacts,
+          };
+        } catch (e) {
+          const refreshed = this.refreshHeads(work.id);
+          if (refreshed.changed) {
+            moved = `the change set moved during dual review; recaptured ${this.currentCommit(work.id)?.slice(0, 12) ?? 'new HEAD'}`;
+            this.ctx.store.appendEvent({
+              workId: work.id,
+              type: 'lane.discarded',
+              payload: { gate, reason: moved, evaluationHash: evaluations[winnerIdx]!.evaluationHash },
+            });
+            continue;
+          }
+          facts.dualReview = {
+            changeSetId: facts.commit,
+            complete: false,
+            clean: false,
+            disagreement: false,
+            reason: `dual review incomplete: ${(e as Error).message}`,
+          };
+        }
+        evaluations = active.map((p, index) =>
+          index === winnerIdx ? evaluateLaneEligibility(p, facts, { requireDualReview: true }) : evaluations[index]!,
+        );
+        if (evaluations[winnerIdx]!.status !== 'eligible') {
+          return this.laneFallback(work, gate, evaluations, unusable, facts.commit);
+        }
+      }
+      this.laneBeforeSave?.();
       const saved = this.savePolicyPass(work, facts, winner, evaluations[winnerIdx]!);
       if ('work' in saved) {
         this.render(work.id, [`${LANE_GATE_LABEL[gate]} ${saved.decision.rationale}.`]);
         return { status: 'passed', work: saved.work, gate, policy: winner.name, decision: saved.decision, reasons: [] };
       }
-      if ('ineligible' in saved) return this.laneFallback(work, gate, evaluations, [saved.ineligible]);
+      if ('ineligible' in saved) {
+        return this.laneFallback(work, gate, evaluations, [saved.ineligible], reviewedChangeSet);
+      }
       moved = saved.moved;
+      if (gate === 'codeReview') this.refreshHeads(work.id);
       this.ctx.store.appendEvent({ workId: work.id, type: 'lane.discarded', payload: { gate, reason: moved, evaluationHash: evaluations[winnerIdx]!.evaluationHash } });
+      } finally {
+        if (reviewClaim) this.ctx.store.releaseClaim(work.id, reviewClaim);
+      }
     }
     // Facts kept moving: nothing was saved and the task stays in the lane, so the next sync evaluates again.
     this.render(work.id, [`Autonomous lane: ${moved}; no policy decision was saved. Run sync again.`]);
@@ -3552,7 +3940,19 @@ export class Engine {
   /** Test seam: runs after a lane evaluation and before its decision is saved. */
   laneBeforeSave?: () => void;
 
-  private laneFallback(work: WorkPackage, gate: LaneGate, evaluations: LaneEvaluation[], extra: string[]): LaneOutcome {
+  /** Test seam: runs after model calls and before completed dual reviews are published. */
+  dualReviewBeforePublish?: () => void;
+
+  /** Test seam: runs after lane fallback and before its human handoff. */
+  laneBeforeHandoff?: () => void;
+
+  private laneFallback(
+    work: WorkPackage,
+    gate: LaneGate,
+    evaluations: LaneEvaluation[],
+    extra: string[],
+    evaluatedChangeSetId?: string,
+  ): LaneOutcome {
     const reasons = [
       ...extra,
       ...evaluations.flatMap((e) => e.reasons.map((r) => `${e.policy}: ${r}`)),
@@ -3586,10 +3986,11 @@ export class Engine {
           workRevision: current.currentRevision,
           reasons,
           evaluationHash,
+          evaluatedChangeSetId,
           evaluations: evaluations.map((e) => ({ policy: e.policy, policyHash: e.policyHash, status: e.status, evaluationHash: e.evaluationHash })),
         },
       });
-      return { status: 'fallback' as const, work: current, gate, reasons };
+      return { status: 'fallback' as const, work: current, gate, reasons, evaluatedChangeSetId };
     });
     if (outcome.status === 'fallback') {
       this.render(work.id, [`Autonomous lane: a human decides the ${gate} gate — ${reasons.slice(0, 3).join('; ')}${reasons.length > 3 ? '; …' : ''}`]);
@@ -3716,6 +4117,85 @@ export class Engine {
           this.ctx.store.saveEec(bumpEecRevision(eec, { approvedPlanHash: plan.contentHash, approvalDecisionIds: [...eec.approvalDecisionIds, decision.id] }));
           return { work: next, decision };
         }
+        if (facts.gate === 'codeReview') {
+          const profiles = resolvePolicyReviewers(policy.policy, this.ctx.config.models.profiles);
+          if (!profiles) throw new LaneIneligible(`policy ${policy.name} does not configure codeReview`);
+          if (facts.dualReview?.changeSetId !== commitNow || facts.dualReview.artifacts?.length !== 2) {
+            throw new LaneIneligible('the exact evaluated review pair is missing or stale');
+          }
+          const selected = facts.dualReview.artifacts.map((expected, index) => {
+            const artifact = this.ctx.store.listArtifacts(work.id, 'review').find((entry) => entry.id === expected.id);
+            if (
+              !artifact ||
+              artifact.contentHash !== expected.contentHash ||
+              artifact.relatedCommit !== commitNow
+            ) {
+              throw new LaneIneligible(`evaluated review artifact ${expected.id} is no longer current`);
+            }
+            let review: ReviewResult;
+            try {
+              review = JSON.parse(this.ctx.store.getArtifactContent(artifact.id)) as ReviewResult;
+            } catch {
+              throw new LaneIneligible(`review artifact ${artifact.id} is unreadable`);
+            }
+            const profile = profiles[index]!;
+            if (
+              review.changeSetId !== commitNow ||
+              review.reviewer?.profile !== profile.name ||
+              review.reviewer.provider !== profile.provider ||
+              review.reviewer.model !== profile.model
+            ) {
+              throw new LaneIneligible(`evaluated review artifact ${artifact.id} no longer matches reviewer ${profile.name}`);
+            }
+            return { artifact, review };
+          });
+          if (selected.some((entry) => entry!.review.disposition !== 'no-blocking-findings')) {
+            throw new LaneIneligible('both configured reviewers must have no kept blocking findings');
+          }
+          try {
+            this.assertPrApproval(work.id, commitNow);
+          } catch (e) {
+            throw new LaneIneligible((e as Error).message);
+          }
+          // A PR lookup can block while a worktree advances. Never bind its result to newer heads.
+          const afterPr = observe(this.repoStates(work.id));
+          if (afterPr.uncommitted.length) {
+            return { moved: 'a worktree became dirty during the PR check' };
+          }
+          if (changeSetId(afterPr.repos) !== commitNow) {
+            return { moved: 'a worktree advanced during the PR check' };
+          }
+          const decision: Decision = {
+            ...base,
+            gate: 'code-review',
+            artifactIds: selected.map((entry) => entry!.artifact.id),
+            artifactHashes: selected.map((entry) => entry!.artifact.contentHash),
+            commitSha: commitNow,
+          };
+          const next =
+            current.currentState === 'AI_REVIEW'
+              ? transition(transition(current, 'HUMAN_CODE_REVIEW'), 'VERIFYING')
+              : transition(current, 'VERIFYING');
+          this.ctx.store.saveDecision(decision);
+          this.ctx.store.saveWork(next);
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: 'code-review.passed-by-policy',
+            payload: {
+              decisionId: decision.id,
+              commitSha: commitNow,
+              policy: policy.name,
+              reviewers: profiles.map((profile) => profile.name),
+            },
+          });
+          const eec = this.ctx.store.getLatestEec(work.id)!;
+          this.ctx.store.saveEec(
+            bumpEecRevision(eec, {
+              approvalDecisionIds: [...eec.approvalDecisionIds, decision.id],
+            }),
+          );
+          return { work: next, decision };
+        }
         if (facts.gate === 'acceptance') {
           try {
             this.assertPrApproval(work.id, commitNow);
@@ -3749,7 +4229,7 @@ export class Engine {
           });
           return { work: next, decision };
         }
-        throw new LaneIneligible('code review is not passed by policy until two-reviewer review (part B) exists');
+        throw new LaneIneligible(`unsupported lane gate ${facts.gate}`);
       });
     } catch (e) {
       if (e instanceof LaneIneligible) return { ineligible: e.message };

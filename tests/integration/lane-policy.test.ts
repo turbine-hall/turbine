@@ -109,7 +109,7 @@ describe('lane policy schema (FR-A1, FR-A2)', () => {
     expect(LanePolicySchema.safeParse({ ...parsePolicyYaml(EXAMPLE), deniedTriggers: Object.keys(SOFT_TRIGGERS) }).success).toBe(true);
   });
 
-  it('a policy Decision needs every policy field and can never approve a policy, waive, or pass code review', () => {
+  it('a policy Decision needs every policy field and can never approve a policy or waive', () => {
     const base = {
       id: 'dec_1', workId: 'work_1', gate: 'plan', action: 'approve', artifactIds: [], artifactHashes: [], workRevision: 1,
       actorId: 'policy:routine', actorType: 'policy', identityAssurance: 'local-attestation', decidedAt: new Date().toISOString(),
@@ -121,7 +121,7 @@ describe('lane policy schema (FR-A1, FR-A2)', () => {
     }
     expect(DecisionSchema.safeParse({ ...base, gate: 'policy' }).success).toBe(false);
     expect(DecisionSchema.safeParse({ ...base, gate: 'exception' }).success).toBe(false);
-    expect(DecisionSchema.safeParse({ ...base, gate: 'code-review' }).success).toBe(false);
+    expect(DecisionSchema.safeParse({ ...base, gate: 'code-review' }).success).toBe(true);
     expect(DecisionSchema.safeParse({ ...base, actorType: 'human', gate: 'policy' }).success).toBe(true);
   });
 });
@@ -150,7 +150,7 @@ describe('loading .turbine/policies (FR-A1)', () => {
     expect(errors.join('\n')).toMatch(/legacy\.yml: ignored/);
     const states = Object.fromEntries(policyStatuses(engine.ctx.store, dir).policies.map((p) => [p.name, p.state]));
     expect(states).toMatchObject({ routine: 'unapproved', 'bad-key': 'invalid', 'bad-path': 'invalid', linked: 'invalid' });
-    expect(() => pendingPolicyApproval(engine.ctx.store, dir, 'bad-key')).toThrow(/invalid/);
+    expect(() => pendingPolicyApproval(engine.ctx.store, dir, 'bad-key', engine.ctx.config.models.profiles)).toThrow(/invalid/);
     engine.ctx.store.close();
   });
 
@@ -198,7 +198,15 @@ describe('approval and drift (FR-A3, FR-A4)', () => {
 
   it('approval is bound to the typed short hash and recorded as a human policy Decision', () => {
     const { dir, engine } = laneProject(dirs, { approved: false });
-    expect(() => approvePolicy(engine.ctx.store, dir, { name: 'routine', confirmToken: 'deadbeef', reviewer: 'Ana', presence: 'test' })).toThrow(/does not match/);
+    expect(() =>
+      approvePolicy(engine.ctx.store, dir, {
+        name: 'routine',
+        confirmToken: 'deadbeef',
+        reviewer: 'Ana',
+        presence: 'test',
+        profiles: engine.ctx.config.models.profiles,
+      }),
+    ).toThrow(/does not match/);
     expect(engine.ctx.store.getLanePolicy('routine')).toBeNull();
     const { decision, policy, warnings } = approve(engine, 'routine');
     expect(decision).toMatchObject({ gate: 'policy', actorType: 'human', actorId: 'Ana', workId: 'policy:routine', presence: 'test' });
