@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@turbine-hall/turbine-adapter-git": "workspace:*",
+    "@turbine-hall/turbine-adapter-github": "workspace:*",
     "@turbine-hall/turbine-adapter-jira": "workspace:*",
     "@turbine-hall/turbine-adapter-tests": "workspace:*",
     "@turbine-hall/turbine-contracts": "workspace:*",
@@ -24,7 +25,7 @@
     "@turbine-hall/turbine-skills": "workspace:*",
     "@turbine-hall/turbine-storage-sqlite": "workspace:*",
     "@turbine-hall/turbine-tools": "workspace:*",
-    "commander": "^14.0.1",
+    "commander": "^15.1.0",
     "typescript": "^5.9.3",
     "yaml": "^2.8.1"
   },

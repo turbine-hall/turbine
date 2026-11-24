@@ -30,7 +30,23 @@ import { ensureBoard } from './board/launch.js';
 import { handleError, printResult } from './output.js';
 import { callerCwd, factoryRoot, findProjectRoot, resolveProjectPath } from './paths.js';
 import { HUMAN_PRESENCE, ask, askReviewer, assertHumanTerminal } from './human-gate.js';
+import { callerCwd, factoryRoot, findProjectRoot } from './paths.js';
+import { HUMAN_PRESENCE, ask, askReviewer, assertHumanTerminal, gitUserName } from './human-gate.js';
 import { repoToplevel } from './engine/context/git-read.js';
+import { formatTokenCount, formatUsageQualifiers } from './engine/usage.js';
+
+function isAgentSession(): boolean {
+  return ['TURBINE_AGENT', 'CLAUDECODE', 'CURSOR_AGENT'].some((k) => process.env[k] && process.env[k] !== '0');
+}
+
+function parseTokenArg(raw: string): number | 'unknown' {
+  if (raw === 'unknown' || raw === '?') return 'unknown';
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) {
+    throw err('E_INVALID_CONFIG', `token count must be a non-negative integer or "unknown" (got ${raw})`);
+  }
+  return n;
+}
 
 const program = new Command();
 program.name('turbine').description('Turbine Hall CLI').version('0.5.0');
@@ -597,10 +613,11 @@ task
   .option('--file <path>')
   .option('--type <type>', 'feature')
   .option('--json')
-  .action((opts) => {
+  .action(async (opts) => {
     try {
       const engine = withEngine();
       const work = engine.createTask({ title: opts.title, file: opts.file, type: opts.type });
+      await engine.waitForMirror();
       printResult(
         {
           id: work.id,
@@ -1065,6 +1082,8 @@ task
           decisions: engine.ctx.store.listDecisions(work.id),
           evidence: engine.ctx.store.listEvidence(work.id),
           events: engine.ctx.store.listEvents(work.id),
+          usage: engine.usageSummary(work.id),
+          roleRuns: engine.ctx.store.listRoleRuns(work.id),
           redacted: !!opts.redact,
         },
         true,
@@ -1305,6 +1324,102 @@ task
     }
   });
 
+const usageCmd = task
+  .command('usage')
+  .description('Token and model usage for a task (Turbine role_runs + coding-agent records)');
+
+usageCmd
+  .command('add')
+  .argument('<id>')
+  .requiredOption('--source <name>', 'agent name (e.g. cursor) — records source=agent')
+  .option('--model <id>', 'model id')
+  .option('--provider <name>', 'model provider')
+  .requiredOption('--input <n>', 'input tokens, or "unknown"')
+  .requiredOption('--output <n>', 'output tokens, or "unknown"')
+  .option('--method <m>', 'measured|reported|estimated', 'reported')
+  .option('--note <text>')
+  .option('--by <name>', 'who recorded this (defaults to git user.name or agent)')
+  .option('--json')
+  .description('Record coding-agent (or other) usage against a task. Append-only; no edit/delete.')
+  .action((id, opts) => {
+    try {
+      const engine = withEngine();
+      const method = String(opts.method);
+      if (!['measured', 'reported', 'estimated'].includes(method)) {
+        throw err('E_INVALID_CONFIG', 'method must be measured, reported, or estimated');
+      }
+      const agent = isAgentSession();
+      const recordedBy =
+        opts.by?.trim() ||
+        (agent ? 'agent:session' : gitUserName(engine.ctx.projectRoot) || 'local-user');
+      const record = engine.addUsage({
+        idOrAlias: id,
+        source: 'agent',
+        agentName: String(opts.source),
+        modelId: opts.model,
+        modelProvider: opts.provider,
+        inputTokens: parseTokenArg(String(opts.input)),
+        outputTokens: parseTokenArg(String(opts.output)),
+        method: method as 'measured' | 'reported' | 'estimated',
+        note: opts.note,
+        recordedBy,
+        enteredBy: agent ? 'agent' : 'human',
+      });
+      printResult(
+        { id: record.id, workId: record.workId, source: record.source, agentName: record.agentName },
+        !!opts.json,
+      );
+      engine.ctx.store.close();
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+usageCmd
+  .argument('<id>')
+  .option('--json')
+  .description('Show per-source and per-model totals (unknown never summed as 0)')
+  .action((id, opts) => {
+    try {
+      const engine = withEngine();
+      const summary = engine.usageSummary(id);
+      if (opts.json) {
+        printResult(summary, true);
+      } else {
+        const out = process.stdout;
+        out.write(`Usage — ${summary.workId}\n`);
+        out.write(
+          `  Turbine: calls=${summary.bySource.turbine.calls} in=${formatTokenCount(summary.bySource.turbine.input)} out=${formatTokenCount(summary.bySource.turbine.output)} total=${formatTokenCount(summary.bySource.turbine.total)}${formatUsageQualifiers(summary.bySource.turbine)}\n`,
+        );
+        out.write(
+          `  Agent:   calls=${summary.bySource.agent.calls} in=${formatTokenCount(summary.bySource.agent.input)} out=${formatTokenCount(summary.bySource.agent.output)} total=${formatTokenCount(summary.bySource.agent.total)}${formatUsageQualifiers(summary.bySource.agent)}\n`,
+        );
+        out.write(
+          `  Grand:   calls=${summary.grand.calls} in=${formatTokenCount(summary.grand.input)} out=${formatTokenCount(summary.grand.output)} total=${formatTokenCount(summary.grand.total)}${formatUsageQualifiers(summary.grand)}\n`,
+        );
+        if (summary.byModel.length) {
+          out.write('  By model:\n');
+          for (const b of summary.byModel) {
+            out.write(
+              `    - ${b.source}/${b.modelId ?? b.agentName ?? '?'}: calls=${b.calls} in=${formatTokenCount(b.input)} out=${formatTokenCount(b.output)} total=${formatTokenCount(b.total)}${formatUsageQualifiers(b)}\n`,
+            );
+          }
+        }
+        if (summary.records.length) {
+          out.write(`  Records (${summary.records.length}):\n`);
+          for (const r of summary.records) {
+            out.write(
+              `    - ${r.id.slice(0, 16)}… ${r.source}${r.agentName ? `:${r.agentName}` : ''} model=${r.modelId ?? '—'} method=${r.method} enteredBy=${r.enteredBy} in=${formatTokenCount(r.tokens.input)} out=${formatTokenCount(r.tokens.output)}\n`,
+            );
+          }
+        }
+      }
+      engine.ctx.store.close();
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
 task
   .command('risk')
   .argument('<id>')
@@ -1409,6 +1524,7 @@ async function decideCommand(id: string, action: 'approve' | 'reject', reason?: 
     out.write('\nRecorded as a local attestation (identity not cryptographically verified).\n');
     const work = (result as { work: { id: string; currentState: string } }).work;
     printResult({ id: work.id, state: work.currentState }, false);
+    await engine.waitForMirror();
   } finally {
     engine.ctx.store.close();
   }

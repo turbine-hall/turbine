@@ -36,6 +36,7 @@ export function defaultConfig(projectRoot: string, name?: string): ProjectConfig
       default: 'file',
       adapters: {
         jira: { enabled: false, siteUrl: null, credentialRef: null },
+        github: { enabled: false, apiBaseUrl: null, credentialRef: null, mirrorRepos: [] },
       },
     },
     models: {
@@ -50,6 +51,7 @@ export function defaultConfig(projectRoot: string, name?: string): ProjectConfig
         currency: 'USD',
         maxEstimatedCost: 5,
         maxModelCalls: 15,
+        maxTokens: null,
         maxExecutionAttempts: 2,
       },
     },

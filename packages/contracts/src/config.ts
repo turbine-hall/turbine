@@ -23,9 +23,26 @@ export const ProjectConfigSchema = z.object({
             credentialRef: z.string().nullable().default(null),
           })
           .default({ enabled: false, siteUrl: null, credentialRef: null }),
+        github: z
+          .object({
+            enabled: z.boolean().default(false),
+            /**
+             * Documented enterprise API hint only. Live mirror uses `GITHUB_API_BASE_URL` (env)
+             * or https://api.github.com — never this repo-owned field with the env token.
+             */
+            apiBaseUrl: z.string().nullable().default(null),
+            credentialRef: z.string().nullable().default(null),
+            /**
+             * owner/repo values that may receive packet mirrors. Empty = no GitHub mirrors
+             * (fail closed). Compared case-insensitively.
+             */
+            mirrorRepos: z.array(z.string()).default([]),
+          })
+          .default({ enabled: false, apiBaseUrl: null, credentialRef: null, mirrorRepos: [] }),
       })
       .default({
         jira: { enabled: false, siteUrl: null, credentialRef: null },
+        github: { enabled: false, apiBaseUrl: null, credentialRef: null, mirrorRepos: [] },
       }),
   }),
   models: z.object({
@@ -60,12 +77,20 @@ export const ProjectConfigSchema = z.object({
           maxEstimatedCost: z.number().default(5),
           maxModelCalls: z.number().int().default(15),
           maxExecutionAttempts: z.number().int().default(2),
+          /**
+           * Optional retrospective cap on measured Turbine-side input+output tokens.
+           * Null/omitted = no token budget. Unknown usage does not count toward the cap.
+           * Further checked calls are refused once measured usage has reached the limit;
+           * one call may finish above the remaining allowance (check uses completed usage).
+           */
+          maxTokens: z.number().int().positive().nullable().default(null),
         })
         .default({
           currency: 'USD',
           maxEstimatedCost: 5,
           maxModelCalls: 15,
           maxExecutionAttempts: 2,
+          maxTokens: null,
         }),
     })
     .default({
@@ -74,6 +99,7 @@ export const ProjectConfigSchema = z.object({
         maxEstimatedCost: 5,
         maxModelCalls: 15,
         maxExecutionAttempts: 2,
+        maxTokens: null,
       },
     }),
   tools: z

@@ -7,9 +7,12 @@ Short definitions for the words used in task documents.
 |---|---|
 | **Task / work item** | One requested change, with an ID like \`work_01…\`. Its documents live in \`.turbine/tasks/<id>/\`. |
 | **STATUS.md** | Where the task is, who acts next, and what blocks it. Start here. |
-| **SPEC.md** | What must be true when the task is done (requirements), open questions, and the plan. |
+| **SPEC.md** | What must be true when the task is done (requirements), open questions, and context. Links to the plan docs. |
+| **PLAN.md** | Detailed implementation plan: architecture, data model, interfaces, steps, tests, risks, coding-agent token estimate. |
+| **EXECUTIVE-SUMMARY.md** | Short high-level plan narrative plus Mermaid diagrams of the change. |
 | **REVIEW.md** | What actually changed (from git), traceability, AI review, check results, and the acceptance checklist. |
 | **evidence/** | Raw data (JSON, logs) behind the documents. You rarely need it. |
+| **Coding-agent token estimate** | Heuristic budget for the coding agent (\`confidence: estimated\`). Not billed cost and not this planning call's usage. |
 | **Requirement (FR-001)** | One checkable rule, ideally "WHEN … THE SYSTEM SHALL …". |
 | **P0 / P1 / P2** | Priority. P0 must work for the task to be accepted; P1 should; P2 is nice to have. |
 | **Open question** | A decision only a human can make. Questions block approval until answered. |

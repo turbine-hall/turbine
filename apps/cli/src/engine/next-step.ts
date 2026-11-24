@@ -177,10 +177,15 @@ function computeNextStepRaw(input: {
         ...baseStep,
         summary: 'Generate the implementation plan.',
         who: 'either',
-        doNow: 'Run sync to create the plan (in SPEC.md).',
+        doNow: 'Run sync to create the plan (PLAN.md + EXECUTIVE-SUMMARY.md).',
         commands: [sync, next],
         openFiles: [paths.status, ...contextFiles],
-        agentPlaybook: [readFirst('planning', knowledgeOk), briefNote, 'Run turbine task sync <id>.', 'Then ask the human to review SPEC.md → Plan.'],
+        agentPlaybook: [
+          readFirst('planning', knowledgeOk),
+          briefNote,
+          'Run turbine task sync <id>.',
+          'Then ask the human to review PLAN.md and EXECUTIVE-SUMMARY.md.',
+        ],
       };
 
     case 'PLAN_REVIEW':
@@ -188,10 +193,10 @@ function computeNextStepRaw(input: {
         ...baseStep,
         summary: 'Human approves the plan.',
         who: 'human',
-        doNow: `Read SPEC.md → Plan (and fix CRITICAL items from turbine task analyze), then in your own terminal run: ${approve}`,
+        doNow: `Read PLAN.md and EXECUTIVE-SUMMARY.md (and fix CRITICAL items from turbine task analyze), then in your own terminal run: ${approve}`,
         commands: [approve, next],
-        openFiles: [paths.plan, paths.status],
-        agentPlaybook: ['Present plan steps briefly.', ...humanOnly],
+        openFiles: [paths.planDoc, paths.executiveSummary, paths.status],
+        agentPlaybook: ['Present plan steps and executive summary briefly.', ...humanOnly],
       };
 
     case 'PLAN_APPROVED':
@@ -212,7 +217,7 @@ function computeNextStepRaw(input: {
           readFirst('implementing', knowledgeOk),
           briefNote,
           'Run turbine task sync <id> (execute).',
-          'Read SPEC.md → Requirements and Plan; follow the plan steps and file list.',
+          'Read SPEC.md → Requirements and PLAN.md; follow the plan steps and file list.',
           'Make all code changes in the worktree path.',
           'Commit on the turbine/* branch in the worktree.',
           'Tell human: main folder is still old until PR merge.',

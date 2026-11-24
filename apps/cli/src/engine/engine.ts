@@ -15,6 +15,9 @@ import {
   type RiskProfile,
   type RoleRun,
   type TaskContext,
+  type UsageMethod,
+  type UsageRecord,
+  type UsageSummary,
   type WorkPackage,
   type WorkState,
   type WorkType,
@@ -48,7 +51,14 @@ import { getSkill, loadSkills, runSkill, type SkillManifest } from '@turbine-hal
 import type { ModelAdapter } from '@turbine-hall/turbine-models';
 import { ToolBroker } from '@turbine-hall/turbine-tools';
 import { createJiraAdapter, issueToMarkdown, type JiraIssue } from '@turbine-hall/turbine-adapter-jira';
+import { createGitHubAdapter } from '@turbine-hall/turbine-adapter-github';
 import { inspectRepo } from '@turbine-hall/turbine-adapter-git';
+import {
+  githubLinksFromText,
+  mirrorLinkedIssues,
+  type MirrorAdapters,
+  type MirrorRunResult,
+} from './issue-mirror.js';
 import { hasUncommittedChanges, observeBranch, repoToplevel } from './context/git-read.js';
 import { briefConfigOf, syncBriefClaimsToHead } from './context/brief.js';
 import { repoHead } from './context/understand.js';
@@ -109,6 +119,7 @@ import {
   writeFile,
   writeFileAtomic,
 } from './packet.js';
+import { measuredTurbineTokens, summarizeUsage } from './usage.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -140,7 +151,7 @@ export const githubPrApprovalChecker: PrApprovalChecker = ({ projectRoot, branch
   if (r.status !== 0) {
     return { approved: false, detail: `gh failed: ${(r.stderr || r.error?.message || '').trim()}` };
   }
-  let prs: Array<{ number: number; url: string; reviewDecision: string; headRefOid: string }> = [];
+  let prs: Array<{ number: number; url: string; reviewDecision: string; headRefOid: string }>;
   try {
     prs = JSON.parse(r.stdout || '[]');
   } catch {
@@ -164,10 +175,105 @@ export const githubPrApprovalChecker: PrApprovalChecker = ({ projectRoot, branch
 export class Engine {
   /** Replaceable for tests; used when humanGates.requirePrApproval is on. */
   prApprovalChecker: PrApprovalChecker = githubPrApprovalChecker;
+  /**
+   * Optional tool adapters for packet→issue mirroring (tests inject fixture adapters).
+   * When unset, live adapters are built from project config + env (still gated by tools policy).
+   */
+  mirrorAdapters?: MirrorAdapters;
+  /**
+   * When true, mirroring uses only injected `mirrorAdapters` (no live adapters) and skips
+   * adapter enabled / mirrorRepos gates — for offline tests.
+   */
+  mirrorFixtureMode = false;
+  private mirrorJob: Promise<MirrorRunResult | undefined> = Promise.resolve(undefined);
 
   constructor(readonly ctx: EngineContext) {
     ensureDefaultMock();
     configureModelsFromProfiles(this.ctx.config.models.profiles);
+  }
+
+  /** Await the latest packet-mirror attempt (tests / sync). */
+  async waitForMirror(): Promise<MirrorRunResult | undefined> {
+    return this.mirrorJob;
+  }
+
+  /** Turbine role_runs + external usage_records summary for a task. */
+  usageSummary(idOrAlias: string): UsageSummary {
+    const work = this.ctx.store.getWork(idOrAlias);
+    return summarizeUsage({
+      workId: work.id,
+      roleRuns: this.ctx.store.listRoleRuns(work.id),
+      records: this.ctx.store.listUsageRecords(work.id),
+    });
+  }
+
+  /**
+   * Record coding-agent (or other) usage against a task. Agents may add records; there is no
+   * edit/delete API for human-entered rows (FR-006).
+   */
+  addUsage(input: {
+    idOrAlias: string;
+    source: 'turbine' | 'agent';
+    agentName?: string;
+    modelId?: string;
+    modelProvider?: string;
+    inputTokens: number | 'unknown';
+    outputTokens: number | 'unknown';
+    method: UsageMethod;
+    note?: string;
+    recordedBy: string;
+    enteredBy: 'human' | 'agent';
+  }): UsageRecord {
+    const work = this.ctx.store.getWork(input.idOrAlias);
+    if (input.source === 'agent' && !input.agentName?.trim()) {
+      throw err('E_INVALID_CONFIG', 'agentName is required when source is agent');
+    }
+    if (input.inputTokens !== 'unknown' && (!Number.isFinite(input.inputTokens) || input.inputTokens < 0)) {
+      throw err('E_INVALID_CONFIG', 'input tokens must be a non-negative number or unknown');
+    }
+    if (input.outputTokens !== 'unknown' && (!Number.isFinite(input.outputTokens) || input.outputTokens < 0)) {
+      throw err('E_INVALID_CONFIG', 'output tokens must be a non-negative number or unknown');
+    }
+    const record: UsageRecord = {
+      id: createId('usage'),
+      workId: work.id,
+      source: input.source,
+      agentName: input.agentName?.trim() || undefined,
+      modelId: input.modelId,
+      modelProvider: input.modelProvider,
+      tokens: { input: input.inputTokens, output: input.outputTokens },
+      method: input.method,
+      note: input.note,
+      recordedAt: now(),
+      recordedBy: input.recordedBy,
+      enteredBy: input.enteredBy,
+    };
+    // Record + event commit together so a mid-write failure cannot leave a counted row without its event
+    // (retry would otherwise insert a second ID and double-count in summaries).
+    this.ctx.store.transaction(() => {
+      this.ctx.store.saveUsageRecord(record);
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'usage.recorded',
+        payload: {
+          usageId: record.id,
+          source: record.source,
+          agentName: record.agentName,
+          modelId: record.modelId,
+          method: record.method,
+          enteredBy: record.enteredBy,
+        },
+      });
+    });
+    // Render after commit: packet refresh must not roll back counted usage. Failures here are
+    // surfaceable via sync/render; the record already exists so a blind retry would double-count —
+    // callers should not re-add on render-only errors.
+    try {
+      this.render(work.id, [`Usage recorded (${record.source}${record.agentName ? `:${record.agentName}` : ''})`]);
+    } catch {
+      /* usage is committed; next sync/render refreshes the packet */
+    }
+    return record;
   }
 
   private artifactLocation(workId: string, type: string, revision: number): string {
@@ -220,6 +326,7 @@ export class Engine {
     const snapshotHash = contentHashText(sourceText);
     const workId = createId('work');
     const createdAt = now();
+    const ghLinks = githubLinksFromText(sourceText);
 
     const work: WorkPackage = {
       id: workId,
@@ -234,6 +341,7 @@ export class Engine {
           externalId: input.file,
           snapshotHash,
         },
+        ...ghLinks.map((l) => ({ ...l.sourceRef, snapshotHash })),
       ],
       acceptanceCriteria: [],
       constraints: [],
@@ -245,7 +353,7 @@ export class Engine {
       selectedRoles: [],
       currentState: 'IMPORTED',
       currentRevision: 1,
-      aliases: [],
+      aliases: ghLinks.map((l) => l.alias),
       createdAt,
       updatedAt: createdAt,
     };
@@ -365,6 +473,7 @@ export class Engine {
    */
   private async runAsRole(input: {
     skill: SkillManifest;
+    companionSkills?: SkillManifest[];
     model: ModelAdapter;
     workId: string;
     roleId: string;
@@ -373,13 +482,16 @@ export class Engine {
     maxOutputTokens: number;
   }): Promise<{ content: unknown; usage?: { inputTokens?: number; outputTokens?: number } }> {
     const work = this.ctx.store.getWork(input.workId);
+    const companions = input.companionSkills ?? [];
     const { grants } = this.roleGrants(work, input.roleId, input.skill.id);
+    for (const c of companions) this.roleGrants(work, input.roleId, c.id);
+    const skillIds = [input.skill.id, ...companions.map((c) => c.id)];
     const run: RoleRun = {
       id: createId('run'),
       workId: work.id,
       roleId: input.roleId,
       roleVersion: getRole(this.ctx.factoryRoot, input.roleId).version,
-      skillIds: [input.skill.id],
+      skillIds,
       toolCapabilityGrants: grants,
       modelProvider: input.model.provider,
       modelId: input.model.id,
@@ -392,16 +504,26 @@ export class Engine {
     };
     this.ctx.store.saveRoleRun(run);
     try {
-      const result = await runSkill({ ...input, grantedCapabilities: grants });
+      const result = await runSkill({ ...input, companionSkills: companions, grantedCapabilities: grants });
       this.ctx.store.saveRoleRun({
         ...run,
         status: 'succeeded',
         endedAt: now(),
-        tokens: { input: result.usage?.inputTokens, output: result.usage?.outputTokens },
+        tokens: {
+          input: typeof result.usage?.inputTokens === 'number' ? result.usage.inputTokens : 'unknown',
+          output: typeof result.usage?.outputTokens === 'number' ? result.usage.outputTokens : 'unknown',
+        },
       });
       return result;
     } catch (e) {
-      this.ctx.store.saveRoleRun({ ...run, status: 'failed', endedAt: now(), errorCode: (e as { code?: string }).code ?? 'E_RUN_FAILURE' });
+      this.ctx.store.saveRoleRun({
+        ...run,
+        status: 'failed',
+        endedAt: now(),
+        errorCode: (e as { code?: string }).code ?? 'E_RUN_FAILURE',
+        // Failures still record model identity; usage is unknown unless the adapter already returned it (it did not here).
+        tokens: { input: 'unknown', output: 'unknown' },
+      });
       throw e;
     }
   }
@@ -428,6 +550,13 @@ export class Engine {
     const max = this.ctx.config.budgets.perTask.maxModelCalls;
     if (budget.modelCalls >= max) {
       throw err('E_BUDGET_EXCEEDED', `Model call budget exceeded (${budget.modelCalls}/${max})`);
+    }
+    const maxTokens = this.ctx.config.budgets.perTask.maxTokens;
+    if (maxTokens != null) {
+      const used = measuredTurbineTokens(this.ctx.store.listRoleRuns(workId));
+      if (used >= maxTokens) {
+        throw err('E_BUDGET_EXCEEDED', `Token budget exceeded (${used}/${maxTokens} measured Turbine tokens)`);
+      }
     }
   }
 
@@ -1132,6 +1261,7 @@ export class Engine {
     this.checkBudget(work.id);
     const model = getModel(this.ctx.config.models.profiles.analysis?.model ?? 'mock-default');
     const skill = getSkill(this.ctx.factoryRoot, 'core/plan-change');
+    const executiveSummarySkill = getSkill(this.ctx.factoryRoot, 'core/plan-executive-summary');
     const spec = this.ctx.store.getLatestArtifact(work.id, 'specification');
     const specJson = (() => {
       try {
@@ -1164,6 +1294,7 @@ export class Engine {
       : '';
     const result = await this.runAsRole({
       skill,
+      companionSkills: [executiveSummarySkill],
       model,
       workId: work.id,
       roleId: work.selectedRoles.some((r) => r.id === 'project-manager') || !work.selectedRoles.some((r) => r.id === 'architect')
@@ -1171,7 +1302,7 @@ export class Engine {
         : 'architect',
       context: `REQUIREMENTS (link every step and test to these IDs):\n${work.acceptanceCriteria.map((c) => `- ${c.id} (${c.priority ?? 'P1'}): ${c.statement}`).join('\n')}\n\nVALID REQUIREMENT IDS: ${validIds.join(', ')}. Use only these; every one needs at least one step, and every P0 at least one test.${feedback}\n\nAPPROVED SPEC CONTEXT:\n${specText}\n\nPROJECT_EVIDENCE (each line ends with its source):\n${repoContext}\n\nTASK_CONTEXT (files that may matter, each with a checkable reason; a selection, NOT a complete list):\n${taskContextText}${extraRepoEvidence ? `\n\n${extraRepoEvidence}` : ''}\n\nREPOSITORIES IN SCOPE:\n- project (this repo)\n${(work.repositories ?? []).map((r) => `- ${r.name}: ${r.path}`).join('\n')}\nOnly plan changes in these repositories; if another repo is needed, say so under risks.`,
       schemaId: 'plan',
-      maxOutputTokens: 4000,
+      maxOutputTokens: 5000,
     });
     // The completed model call is charged on its own, committed before publication. Publication can roll back
     // (a failed write, a lost claim); the call still happened, so it still counts.
@@ -1682,6 +1813,14 @@ export class Engine {
       );
     if (!planOk) throw err('E_STALE_REVISION', 'Current plan is not approved');
 
+    // Reuse existing worktrees (CHANGES_REQUESTED loop) or create them on first execute.
+    // Budget applies only when this path will call the model (first execute); a model-free
+    // resume with existing worktrees must not be blocked by an exhausted token budget.
+    const existing = this.repoStates(work.id);
+    if (existing.length === 0) {
+      this.checkBudget(work.id);
+    }
+
     // Rebuilt when the base commit moved or this is a new CHANGES_REQUESTED cycle, before anything points at it.
     // It runs before the task leaves PLAN_APPROVED / CHANGES_REQUESTED and before any worktree exists, so a
     // failure here (an unreadable repository, an unwritable packet folder) leaves the task retryable.
@@ -1697,8 +1836,6 @@ export class Engine {
       this.ctx.store.saveEec(eec);
     }
 
-    // Reuse existing worktrees (CHANGES_REQUESTED loop) or create them.
-    const existing = this.repoStates(work.id);
     const repos =
       existing.length > 0
         ? observe(existing).repos
@@ -1915,9 +2052,11 @@ export class Engine {
 
   lintWork(idOrAlias: string): LintIssue[] {
     const work = this.ctx.store.getWork(idOrAlias);
+    const hasPlan = Boolean(this.ctx.store.getLatestArtifact(work.id, 'plan'));
     return lintPacket(packetPaths(this.ctx.projectRoot, work.id), {
       track: trackFor(work),
       requirementIds: work.acceptanceCriteria.map((c) => c.id),
+      hasPlan,
     });
   }
 
@@ -1941,6 +2080,21 @@ export class Engine {
     } catch {
       gate = undefined;
     }
+    const mirrorNotes: string[] = [];
+    const lastMirrorPath = join(paths.evidenceDir, 'issue-mirror-last.json');
+    if (existsSync(lastMirrorPath)) {
+      try {
+        const last = JSON.parse(readFileSync(lastMirrorPath, 'utf8')) as MirrorRunResult;
+        for (const t of last.targets ?? []) {
+          if (t.status === 'mirrored') mirrorNotes.push(`Issue mirror → ${t.provider}:${t.key} updated (comment ${t.commentId ?? '—'})`);
+          else if (t.status === 'skipped') mirrorNotes.push(`Issue mirror skipped for ${t.provider}:${t.key}: ${t.reason ?? 'unknown'}`);
+          else mirrorNotes.push(`Issue mirror FAILED for ${t.provider}:${t.key}: ${t.reason ?? 'unknown'}`);
+        }
+      } catch {
+        mirrorNotes.push('Issue mirror: previous result file was unreadable');
+      }
+    }
+    const renderNotes = [...notes, ...mirrorNotes];
     // Raw data goes to evidence/, never inline.
     const evidence: Array<[string, unknown]> = [
       ['assessment.json', assessment?.content],
@@ -1975,7 +2129,7 @@ export class Engine {
       work,
       track: trackFor(work),
       next: computeNextStep({ projectRoot: this.ctx.projectRoot, work }),
-      notes,
+      notes: renderNotes,
       sourceText: source?.content.text ?? work.objective,
       facts: normalizeAssessment(assessment?.content).facts,
       spec: spec ? { hash: spec.hash, data: normalizeSpec(spec.content, work.acceptanceCriteria) } : undefined,
@@ -1992,10 +2146,110 @@ export class Engine {
       analysis: this.analyzeWork(work.id),
       evidenceFiles,
       contextFile: existsSync(paths.context),
+      usage: summarizeUsage({
+        workId: work.id,
+        roleRuns: this.ctx.store.listRoleRuns(work.id),
+        records: this.ctx.store.listUsageRecords(work.id),
+      }),
     };
     const glossary = join(this.ctx.projectRoot, '.turbine', 'GLOSSARY.md');
     if (!existsSync(glossary)) writeFile(glossary, GLOSSARY);
     renderPacket(data);
+    // Packet → linked GitHub/Jira sticky comment (capability + adapter gated). Serialize jobs so
+    // concurrent renders cannot create duplicate sticky comments or race stale bodies.
+    const sourceText = source?.content.text;
+    this.mirrorJob = this.mirrorJob
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          const fresh = this.ctx.store.getWork(workId);
+          return await this.runIssueMirror(fresh, sourceText);
+        } catch {
+          return undefined;
+        }
+      });
+  }
+
+  private async runIssueMirror(work: WorkPackage, sourceText?: string): Promise<MirrorRunResult | undefined> {
+    try {
+      const adapters: MirrorAdapters = this.mirrorFixtureMode
+        ? {
+            // Fixture mode: never invent live adapters — missing provider → explicit skip.
+            github: this.mirrorAdapters?.github,
+            jira: this.mirrorAdapters?.jira,
+          }
+        : {
+            github:
+              this.mirrorAdapters?.github ??
+              createGitHubAdapter({
+                // Host trust is env-only — never take apiBaseUrl from repo project.yaml with the env token.
+                apiBaseUrl: process.env.GITHUB_API_BASE_URL || undefined,
+                token: process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN,
+              }),
+            jira:
+              this.mirrorAdapters?.jira ??
+              createJiraAdapter({
+                // Host trust is env-only — never take siteUrl from repo project.yaml with the env token.
+                siteUrl: process.env.JIRA_SITE_URL || '',
+                email: process.env.JIRA_EMAIL,
+                apiToken: process.env.JIRA_API_TOKEN,
+              }),
+          };
+      const result = await mirrorLinkedIssues({
+        projectRoot: this.ctx.projectRoot,
+        work,
+        config: this.ctx.config,
+        sourceText,
+        adapters,
+        fixtureMode: this.mirrorFixtureMode,
+      });
+      if (result.targets.length) {
+        try {
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: 'issue.mirror',
+            payload: {
+              targets: result.targets.map((t) => ({
+                provider: t.provider,
+                key: t.key,
+                status: t.status,
+                reason: t.reason,
+                commentId: t.commentId,
+              })),
+            },
+          });
+        } catch {
+          // Store may already be closed (tests); evidence file is the durable record.
+        }
+      }
+      return result;
+    } catch (e) {
+      const paths = packetPaths(this.ctx.projectRoot, work.id);
+      mkdirSync(paths.evidenceDir, { recursive: true });
+      const failed: MirrorRunResult = {
+        at: new Date().toISOString(),
+        workId: work.id,
+        targets: [
+          {
+            provider: 'github',
+            key: '—',
+            status: 'failed',
+            reason: (e as Error).message,
+          },
+        ],
+      };
+      writeFileSync(join(paths.evidenceDir, 'issue-mirror-last.json'), JSON.stringify(failed, null, 2) + '\n');
+      try {
+        this.ctx.store.appendEvent({
+          workId: work.id,
+          type: 'issue.mirror',
+          payload: { error: (e as Error).message },
+        });
+      } catch {
+        // Store may already be closed (tests); evidence file is the durable record.
+      }
+      return failed;
+    }
   }
 
   /**
@@ -2063,7 +2317,7 @@ export class Engine {
   repoStates(workId: string): RepoState[] {
     const change = this.ctx.store.getLatestArtifact(workId, 'change-report');
     if (!change) return [];
-    let content: Record<string, unknown> = {};
+    let content: Record<string, unknown>;
     try {
       content = JSON.parse(this.ctx.store.getArtifactContent(change.id));
     } catch {
@@ -2709,6 +2963,7 @@ export class Engine {
     idOrAlias: string,
     _actorId = 'local-user',
   ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
+    try {
     let work = this.ctx.store.getWork(idOrAlias);
     const paths = packetPaths(this.ctx.projectRoot, work.id);
     const approveHint = `Human approves in their own terminal: turbine task approve ${work.id}`;
@@ -2850,6 +3105,9 @@ export class Engine {
       work,
       detail: { openFile: paths.status, state: work.currentState },
     };
+    } finally {
+      await this.waitForMirror();
+    }
   }
 
   /** What a human is being asked to approve right now (shown before confirmation). */

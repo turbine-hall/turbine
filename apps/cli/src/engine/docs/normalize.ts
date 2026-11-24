@@ -9,12 +9,26 @@ import type { AcceptanceCriterion, RequirementPriority } from '@turbine-hall/tur
 export type PlanStep = { id: string; description: string; requirementIds: string[]; files: string[] };
 export type PlannedTest = { requirementId: string; test: string; kind: string };
 export type PlanRisk = { risk: string; mitigation?: string };
+export type PlanDiagram = { title: string; mermaid: string };
+export type CodingAgentTokenEstimate = {
+  totalTokens: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  basis: string;
+  confidence: 'estimated';
+};
 export type NormalizedPlan = {
   summary: string;
+  architecture?: string;
+  dataModel?: string;
+  interfaces?: string;
+  executiveSummary?: string;
+  diagrams: PlanDiagram[];
   steps: PlanStep[];
   testPlan: PlannedTest[];
   risks: PlanRisk[];
   complexity?: string;
+  codingAgentTokenEstimate?: CodingAgentTokenEstimate;
 };
 
 export type Fact = { text: string; source: string };
@@ -119,12 +133,51 @@ export function normalizePlan(raw: unknown): NormalizedPlan {
     const x = (r ?? {}) as Record<string, unknown>;
     return { risk: str(x.risk ?? x.text ?? x.description), mitigation: str(x.mitigation) || undefined };
   });
+  const diagrams = arr(o.diagrams)
+    .map((d): PlanDiagram | null => {
+      if (typeof d === 'string') {
+        const mermaid = d.trim();
+        if (!mermaid) return null;
+        return { title: 'Change overview', mermaid };
+      }
+      const x = (d ?? {}) as Record<string, unknown>;
+      const mermaid = str(x.mermaid ?? x.diagram ?? x.body);
+      if (!mermaid) return null;
+      return { title: str(x.title) || 'Change overview', mermaid };
+    })
+    .filter((d): d is PlanDiagram => d !== null);
+
+  let codingAgentTokenEstimate: CodingAgentTokenEstimate | undefined;
+  const rawEst = o.codingAgentTokenEstimate ?? o.tokenEstimate;
+  if (rawEst && typeof rawEst === 'object') {
+    const e = rawEst as Record<string, unknown>;
+    const total = Number(e.totalTokens ?? e.total);
+    const basis = str(e.basis ?? e.reason);
+    if (Number.isFinite(total) && total > 0 && basis) {
+      const inputTokens = Number(e.inputTokens ?? e.input);
+      const outputTokens = Number(e.outputTokens ?? e.output);
+      codingAgentTokenEstimate = {
+        totalTokens: Math.round(total),
+        inputTokens: Number.isFinite(inputTokens) && inputTokens > 0 ? Math.round(inputTokens) : undefined,
+        outputTokens: Number.isFinite(outputTokens) && outputTokens > 0 ? Math.round(outputTokens) : undefined,
+        basis,
+        confidence: 'estimated',
+      };
+    }
+  }
+
   return {
     summary: str(o.summary),
+    architecture: str(o.architecture) || undefined,
+    dataModel: str(o.dataModel ?? o.data_model ?? o.database) || undefined,
+    interfaces: str(o.interfaces ?? o.apis) || undefined,
+    executiveSummary: str(o.executiveSummary ?? o.executive_summary) || undefined,
+    diagrams,
     steps: steps.filter((s) => s.description),
     testPlan: testPlan.filter((t) => t.test),
     risks: risks.filter((r) => r.risk),
     complexity: str(o.estimatedComplexity ?? o.complexity) || undefined,
+    codingAgentTokenEstimate,
   };
 }
 
