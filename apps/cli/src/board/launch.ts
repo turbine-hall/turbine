@@ -31,8 +31,8 @@ function serveCommand(): { command: string; args: string[] } {
   if (!import.meta.url.endsWith('.ts')) {
     return { command: process.execPath, args: [serveJs] };
   }
-  // board/ → package root (apps/cli or installed package)
-  const cliRoot = fileURLToPath(new URL('../../..', import.meta.url));
+  // board/ → .. → src|dist → .. → CLI package root (apps/cli or installed package)
+  const cliRoot = fileURLToPath(new URL('../..', import.meta.url));
   const tsx = [
     join(cliRoot, 'node_modules/tsx/dist/cli.mjs'),
     join(factoryRoot(), 'node_modules/tsx/dist/cli.mjs'),
