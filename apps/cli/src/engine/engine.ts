@@ -2535,6 +2535,20 @@ export class Engine {
     return review?.content.changeSetId === changeSetId(repos);
   }
 
+  /** A failed-closed dual-review handoff is valid only for the exact recorded change set. */
+  private dualReviewHandoffIsCurrent(workId: string): boolean {
+    const repos = this.repoStates(workId);
+    if (!repos.length) return false;
+    const handoff = this.ctx.store
+      .listEvents(workId)
+      .filter((event) => event.type === 'review.handed-off')
+      .at(-1);
+    return (
+      handoff?.payload.mode === 'dual-review-failed-closed' &&
+      handoff.payload.changeSetId === changeSetId(repos)
+    );
+  }
+
   /** Uncommitted files in any worktree (approving code with uncommitted work is refused). */
   uncommitted(workId: string): Array<{ repo: string; paths: string[] }> {
     const repos = this.repoStates(workId).filter((r) => existsSync(r.worktreePath));
@@ -3364,7 +3378,11 @@ export class Engine {
       return { action: 'verify', work: verified.work, detail: verified };
     }
 
-    if (work.currentState === 'HUMAN_CODE_REVIEW' && !this.aiReviewIsCurrent(work.id)) {
+    if (
+      work.currentState === 'HUMAN_CODE_REVIEW' &&
+      !this.aiReviewIsCurrent(work.id) &&
+      !this.dualReviewHandoffIsCurrent(work.id)
+    ) {
       // Tasks stuck at code review with a review for an older commit (pre-fix behaviour).
       work = transition(work, 'AI_REVIEW');
       this.ctx.store.saveWork(work);
@@ -3452,7 +3470,7 @@ export class Engine {
       case 'HUMAN_CODE_REVIEW': {
         const head = this.currentCommit(work.id);
         if (!head) throw err('E_EEC_UNSATISFIED', 'No implementation commit recorded');
-        if (!this.aiReviewIsCurrent(work.id)) {
+        if (!this.aiReviewIsCurrent(work.id) && !this.dualReviewHandoffIsCurrent(work.id)) {
           throw err('E_EVIDENCE_STALE', `The AI review is for an older commit. Run: turbine task sync ${work.id} (re-runs the review), then approve.`);
         }
         return { work, gate: 'code-review', subject: head, confirmToken: head.slice(0, 8), openFile: paths.review };
@@ -3751,7 +3769,11 @@ export class Engine {
       this.ctx.store.appendEvent({
         workId: work.id,
         type: 'review.handed-off',
-        payload: { mode: 'dual-review-failed-closed', reasons },
+        payload: {
+          mode: 'dual-review-failed-closed',
+          changeSetId: changeSetId(this.repoStates(work.id)),
+          reasons,
+        },
       });
       return transitioned;
     });

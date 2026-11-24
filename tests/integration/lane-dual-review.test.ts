@@ -175,6 +175,20 @@ describe('autonomous dual review', () => {
     expect(
       engine.ctx.store.listEvents(pending.id).some((entry) => entry.type === 'review.handed-off'),
     ).toBe(true);
+    const callsAtHandoff = engine.ctx.store.getBudget(pending.id).modelCalls;
+    const waiting = await engine.syncFromMarkdown(pending.id);
+    expect(waiting.action).toBe('awaiting-human');
+    expect(waiting.work.currentState).toBe('HUMAN_CODE_REVIEW');
+    expect(engine.ctx.store.getBudget(pending.id).modelCalls).toBe(callsAtHandoff);
+    const approval = engine.pendingApproval(pending.id);
+    expect(approval.gate).toBe('code-review');
+    engine.decide(pending.id, {
+      action: 'approve',
+      reviewer: 'Rae',
+      confirmToken: approval.confirmToken,
+      presence: 'test',
+    });
+    expect(engine.ctx.store.getWork(pending.id).currentState).toBe('VERIFYING');
     engine.ctx.store.close();
   }, 60_000);
 
