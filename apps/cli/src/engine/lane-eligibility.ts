@@ -6,6 +6,7 @@ import { deniedBy, resolvePolicyReviewers, type ModelProfiles } from './lane-pol
 export const LANE_GATE_FOR_STATE: Partial<Record<WorkState, LaneGate>> = {
   REQUIREMENTS_REVIEW: 'requirements',
   PLAN_REVIEW: 'plan',
+  AI_REVIEW: 'codeReview',
   HUMAN_CODE_REVIEW: 'codeReview',
   HUMAN_ACCEPTANCE: 'acceptance',
 };
@@ -53,6 +54,7 @@ export type LaneFacts = {
     complete: boolean;
     clean: boolean;
     disagreement: boolean;
+    artifacts?: Array<{ id: string; contentHash: string }>;
     reason?: string;
   };
 };

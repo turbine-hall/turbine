@@ -228,6 +228,9 @@ export function resolvePolicyReviewers(
     throw err('E_INVALID_CONFIG', `Policy ${policy.name}: codeReview requires exactly two reviewer profiles`);
   }
   const resolved = policy.reviewers.map((name) => {
+    if (!Object.prototype.hasOwnProperty.call(profiles, name)) {
+      throw err('E_INVALID_CONFIG', `Policy ${policy.name}: reviewer profile "${name}" is not configured`);
+    }
     const profile = profiles[name];
     if (!profile) throw err('E_INVALID_CONFIG', `Policy ${policy.name}: reviewer profile "${name}" is not configured`);
     return { name, provider: profile.provider, model: profile.model, maxOutputTokens: profile.maxOutputTokens ?? 4000 };

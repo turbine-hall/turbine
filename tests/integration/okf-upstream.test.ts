@@ -23,7 +23,15 @@ const VENV_PYTHON = join(FIXTURE, '.venv/bin/python');
 
 /** Prefer fixture .venv; create it with PyYAML when system python lacks the module (PEP 668). */
 function ensurePythonBin(): string {
-  if (existsSync(VENV_PYTHON)) return VENV_PYTHON;
+  if (existsSync(VENV_PYTHON)) {
+    const probe = spawnSync(VENV_PYTHON, ['-c', 'import yaml'], { encoding: 'utf8' });
+    if (probe.status === 0) return VENV_PYTHON;
+    const pip = spawnSync(VENV_PYTHON, ['-m', 'pip', 'install', '--quiet', 'pyyaml'], { encoding: 'utf8' });
+    if (pip.status !== 0) {
+      throw new Error(`okf-upstream: failed to repair PyYAML in fixture venv: ${pip.stderr || pip.stdout}`);
+    }
+    return VENV_PYTHON;
+  }
   const probe = spawnSync('python3', ['-c', 'import yaml'], { encoding: 'utf8' });
   if (probe.status === 0) return 'python3';
   const venv = spawnSync('python3', ['-m', 'venv', join(FIXTURE, '.venv')], { encoding: 'utf8' });

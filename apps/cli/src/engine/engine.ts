@@ -2716,7 +2716,12 @@ export class Engine {
     work: WorkPackage,
     policy: ApprovedLanePolicy,
     expectedChangeSetId: string,
-  ): Promise<{ reviews: [ReviewResult, ReviewResult]; clean: boolean; disagreement: boolean }> {
+  ): Promise<{
+    reviews: [ReviewResult, ReviewResult];
+    artifacts: Array<{ id: string; contentHash: string }>;
+    clean: boolean;
+    disagreement: boolean;
+  }> {
     const profiles = resolvePolicyReviewers(policy.policy, this.ctx.config.models.profiles);
     if (!profiles) throw new LaneIneligible(`policy ${policy.name} does not configure codeReview`);
     const repos = this.repoStates(work.id);
@@ -2727,12 +2732,18 @@ export class Engine {
     const diff = collectDiffs(repos);
     const reviews: ReviewResult[] = [];
     for (const profile of profiles) {
+      const model = getModel(profile.model);
+      if (model.provider !== profile.provider) {
+        throw new LaneIneligible(
+          `reviewer profile ${profile.name} requires provider ${profile.provider}, but model ${profile.model} resolved to ${model.provider}`,
+        );
+      }
       const review = await this.runReviewWithModel({
         work,
         facts,
         diffText: diff.text,
         changeSetId: expectedChangeSetId,
-        model: getModel(profile.model),
+        model,
         maxOutputTokens: profile.maxOutputTokens,
         reviewer: { profile: profile.name, provider: profile.provider, model: profile.model },
         requireParseable: true,
@@ -2749,7 +2760,19 @@ export class Engine {
     const disagreement = blocking[0] !== blocking[1];
     const clean = !blocking[0] && !blocking[1];
     const change = this.ctx.store.getLatestArtifact(work.id, 'change-report');
-    this.ctx.store.transaction(() => {
+    this.dualReviewBeforePublish?.();
+    const artifacts = this.ctx.store.transaction(() => {
+      const current = this.ctx.store.getWork(work.id);
+      if (current.currentState !== work.currentState || current.currentRevision !== work.currentRevision) {
+        throw new LaneIneligible('task state or revision changed while dual review was running');
+      }
+      if (!this.laneState(work.id).inLane) {
+        throw new LaneIneligible('task left the autonomous lane while dual review was running');
+      }
+      const observed = observe(this.repoStates(work.id));
+      if (observed.uncommitted.length || changeSetId(observed.repos) !== expectedChangeSetId) {
+        throw new LaneIneligible('the change set moved before dual review was published');
+      }
       const artifacts = pair.map((review) =>
         this.saveArtifact({
           workId: work.id,
@@ -2816,6 +2839,7 @@ export class Engine {
           disagreement,
         },
       });
+      return artifacts;
     });
     this.render(work.id, [
       disagreement
@@ -2824,7 +2848,12 @@ export class Engine {
           ? `Dual review completed cleanly for policy ${policy.name}.`
           : 'Both autonomous reviewers found blocking issues; a human decides code review.',
     ]);
-    return { reviews: pair, clean, disagreement };
+    return {
+      reviews: pair,
+      artifacts: artifacts.map((artifact) => ({ id: artifact.id, contentHash: artifact.contentHash })),
+      clean,
+      disagreement,
+    };
   }
 
   /** Throws unless `expected` (full sha or >=7-char prefix) names the commit currently under review. */
@@ -3173,6 +3202,23 @@ export class Engine {
     idOrAlias: string,
     actorId = 'local-user',
   ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
+    const pending = this.ctx.store.getWork(idOrAlias);
+    if (pending.currentState === 'AI_REVIEW') {
+      const lane = await this.tryLanePass(pending.id);
+      if (lane?.status === 'passed') {
+        const detail = {
+          lane: {
+            status: lane.status,
+            gate: lane.gate,
+            policy: lane.policy,
+            decisionId: lane.decision?.id,
+            reasons: lane.reasons,
+          },
+        };
+        await this.waitForMirror();
+        return { action: 'lane.passed', work: lane.work, detail };
+      }
+    }
     const result = await this.syncStep(idOrAlias, actorId);
     const lane = await this.tryLanePass(result.work.id);
     if (!lane) return result;
@@ -3554,8 +3600,20 @@ export class Engine {
       ? commit
       : (this.ctx.store.getLatestArtifact(work.id, gate === 'requirements' ? 'specification' : 'plan')?.contentHash ?? '');
     if (!subject) readErrors.push(`no ${gate === 'requirements' ? 'specification' : gate === 'plan' ? 'plan' : 'change set'} to decide on`);
-    // The same preconditions a human approval checks (synced SPEC.md, clean worktree, current AI review).
-    attempt('approval preconditions', () => this.pendingApproval(work.id), undefined);
+    // At AI_REVIEW there is intentionally no advisory review yet. Check the preconditions that
+    // do not depend on that advisory artifact; the lane's own dual pair supplies review evidence.
+    if (work.currentState === 'AI_REVIEW' && gate === 'codeReview') {
+      attempt(
+        'approval preconditions',
+        () => {
+          const dirty = this.uncommitted(work.id);
+          if (dirty.length) throw new Error('worktree has uncommitted changes');
+        },
+        undefined,
+      );
+    } else {
+      attempt('approval preconditions', () => this.pendingApproval(work.id), undefined);
+    }
     const lintErrors = attempt('task lint', () => this.lintWork(work.id).filter((i) => i.level === 'error').map((i) => `${i.file}: ${i.message}`), []);
     const analysisGate = gate === 'acceptance' ? undefined : gate === 'codeReview' ? 'code-review' : gate;
     const criticalFindings = attempt(
@@ -3700,6 +3758,7 @@ export class Engine {
             complete: true,
             clean: dual.clean,
             disagreement: dual.disagreement,
+            artifacts: dual.artifacts,
           };
         } catch (e) {
           facts.dualReview = {
@@ -3732,6 +3791,9 @@ export class Engine {
 
   /** Test seam: runs after a lane evaluation and before its decision is saved. */
   laneBeforeSave?: () => void;
+
+  /** Test seam: runs after model calls and before completed dual reviews are published. */
+  dualReviewBeforePublish?: () => void;
 
   private laneFallback(work: WorkPackage, gate: LaneGate, evaluations: LaneEvaluation[], extra: string[]): LaneOutcome {
     const reasons = [
@@ -3900,30 +3962,46 @@ export class Engine {
         if (facts.gate === 'codeReview') {
           const profiles = resolvePolicyReviewers(policy.policy, this.ctx.config.models.profiles);
           if (!profiles) throw new LaneIneligible(`policy ${policy.name} does not configure codeReview`);
-          const currentReviews = this.ctx.store
-            .listArtifacts(work.id, 'review')
-            .filter((artifact) => artifact.relatedCommit === commitNow)
-            .map((artifact) => {
-              try {
-                return { artifact, review: JSON.parse(this.ctx.store.getArtifactContent(artifact.id)) as ReviewResult };
-              } catch {
-                throw new LaneIneligible(`review artifact ${artifact.id} is unreadable`);
-              }
-            })
-            .filter(({ review }) => review.changeSetId === commitNow && review.reviewer);
-          const selected = profiles.map((profile) =>
-            currentReviews
-              .filter(
-                ({ review }) =>
-                  review.reviewer?.profile === profile.name &&
-                  review.reviewer.provider === profile.provider &&
-                  review.reviewer.model === profile.model,
-              )
-              .at(-1),
-          );
-          if (selected.some((entry) => !entry)) throw new LaneIneligible('both configured reviewer artifacts are required at the current change set');
+          if (facts.dualReview?.changeSetId !== commitNow || facts.dualReview.artifacts?.length !== 2) {
+            throw new LaneIneligible('the exact evaluated review pair is missing or stale');
+          }
+          const selected = facts.dualReview.artifacts.map((expected, index) => {
+            const artifact = this.ctx.store.listArtifacts(work.id, 'review').find((entry) => entry.id === expected.id);
+            if (
+              !artifact ||
+              artifact.contentHash !== expected.contentHash ||
+              artifact.relatedCommit !== commitNow
+            ) {
+              throw new LaneIneligible(`evaluated review artifact ${expected.id} is no longer current`);
+            }
+            let review: ReviewResult;
+            try {
+              review = JSON.parse(this.ctx.store.getArtifactContent(artifact.id)) as ReviewResult;
+            } catch {
+              throw new LaneIneligible(`review artifact ${artifact.id} is unreadable`);
+            }
+            const profile = profiles[index]!;
+            if (
+              review.changeSetId !== commitNow ||
+              review.reviewer?.profile !== profile.name ||
+              review.reviewer.provider !== profile.provider ||
+              review.reviewer.model !== profile.model
+            ) {
+              throw new LaneIneligible(`evaluated review artifact ${artifact.id} no longer matches reviewer ${profile.name}`);
+            }
+            return { artifact, review };
+          });
           if (selected.some((entry) => entry!.review.disposition !== 'no-blocking-findings')) {
             throw new LaneIneligible('both configured reviewers must have no kept blocking findings');
+          }
+          try {
+            this.assertPrApproval(work.id, commitNow);
+          } catch (e) {
+            throw new LaneIneligible((e as Error).message);
+          }
+          // A PR lookup can block while a worktree advances. Never bind its result to newer heads.
+          if (changeSetId(observe(this.repoStates(work.id)).repos) !== commitNow) {
+            return { moved: 'a worktree advanced during the PR check' };
           }
           const decision: Decision = {
             ...base,
@@ -3932,7 +4010,10 @@ export class Engine {
             artifactHashes: selected.map((entry) => entry!.artifact.contentHash),
             commitSha: commitNow,
           };
-          const next = transition(current, 'VERIFYING');
+          const next =
+            current.currentState === 'AI_REVIEW'
+              ? transition(transition(current, 'HUMAN_CODE_REVIEW'), 'VERIFYING')
+              : transition(current, 'VERIFYING');
           this.ctx.store.saveDecision(decision);
           this.ctx.store.saveWork(next);
           this.ctx.store.appendEvent({

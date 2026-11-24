@@ -230,6 +230,24 @@ export function reviewOutputIsParseable(raw: unknown): raw is {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
   const value = raw as Record<string, unknown>;
   if (!Array.isArray(value.findings) || typeof value.summary !== 'string') return false;
+  if (
+    value.findings.some((finding) => {
+      if (!finding || typeof finding !== 'object' || Array.isArray(finding)) return true;
+      const entry = finding as Record<string, unknown>;
+      const severity = typeof entry.severity === 'string' ? entry.severity.toLowerCase() : '';
+      return (
+        !['high', 'medium', 'low'].includes(severity) ||
+        typeof entry.claim !== 'string' ||
+        !entry.claim.trim() ||
+        typeof entry.file !== 'string' ||
+        !entry.file.trim() ||
+        (entry.line !== undefined && (!Number.isInteger(entry.line) || (entry.line as number) <= 0)) ||
+        (entry.quote !== undefined && (typeof entry.quote !== 'string' || !entry.quote.trim()))
+      );
+    })
+  ) {
+    return false;
+  }
   if (!value.claims || typeof value.claims !== 'object' || Array.isArray(value.claims)) return false;
   const claims = value.claims as Record<string, unknown>;
   if (!Array.isArray(claims.dependenciesAdded) || !Array.isArray(claims.testFilesChanged)) return false;
