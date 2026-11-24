@@ -29,8 +29,6 @@ import { initProject, openContext } from './engine/project.js';
 import { ensureBoard } from './board/launch.js';
 import { handleError, printResult } from './output.js';
 import { callerCwd, factoryRoot, findProjectRoot, resolveProjectPath } from './paths.js';
-import { HUMAN_PRESENCE, ask, askReviewer, assertHumanTerminal } from './human-gate.js';
-import { callerCwd, factoryRoot, findProjectRoot } from './paths.js';
 import { HUMAN_PRESENCE, ask, askReviewer, assertHumanTerminal, gitUserName } from './human-gate.js';
 import { repoToplevel } from './engine/context/git-read.js';
 import { formatTokenCount, formatUsageQualifiers } from './engine/usage.js';

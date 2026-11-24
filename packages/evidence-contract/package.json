@@ -19,5 +19,25 @@
   },
   "devDependencies": {
     "typescript": "^5.9.3"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/turbine-hall/turbine.git",
+    "directory": "packages/evidence-contract"
+  },
+  "homepage": "https://github.com/turbine-hall/turbine#readme",
+  "bugs": {
+    "url": "https://github.com/turbine-hall/turbine/issues"
+  },
+  "description": "Engineering Evidence Contract for Turbine Hall",
+  "engines": {
+    "node": "^22.13.0 || ^24.0.0 || >=26.0.0"
   }
 }

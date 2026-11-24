@@ -148,6 +148,16 @@ Changes spanning several repositories (for example frontend + backend) are bound
 
 ### Install
 
+**npm (recommended once published):**
+
+```bash
+npm install -g @turbine-hall/turbine-cli
+# or without a global install:
+npx @turbine-hall/turbine-cli --help
+```
+
+**From source (contributors):**
+
 ```bash
 git clone https://github.com/turbine-hall/turbine.git
 cd turbine
@@ -155,7 +165,7 @@ pnpm install
 pnpm build
 ```
 
-Optional alias so you can run `turbine` from any project directory:
+Optional alias so you can run `turbine` from any project directory while developing:
 
 ```bash
 alias turbine='pnpm --dir /path/to/turbine turbine'

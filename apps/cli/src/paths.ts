@@ -23,16 +23,23 @@ export function resolveProjectPath(projectPath?: string): string {
   return resolve(callerCwd(), projectPath);
 }
 
-/** Monorepo root containing frameworks/, roles/, skills/, packages/ */
+/**
+ * Root that holds frameworks/, roles/, and skills/.
+ * Prefer the CLI package root (published install or post-build copy under apps/cli/),
+ * then the monorepo checkout when running from source before copy-factory.
+ */
 export function factoryRoot(): string {
+  const marker = join('frameworks', 'turbine', '0.5.0', 'framework.json');
   const candidates = [
-    resolve(here, '../../..'),
+    resolve(here, '..'), // apps/cli or installed package root (dist/ → ..)
+    resolve(here, '../..'),
+    resolve(here, '../../..'), // monorepo root from apps/cli/src|dist
     resolve(here, '../../../..'),
     process.cwd(),
     callerCwd(),
   ];
   for (const c of candidates) {
-    if (existsSync(join(c, 'frameworks', 'turbine', '0.5.0', 'framework.json'))) return c;
+    if (existsSync(join(c, marker))) return c;
   }
   return resolve(here, '../../..');
 }
