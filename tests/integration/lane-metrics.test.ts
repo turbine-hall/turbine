@@ -206,6 +206,120 @@ describe('autonomous lane metrics and audits (Part G)', () => {
     expect(evaluateSuspendWhen(engine.ctx.store, 'routine')).toMatchObject({ suspended: true });
   });
 
+  it('FR-G4: skips legacy reviewer agreements with a recorded reason', () => {
+    const policy = ROUTINE_POLICY.replace(
+      'gates: [requirements, plan, acceptance]',
+      'suspendWhen:\n  reviewerDisagreement: { above: 0 }\ngates: [requirements, plan, acceptance]',
+    );
+    const { engine } = laneProject(dirs, { policy });
+    const work = engine.createTask({ title: 'Legacy review', text: 'legacy', type: 'bug', labels: ['bug'] });
+    const recordedAt = new Date().toISOString();
+    const legacy = {
+      id: createId('agreement'),
+      workId: work.id,
+      changeSetId: 'legacy-review',
+      lens: 'tests',
+      reviewerProfiles: ['review-primary', 'review-secondary'],
+      blocking: [true, false],
+      agreed: false,
+      recordedAt,
+    };
+    engine.ctx.store.db
+      .prepare(
+        `INSERT INTO reviewer_agreements(id, work_id, change_set_id, lens, data, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(legacy.id, work.id, legacy.changeSetId, legacy.lens, JSON.stringify(legacy), recordedAt);
+
+    expect(computeLaneMetrics(engine.ctx.store, { policy: 'routine' }).rows[0]!.reviewerDisagreementRate)
+      .toMatchObject({ value: 'unknown', numerator: 0, denominator: 0 });
+    expect(evaluateSuspendWhen(engine.ctx.store, 'routine')).toEqual({ suspended: false, reasons: [] });
+    expect(
+      engine.ctx.store.listEvents(work.id).filter((event) => event.type === 'review.agreement-skipped'),
+    ).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          agreementId: legacy.id,
+          reason: expect.stringMatching(/legacy.*lacks evaluated policy identity/i),
+        }),
+      }),
+    ]);
+  });
+
+  it('FR-G4: rejects partially attributed reviewer agreements', () => {
+    const { engine } = laneProject(dirs);
+    const work = engine.createTask({ title: 'Malformed review', text: 'malformed', type: 'bug', labels: ['bug'] });
+    const recordedAt = new Date().toISOString();
+    const malformed = {
+      id: createId('agreement'),
+      workId: work.id,
+      changeSetId: 'malformed-review',
+      policyId: 'routine',
+      lens: 'tests',
+      reviewerProfiles: ['review-primary', 'review-secondary'],
+      blocking: [true, false],
+      agreed: false,
+      recordedAt,
+    };
+    engine.ctx.store.db
+      .prepare(
+        `INSERT INTO reviewer_agreements(id, work_id, change_set_id, lens, data, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(malformed.id, work.id, malformed.changeSetId, malformed.lens, JSON.stringify(malformed), recordedAt);
+
+    expect(() => computeLaneMetrics(engine.ctx.store, { policy: 'routine' })).toThrow(/reviewer agreement.*unreadable/i);
+  });
+
+  it('FR-G4: suspension uses audit completion order rather than queue order', () => {
+    const policy = ROUTINE_POLICY.replace(
+      'gates: [requirements, plan, acceptance]',
+      'suspendWhen:\n  auditProblems: { atLeast: 1, inLastAudits: 1 }\ngates: [requirements, plan, acceptance]',
+    );
+    const { engine } = laneProject(dirs, { policy });
+    const work = engine.createTask({ title: 'Audit ordering', text: 'audits', type: 'bug', labels: ['bug'] });
+    engine.ctx.store.saveLaneMergeRecord(merge(work.id, { id: 'merge-queued-first', mergeSha: 'sha-first' }));
+    engine.ctx.store.saveLaneMergeRecord(merge(work.id, { id: 'merge-queued-last', mergeSha: 'sha-last' }));
+    const base = {
+      workId: work.id,
+      policyId: 'routine',
+      seed: 'a'.repeat(64),
+      draw: 0,
+      rate: 1,
+      outcome: 'queued' as const,
+    };
+    const queuedFirst = engine.ctx.store.enqueueLaneAudit({
+      ...base,
+      id: 'audit-queued-first',
+      mergeRecordId: 'merge-queued-first',
+      queuedAt: '2026-01-01T00:00:00.000Z',
+    });
+    const queuedLast = engine.ctx.store.enqueueLaneAudit({
+      ...base,
+      id: 'audit-queued-last',
+      mergeRecordId: 'merge-queued-last',
+      queuedAt: '2026-01-02T00:00:00.000Z',
+    });
+    engine.ctx.store.recordLaneAudit({
+      ...queuedFirst,
+      outcome: 'problem',
+      note: 'recently completed problem',
+      recordedBy: 'Human Reviewer',
+      recordedAt: '2026-01-04T00:00:00.000Z',
+    });
+    engine.ctx.store.recordLaneAudit({
+      ...queuedLast,
+      outcome: 'ok',
+      recordedBy: 'Human Reviewer',
+      recordedAt: '2026-01-03T00:00:00.000Z',
+    });
+
+    expect(evaluateSuspendWhen(engine.ctx.store, 'routine')).toMatchObject({
+      suspended: true,
+      reasons: [expect.stringMatching(/1 audit problems.*last 1 audits/i)],
+    });
+  });
+
   it('FR-G5: metrics --json emits the same machine-readable report including the human lane', () => {
     const { dir, engine } = laneProject(dirs);
     const work = engine.createTask({ title: 'Human task', text: 'human', type: 'bug', labels: [] });

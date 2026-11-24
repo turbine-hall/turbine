@@ -55,15 +55,41 @@ function policyForWork(store: WorkStore, workId: string): string | null {
   return decisions.at(-1)?.policyId ?? null;
 }
 
+function attributedAgreements(store: WorkStore, workId: string, changeSetId?: string) {
+  return store.listReviewerAgreements(workId, changeSetId).filter((agreement) => {
+    if (agreement.policyId && agreement.policyHash) return true;
+    const alreadyRecorded = store
+      .listEvents(workId)
+      .some(
+        (event) =>
+          event.type === 'review.agreement-skipped' &&
+          event.payload.agreementId === agreement.id,
+      );
+    if (!alreadyRecorded) {
+      store.appendEvent({
+        workId,
+        type: 'review.agreement-skipped',
+        payload: {
+          agreementId: agreement.id,
+          changeSetId: agreement.changeSetId,
+          lens: agreement.lens,
+          reason: 'legacy reviewer agreement lacks evaluated policy identity',
+        },
+      });
+    }
+    return false;
+  }) as Array<ReturnType<WorkStore['listReviewerAgreements']>[number] & { policyId: string; policyHash: string }>;
+}
+
 function agreementsForPolicy(store: WorkStore, policyId: string) {
   return store
     .listWork()
-    .flatMap((work) => store.listReviewerAgreements(work.id))
+    .flatMap((work) => attributedAgreements(store, work.id))
     .filter((agreement) => agreement.policyId === policyId);
 }
 
 export function policyForReviewPair(store: WorkStore, workId: string, changeSetId: string): string | null {
-  const agreements = store.listReviewerAgreements(workId, changeSetId);
+  const agreements = attributedAgreements(store, workId, changeSetId);
   const policyIds = new Set(agreements.map((agreement) => agreement.policyId));
   if (policyIds.size > 1) {
     throw err('E_INVALID_CONFIG', `Reviewer agreements for ${workId} at ${changeSetId} name conflicting policies`);
@@ -206,6 +232,7 @@ export function evaluateSuspendWhen(store: WorkStore, policyId: string): { suspe
   const audits = store
     .listLaneAudits(policyId)
     .filter((audit) => audit.outcome !== 'queued')
+    .sort((a, b) => a.recordedAt!.localeCompare(b.recordedAt!) || a.id.localeCompare(b.id))
     .slice(-thresholds.auditProblems.inLastAudits);
   const problems = audits.filter((audit) => audit.outcome === 'problem').length;
   if (problems >= thresholds.auditProblems.atLeast) {

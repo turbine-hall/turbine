@@ -96,14 +96,16 @@ export type ReviewerAgreement = {
   id: string;
   workId: string;
   changeSetId: string;
-  policyId: string;
-  policyHash: string;
+  /** Absent only on legacy rows written before review pairs persisted policy identity. */
+  policyId?: string;
+  policyHash?: string;
   lens: string;
   reviewerProfiles: [string, string];
   blocking: [boolean, boolean];
   agreed: boolean;
   recordedAt: string;
 };
+type AttributedReviewerAgreement = ReviewerAgreement & { policyId: string; policyHash: string };
 
 export class WorkStore {
   readonly db: SqliteDb;
@@ -852,7 +854,9 @@ export class WorkStore {
     });
   }
 
-  saveReviewerAgreement(input: Omit<ReviewerAgreement, 'id' | 'recordedAt'>): ReviewerAgreement {
+  saveReviewerAgreement(
+    input: Omit<AttributedReviewerAgreement, 'id' | 'recordedAt'>,
+  ): AttributedReviewerAgreement {
     if (
       !input.workId ||
       !input.changeSetId ||
@@ -863,7 +867,7 @@ export class WorkStore {
     ) {
       throw err('E_INVALID_CONFIG', 'Reviewer agreement is missing a work, policy, lens, or change-set identity');
     }
-    const record: ReviewerAgreement = { ...input, id: createId('agreement'), recordedAt: now() };
+    const record: AttributedReviewerAgreement = { ...input, id: createId('agreement'), recordedAt: now() };
     this.db
       .prepare(
         `INSERT INTO reviewer_agreements(id, work_id, change_set_id, lens, data, recorded_at)
@@ -883,12 +887,12 @@ export class WorkStore {
           .all(workId) as Array<{ data: string }>);
     return rows.map((row) => {
       const value = JSON.parse(row.data) as ReviewerAgreement;
+      const isLegacy = value?.policyId == null && value?.policyHash == null;
       if (
         !value ||
         value.workId !== workId ||
         !value.changeSetId ||
-        !value.policyId ||
-        !value.policyHash ||
+        (!isLegacy && (!value.policyId || !value.policyHash)) ||
         !value.lens ||
         !Array.isArray(value.reviewerProfiles) ||
         value.reviewerProfiles.length !== 2 ||
