@@ -2730,6 +2730,11 @@ export class Engine {
     }
     const facts = computeFacts(repos);
     const diff = collectDiffs(repos);
+    if (diff.truncated.length) {
+      throw new LaneIneligible(
+        `dual review cannot cover truncated diff content in: ${diff.truncated.join(', ')}`,
+      );
+    }
     const reviews: ReviewResult[] = [];
     for (const profile of profiles) {
       const model = getModel(profile.model);
@@ -3202,8 +3207,9 @@ export class Engine {
     idOrAlias: string,
     actorId = 'local-user',
   ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
-    const pending = this.ctx.store.getWork(idOrAlias);
+    let pending = this.ctx.store.getWork(idOrAlias);
     if (pending.currentState === 'AI_REVIEW') {
+      pending = this.refreshHeads(pending.id).work;
       const lane = await this.tryLanePass(pending.id);
       if (lane?.status === 'passed') {
         const detail = {
@@ -3217,6 +3223,19 @@ export class Engine {
         };
         await this.waitForMirror();
         return { action: 'lane.passed', work: lane.work, detail };
+      }
+      if (
+        lane?.status === 'fallback' &&
+        (lane.reasons.some((reason) => reason.includes('dual review')) ||
+          this.hasCurrentDualReview(pending.id))
+      ) {
+        const handedOff = this.handoffDualReviewToHuman(pending, lane.reasons);
+        await this.waitForMirror();
+        return {
+          action: 'review.human',
+          work: handedOff,
+          detail: { openFile: packetPaths(this.ctx.projectRoot, handedOff.id).review, reasons: lane.reasons },
+        };
       }
     }
     const result = await this.syncStep(idOrAlias, actorId);
@@ -3704,6 +3723,45 @@ export class Engine {
     return changeSetId(seen);
   }
 
+  private hasCurrentDualReview(workId: string): boolean {
+    const repos = this.repoStates(workId);
+    if (!repos.length) return false;
+    const commit = changeSetId(repos);
+    return this.ctx.store
+      .listArtifacts(workId, 'review')
+      .filter((artifact) => artifact.relatedCommit === commit)
+      .some((artifact) => {
+        try {
+          return !!(JSON.parse(this.ctx.store.getArtifactContent(artifact.id)) as ReviewResult).reviewer;
+        } catch {
+          return false;
+        }
+      });
+  }
+
+  /** Move a failed autonomous review to the human gate without requiring another model call. */
+  private handoffDualReviewToHuman(work: WorkPackage, reasons: string[]): WorkPackage {
+    const next = this.ctx.store.transaction(() => {
+      const current = this.ctx.store.getWork(work.id);
+      if (current.currentState !== 'AI_REVIEW' || current.currentRevision !== work.currentRevision) {
+        return current;
+      }
+      const transitioned = transition(current, 'HUMAN_CODE_REVIEW');
+      this.ctx.store.saveWork(transitioned);
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'review.handed-off',
+        payload: { mode: 'dual-review-failed-closed', reasons },
+      });
+      return transitioned;
+    });
+    this.render(work.id, [
+      'Autonomous dual review did not pass; a human decides code review.',
+      ...reasons.slice(0, 3),
+    ]);
+    return next;
+  }
+
   /**
    * At a gate that waits for a human, try to pass it with an approved, active lane policy. Never records a
    * human decision. Returns undefined when no lane policy has ever been approved (the lane is not in use).
@@ -3761,6 +3819,16 @@ export class Engine {
             artifacts: dual.artifacts,
           };
         } catch (e) {
+          const refreshed = this.refreshHeads(work.id);
+          if (refreshed.changed) {
+            moved = `the change set moved during dual review; recaptured ${this.currentCommit(work.id)?.slice(0, 12) ?? 'new HEAD'}`;
+            this.ctx.store.appendEvent({
+              workId: work.id,
+              type: 'lane.discarded',
+              payload: { gate, reason: moved, evaluationHash: evaluations[winnerIdx]!.evaluationHash },
+            });
+            continue;
+          }
           facts.dualReview = {
             changeSetId: facts.commit,
             complete: false,
@@ -3782,6 +3850,7 @@ export class Engine {
       }
       if ('ineligible' in saved) return this.laneFallback(work, gate, evaluations, [saved.ineligible]);
       moved = saved.moved;
+      if (gate === 'codeReview') this.refreshHeads(work.id);
       this.ctx.store.appendEvent({ workId: work.id, type: 'lane.discarded', payload: { gate, reason: moved, evaluationHash: evaluations[winnerIdx]!.evaluationHash } });
     }
     // Facts kept moving: nothing was saved and the task stays in the lane, so the next sync evaluates again.
@@ -4000,7 +4069,11 @@ export class Engine {
             throw new LaneIneligible((e as Error).message);
           }
           // A PR lookup can block while a worktree advances. Never bind its result to newer heads.
-          if (changeSetId(observe(this.repoStates(work.id)).repos) !== commitNow) {
+          const afterPr = observe(this.repoStates(work.id));
+          if (afterPr.uncommitted.length) {
+            return { moved: 'a worktree became dirty during the PR check' };
+          }
+          if (changeSetId(afterPr.repos) !== commitNow) {
             return { moved: 'a worktree advanced during the PR check' };
           }
           const decision: Decision = {

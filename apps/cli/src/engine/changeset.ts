@@ -185,7 +185,7 @@ export function collectDiffs(repos: RepoState[], maxChars = 60_000): { text: str
   const truncated: string[] = [];
   const perRepo = Math.floor(maxChars / Math.max(1, repos.length));
   const parts = repos.map((r) => {
-    let d = diffWorktree(r.worktreePath, r.baseCommit);
+    let d = diffWorktree(r.worktreePath, r.baseCommit, r.headCommit);
     if (d.length > perRepo) {
       truncated.push(r.name);
       d = `${d.slice(0, perRepo)}\n[... diff truncated at ${perRepo} characters ...]`;

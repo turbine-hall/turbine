@@ -1,11 +1,11 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
 import { contentHash, createId } from '../../packages/contracts/dist/index.js';
 import type { ModelAdapter } from '../../packages/models/dist/index.js';
 import { createMockModelAdapter, registerModel } from '../../packages/models/dist/index.js';
 import { packetPaths } from '../../apps/cli/src/engine/packet.js';
 import type { Engine } from '../../apps/cli/src/engine/engine.js';
-import { changeSetId, observe } from '../../apps/cli/src/engine/changeset.js';
+import { changeSetId, collectDiffs, observe } from '../../apps/cli/src/engine/changeset.js';
 import { cleanup, commitIn } from './fixture.js';
 import {
   DUAL_ROUTINE_POLICY,
@@ -145,6 +145,7 @@ describe('autonomous dual review', () => {
   it('runs eligible dual review before the advisory analysis model', async () => {
     const { engine } = laneProject(dirs, { policy: DUAL_ROUTINE_POLICY });
     useReviewers('clean', 'clean');
+    const pending = await reachAiReview(engine);
     engine.ctx.config.models.profiles.analysis = { provider: 'mock', model: 'failing-analysis' };
     const fallback = createMockModelAdapter('failing-analysis');
     registerModel({
@@ -154,9 +155,49 @@ describe('autonomous dual review', () => {
         return fallback.run(request);
       },
     });
-    const work = await toCodeReview(engine);
+    const work = (await engine.syncFromMarkdown(pending.id)).work;
     expect(work.currentState).toBe('VERIFYING');
     expect(engine.ctx.store.listDecisions(work.id).some((entry) => entry.gate === 'code-review')).toBe(true);
+    engine.ctx.store.close();
+  }, 60_000);
+
+  it('hands budget-exhausted dual review to a human without another model call', async () => {
+    const { engine } = laneProject(dirs, { policy: DUAL_ROUTINE_POLICY });
+    useReviewers('clean', 'clean');
+    const pending = await reachAiReview(engine);
+    const before = engine.ctx.store.getBudget(pending.id).modelCalls;
+    engine.ctx.config.budgets.perTask.maxModelCalls = before + 1;
+    const result = await engine.syncFromMarkdown(pending.id);
+    expect(result.action).toBe('review.human');
+    expect(result.work.currentState).toBe('HUMAN_CODE_REVIEW');
+    expect(engine.ctx.store.getBudget(pending.id).modelCalls).toBe(before + 1);
+    expect(engine.ctx.store.listDecisions(pending.id).some((entry) => entry.gate === 'code-review')).toBe(false);
+    expect(
+      engine.ctx.store.listEvents(pending.id).some((entry) => entry.type === 'review.handed-off'),
+    ).toBe(true);
+    engine.ctx.store.close();
+  }, 60_000);
+
+  it('routes truncated dual-review diffs to a human without a policy pass', async () => {
+    const roomyPolicy = DUAL_ROUTINE_POLICY.replace('maxChangedLines: 40', 'maxChangedLines: 100000');
+    const { engine } = laneProject(dirs, { policy: roomyPolicy });
+    useReviewers('clean', 'clean');
+    const work = await toCodeReview(engine, { 'LARGE.txt': `marker\n${'x'.repeat(70_000)}\n` });
+    expect(work.currentState).toBe('HUMAN_CODE_REVIEW');
+    expect(engine.ctx.store.listDecisions(work.id).some((entry) => entry.gate === 'code-review')).toBe(false);
+    const reasons = laneEvents(engine, work.id).at(-1)!.payload.reasons as string[];
+    expect(reasons.join('\n')).toMatch(/truncated diff content/);
+    engine.ctx.store.close();
+  }, 60_000);
+
+  it('pins collected review diffs to the recorded head instead of live HEAD', async () => {
+    const { engine } = laneProject(dirs, { policy: DUAL_ROUTINE_POLICY });
+    const pending = await reachAiReview(engine);
+    const recorded = engine.repoStates(pending.id);
+    commitIn(recorded[0]!.worktreePath, 'AFTER.md', 'must not enter recorded diff\n');
+    const diff = collectDiffs(recorded);
+    expect(diff.text).not.toContain('must not enter recorded diff');
+    expect(diff.text).toContain('fixture fixed');
     engine.ctx.store.close();
   }, 60_000);
 
@@ -207,11 +248,43 @@ describe('autonomous dual review', () => {
     };
     const outcome = await advancing.engine.tryLanePass(pending.id);
     const decisions = advancing.engine.ctx.store.listDecisions(pending.id).filter((entry) => entry.gate === 'code-review');
-    expect(outcome?.status).not.toBe('passed');
-    expect(checks).toBeGreaterThanOrEqual(1);
+    expect(outcome?.status).toBe('passed');
+    expect(checks).toBeGreaterThanOrEqual(2);
     expect(changeSetId(observe(advancing.engine.repoStates(pending.id)).repos)).not.toBe(reviewedHead);
-    expect(decisions).toHaveLength(0);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]!.commitSha).toBe(changeSetId(observe(advancing.engine.repoStates(pending.id)).repos));
     advancing.engine.ctx.store.close();
+
+    const dirty = laneProject(dirs, { policy: DUAL_ROUTINE_POLICY });
+    useReviewers('clean', 'clean');
+    dirty.engine.ctx.config.humanGates.requirePrApproval = true;
+    const dirtyPending = await reachAiReview(dirty.engine);
+    dirty.engine.prApprovalChecker = () => {
+      writeFileSync(
+        `${dirty.engine.repoStates(dirtyPending.id)[0]!.worktreePath}/DIRTY.md`,
+        'uncommitted during PR lookup\n',
+      );
+      return { approved: true, detail: 'approved' };
+    };
+    const dirtyOutcome = await dirty.engine.tryLanePass(dirtyPending.id);
+    expect(dirtyOutcome?.status).not.toBe('passed');
+    expect(dirty.engine.uncommitted(dirtyPending.id)).not.toHaveLength(0);
+    expect(
+      dirty.engine.ctx.store.listDecisions(dirtyPending.id).filter((entry) => entry.gate === 'code-review'),
+    ).toHaveLength(0);
+    dirty.engine.ctx.store.close();
+  }, 60_000);
+
+  it('refreshes recorded heads before the early AI_REVIEW lane pass', async () => {
+    const { engine } = laneProject(dirs, { policy: DUAL_ROUTINE_POLICY });
+    useReviewers('clean', 'clean');
+    const pending = await reachAiReview(engine);
+    commitIn(engine.repoStates(pending.id)[0]!.worktreePath, 'LATE.md', 'captured before early lane review\n');
+    const result = await engine.syncFromMarkdown(pending.id);
+    const decision = engine.ctx.store.listDecisions(pending.id).find((entry) => entry.gate === 'code-review')!;
+    expect(result.work.currentState).toBe('VERIFYING');
+    expect(decision.commitSha).toBe(engine.currentCommit(pending.id));
+    engine.ctx.store.close();
   }, 60_000);
 
   it('binds the policy decision to the exact evaluated review pair', async () => {
