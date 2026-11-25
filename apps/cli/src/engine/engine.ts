@@ -150,7 +150,6 @@ import {
   type LanePrTarget,
 } from './lane-pr.js';
 import {
-  createFixtureImplementer,
   defaultSandboxHooks,
   planSandboxMounts,
   preflightSandbox,
@@ -2270,8 +2269,20 @@ export class Engine {
       );
     }
     // FR-D3: sandboxed-unattended preflight before leaving PLAN_APPROVED so a refuse leaves the task retryable.
+    // After a fix-cap / limit leave-lane, require a human `lane.retry` before another autonomous launch.
     if (executionModeEarly === 'sandboxed-unattended') {
-      preflightSandbox(this.sandboxHooks ?? defaultSandboxHooks());
+      const membership = this.laneState(work.id);
+      if (!membership.inLane) {
+        // Supervised recovery only: prepare/reuse worktrees below without running the sandbox.
+      } else {
+        if (!this.sandboxImplementer) {
+          throw err(
+            'E_UNSAFE_EXECUTION',
+            'sandboxed-unattended requires a bound agent implementer (Engine.sandboxImplementer). It will not start with the default fixture or fall back to unsandboxed execution.',
+          );
+        }
+        preflightSandbox(this.sandboxHooks ?? defaultSandboxHooks());
+      }
     }
 
     // Rebuilt when the base commit moved or this is a new CHANGES_REQUESTED cycle, before anything points at it.
@@ -2304,7 +2315,7 @@ export class Engine {
     let modelNotes: unknown;
     const primary = repos[0]!;
 
-    if (executionMode === 'sandboxed-unattended') {
+    if (executionMode === 'sandboxed-unattended' && this.laneState(work.id).inLane) {
       work = await this.runSandboxedUnattended({
         work,
         plan,
@@ -2423,12 +2434,13 @@ export class Engine {
       }
     }
 
-    const implementer: AgentImplementer =
-      this.sandboxImplementer ??
-      createFixtureImplementer({
-        ok: false,
-        report: 'No sandbox implementer configured; inject Engine.sandboxImplementer for tests or live agent CLIs.',
-      });
+    const implementer = this.sandboxImplementer;
+    if (!implementer) {
+      throw err(
+        'E_UNSAFE_EXECUTION',
+        'sandboxed-unattended requires a bound agent implementer (Engine.sandboxImplementer).',
+      );
+    }
 
     const adapterInput = {
       workId: work.id,
@@ -2437,6 +2449,14 @@ export class Engine {
       context: this.promptContext(work, input.taskContext),
       knowledge,
     };
+
+    // Record worktree ownership before phases so a thrown implementer cannot leave IMPLEMENTING with no repos.
+    this.saveChangeSet(work.id, input.repos, {
+      status: 'sandboxed-running',
+      summary: 'Sandboxed-unattended run started; worktrees recorded.',
+      createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
+      parentArtifactIds: [input.plan.id],
+    });
 
     this.ctx.store.appendEvent({
       workId: work.id,
@@ -2450,12 +2470,43 @@ export class Engine {
       },
     });
 
+    const timeoutMs = this.ctx.config.quality.timeoutMs;
+    const runCommandsInWorktree = (commands: string[], phase: 'setup' | 'check'): PhaseResult => {
+      if (commands.length === 0) {
+        return {
+          ok: true,
+          report: phase === 'setup' ? 'no setup commands' : 'no quality.checks configured',
+          outputBytes: 24,
+        };
+      }
+      const lines: string[] = [];
+      let bytes = 0;
+      for (const command of commands) {
+        const run = runCommand({
+          repo: input.primary.name,
+          command,
+          cwd: input.primary.worktreePath,
+          phase,
+          timeoutMs,
+        });
+        bytes += Buffer.byteLength(run.stdoutTail + run.stderrTail, 'utf8');
+        lines.push(`${command} → exit ${run.exitCode}${run.error ? ` (${run.error})` : ''}`);
+        if (!run.passed) {
+          return { ok: false, report: lines.join('\n'), outputBytes: bytes };
+        }
+      }
+      return { ok: true, report: lines.join('\n'), outputBytes: bytes };
+    };
+
     const phaseHooks: SandboxHooks = {
       ...hooks,
       runPhase: async (phase, ctx) => {
+        if (ctx.signal.aborted) {
+          return { ok: false, report: `${phase} aborted (wall-clock)`, outputBytes: 0 };
+        }
         if (phase === 'setup') {
-          const setup = this.ctx.config.quality.setup ?? [];
-          return { ok: true, report: setup.length ? `setup commands planned: ${setup.join('; ')}` : 'no setup commands', outputBytes: 32 };
+          if (customHooks) return customHooks.runPhase(phase, ctx);
+          return runCommandsInWorktree(this.ctx.config.quality.setup ?? [], 'setup');
         }
         if (phase === 'implement' || phase === 'fix') {
           const result = await implementer.run(adapterInput);
@@ -2490,11 +2541,20 @@ export class Engine {
           } satisfies PhaseResult;
         }
         if (phase === 'checks') {
-          // Deterministic checks with no network (FR-D2). Tests inject sandboxHooks.runPhase for fail/pass control.
+          // Deterministic checks with no network (FR-D2). Tests may override via sandboxHooks.runPhase.
           if (customHooks) return customHooks.runPhase(phase, ctx);
-          return { ok: true, report: 'checks skipped in default hooks; inject sandboxHooks.runPhase for real checks', outputBytes: 48 };
+          return runCommandsInWorktree(this.ctx.config.quality.checks ?? [], 'check');
         }
-        // commit
+        // commit — git commits are produced by the implementer; this phase confirms the worktree is clean.
+        if (customHooks) return customHooks.runPhase(phase, ctx);
+        const dirty = this.uncommitted(work.id);
+        if (dirty.length) {
+          return {
+            ok: false,
+            report: `commit phase refused: uncommitted files remain (${dirty.map((d) => d.repo).join(', ')})`,
+            outputBytes: 64,
+          };
+        }
         return { ok: true, report: 'commit phase complete', outputBytes: 24 };
       },
     };
@@ -2505,11 +2565,55 @@ export class Engine {
       maxExecutionAttempts: this.ctx.config.budgets.perTask.maxExecutionAttempts,
     };
 
-    const run = await runSandboxedStateMachine({ hooks: phaseHooks, limits, mount });
+    let run: Awaited<ReturnType<typeof runSandboxedStateMachine>>;
+    try {
+      run = await runSandboxedStateMachine({ hooks: phaseHooks, limits, mount });
+    } catch (e) {
+      const reason = `sandboxed phase threw: ${(e as Error).message.split('\n')[0]}`;
+      const observed = observe(input.repos).repos;
+      this.saveChangeSet(work.id, observed, {
+        status: 'sandboxed-incomplete',
+        summary: `${reason}. Worktrees preserved; agent reports unverified.`,
+        modelNotes: { error: reason },
+        createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
+        parentArtifactIds: [input.plan.id],
+      });
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'execution.phase-failed',
+        payload: { reason, runtime },
+      });
+      work = this.toChangesRequested(work, 'execution-fail-cap', {
+        atomic: () => {
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: 'lane.fallback',
+            payload: {
+              gate: 'codeReview',
+              workRevision: work.currentRevision,
+              reasons: [reason],
+              evaluationHash: contentHash({ workId: work.id, reason, status: 'phase-threw' }),
+            },
+          });
+        },
+      });
+      this.render(work.id, [
+        `Sandboxed-unattended failed: ${reason}`,
+        'Task left the autonomous lane. Worktrees are preserved for recovery.',
+      ]);
+      return work;
+    }
 
     this.ctx.store.appendEvent({
       workId: work.id,
-      type: run.status === 'limit-exceeded' ? 'execution.limit-exceeded' : run.status === 'fix-cap' ? 'execution.fix-cap' : 'execution.sandboxed',
+      type:
+        run.status === 'limit-exceeded'
+          ? 'execution.limit-exceeded'
+          : run.status === 'fix-cap'
+            ? 'execution.fix-cap'
+            : run.status === 'phase-failed'
+              ? 'execution.phase-failed'
+              : 'execution.sandboxed',
       payload: {
         status: run.status,
         runtime: run.runtime,
@@ -2519,12 +2623,13 @@ export class Engine {
         // Agent reports are stored for audit but must not be treated as evidence (FR-D5).
         reportsUnverified: run.reports,
         ...(run.status === 'limit-exceeded' ? { limitName: run.limitName, reason: run.reason } : {}),
-        ...(run.status === 'fix-cap' ? { reason: run.reason } : {}),
+        ...(run.status === 'fix-cap' || run.status === 'phase-failed' ? { reason: run.reason } : {}),
       },
     });
 
+    const observedRepos = observe(input.repos).repos;
     // Never promote agent reports into the change-set summary as verified evidence.
-    this.saveChangeSet(work.id, input.repos, {
+    this.saveChangeSet(work.id, observedRepos, {
       status: run.status === 'completed' ? 'committed' : 'sandboxed-incomplete',
       summary:
         run.status === 'completed'
@@ -2535,11 +2640,11 @@ export class Engine {
       parentArtifactIds: [input.plan.id],
     });
 
-    if (run.status === 'fix-cap' || run.status === 'limit-exceeded') {
+    if (run.status === 'fix-cap' || run.status === 'limit-exceeded' || run.status === 'phase-failed') {
       const reason =
-        run.status === 'fix-cap'
-          ? run.reason
-          : `sandboxed run hit ${run.limitName ?? 'limit'}: ${run.reason}`;
+        run.status === 'limit-exceeded'
+          ? `sandboxed run hit ${run.limitName ?? 'limit'}: ${run.reason}`
+          : run.reason;
       work = this.toChangesRequested(work, 'execution-fail-cap', {
         atomic: () => {
           this.ctx.store.appendEvent({

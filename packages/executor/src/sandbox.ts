@@ -36,14 +36,22 @@ export type PhaseResult = {
   usage?: { inputTokens?: number; outputTokens?: number; modelId?: string };
 };
 
+export type PhaseContext = {
+  network: PhaseNetwork;
+  attempt: number;
+  /** Abort when the wall-clock deadline expires; hooks must stop the phase process/container. */
+  signal: AbortSignal;
+};
+
 export type SandboxHooks = {
   detectRuntime: () => ContainerRuntime | undefined;
   /**
-   * Returns true when an unexpected egress probe *succeeds* (network policy not in effect).
-   * Preflight requires this to be false (probe fails as expected).
+   * Returns true when an unexpected egress probe *succeeds* (network policy not in effect)
+   * or when the probe outcome is unknown. Preflight refuses unless this is false
+   * (probe failed as expected under policy).
    */
   egressProbeSucceeds: () => boolean;
-  runPhase: (phase: SandboxPhase, ctx: { network: PhaseNetwork; attempt: number }) => Promise<PhaseResult>;
+  runPhase: (phase: SandboxPhase, ctx: PhaseContext) => Promise<PhaseResult>;
   nowMs?: () => number;
 };
 
@@ -65,7 +73,7 @@ export type SandboxRunResult =
       usage: Array<NonNullable<PhaseResult['usage']>>;
     }
   | {
-      status: 'fix-cap' | 'limit-exceeded';
+      status: 'fix-cap' | 'limit-exceeded' | 'phase-failed';
       runtime: ContainerRuntime;
       attempts: number;
       outputBytes: number;
@@ -76,7 +84,8 @@ export type SandboxRunResult =
       reason: string;
     };
 
-const FORBIDDEN_BASENAMES = ['.ssh', '.git-credentials', '.netrc'];
+/** Credential / state paths that must never be the worktree or lie under it as a mount root. */
+const FORBIDDEN_LEAF_NAMES = ['.ssh', '.git-credentials', '.netrc'] as const;
 
 /** Paths that must never be bind-mounted into a sandboxed-unattended container (FR-D1). */
 export function forbiddenMountPaths(projectRoot: string, home = process.env.HOME ?? ''): string[] {
@@ -89,9 +98,14 @@ export function forbiddenMountPaths(projectRoot: string, home = process.env.HOME
   return [...new Set(out.map((p) => resolve(p)))];
 }
 
+function pathsOverlap(a: string, b: string): boolean {
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
 /**
  * Build the mount plan for a sandboxed run: only the task worktree is allowed.
- * Home, SSH agent sockets, git credentials and `.turbine/state/` are never mounted.
+ * Home itself, SSH agent sockets, git credentials and `.turbine/state/` are never mounted.
+ * An isolated worktree that merely lives under `$HOME` is allowed (home is not mounted).
  */
 export function planSandboxMounts(input: {
   worktreePath: string;
@@ -100,22 +114,34 @@ export function planSandboxMounts(input: {
   home?: string;
 }): SandboxMountPlan {
   const worktreePath = resolve(input.worktreePath);
+  const home = input.home ?? process.env.HOME ?? '';
+  const homeResolved = home ? resolve(home) : '';
   const forbiddenMounts = forbiddenMountPaths(input.projectRoot, input.home);
   if (!existsSync(worktreePath)) {
     throw err('E_UNSAFE_EXECUTION', `Sandbox worktree does not exist: ${worktreePath}`);
   }
+  // Mounting home itself is forbidden; a descendant worktree under home is fine.
+  if (homeResolved && worktreePath === homeResolved) {
+    throw err('E_UNSAFE_EXECUTION', 'Sandbox worktree must not be the home directory');
+  }
+
   for (const forbidden of forbiddenMounts) {
-    if (worktreePath === forbidden || worktreePath.startsWith(`${forbidden}/`)) {
-      throw err('E_UNSAFE_EXECUTION', `Sandbox worktree must not be under forbidden path ${forbidden}`);
+    if (homeResolved && forbidden === homeResolved) continue;
+    // Reject equality, worktree under forbidden (e.g. under .ssh), or forbidden under worktree
+    // (e.g. mounting project root that contains .turbine/state).
+    if (pathsOverlap(worktreePath, forbidden)) {
+      throw err('E_UNSAFE_EXECUTION', `Sandbox worktree overlaps forbidden path ${forbidden}`);
     }
   }
-  // SSH agent socket must not be passed through.
-  if (process.env.SSH_AUTH_SOCK) {
-    // Recorded as forbidden for callers that assemble docker -v flags.
-    forbiddenMounts.push(resolve(process.env.SSH_AUTH_SOCK));
+
+  for (const leaf of FORBIDDEN_LEAF_NAMES) {
+    if (worktreePath.endsWith(`/${leaf}`) || worktreePath.endsWith(leaf)) {
+      throw err('E_UNSAFE_EXECUTION', `Sandbox worktree must not be ${leaf}`);
+    }
   }
-  for (const name of FORBIDDEN_BASENAMES) {
-    void name;
+
+  if (process.env.SSH_AUTH_SOCK) {
+    forbiddenMounts.push(resolve(process.env.SSH_AUTH_SOCK));
   }
   return { worktreePath, forbiddenMounts, runtime: input.runtime };
 }
@@ -130,18 +156,21 @@ export function detectContainerRuntime(
 }
 
 /**
- * Live egress probe: attempt a fetch to a non-allowlisted host. For preflight the probe MUST fail
- * (network policy in effect). A successful fetch means the sandbox is not constrained.
+ * Live egress probe: fetch a host that policy must block. Success ⇒ network is open (refuse).
+ * Unknown outcomes (timeout, spawn error, null status) are treated as open so preflight fails closed.
+ * Default URL is a real public endpoint (not `.invalid`, which always fails DNS and never proves policy).
  */
-export function liveEgressProbeSucceeds(url = 'https://example.invalid/'): boolean {
+export function liveEgressProbeSucceeds(url = 'https://example.com/'): boolean {
   try {
-    const result = spawnSync(process.execPath, ['-e', `fetch(${JSON.stringify(url)}).then(()=>process.exit(0)).catch(()=>process.exit(1))`], {
-      encoding: 'utf8',
-      timeout: 5_000,
-    });
+    const result = spawnSync(
+      process.execPath,
+      ['-e', `fetch(${JSON.stringify(url)}).then(()=>process.exit(0)).catch(()=>process.exit(1))`],
+      { encoding: 'utf8', timeout: 5_000 },
+    );
+    if (result.error || result.status === null) return true;
     return result.status === 0;
   } catch {
-    return false;
+    return true;
   }
 }
 
@@ -168,15 +197,37 @@ export function preflightSandbox(hooks: SandboxHooks = defaultSandboxHooks()): {
   if (hooks.egressProbeSucceeds()) {
     throw err(
       'E_UNSAFE_EXECUTION',
-      'sandboxed-unattended egress probe succeeded; network policy is not in effect. Refusing to start (no unsandboxed fallback).',
+      'sandboxed-unattended egress probe succeeded or was inconclusive; network policy is not proven. Refusing to start (no unsandboxed fallback).',
     );
   }
   return { runtime };
 }
 
+function phaseFailed(
+  mount: SandboxMountPlan,
+  attempts: number,
+  outputBytes: number,
+  reports: string[],
+  commits: string[],
+  usage: Array<NonNullable<PhaseResult['usage']>>,
+  reason: string,
+): SandboxRunResult {
+  return {
+    status: 'phase-failed',
+    runtime: mount.runtime,
+    attempts,
+    outputBytes,
+    reports,
+    commits,
+    usage,
+    reason,
+  };
+}
+
 /**
  * Fixed state machine: setup → implement → checks → (fix → checks)* → commit.
  * After maxExecutionAttempts failed check rounds → fix-cap (caller moves to CHANGES_REQUESTED).
+ * Wall-clock expiry aborts the active phase via AbortSignal (hooks must stop the process/container).
  */
 export async function runSandboxedStateMachine(input: {
   hooks: SandboxHooks;
@@ -224,7 +275,43 @@ export async function runSandboxedStateMachine(input: {
   const run = async (phase: SandboxPhase): Promise<PhaseResult | SandboxRunResult> => {
     const limited = withinLimits();
     if (limited) return limited;
-    const result = await input.hooks.runPhase(phase, { network: PHASE_NETWORK[phase], attempt: attempts });
+    const remaining = Math.max(1, input.limits.wallClockMs - (now() - started));
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), remaining);
+    let result: PhaseResult;
+    try {
+      const phasePromise = input.hooks.runPhase(phase, {
+        network: PHASE_NETWORK[phase],
+        attempt: attempts,
+        signal: controller.signal,
+      });
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        controller.signal.addEventListener(
+          'abort',
+          () => reject(Object.assign(new Error('sandbox wall-clock exceeded'), { code: 'SANDBOX_DEADLINE' })),
+          { once: true },
+        );
+      });
+      result = await Promise.race([phasePromise, timeoutPromise]);
+    } catch (e) {
+      const code = (e as { code?: string }).code;
+      if (code === 'SANDBOX_DEADLINE' || controller.signal.aborted) {
+        return {
+          status: 'limit-exceeded',
+          runtime: input.mount.runtime,
+          attempts,
+          outputBytes,
+          reports,
+          commits,
+          usage,
+          limitName: 'wall-clock',
+          reason: `wall-clock limit ${input.limits.wallClockMs}ms exceeded during ${phase}`,
+        };
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
     outputBytes += result.outputBytes ?? Buffer.byteLength(result.report ?? '', 'utf8');
     if (result.report) reports.push(result.report);
     if (result.commits?.length) commits.push(...result.commits);
@@ -237,21 +324,19 @@ export async function runSandboxedStateMachine(input: {
   for (const phase of ['setup', 'implement'] as const) {
     const result = await run(phase);
     if ('status' in result) return result;
-    if (phase === 'setup' && !result.ok) {
-      return {
-        status: 'limit-exceeded',
-        runtime: input.mount.runtime,
+    if (!result.ok) {
+      return phaseFailed(
+        input.mount,
         attempts,
         outputBytes,
         reports,
         commits,
         usage,
-        reason: `setup failed: ${result.report ?? 'unknown'}`,
-      };
+        `${phase} failed: ${result.report ?? 'unknown'}`,
+      );
     }
   }
 
-  // checks → fix loop
   for (;;) {
     attempts += 1;
     const checks = await run('checks');
@@ -271,10 +356,32 @@ export async function runSandboxedStateMachine(input: {
     }
     const fix = await run('fix');
     if ('status' in fix) return fix;
+    if (!fix.ok) {
+      return phaseFailed(
+        input.mount,
+        attempts,
+        outputBytes,
+        reports,
+        commits,
+        usage,
+        `fix failed: ${fix.report ?? 'unknown'}`,
+      );
+    }
   }
 
   const commit = await run('commit');
   if ('status' in commit) return commit;
+  if (!commit.ok) {
+    return phaseFailed(
+      input.mount,
+      attempts,
+      outputBytes,
+      reports,
+      commits,
+      usage,
+      `commit failed: ${commit.report ?? 'unknown'}`,
+    );
+  }
 
   return {
     status: 'completed',

@@ -2,7 +2,9 @@
  * Autonomous lane Part D — sandboxed-unattended executor (AC14–AC15, FR-D1–D6).
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { resolve } from 'node:path';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import {
   createFixtureImplementer,
   forbiddenMountPaths,
@@ -29,6 +31,7 @@ function fixtureHooks(opts: {
   runtime?: 'docker' | 'podman' | undefined;
   egressSucceeds?: boolean;
   checksOk?: boolean | ((attempt: number) => boolean);
+  commitOk?: boolean;
 }): SandboxHooks {
   let checkAttempt = 0;
   return {
@@ -40,6 +43,9 @@ function fixtureHooks(opts: {
         const ok =
           typeof opts.checksOk === 'function' ? opts.checksOk(ctx.attempt || checkAttempt) : (opts.checksOk ?? true);
         return { ok, report: ok ? 'checks passed' : `checks failed attempt ${checkAttempt}`, outputBytes: 20 };
+      }
+      if (phase === 'commit') {
+        return { ok: opts.commitOk ?? true, report: 'commit', outputBytes: 8 };
       }
       return { ok: true, report: `${phase} ok`, outputBytes: 8 };
     },
@@ -82,6 +88,7 @@ describe('Part D sandboxed-unattended executor', () => {
       ]),
     );
     for (const f of payload.forbiddenMounts) {
+      if (f === resolve('/tmp/fake-home')) continue; // listed as forbidden mount, not as worktree parent ban
       expect(f === payload.worktreePath || payload.worktreePath.startsWith(`${f}/`)).toBe(false);
     }
     const plan = planSandboxMounts({
@@ -95,6 +102,32 @@ describe('Part D sandboxed-unattended executor', () => {
     engine.ctx.store.close();
   });
 
+  it('FR-D1: isolated worktree under $HOME is allowed; home itself and .turbine/state overlap are refused', () => {
+    const home = mkdtempSync(join(tmpdir(), 'turbine-home-'));
+    dirs.push(home);
+    const project = join(home, 'project');
+    const wt = join(project, 'worktrees', 'task-1');
+    mkdirSync(wt, { recursive: true });
+    writeFileSync(join(wt, 'README'), 'ok');
+    mkdirSync(join(project, '.turbine', 'state'), { recursive: true });
+
+    const plan = planSandboxMounts({
+      worktreePath: wt,
+      projectRoot: project,
+      runtime: 'docker',
+      home,
+    });
+    expect(plan.worktreePath).toBe(resolve(wt));
+
+    expect(() =>
+      planSandboxMounts({ worktreePath: home, projectRoot: project, runtime: 'docker', home }),
+    ).toThrow(/home directory/i);
+
+    expect(() =>
+      planSandboxMounts({ worktreePath: project, projectRoot: project, runtime: 'docker', home }),
+    ).toThrow(/overlaps forbidden path/);
+  });
+
   it('AC14 / FR-D3: missing runtime refuses start and never falls back to unsandboxed', async () => {
     const { engine } = laneProject(dirs);
     engine.ctx.config.execution.mode = 'sandboxed-unattended';
@@ -105,7 +138,6 @@ describe('Part D sandboxed-unattended executor', () => {
     await expect(engine.execute(work.id)).rejects.toThrow(/E_UNSAFE_EXECUTION|requires Docker or Podman/);
     expect(engine.ctx.store.getWork(work.id).currentState).toBe('PLAN_APPROVED');
     expect(engine.ctx.store.listEvents(work.id).some((e) => e.type === 'execution.sandboxed')).toBe(false);
-    // Still IMPLEMENTING with no sandboxed completion — no unsandboxed agent run was substituted.
     expect(engine.ctx.store.listUsageRecords(work.id)).toHaveLength(0);
     engine.ctx.store.close();
   });
@@ -114,8 +146,9 @@ describe('Part D sandboxed-unattended executor', () => {
     const { engine } = laneProject(dirs);
     engine.ctx.config.execution.mode = 'sandboxed-unattended';
     engine.sandboxHooks = fixtureHooks({ runtime: 'podman', egressSucceeds: true });
+    engine.sandboxImplementer = createFixtureImplementer({ ok: true });
     const work = await toPlanApproved(engine);
-    await expect(engine.execute(work.id)).rejects.toThrow(/egress probe succeeded|E_UNSAFE_EXECUTION/);
+    await expect(engine.execute(work.id)).rejects.toThrow(/egress probe succeeded|E_UNSAFE_EXECUTION|inconclusive/);
     expect(engine.ctx.store.listEvents(work.id).some((e) => e.type === 'execution.sandboxed')).toBe(false);
     engine.ctx.store.close();
   });
@@ -126,6 +159,17 @@ describe('Part D sandboxed-unattended executor', () => {
     engine.ctx.config.execution.allowNetwork = true;
     const work = await toPlanApproved(engine);
     await expect(engine.execute(work.id)).rejects.toThrow(/E_UNSAFE_EXECUTION|sandboxed-unattended/);
+    engine.ctx.store.close();
+  });
+
+  it('FR-D3: sandboxed-unattended without a bound implementer refuses before IMPLEMENTING', async () => {
+    const { engine } = laneProject(dirs);
+    engine.ctx.config.execution.mode = 'sandboxed-unattended';
+    engine.sandboxHooks = fixtureHooks({ runtime: 'docker' });
+    // no sandboxImplementer
+    const work = await toPlanApproved(engine);
+    await expect(engine.execute(work.id)).rejects.toThrow(/bound agent implementer|E_UNSAFE_EXECUTION/);
+    expect(engine.ctx.store.getWork(work.id).currentState).toBe('PLAN_APPROVED');
     engine.ctx.store.close();
   });
 
@@ -152,8 +196,29 @@ describe('Part D sandboxed-unattended executor', () => {
     engine.ctx.store.close();
   });
 
+  it('FR-D2: after leave-lane, sync/execute does not restart sandboxed run without lane.retry', async () => {
+    const { engine } = laneProject(dirs);
+    engine.ctx.config.execution.mode = 'sandboxed-unattended';
+    engine.ctx.config.budgets.perTask.maxExecutionAttempts = 1;
+    engine.sandboxHooks = fixtureHooks({ runtime: 'docker', checksOk: false });
+    engine.sandboxImplementer = createFixtureImplementer({ commits: ['c1'], ok: true });
+
+    const work = await toPlanApproved(engine);
+    await engine.execute(work.id);
+    expect(engine.laneState(work.id).inLane).toBe(false);
+    const sandboxedBefore = engine.ctx.store.listEvents(work.id).filter((e) => e.type === 'execution.sandboxed' || e.type === 'execution.fix-cap').length;
+
+    // Sync from CHANGES_REQUESTED would call execute; without lane membership it must use supervised recovery.
+    const again = await engine.execute(work.id);
+    expect(again.work.currentState).toBe('IMPLEMENTING');
+    expect(engine.laneState(work.id).inLane).toBe(false);
+    const sandboxedAfter = engine.ctx.store.listEvents(work.id).filter((e) => e.type === 'execution.sandboxed' || e.type === 'execution.fix-cap').length;
+    expect(sandboxedAfter).toBe(sandboxedBefore);
+    engine.ctx.store.close();
+  });
+
   it('FR-D4: agent adapter receives SPEC+PLAN+CONTEXT+knowledge and records usage with commits', async () => {
-    const { dir, engine } = laneProject(dirs);
+    const { engine } = laneProject(dirs);
     engine.ctx.config.execution.mode = 'sandboxed-unattended';
     let seen: { spec: string; plan: string; context: string; knowledge: string } | undefined;
     engine.sandboxHooks = fixtureHooks({ runtime: 'docker', checksOk: true });
@@ -179,7 +244,6 @@ describe('Part D sandboxed-unattended executor', () => {
 
     const done = engine.ctx.store.listEvents(work.id).find((e) => e.type === 'execution.sandboxed');
     expect((done!.payload as { commits: string[] }).commits).toContain('cafebabe');
-    void dir;
     engine.ctx.store.close();
   });
 
@@ -204,8 +268,25 @@ describe('Part D sandboxed-unattended executor', () => {
     expect(body.summary).toMatch(/unverified/i);
     expect(body.modelNotes?.unverifiedReports?.some((r) => /fully satisfied/i.test(r))).toBe(true);
     expect(body.modelNotes?.commits).toEqual([]);
-    // No evidence rows invented from the agent report.
     expect(engine.ctx.store.listEvidence(work.id).filter((e) => /agent|implementer/i.test(e.kind))).toHaveLength(0);
+    engine.ctx.store.close();
+  });
+
+  it('FR-D2/D5: implement ok:false ends as phase-failed, not completed', async () => {
+    const { engine } = laneProject(dirs);
+    engine.ctx.config.execution.mode = 'sandboxed-unattended';
+    engine.sandboxHooks = fixtureHooks({ runtime: 'docker', checksOk: true });
+    engine.sandboxImplementer = createFixtureImplementer({
+      ok: false,
+      report: 'implementer failed',
+      commits: [],
+    });
+
+    const work = await toPlanApproved(engine);
+    const result = await engine.execute(work.id);
+    expect(result.work.currentState).toBe('CHANGES_REQUESTED');
+    expect(engine.ctx.store.listEvents(work.id).some((e) => e.type === 'execution.phase-failed')).toBe(true);
+    expect(engine.ctx.store.listEvents(work.id).some((e) => e.type === 'execution.sandboxed')).toBe(false);
     engine.ctx.store.close();
   });
 
@@ -256,6 +337,39 @@ describe('Part D sandboxed-unattended executor', () => {
     }
   });
 
+  it('FR-D6: AbortSignal is aborted when wall-clock expires during a hanging phase', async () => {
+    let sawAbort = false;
+    const hooks: SandboxHooks = {
+      detectRuntime: () => 'docker',
+      egressProbeSucceeds: () => false,
+      runPhase: async (_phase, ctx) =>
+        new Promise((resolve) => {
+          ctx.signal.addEventListener('abort', () => {
+            sawAbort = true;
+            resolve({ ok: false, report: 'aborted', outputBytes: 0 });
+          });
+        }),
+    };
+    const result = await runSandboxedStateMachine({
+      hooks,
+      limits: { wallClockMs: 30, maxOutputBytes: 1_000_000, maxExecutionAttempts: 2 },
+      mount: { worktreePath: '/tmp', forbiddenMounts: [], runtime: 'docker' },
+    });
+    expect(result.status).toBe('limit-exceeded');
+    expect(sawAbort).toBe(true);
+  });
+
+  it('commit phase ok:false does not complete', async () => {
+    const hooks = fixtureHooks({ runtime: 'docker', checksOk: true, commitOk: false });
+    const result = await runSandboxedStateMachine({
+      hooks,
+      limits: { wallClockMs: 60_000, maxOutputBytes: 1_000_000, maxExecutionAttempts: 2 },
+      mount: { worktreePath: '/tmp', forbiddenMounts: [], runtime: 'docker' },
+    });
+    expect(result.status).toBe('phase-failed');
+    if (result.status === 'phase-failed') expect(result.reason).toMatch(/commit failed/);
+  });
+
   it('FR-D6 via engine: limit-exceeded moves to CHANGES_REQUESTED and leaves the lane', async () => {
     const { engine } = laneProject(dirs);
     engine.ctx.config.execution.mode = 'sandboxed-unattended';
@@ -265,6 +379,7 @@ describe('Part D sandboxed-unattended executor', () => {
       egressProbeSucceeds: () => false,
       runPhase: async (phase) => {
         if (phase === 'checks') return { ok: true, report: 'ok', outputBytes: 8 };
+        if (phase === 'commit') return { ok: true, report: 'ok', outputBytes: 8 };
         return { ok: true, report: 'y'.repeat(80), outputBytes: 80 };
       },
     };
@@ -280,6 +395,8 @@ describe('Part D sandboxed-unattended executor', () => {
     const ev = engine.ctx.store.listEvents(work.id).find((e) => e.type === 'execution.limit-exceeded');
     expect(ev).toBeTruthy();
     expect((ev!.payload as { limitName?: string }).limitName).toBe('output-size');
+    // Worktrees remain recoverable via change-report.
+    expect(engine.repoStates(work.id).length).toBeGreaterThan(0);
     engine.ctx.store.close();
   });
 });

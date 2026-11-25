@@ -14,6 +14,7 @@ export {
   preflightSandbox,
   runSandboxedStateMachine,
   type ContainerRuntime,
+  type PhaseContext,
   type PhaseNetwork,
   type PhaseResult,
   type SandboxHooks,
