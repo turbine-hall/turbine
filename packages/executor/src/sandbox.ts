@@ -31,6 +31,11 @@ export type PhaseResult = {
   report?: string;
   /** Bytes of captured output for this phase (FR-D6). */
   outputBytes?: number;
+  /**
+   * True when the runner stopped because more output arrived after the remaining budget
+   * was fully consumed. Distinct from `outputBytes === remaining` with no overflow.
+   */
+  outputOverflow?: boolean;
   /** Git commits produced in the worktree this phase (evidence). */
   commits?: string[];
   usage?: { inputTokens?: number; outputTokens?: number; modelId?: string };
@@ -45,6 +50,13 @@ export type PhaseContext = {
   remainingOutputBytes: number;
 };
 
+export type SandboxEvidenceSnapshot = {
+  /** Per-repo HEAD the post-commit checks read. */
+  heads: Record<string, string>;
+  /** True when the task worktree is dirty after those checks. */
+  dirty: boolean;
+};
+
 export type SandboxHooks = {
   detectRuntime: () => ContainerRuntime | undefined;
   /**
@@ -55,6 +67,11 @@ export type SandboxHooks = {
   egressProbeSucceeds: () => boolean;
   runPhase: (phase: SandboxPhase, ctx: PhaseContext) => Promise<PhaseResult>;
   nowMs?: () => number;
+  /**
+   * Optional: read worktree HEAD(s) and dirty state after successful post-commit checks.
+   * Completion is refused when dirty; the Engine rechecks heads before publishing.
+   */
+  readEvidence?: () => SandboxEvidenceSnapshot;
 };
 
 export type SandboxLimits = {
@@ -73,6 +90,8 @@ export type SandboxRunResult =
       /** Unverified agent reports — not evidence. */
       reports: string[];
       usage: Array<NonNullable<PhaseResult['usage']>>;
+      /** HEADs observed with the post-commit checks; Engine must recheck before publish. */
+      evidenceHeads: Record<string, string>;
     }
   | {
       status: 'fix-cap' | 'limit-exceeded' | 'phase-failed';
@@ -84,7 +103,12 @@ export type SandboxRunResult =
       usage: Array<NonNullable<PhaseResult['usage']>>;
       limitName?: 'wall-clock' | 'output-size';
       reason: string;
+      /** False when a deadline abort could not confirm the phase workload stopped. */
+      workloadStopped?: boolean;
     };
+
+/** Grace period after AbortSignal before treating a hung phase as unconfirmed termination. */
+export const PHASE_TERMINATION_GRACE_MS = 5_000;
 
 /** Credential / state paths that must never be the worktree or lie under it as a mount root. */
 const FORBIDDEN_LEAF_NAMES = ['.ssh', '.git-credentials', '.netrc'] as const;
@@ -323,7 +347,19 @@ export async function runSandboxedStateMachine(input: {
     } catch (e) {
       const code = (e as { code?: string }).code;
       if (code === 'SANDBOX_DEADLINE' || controller.signal.aborted) {
-        if (phasePromise) await phasePromise.catch(() => undefined);
+        let workloadStopped = true;
+        if (phasePromise) {
+          const settled = await Promise.race([
+            phasePromise.then(
+              () => true,
+              () => true,
+            ),
+            new Promise<false>((resolve) => {
+              setTimeout(() => resolve(false), PHASE_TERMINATION_GRACE_MS);
+            }),
+          ]);
+          workloadStopped = settled;
+        }
         return {
           status: 'limit-exceeded',
           runtime: input.mount.runtime,
@@ -333,7 +369,10 @@ export async function runSandboxedStateMachine(input: {
           commits,
           usage,
           limitName: 'wall-clock',
-          reason: `wall-clock limit ${input.limits.wallClockMs}ms exceeded during ${phase}`,
+          workloadStopped,
+          reason: workloadStopped
+            ? `wall-clock limit ${input.limits.wallClockMs}ms exceeded during ${phase}`
+            : `wall-clock limit ${input.limits.wallClockMs}ms exceeded during ${phase}; phase termination not confirmed within ${PHASE_TERMINATION_GRACE_MS}ms`,
         };
       }
       throw e;
@@ -341,7 +380,7 @@ export async function runSandboxedStateMachine(input: {
       clearTimeout(timer);
     }
     const phaseBytes = result.outputBytes ?? Buffer.byteLength(result.report ?? '', 'utf8');
-    if (phaseBytes > remainingOutputBytes) {
+    if (result.outputOverflow || phaseBytes > remainingOutputBytes) {
       outputBytes += phaseBytes;
       if (result.report) reports.push(result.report);
       if (result.commits?.length) commits.push(...result.commits);
@@ -444,6 +483,19 @@ export async function runSandboxedStateMachine(input: {
     );
   }
 
+  const evidence = input.hooks.readEvidence?.() ?? { heads: {}, dirty: false };
+  if (evidence.dirty) {
+    return phaseFailed(
+      input.mount,
+      attempts,
+      outputBytes,
+      reports,
+      commits,
+      usage,
+      'post-commit checks left the worktree dirty; completion refused',
+    );
+  }
+
   return {
     status: 'completed',
     runtime: input.mount.runtime,
@@ -452,5 +504,6 @@ export async function runSandboxedStateMachine(input: {
     outputBytes,
     reports,
     usage,
+    evidenceHeads: evidence.heads,
   };
 }

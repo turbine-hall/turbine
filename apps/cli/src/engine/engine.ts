@@ -254,8 +254,13 @@ export class Engine {
   private mirrorJob: Promise<MirrorRunResult | undefined> = Promise.resolve(undefined);
   /** Fixture seam for Part C. Live mode derives owner/repo from origin. */
   lanePrTarget?: LanePrTarget;
-  /** Fixture seam for Part D sandboxed-unattended (tests inject hooks + implementer). */
+  /**
+   * Fixture seam for Part D sandboxed-unattended.
+   * Full `sandboxHooks` overrides preflight + phase execution (integration fixtures).
+   * `sandboxPreflightHooks` alone overrides detect/egress while Engine refuses host setup/checks.
+   */
   sandboxHooks?: SandboxHooks;
+  sandboxPreflightHooks?: Pick<SandboxHooks, 'detectRuntime' | 'egressProbeSucceeds'>;
   sandboxImplementer?: AgentImplementer;
   /** Work ids with an in-flight sandboxed run — blocks concurrent capture/sync publication. */
   private sandboxInFlight = new Set<string>();
@@ -2285,7 +2290,7 @@ export class Engine {
             'sandboxed-unattended requires a bound agent implementer (Engine.sandboxImplementer). It will not start with the default fixture or fall back to unsandboxed execution.',
           );
         }
-        sandboxedPreflightRuntime = preflightSandbox(this.sandboxHooks ?? defaultSandboxHooks()).runtime;
+        sandboxedPreflightRuntime = preflightSandbox(this.resolveSandboxPreflightHooks()).runtime;
       }
     }
 
@@ -2407,6 +2412,18 @@ export class Engine {
     };
   }
 
+  /** Preflight hooks: full sandboxHooks win; otherwise merge optional preflight-only overrides. */
+  private resolveSandboxPreflightHooks(): SandboxHooks {
+    if (this.sandboxHooks) return this.sandboxHooks;
+    const defaults = defaultSandboxHooks();
+    if (!this.sandboxPreflightHooks) return defaults;
+    return {
+      ...defaults,
+      detectRuntime: this.sandboxPreflightHooks.detectRuntime,
+      egressProbeSucceeds: this.sandboxPreflightHooks.egressProbeSucceeds,
+    };
+  }
+
   /**
    * Part D: run the implementer inside Docker/Podman after fail-closed preflight.
    * Agent prose is never evidence — only commits + later check results count (FR-D5).
@@ -2422,50 +2439,84 @@ export class Engine {
   }): Promise<WorkPackage> {
     let work = input.work;
     const startedRevision = work.currentRevision;
+    const claim = { pid: process.pid, startedAt: now() };
     if (this.sandboxInFlight.has(work.id)) {
       throw err('E_CONCURRENT', `${work.id} already has a sandboxed-unattended run in flight`);
     }
     this.sandboxInFlight.add(work.id);
 
-    const failInit = (reason: string): WorkPackage => {
-      this.saveChangeSet(work.id, input.repos, {
-        status: 'sandboxed-incomplete',
-        summary: `${reason}. Worktrees preserved.`,
-        createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
-        parentArtifactIds: [input.plan.id],
-      });
-      this.ctx.store.appendEvent({
-        workId: work.id,
-        type: 'execution.phase-failed',
-        payload: { reason, runtime: input.preflightRuntime },
-      });
-      return this.toChangesRequested(work, 'execution-fail-cap', {
+    const stillOwnsExecution = (): boolean => {
+      const live = this.ctx.store.getWork(work.id);
+      return live.currentState === 'IMPLEMENTING' && live.currentRevision === startedRevision;
+    };
+
+    const failWithLeaveLane = (args: {
+      reason: string;
+      observed: RepoState[];
+      eventType: 'execution.phase-failed' | 'execution.fix-cap' | 'execution.limit-exceeded';
+      evaluationStatus: string;
+      payload?: Record<string, unknown>;
+      modelNotes?: unknown;
+    }): WorkPackage => {
+      // Keep sandboxed-running until the incomplete report + lane fallback + state transition
+      // publish together so a concurrent capture cannot advance on a clean failure commit.
+      work = this.toChangesRequested(work, 'execution-fail-cap', {
+        guard: (stored) =>
+          stored.currentState === 'IMPLEMENTING' && stored.currentRevision === startedRevision
+            ? undefined
+            : 'execution ownership changed',
         atomic: () => {
+          this.saveChangeSet(work.id, args.observed, {
+            status: 'sandboxed-incomplete',
+            summary: `${args.reason}. Worktrees preserved; agent reports unverified.`,
+            modelNotes: args.modelNotes,
+            createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
+            parentArtifactIds: [input.plan.id],
+          });
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: args.eventType,
+            payload: { reason: args.reason, runtime: input.preflightRuntime, ...args.payload },
+          });
           this.ctx.store.appendEvent({
             workId: work.id,
             type: 'lane.fallback',
             payload: {
               gate: 'codeReview',
               workRevision: work.currentRevision,
-              reasons: [reason],
-              evaluationHash: contentHash({ workId: work.id, reason, status: 'sandbox-init-failed' }),
+              reasons: [args.reason],
+              evaluationHash: contentHash({
+                workId: work.id,
+                reason: args.reason,
+                status: args.evaluationStatus,
+              }),
             },
           });
         },
       });
+      return work;
     };
 
-    // Record worktree ownership before any further init so a mid-setup throw stays recoverable.
+    const failInit = (reason: string): WorkPackage =>
+      failWithLeaveLane({
+        reason,
+        observed: input.repos,
+        eventType: 'execution.phase-failed',
+        evaluationStatus: 'sandbox-init-failed',
+      });
+
+    // Record worktree ownership + recoverable claim before any further init.
     this.saveChangeSet(work.id, input.repos, {
       status: 'sandboxed-running',
       summary: 'Sandboxed-unattended run started; worktrees recorded.',
+      modelNotes: { claim },
       createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
       parentArtifactIds: [input.plan.id],
     });
 
     try {
     const customHooks = this.sandboxHooks;
-    const hooks = customHooks ?? defaultSandboxHooks();
+    const hooks = this.resolveSandboxPreflightHooks();
     // Bind the workload to the runtime preflight probed — do not silently switch.
     const detected = hooks.detectRuntime();
     if (!detected || detected !== input.preflightRuntime) {
@@ -2526,6 +2577,7 @@ export class Engine {
      * Host `runCommand` is not a sandbox. Until a container phase runner is bound via
      * `sandboxHooks`, refuse to execute configured setup/checks on the host (fail closed).
      * Empty command lists succeed without running anything. Tests inject `sandboxHooks`.
+     * Preflight-only overrides use `sandboxPreflightHooks` so this refuse path stays testable.
      */
     const refuseHostPhase = (phase: 'setup' | 'checks', commands: string[]): PhaseResult => {
       if (commands.length === 0) {
@@ -2544,9 +2596,24 @@ export class Engine {
 
     const phaseHooks: SandboxHooks = {
       ...hooks,
+      readEvidence: () => {
+        const seen = observe(input.repos);
+        return {
+          heads: Object.fromEntries(seen.repos.map((r) => [r.name, r.headCommit])),
+          dirty: seen.uncommitted.length > 0,
+        };
+      },
       runPhase: async (phase, ctx) => {
         if (ctx.signal.aborted) {
           return { ok: false, report: `${phase} aborted (wall-clock)`, outputBytes: 0 };
+        }
+        // Recheck ownership before every phase so a mid-run requirements edit cannot drive another fix.
+        if (!stillOwnsExecution()) {
+          return {
+            ok: false,
+            report: `${phase} aborted: execution ownership lost (revision or state changed)`,
+            outputBytes: 48,
+          };
         }
         if (phase === 'setup') {
           if (customHooks) return customHooks.runPhase(phase, ctx);
@@ -2623,11 +2690,6 @@ export class Engine {
       maxExecutionAttempts: this.ctx.config.budgets.perTask.maxExecutionAttempts,
     };
 
-    const stillOwnsExecution = (): boolean => {
-      const live = this.ctx.store.getWork(work.id);
-      return live.currentState === 'IMPLEMENTING' && live.currentRevision === startedRevision;
-    };
-
     let run: Awaited<ReturnType<typeof runSandboxedStateMachine>>;
     try {
       run = await runSandboxedStateMachine({ hooks: phaseHooks, limits, mount });
@@ -2636,32 +2698,12 @@ export class Engine {
       if (!stillOwnsExecution()) {
         return this.ctx.store.getWork(work.id);
       }
-      const observed = observe(input.repos).repos;
-      this.saveChangeSet(work.id, observed, {
-        status: 'sandboxed-incomplete',
-        summary: `${reason}. Worktrees preserved; agent reports unverified.`,
+      work = failWithLeaveLane({
+        reason,
+        observed: observe(input.repos).repos,
+        eventType: 'execution.phase-failed',
+        evaluationStatus: 'phase-threw',
         modelNotes: { error: reason },
-        createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
-        parentArtifactIds: [input.plan.id],
-      });
-      this.ctx.store.appendEvent({
-        workId: work.id,
-        type: 'execution.phase-failed',
-        payload: { reason, runtime },
-      });
-      work = this.toChangesRequested(work, 'execution-fail-cap', {
-        atomic: () => {
-          this.ctx.store.appendEvent({
-            workId: work.id,
-            type: 'lane.fallback',
-            payload: {
-              gate: 'codeReview',
-              workRevision: work.currentRevision,
-              reasons: [reason],
-              evaluationHash: contentHash({ workId: work.id, reason, status: 'phase-threw' }),
-            },
-          });
-        },
       });
       this.render(work.id, [
         `Sandboxed-unattended failed: ${reason}`,
@@ -2671,67 +2713,38 @@ export class Engine {
     }
 
     if (!stillOwnsExecution()) {
-      // Another sync advanced the task while the implementer ran — do not publish over it.
+      // Another sync advanced the task while the implementer ran — clear our running claim only.
+      this.clearOrphanedSandboxClaim(work.id, claim, 'execution ownership lost during sandboxed run');
       return this.ctx.store.getWork(work.id);
     }
 
-    this.ctx.store.appendEvent({
-      workId: work.id,
-      type:
-        run.status === 'limit-exceeded'
-          ? 'execution.limit-exceeded'
-          : run.status === 'fix-cap'
-            ? 'execution.fix-cap'
-            : run.status === 'phase-failed'
-              ? 'execution.phase-failed'
-              : 'execution.sandboxed',
-      payload: {
-        status: run.status,
-        runtime: run.runtime,
-        attempts: run.attempts,
-        outputBytes: run.outputBytes,
-        commits: run.commits,
-        // Agent reports are stored for audit but must not be treated as evidence (FR-D5).
-        reportsUnverified: run.reports,
-        ...(run.status === 'limit-exceeded' ? { limitName: run.limitName, reason: run.reason } : {}),
-        ...(run.status === 'fix-cap' || run.status === 'phase-failed' ? { reason: run.reason } : {}),
-      },
-    });
-
-    const observedRepos = observe(input.repos).repos;
-    const hasCommitPastBase = changeSetId(observedRepos) !== baseSetId(observedRepos);
-    const completedWithCommit = run.status === 'completed' && hasCommitPastBase;
-    // Never promote agent reports into the change-set summary as verified evidence.
-    this.saveChangeSet(work.id, observedRepos, {
-      status: completedWithCommit ? 'committed' : 'sandboxed-incomplete',
-      summary: completedWithCommit
-        ? `Sandboxed run completed (observed commit past base; agent reports unverified).`
-        : run.status === 'completed'
-          ? 'Sandboxed run finished without an observed commit past the base; agent reports unverified.'
-          : `Sandboxed run ${run.status}: ${'reason' in run ? run.reason : 'incomplete'}. Agent reports are unverified.`,
-      modelNotes: { unverifiedReports: run.reports, adapterCommits: run.commits, observedPastBase: hasCommitPastBase },
-      createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
-      parentArtifactIds: [input.plan.id],
-    });
-
-    if (run.status === 'fix-cap' || run.status === 'limit-exceeded' || run.status === 'phase-failed') {
+    if (run.status !== 'completed') {
       const reason =
         run.status === 'limit-exceeded'
           ? `sandboxed run hit ${run.limitName ?? 'limit'}: ${run.reason}`
           : run.reason;
-      work = this.toChangesRequested(work, 'execution-fail-cap', {
-        atomic: () => {
-          this.ctx.store.appendEvent({
-            workId: work.id,
-            type: 'lane.fallback',
-            payload: {
-              gate: 'codeReview',
-              workRevision: work.currentRevision,
-              reasons: [reason],
-              evaluationHash: contentHash({ workId: work.id, reason, status: run.status }),
-            },
-          });
+      const eventType =
+        run.status === 'limit-exceeded'
+          ? 'execution.limit-exceeded'
+          : run.status === 'fix-cap'
+            ? 'execution.fix-cap'
+            : 'execution.phase-failed';
+      work = failWithLeaveLane({
+        reason,
+        observed: observe(input.repos).repos,
+        eventType,
+        evaluationStatus: run.status,
+        payload: {
+          status: run.status,
+          attempts: run.attempts,
+          outputBytes: run.outputBytes,
+          commits: run.commits,
+          reportsUnverified: run.reports,
+          ...(run.status === 'limit-exceeded'
+            ? { limitName: run.limitName, workloadStopped: run.workloadStopped }
+            : {}),
         },
+        modelNotes: { unverifiedReports: run.reports, adapterCommits: run.commits },
       });
       this.render(work.id, [
         `Sandboxed-unattended ${run.status}: ${reason}`,
@@ -2739,6 +2752,63 @@ export class Engine {
       ]);
       return work;
     }
+
+    this.ctx.store.appendEvent({
+      workId: work.id,
+      type: 'execution.sandboxed',
+      payload: {
+        status: run.status,
+        runtime: run.runtime,
+        attempts: run.attempts,
+        outputBytes: run.outputBytes,
+        commits: run.commits,
+        reportsUnverified: run.reports,
+        evidenceHeads: run.evidenceHeads,
+      },
+    });
+
+    const observedRepos = observe(input.repos).repos;
+    // Pin completion to the commit the post-commit checks read (AGENTS.md rule 5).
+    const evidenceHeads = run.evidenceHeads;
+    const headMismatch = observedRepos.some((r) => evidenceHeads[r.name] !== r.headCommit);
+    if (headMismatch) {
+      work = failWithLeaveLane({
+        reason:
+          'sandboxed completion refused: HEAD changed between post-commit checks and publish (retryable)',
+        observed: observedRepos,
+        eventType: 'execution.phase-failed',
+        evaluationStatus: 'evidence-head-mismatch',
+        modelNotes: {
+          unverifiedReports: run.reports,
+          adapterCommits: run.commits,
+          evidenceHeads,
+          observedHeads: Object.fromEntries(observedRepos.map((r) => [r.name, r.headCommit])),
+        },
+      });
+      this.render(work.id, [
+        'Sandboxed-unattended completion refused: repository HEAD changed after checks.',
+        'Task left the autonomous lane. Re-run when the worktree is stable.',
+      ]);
+      return work;
+    }
+
+    const hasCommitPastBase = changeSetId(observedRepos) !== baseSetId(observedRepos);
+    const completedWithCommit = hasCommitPastBase;
+    // Release the capture guard only once the completed (or incomplete-without-commit) report is ready.
+    this.saveChangeSet(work.id, observedRepos, {
+      status: completedWithCommit ? 'committed' : 'sandboxed-incomplete',
+      summary: completedWithCommit
+        ? `Sandboxed run completed (observed commit past base; agent reports unverified).`
+        : 'Sandboxed run finished without an observed commit past the base; agent reports unverified.',
+      modelNotes: {
+        unverifiedReports: run.reports,
+        adapterCommits: run.commits,
+        observedPastBase: hasCommitPastBase,
+        evidenceHeads,
+      },
+      createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
+      parentArtifactIds: [input.plan.id],
+    });
 
     this.render(
       work.id,
@@ -2757,6 +2827,36 @@ export class Engine {
     } finally {
       this.sandboxInFlight.delete(work.id);
     }
+  }
+
+  /** True when a sandboxed-running claim's owner process is still alive on this host. */
+  private sandboxClaimOwnerAlive(pid: unknown): boolean {
+    if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Clear a sandboxed-running change report when the owning process is gone (or ownership was lost).
+   * Preserves worktrees for supervised recovery; does not invent commits.
+   */
+  private clearOrphanedSandboxClaim(
+    workId: string,
+    claim: { pid: number; startedAt: string } | undefined,
+    reason: string,
+  ): void {
+    const repos = this.repoStates(workId);
+    if (!repos.length) return;
+    this.saveChangeSet(workId, observe(repos).repos, {
+      status: 'sandboxed-incomplete',
+      summary: `${reason}. Worktrees preserved for supervised recovery.`,
+      modelNotes: { interruptedClaim: claim, reason },
+      createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
+    });
   }
 
   /**
@@ -3280,16 +3380,61 @@ export class Engine {
         reason: 'Sandboxed-unattended run still in flight; wait for it to finish before capturing commits.',
       };
     }
-    // Cross-Engine instances share the store: refuse capture while the latest change report is still running.
+    // Cross-Engine instances share the store: wait while a recoverable claim's owner is alive.
     const latestChange = this.ctx.store.getLatestArtifact(work.id, 'change-report');
     if (latestChange) {
       try {
-        const body = JSON.parse(this.ctx.store.getArtifactContent(latestChange.id)) as { status?: string };
+        const body = JSON.parse(this.ctx.store.getArtifactContent(latestChange.id)) as {
+          status?: string;
+          modelNotes?: { claim?: { pid?: number; startedAt?: string } };
+        };
         if (body.status === 'sandboxed-running') {
+          const claim = body.modelNotes?.claim;
+          if (claim && this.sandboxClaimOwnerAlive(claim.pid)) {
+            return {
+              work,
+              moved: false,
+              reason:
+                'Sandboxed-unattended run still marked sandboxed-running with a live owner claim; wait for it to finish.',
+            };
+          }
+          // Owner process is gone (or claim missing) — clear running + leave lane together.
+          const interruptedClaim =
+            claim && typeof claim.pid === 'number' && typeof claim.startedAt === 'string'
+              ? { pid: claim.pid, startedAt: claim.startedAt }
+              : undefined;
+          work = this.toChangesRequested(work, 'execution-fail-cap', {
+            atomic: () => {
+              this.clearOrphanedSandboxClaim(
+                work.id,
+                interruptedClaim,
+                'Sandboxed-unattended run interrupted (owner process gone or claim missing)',
+              );
+              this.ctx.store.appendEvent({
+                workId: work.id,
+                type: 'lane.fallback',
+                payload: {
+                  gate: 'codeReview',
+                  workRevision: work.currentRevision,
+                  reasons: ['sandboxed-unattended interrupted; owner process gone'],
+                  evaluationHash: contentHash({
+                    workId: work.id,
+                    status: 'sandboxed-interrupted',
+                  }),
+                },
+              });
+              this.ctx.store.appendEvent({
+                workId: work.id,
+                type: 'execution.phase-failed',
+                payload: { reason: 'sandboxed-unattended interrupted; owner process gone' },
+              });
+            },
+          });
           return {
             work,
             moved: false,
-            reason: 'Sandboxed-unattended run still marked sandboxed-running in the change report; wait for it to finish.',
+            reason:
+              'Sandboxed-unattended run was interrupted (owner gone). Worktrees preserved; task left the lane for supervised recovery.',
           };
         }
       } catch {

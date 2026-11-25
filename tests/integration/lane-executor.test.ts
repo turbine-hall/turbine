@@ -174,34 +174,23 @@ describe('Part D sandboxed-unattended executor', () => {
     engine.ctx.config.execution.mode = 'sandboxed-unattended';
     engine.ctx.config.quality.checks = ['node lint.mjs'];
     engine.ctx.config.budgets.perTask.maxExecutionAttempts = 1;
-    engine.sandboxHooks = {
+    // Preflight-only: no sandboxHooks phase runner — Engine refuseHostPhase must fire.
+    engine.sandboxPreflightHooks = {
       detectRuntime: () => 'docker',
       egressProbeSucceeds: () => false,
-      runPhase: async (phase) => {
-        if (phase === 'checks') {
-          return {
-            ok: false,
-            report: 'checks: host execution refused until the container phase runner is bound (sandboxHooks); 1 command(s) not run',
-            outputBytes: 96,
-          };
-        }
-        if (phase === 'commit') return { ok: true, report: 'ok', outputBytes: 8 };
-        return { ok: true, report: `${phase} ok`, outputBytes: 8 };
-      },
     };
     engine.sandboxImplementer = createFixtureImplementer({ ok: true, commits: ['c'] });
     const work = await toPlanApproved(engine);
     const result = await engine.execute(work.id);
     expect(result.work.currentState).toBe('CHANGES_REQUESTED');
-    expect(
-      engine.ctx.store.listEvents(work.id).some((e) => {
-        const p = e.payload as { reason?: string; reportsUnverified?: string[] };
-        return (
-          (typeof p.reason === 'string' && /host execution refused/i.test(p.reason)) ||
-          p.reportsUnverified?.some((r) => /host execution refused/i.test(r))
-        );
-      }),
-    ).toBe(true);
+    const refused = engine.ctx.store.listEvents(work.id).some((e) => {
+      const p = e.payload as { reason?: string; reportsUnverified?: string[] };
+      return (
+        (typeof p.reason === 'string' && /host execution refused/i.test(p.reason)) ||
+        p.reportsUnverified?.some((r) => /host execution refused/i.test(r)) === true
+      );
+    });
+    expect(refused).toBe(true);
     engine.ctx.store.close();
   });
 
@@ -401,6 +390,67 @@ describe('Part D sandboxed-unattended executor', () => {
     if (result.status === 'limit-exceeded') {
       expect(result.limitName).toBe('output-size');
     }
+  });
+
+  it('FR-D6: outputOverflow at exact remaining budget is still limit-exceeded', async () => {
+    const hooks: SandboxHooks = {
+      detectRuntime: () => 'docker',
+      egressProbeSucceeds: () => false,
+      runPhase: async (_phase, ctx) => ({
+        ok: false,
+        report: 'truncated',
+        outputBytes: ctx.remainingOutputBytes,
+        outputOverflow: true,
+      }),
+    };
+    const result = await runSandboxedStateMachine({
+      hooks,
+      limits: { wallClockMs: 60_000, maxOutputBytes: 100, maxExecutionAttempts: 2 },
+      mount: { worktreePath: '/tmp', forbiddenMounts: [], runtime: 'docker' },
+    });
+    expect(result.status).toBe('limit-exceeded');
+    if (result.status === 'limit-exceeded') expect(result.limitName).toBe('output-size');
+  });
+
+  it('FR-D6: hung phase after abort records termination-not-confirmed', async () => {
+    const hooks: SandboxHooks = {
+      detectRuntime: () => 'docker',
+      egressProbeSucceeds: () => false,
+      runPhase: async (_phase, ctx) => {
+        await new Promise<never>(() => {
+          // Acknowledge abort but never settle — forces the grace-period path.
+          ctx.signal.addEventListener('abort', () => {
+            /* intentionally do not resolve */
+          });
+        });
+        return { ok: false, report: 'unreachable', outputBytes: 0 };
+      },
+    };
+    const result = await runSandboxedStateMachine({
+      hooks,
+      limits: { wallClockMs: 30, maxOutputBytes: 1_000_000, maxExecutionAttempts: 2 },
+      mount: { worktreePath: '/tmp', forbiddenMounts: [], runtime: 'docker' },
+    });
+    expect(result.status).toBe('limit-exceeded');
+    if (result.status === 'limit-exceeded') {
+      expect(result.limitName).toBe('wall-clock');
+      expect(result.workloadStopped).toBe(false);
+      expect(result.reason).toMatch(/termination not confirmed/i);
+    }
+  }, 20_000);
+
+  it('post-commit dirty evidence refuses completion', async () => {
+    const hooks: SandboxHooks = {
+      ...fixtureHooks({ runtime: 'docker', checksOk: true, commitOk: true }),
+      readEvidence: () => ({ heads: { primary: 'abc' }, dirty: true }),
+    };
+    const result = await runSandboxedStateMachine({
+      hooks,
+      limits: { wallClockMs: 60_000, maxOutputBytes: 1_000_000, maxExecutionAttempts: 2 },
+      mount: { worktreePath: '/tmp', forbiddenMounts: [], runtime: 'docker' },
+    });
+    expect(result.status).toBe('phase-failed');
+    if (result.status === 'phase-failed') expect(result.reason).toMatch(/dirty/i);
   });
 
   it('FR-D6: AbortSignal is aborted when wall-clock expires during a hanging phase', async () => {
