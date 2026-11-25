@@ -1,6 +1,6 @@
 import { err } from '@turbine-hall/turbine-contracts';
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 export type ContainerRuntime = 'docker' | 'podman';
@@ -113,22 +113,38 @@ export function planSandboxMounts(input: {
   runtime: ContainerRuntime;
   home?: string;
 }): SandboxMountPlan {
-  const worktreePath = resolve(input.worktreePath);
+  const lexicalWorktree = resolve(input.worktreePath);
+  if (!existsSync(lexicalWorktree)) {
+    throw err('E_UNSAFE_EXECUTION', `Sandbox worktree does not exist: ${lexicalWorktree}`);
+  }
+  // Canonicalize so a symlink cannot hide a credential path.
+  let worktreePath: string;
+  try {
+    worktreePath = realpathSync(lexicalWorktree);
+  } catch (e) {
+    throw err('E_UNSAFE_EXECUTION', `Sandbox worktree is unreadable: ${(e as Error).message.split('\n')[0]}`);
+  }
   const home = input.home ?? process.env.HOME ?? '';
   const homeResolved = home ? resolve(home) : '';
   const forbiddenMounts = forbiddenMountPaths(input.projectRoot, input.home);
-  if (!existsSync(worktreePath)) {
-    throw err('E_UNSAFE_EXECUTION', `Sandbox worktree does not exist: ${worktreePath}`);
+  if (process.env.SSH_AUTH_SOCK) {
+    forbiddenMounts.push(resolve(process.env.SSH_AUTH_SOCK));
   }
+  const canonicalForbidden = forbiddenMounts.map((p) => {
+    try {
+      return existsSync(p) ? realpathSync(p) : resolve(p);
+    } catch {
+      return resolve(p);
+    }
+  });
   // Mounting home itself is forbidden; a descendant worktree under home is fine.
-  if (homeResolved && worktreePath === homeResolved) {
+  if (homeResolved && worktreePath === (existsSync(homeResolved) ? realpathSync(homeResolved) : homeResolved)) {
     throw err('E_UNSAFE_EXECUTION', 'Sandbox worktree must not be the home directory');
   }
 
-  for (const forbidden of forbiddenMounts) {
-    if (homeResolved && forbidden === homeResolved) continue;
-    // Reject equality, worktree under forbidden (e.g. under .ssh), or forbidden under worktree
-    // (e.g. mounting project root that contains .turbine/state).
+  for (const forbidden of canonicalForbidden) {
+    const homeCanon = homeResolved && existsSync(homeResolved) ? realpathSync(homeResolved) : homeResolved;
+    if (homeCanon && forbidden === homeCanon) continue;
     if (pathsOverlap(worktreePath, forbidden)) {
       throw err('E_UNSAFE_EXECUTION', `Sandbox worktree overlaps forbidden path ${forbidden}`);
     }
@@ -140,10 +156,7 @@ export function planSandboxMounts(input: {
     }
   }
 
-  if (process.env.SSH_AUTH_SOCK) {
-    forbiddenMounts.push(resolve(process.env.SSH_AUTH_SOCK));
-  }
-  return { worktreePath, forbiddenMounts, runtime: input.runtime };
+  return { worktreePath, forbiddenMounts: [...new Set(canonicalForbidden)], runtime: input.runtime };
 }
 
 /** Prefer Docker when both are present (spec Q2). */
@@ -156,19 +169,24 @@ export function detectContainerRuntime(
 }
 
 /**
- * Live egress probe: fetch a host that policy must block. Success ⇒ network is open (refuse).
- * Unknown outcomes (timeout, spawn error, null status) are treated as open so preflight fails closed.
+ * Live egress probe: fetch a host that policy must block.
+ * Exit 0 = open (probe "succeeds" → refuse). Exit 2 = confirmed refusal (ECONNREFUSED/ENETUNREACH).
+ * Any other outcome is inconclusive and treated as open so preflight fails closed.
  * Default URL is a real public endpoint (not `.invalid`, which always fails DNS and never proves policy).
  */
 export function liveEgressProbeSucceeds(url = 'https://example.com/'): boolean {
+  const script = `
+    fetch(${JSON.stringify(url)}).then(() => process.exit(0)).catch((e) => {
+      const code = e && e.cause && e.cause.code || e && e.code;
+      if (code === 'ECONNREFUSED' || code === 'ENETUNREACH') process.exit(2);
+      process.exit(1);
+    });
+  `;
   try {
-    const result = spawnSync(
-      process.execPath,
-      ['-e', `fetch(${JSON.stringify(url)}).then(()=>process.exit(0)).catch(()=>process.exit(1))`],
-      { encoding: 'utf8', timeout: 5_000 },
-    );
+    const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 5_000 });
     if (result.error || result.status === null) return true;
-    return result.status === 0;
+    if (result.status === 2) return false; // confirmed blocked
+    return true; // open (0) or inconclusive (1, …)
   } catch {
     return true;
   }
@@ -279,12 +297,12 @@ export async function runSandboxedStateMachine(input: {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), remaining);
     let result: PhaseResult;
+    const phasePromise = input.hooks.runPhase(phase, {
+      network: PHASE_NETWORK[phase],
+      attempt: attempts,
+      signal: controller.signal,
+    });
     try {
-      const phasePromise = input.hooks.runPhase(phase, {
-        network: PHASE_NETWORK[phase],
-        attempt: attempts,
-        signal: controller.signal,
-      });
       const timeoutPromise = new Promise<never>((_, reject) => {
         controller.signal.addEventListener(
           'abort',
@@ -296,6 +314,8 @@ export async function runSandboxedStateMachine(input: {
     } catch (e) {
       const code = (e as { code?: string }).code;
       if (code === 'SANDBOX_DEADLINE' || controller.signal.aborted) {
+        // Drain the phase so callers do not observe the worktree while it is still mutating.
+        await phasePromise.catch(() => undefined);
         return {
           status: 'limit-exceeded',
           runtime: input.mount.runtime,

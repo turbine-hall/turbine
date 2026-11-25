@@ -2,7 +2,7 @@
  * Autonomous lane Part D — sandboxed-unattended executor (AC14–AC15, FR-D1–D6).
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
@@ -97,8 +97,15 @@ describe('Part D sandboxed-unattended executor', () => {
       runtime: 'docker',
       home: '/tmp/fake-home',
     });
-    expect(plan.worktreePath).toBe(resolve(payload.worktreePath));
-    expect(plan.forbiddenMounts).toEqual(expect.arrayContaining(forbidden));
+    expect(plan.worktreePath).toBe(realpathSync(payload.worktreePath));
+    expect(plan.forbiddenMounts).toEqual(
+      expect.arrayContaining([
+        realpathSync(resolve(dir, '.turbine', 'state')),
+        resolve('/tmp/fake-home'),
+        resolve('/tmp/fake-home', '.ssh'),
+      ]),
+    );
+    void forbidden;
     engine.ctx.store.close();
   });
 
@@ -117,7 +124,7 @@ describe('Part D sandboxed-unattended executor', () => {
       runtime: 'docker',
       home,
     });
-    expect(plan.worktreePath).toBe(resolve(wt));
+    expect(plan.worktreePath).toBe(realpathSync(wt));
 
     expect(() =>
       planSandboxMounts({ worktreePath: home, projectRoot: project, runtime: 'docker', home }),

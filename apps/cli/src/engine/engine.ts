@@ -256,6 +256,8 @@ export class Engine {
   /** Fixture seam for Part D sandboxed-unattended (tests inject hooks + implementer). */
   sandboxHooks?: SandboxHooks;
   sandboxImplementer?: AgentImplementer;
+  /** Work ids with an in-flight sandboxed run — blocks concurrent capture/sync publication. */
+  private sandboxInFlight = new Set<string>();
   /** Accepted tasks wait here in order; none is dropped when another is accepted before the drain. */
   private pendingLanePrs: Array<() => Promise<void>> = [];
   private lanePrDrain: Promise<void> = Promise.resolve();
@@ -2415,6 +2417,21 @@ export class Engine {
     primary: RepoState;
   }): Promise<WorkPackage> {
     let work = input.work;
+    const startedRevision = work.currentRevision;
+    if (this.sandboxInFlight.has(work.id)) {
+      throw err('E_CONCURRENT', `${work.id} already has a sandboxed-unattended run in flight`);
+    }
+    this.sandboxInFlight.add(work.id);
+
+    // Record worktree ownership before any further init so a mid-setup throw stays recoverable.
+    this.saveChangeSet(work.id, input.repos, {
+      status: 'sandboxed-running',
+      summary: 'Sandboxed-unattended run started; worktrees recorded.',
+      createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
+      parentArtifactIds: [input.plan.id],
+    });
+
+    try {
     const customHooks = this.sandboxHooks;
     const hooks = customHooks ?? defaultSandboxHooks();
     // Preflight already ran before IMPLEMENTING; only re-resolve runtime (no second egress probe).
@@ -2448,14 +2465,6 @@ export class Engine {
         'sandboxed-unattended requires a bound agent implementer (Engine.sandboxImplementer).',
       );
     }
-
-    // Record worktree ownership before phases so a thrown implementer cannot leave IMPLEMENTING with no repos.
-    this.saveChangeSet(work.id, input.repos, {
-      status: 'sandboxed-running',
-      summary: 'Sandboxed-unattended run started; worktrees recorded.',
-      createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
-      parentArtifactIds: [input.plan.id],
-    });
 
     this.ctx.store.appendEvent({
       workId: work.id,
@@ -2574,6 +2583,11 @@ export class Engine {
       maxExecutionAttempts: this.ctx.config.budgets.perTask.maxExecutionAttempts,
     };
 
+    const stillOwnsExecution = (): boolean => {
+      const live = this.ctx.store.getWork(work.id);
+      return live.currentState === 'IMPLEMENTING' && live.currentRevision === startedRevision;
+    };
+
     let run: Awaited<ReturnType<typeof runSandboxedStateMachine>>;
     try {
       run = await runSandboxedStateMachine({ hooks: phaseHooks, limits, mount });
@@ -2592,25 +2606,34 @@ export class Engine {
         type: 'execution.phase-failed',
         payload: { reason, runtime },
       });
-      work = this.toChangesRequested(work, 'execution-fail-cap', {
-        atomic: () => {
-          this.ctx.store.appendEvent({
-            workId: work.id,
-            type: 'lane.fallback',
-            payload: {
-              gate: 'codeReview',
-              workRevision: work.currentRevision,
-              reasons: [reason],
-              evaluationHash: contentHash({ workId: work.id, reason, status: 'phase-threw' }),
-            },
-          });
-        },
-      });
+      if (stillOwnsExecution()) {
+        work = this.toChangesRequested(work, 'execution-fail-cap', {
+          atomic: () => {
+            this.ctx.store.appendEvent({
+              workId: work.id,
+              type: 'lane.fallback',
+              payload: {
+                gate: 'codeReview',
+                workRevision: work.currentRevision,
+                reasons: [reason],
+                evaluationHash: contentHash({ workId: work.id, reason, status: 'phase-threw' }),
+              },
+            });
+          },
+        });
+      } else {
+        work = this.ctx.store.getWork(work.id);
+      }
       this.render(work.id, [
         `Sandboxed-unattended failed: ${reason}`,
         'Task left the autonomous lane. Worktrees are preserved for recovery.',
       ]);
       return work;
+    }
+
+    if (!stillOwnsExecution()) {
+      // Another sync advanced the task while the implementer ran — do not publish over it.
+      return this.ctx.store.getWork(work.id);
     }
 
     this.ctx.store.appendEvent({
@@ -2681,6 +2704,9 @@ export class Engine {
       'Next: turbine task sync <id>',
     ]);
     return work;
+    } finally {
+      this.sandboxInFlight.delete(work.id);
+    }
   }
 
   /**
@@ -3196,6 +3222,13 @@ export class Engine {
     let work = this.ctx.store.getWork(idOrAlias);
     if (work.currentState !== 'IMPLEMENTING') {
       throw err('E_INVALID_TRANSITION', `Cannot capture implementation from ${work.currentState}`);
+    }
+    if (this.sandboxInFlight.has(work.id)) {
+      return {
+        work,
+        moved: false,
+        reason: 'Sandboxed-unattended run still in flight; wait for it to finish before capturing commits.',
+      };
     }
     const repos = this.repoStates(work.id);
     if (!repos.length) throw err('E_NOT_FOUND', 'No worktrees recorded; run execute first');
