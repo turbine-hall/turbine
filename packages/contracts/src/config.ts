@@ -124,14 +124,24 @@ export const ProjectConfigSchema = z.object({
     }),
   execution: z
     .object({
-      mode: z.enum(['manual-supervised', 'isolated-worktree']).default('manual-supervised'),
+      /**
+       * `sandboxed-unattended` runs the implementer in Docker/Podman with only the task worktree
+       * mounted (Part D). Other modes never run networked unattended work (`E_UNSAFE_EXECUTION`).
+       */
+      mode: z.enum(['manual-supervised', 'isolated-worktree', 'sandboxed-unattended']).default('manual-supervised'),
       requireIsolatedWorktree: z.boolean().default(true),
       allowNetwork: z.boolean().default(false),
+      /** Wall-clock limit for one sandboxed-unattended run (FR-D6). Cap at Node's max timer delay. */
+      sandboxWallClockMs: z.number().int().positive().max(2_147_483_647).default(1_800_000),
+      /** Max combined stdout/stderr bytes from sandbox phases before limit-exceeded (FR-D6). */
+      sandboxMaxOutputBytes: z.number().int().positive().default(8_000_000),
     })
     .default({
       mode: 'manual-supervised',
       requireIsolatedWorktree: true,
       allowNetwork: false,
+      sandboxWallClockMs: 1_800_000,
+      sandboxMaxOutputBytes: 8_000_000,
     }),
   quality: z
     .object({

@@ -64,6 +64,8 @@ export function defaultConfig(projectRoot: string, name?: string): ProjectConfig
       mode: 'manual-supervised',
       requireIsolatedWorktree: true,
       allowNetwork: false,
+      sandboxWallClockMs: 1_800_000,
+      sandboxMaxOutputBytes: 8_000_000,
     },
     quality: { checks: [] },
     humanGates: {

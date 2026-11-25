@@ -2,7 +2,37 @@ import { createId, err } from '@turbine-hall/turbine-contracts';
 import type { ModelAdapter } from '@turbine-hall/turbine-models';
 import { runSkill, type SkillManifest } from '@turbine-hall/turbine-skills';
 
-export type ExecutionMode = 'manual-supervised' | 'isolated-worktree';
+export type ExecutionMode = 'manual-supervised' | 'isolated-worktree' | 'sandboxed-unattended';
+
+export {
+  detectContainerRuntime,
+  defaultSandboxHooks,
+  forbiddenMountPaths,
+  liveEgressProbeSucceeds,
+  planSandboxMounts,
+  PHASE_NETWORK,
+  PHASE_TERMINATION_GRACE_MS,
+  preflightSandbox,
+  runSandboxedStateMachine,
+  type ContainerRuntime,
+  type PhaseContext,
+  type PhaseNetwork,
+  type PhaseResult,
+  type SandboxEvidenceSnapshot,
+  type SandboxHooks,
+  type SandboxLimits,
+  type SandboxMountPlan,
+  type SandboxPhase,
+  type SandboxRunResult,
+} from './sandbox.js';
+
+export {
+  createFixtureImplementer,
+  formatImplementerPrompt,
+  type AgentImplementer,
+  type ImplementerInput,
+  type ImplementerResult,
+} from './agent-adapter.js';
 
 /**
  * Supervised execution: the engine prepares worktrees and an execution brief; a human or a
@@ -13,7 +43,7 @@ export type ExecutionMode = 'manual-supervised' | 'isolated-worktree';
  * packet (04-EXECUTION_BRIEF.md).
  *
  * Worktree isolation is NOT a security sandbox. Unattended execution requires OS/container
- * isolation.
+ * isolation (`sandboxed-unattended`).
  */
 export async function prepareExecutionGuidance(input: {
   workId: string;
@@ -29,7 +59,7 @@ export async function prepareExecutionGuidance(input: {
   if (input.allowNetwork) {
     throw err(
       'E_UNSAFE_EXECUTION',
-      'Networked autonomous execution is disabled in R0/R1. Use manual-supervised mode.',
+      'Networked autonomous execution is disabled outside sandboxed-unattended. Use manual-supervised mode or sandboxed-unattended.',
     );
   }
   if (!input.model || !input.implementSkill) return {};
