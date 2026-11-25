@@ -110,16 +110,27 @@ function runAsyncCli(input: {
       cwd: input.cwd,
       env: input.env,
       stdio: ['ignore', 'pipe', 'pipe'],
+      // New process group so abort can signal the whole tree (shell + CLI descendants).
+      detached: process.platform !== 'win32',
     });
     let stdout = '';
     let stderr = '';
     let killed = false;
     const onAbort = () => {
       killed = true;
+      const pid = child.pid;
       try {
-        child.kill('SIGKILL');
+        if (pid && process.platform !== 'win32') {
+          process.kill(-pid, 'SIGKILL');
+        } else {
+          child.kill('SIGKILL');
+        }
       } catch {
-        // ignore
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // ignore
+        }
       }
     };
     if (input.signal) {

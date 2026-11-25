@@ -16,7 +16,6 @@ import {
   readFileSync,
   renameSync,
   unlinkSync,
-  writeFileSync,
   writeSync,
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -24,6 +23,7 @@ import {
   defaultSandboxHooks,
   detectContainerRuntime,
   PHASE_NETWORK,
+  PHASE_TERMINATION_GRACE_MS,
   planSandboxMounts,
   type ContainerRuntime,
   type PhaseContext,
@@ -51,6 +51,8 @@ export type ContainerRunOutcome = {
   outputBytes: number;
   outputOverflow: boolean;
   killed: boolean;
+  /** False when abort could not confirm the daemon container stopped. */
+  workloadStopped?: boolean;
 };
 
 export type RunContainerFn = (req: ContainerRunRequest) => Promise<ContainerRunOutcome>;
@@ -137,28 +139,31 @@ export function assertSandboxNetworkPolicyReady(opts: {
 }
 
 /**
- * Resolve extra bind mounts so linked Git worktrees can run `git` inside the container.
- * Mounts the common Git directory (contains objects/refs and `worktrees/<name>`).
+ * Resolve linked-worktree Git layout (common dir + per-worktree admin dir).
+ * Mounts are selective: objects/refs/worktree admin (+ config/HEAD read-only). Hooks are never mounted.
  */
-export function resolveLinkedGitMounts(worktreePath: string): BindMount[] {
+export function resolveLinkedGitLayout(worktreePath: string): {
+  commonDir: string;
+  worktreeGitDir: string;
+} | undefined {
   const gitPath = join(worktreePath, '.git');
-  if (!existsSync(gitPath)) return [];
+  if (!existsSync(gitPath)) return undefined;
   let st;
   try {
     st = lstatSync(gitPath);
   } catch {
-    return [];
+    return undefined;
   }
-  if (st.isDirectory()) return []; // ordinary repo — already under the worktree mount
-  if (!st.isFile()) return [];
+  if (st.isDirectory()) return undefined; // ordinary repo — already under the worktree mount
+  if (!st.isFile()) return undefined;
   let raw: string;
   try {
     raw = readFileSync(gitPath, 'utf8');
   } catch {
-    return [];
+    return undefined;
   }
   const match = /^gitdir:\s*(.+)\s*$/m.exec(raw);
-  if (!match?.[1]) return [];
+  if (!match?.[1]) return undefined;
   const worktreeGitDir = resolve(dirname(gitPath), match[1].trim());
   let commonDir = resolve(worktreeGitDir, '..', '..');
   const commonDirFile = join(worktreeGitDir, 'commondir');
@@ -175,7 +180,29 @@ export function resolveLinkedGitMounts(worktreePath: string): BindMount[] {
       `linked worktree Git common dir is missing (${commonDir}); cannot mount Git admin data`,
     );
   }
-  return [{ host: commonDir, dest: commonDir, mode: 'rw' }];
+  return { commonDir, worktreeGitDir };
+}
+
+/**
+ * Bind mounts so linked Git worktrees can run `git` inside the container.
+ * @param writeable when false (setup/checks), objects/refs/admin are read-only.
+ */
+export function resolveLinkedGitMounts(worktreePath: string, writeable = true): BindMount[] {
+  const layout = resolveLinkedGitLayout(worktreePath);
+  if (!layout) return [];
+  const { commonDir, worktreeGitDir } = layout;
+  const mode = writeable ? 'rw' : 'ro';
+  const mounts: BindMount[] = [
+    { host: join(commonDir, 'objects'), dest: join(commonDir, 'objects'), mode },
+    { host: join(commonDir, 'refs'), dest: join(commonDir, 'refs'), mode },
+    { host: worktreeGitDir, dest: worktreeGitDir, mode },
+  ];
+  // Read-only shared metadata — never mount hooks/.
+  for (const leaf of ['config', 'HEAD', 'packed-refs', 'info'] as const) {
+    const p = join(commonDir, leaf);
+    if (existsSync(p)) mounts.push({ host: p, dest: p, mode: 'ro' });
+  }
+  return mounts;
 }
 
 /** Parse `-v` / `--volume` host paths from container argv (host side only). */
@@ -246,16 +273,29 @@ export function buildContainerArgv(input: {
   return { argv, enforced: true, containerName };
 }
 
-function stopContainer(runtime: ContainerRuntime, name: string): void {
+/** Kill + remove a named container. Returns true only when inspect confirms it is gone. */
+export function stopContainer(runtime: ContainerRuntime, name: string): boolean {
   try {
     spawnSync(runtime, ['kill', name], { encoding: 'utf8', timeout: 15_000 });
   } catch {
-    // ignore
+    // continue to rm / inspect
   }
   try {
     spawnSync(runtime, ['rm', '-f', name], { encoding: 'utf8', timeout: 15_000 });
   } catch {
-    // ignore
+    // continue to inspect
+  }
+  try {
+    const inspect = spawnSync(runtime, ['inspect', '-f', '{{.State.Running}}', name], {
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    // Missing container → status non-zero → confirmed stopped.
+    if (inspect.status !== 0) return true;
+    const running = (inspect.stdout ?? '').trim();
+    return running !== 'true';
+  } catch {
+    return false;
   }
 }
 
@@ -269,9 +309,12 @@ export function defaultRunContainer(req: ContainerRunRequest): Promise<Container
     let outputBytes = 0;
     let outputOverflow = false;
     let killed = false;
+    let workloadStopped = true;
     const onAbort = () => {
       killed = true;
-      if (req.containerName) stopContainer(req.runtime, req.containerName);
+      if (req.containerName) {
+        workloadStopped = stopContainer(req.runtime, req.containerName);
+      }
       try {
         child.kill('SIGKILL');
       } catch {
@@ -304,14 +347,25 @@ export function defaultRunContainer(req: ContainerRunRequest): Promise<Container
     });
     child.on('close', (code) => {
       req.signal?.removeEventListener('abort', onAbort);
-      resolvePromise({
-        exitCode: code,
-        stdout,
-        stderr,
-        outputBytes,
-        outputOverflow,
-        killed,
-      });
+      void (async () => {
+        // If abort could not confirm daemon stop, delay settlement past the state-machine
+        // grace window so ownership stays blocked (workloadStopped=false).
+        if (killed && !workloadStopped) {
+          await new Promise((r) => setTimeout(r, PHASE_TERMINATION_GRACE_MS + 250));
+          if (req.containerName) {
+            workloadStopped = stopContainer(req.runtime, req.containerName);
+          }
+        }
+        resolvePromise({
+          exitCode: code,
+          stdout,
+          stderr,
+          outputBytes,
+          outputOverflow,
+          killed,
+          workloadStopped: killed ? workloadStopped : true,
+        });
+      })();
     });
   });
 }
@@ -525,12 +579,12 @@ export function createContainerSandboxHooksWithProbe(
 ): SandboxHooks {
   const run = opts.runContainer ?? defaultRunContainer;
   const { runtime, mount } = opts;
-  const extraMounts = opts.extraMounts ?? resolveLinkedGitMounts(mount.worktreePath);
   const home = opts.home ?? process.env.HOME;
 
   const shellCommands = (commands: string[]): string[] => {
     if (!commands.length) return ['node', '-e', 'process.exit(0)'];
-    return ['sh', '-c', commands.join(' && ')];
+    // set -e: each line's nonzero status stops the script (avoids `a && b; true` masking).
+    return ['sh', '-c', ['set -e', ...commands].join('\n')];
   };
 
   return {
@@ -541,6 +595,8 @@ export function createContainerSandboxHooksWithProbe(
         return { ok: false, report: `${phase} aborted (wall-clock)`, outputBytes: 0 };
       }
       const network = PHASE_NETWORK[phase];
+      const gitWriteable = phase === 'implement' || phase === 'fix' || phase === 'commit';
+      const extraMounts = opts.extraMounts ?? resolveLinkedGitMounts(mount.worktreePath, gitWriteable);
       let command: string[];
       if (phase === 'setup') {
         command = shellCommands(opts.setupCommands ?? []);
@@ -552,7 +608,7 @@ export function createContainerSandboxHooksWithProbe(
         command = [
           'sh',
           '-c',
-          'git status --porcelain && test -z "$(git status --porcelain)"',
+          'set -e\ngit status --porcelain\ntest -z "$(git status --porcelain)"',
         ];
       } else if (phase === 'implement' || phase === 'fix') {
         if (!opts.agentCommand) {
@@ -602,9 +658,13 @@ export function createContainerSandboxHooksWithProbe(
           maxOutputBytes: ctx.remainingOutputBytes,
         });
         const report = [outcome.stdout, outcome.stderr].filter(Boolean).join('\n').slice(0, 8_000);
+        const stopped = outcome.workloadStopped !== false;
         return {
-          ok: outcome.exitCode === 0 && !outcome.killed && !outcome.outputOverflow,
-          report: report || `${phase} exit ${outcome.exitCode}`,
+          ok: outcome.exitCode === 0 && !outcome.killed && !outcome.outputOverflow && stopped,
+          report:
+            outcome.killed && !stopped
+              ? `${phase}: aborted but container termination not confirmed`
+              : report || `${phase} exit ${outcome.exitCode}`,
           outputBytes: outcome.outputBytes,
           outputOverflow: outcome.outputOverflow,
         };
@@ -624,33 +684,65 @@ export function sandboxPromptPath(worktreePath: string): string {
 
 const PROMPT_EXCLUDE_LINE = '.turbine-sandbox-prompt.md';
 
-/** Ensure the sandbox prompt is listed in the worktree's exclude file (linked or plain). */
+/** True when path or any ancestor is a symlink (reject before writing metadata). */
+function pathHasSymlinkComponent(target: string): boolean {
+  let cur = resolve(target);
+  for (;;) {
+    try {
+      if (lstatSync(cur).isSymbolicLink()) return true;
+    } catch {
+      // missing component — keep walking parents
+    }
+    const parent = dirname(cur);
+    if (parent === cur) return false;
+    cur = parent;
+  }
+}
+
+/** Ensure the sandbox prompt is listed in the common (or plain) info/exclude file. */
 export function ensureSandboxPromptExcluded(worktreePath: string): void {
   const gitPath = join(worktreePath, '.git');
   if (!existsSync(gitPath)) return;
   let excludePath: string;
   try {
     const st = lstatSync(gitPath);
+    if (st.isSymbolicLink()) return;
     if (st.isDirectory()) {
       excludePath = join(gitPath, 'info', 'exclude');
     } else if (st.isFile()) {
-      const raw = readFileSync(gitPath, 'utf8');
-      const match = /^gitdir:\s*(.+)\s*$/m.exec(raw);
-      if (!match?.[1]) return;
-      const worktreeGitDir = resolve(dirname(gitPath), match[1].trim());
-      excludePath = join(worktreeGitDir, 'info', 'exclude');
+      const layout = resolveLinkedGitLayout(worktreePath);
+      if (!layout) return;
+      // Linked worktrees read exclude from the common Git directory.
+      excludePath = join(layout.commonDir, 'info', 'exclude');
     } else {
       return;
     }
   } catch {
     return;
   }
+  if (pathHasSymlinkComponent(excludePath)) return;
   try {
+    if (existsSync(excludePath) && lstatSync(excludePath).isSymbolicLink()) return;
     mkdirSync(dirname(excludePath), { recursive: true });
+    if (pathHasSymlinkComponent(excludePath)) return;
     let existing = '';
-    if (existsSync(excludePath)) existing = readFileSync(excludePath, 'utf8');
+    if (existsSync(excludePath)) {
+      if (lstatSync(excludePath).isSymbolicLink()) return;
+      existing = readFileSync(excludePath, 'utf8');
+    }
     if (existing.split(/\r?\n/).includes(PROMPT_EXCLUDE_LINE)) return;
-    writeFileSync(excludePath, `${existing}${existing.endsWith('\n') || !existing ? '' : '\n'}${PROMPT_EXCLUDE_LINE}\n`, 'utf8');
+    const tmp = `${excludePath}.${process.pid}.tmp`;
+    if (existsSync(tmp)) unlinkSync(tmp);
+    const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
+    try {
+      writeSync(
+        fd,
+        `${existing}${existing.endsWith('\n') || !existing ? '' : '\n'}${PROMPT_EXCLUDE_LINE}\n`,
+      );
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, excludePath);
   } catch {
     // Best-effort; cleanupSandboxPrompt still removes the file.
   }

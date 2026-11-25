@@ -52,7 +52,7 @@ describe('container phase runner', () => {
 
   it('FR-D1: buildContainerArgv bind-mounts worktree, names the container, and can add Git mounts', () => {
     const wt = '/tmp/task-wt';
-    const git = '/tmp/project/.git';
+    const objects = '/tmp/project/.git/objects';
     const built = buildContainerArgv({
       runtime: 'docker',
       image: 'node:22',
@@ -60,15 +60,55 @@ describe('container phase runner', () => {
       network: 'none',
       registries: [],
       command: ['node', '-e', '1'],
-      extraMounts: [{ host: git, dest: git, mode: 'rw' }],
+      extraMounts: [{ host: objects, dest: objects, mode: 'rw' }],
       containerName: 'turbine-sbx-test',
     });
     expect(built.enforced).toBe(true);
     expect(built.argv).toContain('--name');
     expect(built.argv).toContain('turbine-sbx-test');
     expect(built.argv).toContain(`${wt}:${wt}:rw`);
-    expect(built.argv).toContain(`${git}:${git}:rw`);
-    expect(built.argv.join(' ')).not.toMatch(/\.ssh|HOME|\.turbine\/state/);
+    expect(built.argv).toContain(`${objects}:${objects}:rw`);
+    expect(built.argv.join(' ')).not.toMatch(/hooks|\.ssh|\.turbine\/state/);
+  });
+
+  it('setup command script uses set -e so a failed command is not masked', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-shell-'));
+    const wt = join(root, 'wt');
+    mkdirSync(wt);
+    writeFileSync(join(wt, 'README'), 'x');
+    const mount = planSandboxMounts({ worktreePath: wt, projectRoot: root, runtime: 'docker', home: '/tmp/no-home' });
+    let script = '';
+    const hooks = createContainerSandboxHooksWithProbe({
+      worktreePath: wt,
+      projectRoot: root,
+      image: 'node:22',
+      registries: ['registry.npmjs.org'],
+      modelProxyUrl: 'https://proxy.example.com',
+      allowNetwork: 'turbine-allow',
+      runtime: 'docker',
+      mount,
+      egressOpen: false,
+      home: '/tmp/no-home',
+      setupCommands: ['false', 'echo skipped; true'],
+      runContainer: async (req) => {
+        script = req.args.filter((a) => typeof a === 'string' && a.includes('set -e')).join('\n');
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr: 'failed',
+          outputBytes: 8,
+          outputOverflow: false,
+          killed: false,
+        };
+      },
+    });
+    await hooks.runPhase('setup', {
+      network: 'registries',
+      attempt: 1,
+      signal: new AbortController().signal,
+      remainingOutputBytes: 1000,
+    });
+    expect(script).toMatch(/^set -e\nfalse\necho skipped; true$/m);
   });
 
   it('FR-D1: forbidden-mount scan uses bind hosts and skips home so worktrees under $HOME work', () => {
