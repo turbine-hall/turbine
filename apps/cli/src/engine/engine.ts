@@ -150,10 +150,16 @@ import {
   type LanePrTarget,
 } from './lane-pr.js';
 import {
+  assertSandboxNetworkPolicyReady,
+  createContainerSandboxHooks,
+  createImplementerFromConfig,
   defaultSandboxHooks,
+  detectContainerRuntime,
+  formatImplementerPrompt,
   planSandboxMounts,
   preflightSandbox,
   runSandboxedStateMachine,
+  sandboxPromptPath,
   type AgentImplementer,
   type ContainerRuntime,
   type PhaseResult,
@@ -2292,13 +2298,32 @@ export class Engine {
       if (!membership.inLane) {
         // Supervised recovery only: prepare/reuse worktrees below without running the sandbox.
       } else {
-        if (!this.sandboxImplementer) {
+        if (!this.sandboxImplementer && !this.ctx.config.execution.sandboxImplementer) {
           throw err(
             'E_UNSAFE_EXECUTION',
-            'sandboxed-unattended requires a bound agent implementer (Engine.sandboxImplementer). It will not start with the default fixture or fall back to unsandboxed execution.',
+            'sandboxed-unattended requires Engine.sandboxImplementer or execution.sandboxImplementer (claude-code|codex). It will not start with the default fixture or fall back to unsandboxed execution.',
           );
         }
-        sandboxedPreflightRuntime = preflightSandbox(this.resolveSandboxPreflightHooks()).runtime;
+        if (!this.sandboxHooks) {
+          // Worktree may not exist yet — declare network policy + detect runtime here.
+          // In-container egress probe runs in runSandboxedUnattended after the worktree exists.
+          const execCfg = this.ctx.config.execution;
+          assertSandboxNetworkPolicyReady({
+            registries: execCfg.sandboxRegistries,
+            modelProxyUrl: execCfg.sandboxModelProxyUrl,
+            allowNetwork: execCfg.sandboxAllowNetwork,
+          });
+          const runtime = detectContainerRuntime();
+          if (!runtime) {
+            throw err(
+              'E_UNSAFE_EXECUTION',
+              'sandboxed-unattended requires Docker or Podman; no container runtime was found. It will not fall back to unsandboxed execution.',
+            );
+          }
+          sandboxedPreflightRuntime = runtime;
+        } else {
+          sandboxedPreflightRuntime = preflightSandbox(this.resolveSandboxPreflightHooks()).runtime;
+        }
       }
     }
 
@@ -2544,8 +2569,62 @@ export class Engine {
       return work;
     }
 
-    const customHooks = this.sandboxHooks;
-    const hooks = this.resolveSandboxPreflightHooks();
+    const execCfg = this.ctx.config.execution;
+    const implementerId = execCfg.sandboxImplementer;
+    const implementer: AgentImplementer | undefined =
+      this.sandboxImplementer ??
+      (implementerId ? createImplementerFromConfig(implementerId, { containerDelegated: true }) : undefined);
+    if (!implementer) {
+      work = failInit(
+        'sandboxed-unattended requires Engine.sandboxImplementer or execution.sandboxImplementer (claude-code|codex).',
+      );
+      this.render(work.id, [`Sandboxed-unattended init failed: no implementer.`, 'Task left the autonomous lane.']);
+      return work;
+    }
+
+    let customHooks = this.sandboxHooks;
+    if (!customHooks) {
+      try {
+        assertSandboxNetworkPolicyReady({
+          registries: execCfg.sandboxRegistries,
+          modelProxyUrl: execCfg.sandboxModelProxyUrl,
+          allowNetwork: execCfg.sandboxAllowNetwork,
+        });
+        const agentBin = implementer.id === 'codex' ? 'codex' : implementer.id === 'claude-code' ? 'claude' : undefined;
+        customHooks = await createContainerSandboxHooks({
+          worktreePath: input.primary.worktreePath,
+          projectRoot: this.ctx.projectRoot,
+          image: execCfg.sandboxImage,
+          registries: execCfg.sandboxRegistries,
+          modelProxyUrl: execCfg.sandboxModelProxyUrl,
+          allowNetwork: execCfg.sandboxAllowNetwork,
+          runtime: input.preflightRuntime,
+          setupCommands: this.ctx.config.quality.setup ?? [],
+          checkCommands: this.ctx.config.quality.checks ?? [],
+          agentCommand: agentBin
+            ? (_phase, _ctx) => [
+                agentBin,
+                '--prompt-file',
+                sandboxPromptPath(input.primary.worktreePath),
+              ]
+            : undefined,
+        });
+      } catch (e) {
+        work = failInit(`sandbox container hooks refused: ${(e as Error).message.split('\n')[0]}`);
+        this.render(work.id, [`Sandboxed-unattended init failed: container hooks.`, 'Task left the autonomous lane.']);
+        return work;
+      }
+    }
+
+    const hooks = customHooks ?? this.resolveSandboxPreflightHooks();
+    // Re-run fail-closed preflight with the bound hooks (includes in-container egress when live).
+    try {
+      preflightSandbox(hooks);
+    } catch (e) {
+      work = failInit((e as Error).message.split('\n')[0] ?? 'sandbox preflight refused');
+      this.render(work.id, [`Sandboxed-unattended init failed: preflight.`, 'Task left the autonomous lane.']);
+      return work;
+    }
     // Bind the workload to the runtime preflight probed — do not silently switch.
     const detected = hooks.detectRuntime();
     if (!detected || detected !== input.preflightRuntime) {
@@ -2579,13 +2658,6 @@ export class Engine {
       }
     }
 
-    const implementer = this.sandboxImplementer;
-    if (!implementer) {
-      work = failInit('sandboxed-unattended requires a bound agent implementer (Engine.sandboxImplementer).');
-      this.render(work.id, [`Sandboxed-unattended init failed: no implementer.`, 'Task left the autonomous lane.']);
-      return work;
-    }
-
     this.ctx.store.appendEvent({
       workId: work.id,
       type: 'execution.prepared',
@@ -2603,11 +2675,11 @@ export class Engine {
     const testsRunAllowed = !denied.includes('tests.run') && (allow.length === 0 || allow.includes('tests.run'));
 
     /**
-     * Host `runCommand` is not a sandbox. Until a container phase runner is bound via
-     * `sandboxHooks`, refuse to execute configured setup/checks on the host (fail closed).
-     * Empty command lists succeed without running anything. Tests inject `sandboxHooks`.
-     * Preflight-only overrides use `sandboxPreflightHooks` so this refuse path stays testable.
+     * Host execution is not a sandbox. Live path binds createContainerSandboxHooks above.
+     * Tests inject Engine.sandboxHooks. Preflight-only overrides use sandboxPreflightHooks
+     * so the host-refuse path stays testable without a phase runner.
      */
+    const liveContainer = !this.sandboxHooks && !!customHooks;
     const refuseHostPhase = (phase: 'setup' | 'checks', commands: string[]): PhaseResult => {
       if (commands.length === 0) {
         return {
@@ -2649,14 +2721,50 @@ export class Engine {
           return refuseHostPhase('setup', this.ctx.config.quality.setup ?? []);
         }
         if (phase === 'implement' || phase === 'fix') {
-          const result = await implementer.run({
+          const bundle = {
             workId: work.id,
             spec: this.ctx.store.getArtifactContent(input.spec.id),
             plan: this.ctx.store.getArtifactContent(input.plan.id),
             context: this.promptContext(work, input.taskContext),
             knowledge,
             signal: ctx.signal,
-          });
+            worktreePath: input.primary.worktreePath,
+            listCommits: () => {
+              const seen = observe(input.repos).repos;
+              return seen
+                .filter((r) => r.headCommit !== r.baseCommit)
+                .map((r) => r.headCommit);
+            },
+          };
+          if (liveContainer && customHooks) {
+            // Write prompt into the worktree, then run the agent CLI inside the container.
+            writeFileSync(sandboxPromptPath(input.primary.worktreePath), formatImplementerPrompt(bundle), 'utf8');
+            const phaseResult = await customHooks.runPhase(phase, ctx);
+            const commits = bundle.listCommits();
+            try {
+              this.addUsage({
+                idOrAlias: work.id,
+                source: 'agent',
+                agentName: implementer.id,
+                modelId: implementer.id,
+                modelProvider: implementer.id === 'codex' ? 'openai' : 'anthropic',
+                inputTokens: 'unknown',
+                outputTokens: 'unknown',
+                method: 'reported',
+                note: `sandboxed ${phase} via container (report unverified)`,
+                recordedBy: 'executor',
+                enteredBy: 'agent',
+              });
+            } catch {
+              // Usage recording must not abort the sandbox.
+            }
+            return {
+              ...phaseResult,
+              commits,
+              usage: { modelId: implementer.id },
+            } satisfies PhaseResult;
+          }
+          const result = await implementer.run(bundle);
           // FR-D5: report is unverified; only commits + usage are recorded as structured facts.
           if (result.usage) {
             try {
@@ -2695,11 +2803,10 @@ export class Engine {
               outputBytes: 64,
             };
           }
-          // Deterministic checks with no network (FR-D2). Host execution is refused without sandboxHooks.
           if (customHooks) return customHooks.runPhase(phase, ctx);
           return refuseHostPhase('checks', this.ctx.config.quality.checks ?? []);
         }
-        // commit — git commits are produced by the implementer; this phase confirms the worktree is clean.
+        // commit — confirm clean tree (container or host dirty check).
         if (customHooks) return customHooks.runPhase(phase, ctx);
         const dirty = this.uncommitted(work.id);
         if (dirty.length) {

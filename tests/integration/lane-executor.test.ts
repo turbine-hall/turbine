@@ -169,28 +169,18 @@ describe('Part D sandboxed-unattended executor', () => {
     engine.ctx.store.close();
   });
 
-  it('FR-D1: host check execution is refused until a container phase runner is bound', async () => {
+  it('FR-D1: live path without sandboxHooks refuses incomplete network policy (no host checks)', async () => {
     const { engine } = laneProject(dirs);
     engine.ctx.config.execution.mode = 'sandboxed-unattended';
     engine.ctx.config.quality.checks = ['node lint.mjs'];
-    engine.ctx.config.budgets.perTask.maxExecutionAttempts = 1;
-    // Preflight-only: no sandboxHooks phase runner — Engine refuseHostPhase must fire.
-    engine.sandboxPreflightHooks = {
-      detectRuntime: () => 'docker',
-      egressProbeSucceeds: () => false,
-    };
-    engine.sandboxImplementer = createFixtureImplementer({ ok: true, commits: ['c'] });
+    engine.ctx.config.execution.sandboxImplementer = 'claude-code';
+    engine.ctx.config.execution.sandboxRegistries = ['registry.npmjs.org'];
+    engine.ctx.config.execution.sandboxModelProxyUrl = 'https://proxy.example.com';
+    // No sandboxAllowNetwork, no injected sandboxHooks → never run quality.checks on the host.
     const work = await toPlanApproved(engine);
-    const result = await engine.execute(work.id);
-    expect(result.work.currentState).toBe('CHANGES_REQUESTED');
-    const refused = engine.ctx.store.listEvents(work.id).some((e) => {
-      const p = e.payload as { reason?: string; reportsUnverified?: string[] };
-      return (
-        (typeof p.reason === 'string' && /host execution refused/i.test(p.reason)) ||
-        p.reportsUnverified?.some((r) => /host execution refused/i.test(r)) === true
-      );
-    });
-    expect(refused).toBe(true);
+    await expect(engine.execute(work.id)).rejects.toThrow(/network policy|sandboxAllowNetwork|E_UNSAFE_EXECUTION/i);
+    expect(engine.ctx.store.getWork(work.id).currentState).toBe('PLAN_APPROVED');
+    expect(engine.ctx.store.listEvents(work.id).some((e) => e.type === 'execution.sandboxed')).toBe(false);
     engine.ctx.store.close();
   });
 
@@ -220,9 +210,11 @@ describe('Part D sandboxed-unattended executor', () => {
     const { engine } = laneProject(dirs);
     engine.ctx.config.execution.mode = 'sandboxed-unattended';
     engine.sandboxHooks = fixtureHooks({ runtime: 'docker' });
-    // no sandboxImplementer
+    // no sandboxImplementer and no execution.sandboxImplementer
     const work = await toPlanApproved(engine);
-    await expect(engine.execute(work.id)).rejects.toThrow(/bound agent implementer|E_UNSAFE_EXECUTION/);
+    await expect(engine.execute(work.id)).rejects.toThrow(
+      /sandboxImplementer|bound agent implementer|E_UNSAFE_EXECUTION/,
+    );
     expect(engine.ctx.store.getWork(work.id).currentState).toBe('PLAN_APPROVED');
     engine.ctx.store.close();
   });

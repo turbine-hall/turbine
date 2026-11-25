@@ -27,9 +27,28 @@ export {
 } from './sandbox.js';
 
 export {
+  assertSandboxNetworkPolicyReady,
+  buildContainerArgv,
+  containerEgressProbeSucceeds,
+  createContainerSandboxHooks,
+  createContainerSandboxHooksWithProbe,
+  defaultRunContainer,
+  phaseNetworkArgs,
+  sandboxPromptPath,
+  type ContainerRunOutcome,
+  type ContainerRunRequest,
+  type ContainerSandboxOptions,
+  type RunContainerFn,
+} from './container-runner.js';
+
+export {
+  createClaudeCodeImplementer,
+  createCodexImplementer,
   createFixtureImplementer,
+  createImplementerFromConfig,
   formatImplementerPrompt,
   type AgentImplementer,
+  type AgentImplementerId,
   type ImplementerInput,
   type ImplementerResult,
 } from './agent-adapter.js';
