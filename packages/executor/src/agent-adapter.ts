@@ -24,7 +24,11 @@ export type ImplementerResult = {
 };
 
 export type AgentImplementer = {
-  id: 'claude-code' | 'codex' | 'fixture';
+  /**
+   * Supported ids in this release: `fixture` only (tests / injected seams).
+   * Claude Code and Codex adapters are not shipped yet — do not advertise them as live.
+   */
+  id: 'fixture';
   run: (input: ImplementerInput) => Promise<ImplementerResult>;
 };
 

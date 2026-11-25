@@ -53,7 +53,7 @@ function fixtureHooks(opts: {
 }
 
 describe('Part D sandboxed-unattended executor', () => {
-  it('AC14 / FR-D1: sandboxed-unattended mounts only the worktree; home/SSH/credentials/state are forbidden', async () => {
+  it('AC14 / FR-D1: mount plan forbids home/SSH/credentials/state (planning boundary)', async () => {
     const { dir, engine } = laneProject(dirs);
     engine.ctx.config.execution.mode = 'sandboxed-unattended';
     engine.sandboxHooks = fixtureHooks({ runtime: 'docker' });
@@ -166,6 +166,42 @@ describe('Part D sandboxed-unattended executor', () => {
     engine.ctx.config.execution.allowNetwork = true;
     const work = await toPlanApproved(engine);
     await expect(engine.execute(work.id)).rejects.toThrow(/E_UNSAFE_EXECUTION|sandboxed-unattended/);
+    engine.ctx.store.close();
+  });
+
+  it('FR-D1: host check execution is refused until a container phase runner is bound', async () => {
+    const { engine } = laneProject(dirs);
+    engine.ctx.config.execution.mode = 'sandboxed-unattended';
+    engine.ctx.config.quality.checks = ['node lint.mjs'];
+    engine.ctx.config.budgets.perTask.maxExecutionAttempts = 1;
+    engine.sandboxHooks = {
+      detectRuntime: () => 'docker',
+      egressProbeSucceeds: () => false,
+      runPhase: async (phase) => {
+        if (phase === 'checks') {
+          return {
+            ok: false,
+            report: 'checks: host execution refused until the container phase runner is bound (sandboxHooks); 1 command(s) not run',
+            outputBytes: 96,
+          };
+        }
+        if (phase === 'commit') return { ok: true, report: 'ok', outputBytes: 8 };
+        return { ok: true, report: `${phase} ok`, outputBytes: 8 };
+      },
+    };
+    engine.sandboxImplementer = createFixtureImplementer({ ok: true, commits: ['c'] });
+    const work = await toPlanApproved(engine);
+    const result = await engine.execute(work.id);
+    expect(result.work.currentState).toBe('CHANGES_REQUESTED');
+    expect(
+      engine.ctx.store.listEvents(work.id).some((e) => {
+        const p = e.payload as { reason?: string; reportsUnverified?: string[] };
+        return (
+          (typeof p.reason === 'string' && /host execution refused/i.test(p.reason)) ||
+          p.reportsUnverified?.some((r) => /host execution refused/i.test(r))
+        );
+      }),
+    ).toBe(true);
     engine.ctx.store.close();
   });
 
@@ -291,12 +327,13 @@ describe('Part D sandboxed-unattended executor', () => {
 
     const change = engine.ctx.store.getLatestArtifact(work.id, 'change-report');
     const body = JSON.parse(engine.ctx.store.getArtifactContent(change!.id)) as {
+      status: string;
       summary: string;
       modelNotes?: { unverifiedReports?: string[]; commits?: string[] };
     };
-    expect(body.summary).toMatch(/unverified/i);
+    expect(body.status).toBe('sandboxed-incomplete');
+    expect(body.summary).toMatch(/unverified|without an observed commit/i);
     expect(body.modelNotes?.unverifiedReports?.some((r) => /fully satisfied/i.test(r))).toBe(true);
-    expect(body.modelNotes?.commits).toEqual([]);
     expect(engine.ctx.store.listEvidence(work.id).filter((e) => /agent|implementer/i.test(e.kind))).toHaveLength(0);
     engine.ctx.store.close();
   });

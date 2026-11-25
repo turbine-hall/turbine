@@ -1,7 +1,7 @@
 import { err } from '@turbine-hall/turbine-contracts';
 import { spawnSync } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 
 export type ContainerRuntime = 'docker' | 'podman';
 
@@ -41,6 +41,8 @@ export type PhaseContext = {
   attempt: number;
   /** Abort when the wall-clock deadline expires; hooks must stop the phase process/container. */
   signal: AbortSignal;
+  /** Remaining stdout/stderr budget for this phase; hooks must stop capture when exhausted. */
+  remainingOutputBytes: number;
 };
 
 export type SandboxHooks = {
@@ -151,7 +153,7 @@ export function planSandboxMounts(input: {
   }
 
   for (const leaf of FORBIDDEN_LEAF_NAMES) {
-    if (worktreePath.endsWith(`/${leaf}`) || worktreePath.endsWith(leaf)) {
+    if (basename(worktreePath) === leaf) {
       throw err('E_UNSAFE_EXECUTION', `Sandbox worktree must not be ${leaf}`);
     }
   }
@@ -195,7 +197,9 @@ export function liveEgressProbeSucceeds(url = 'https://example.com/'): boolean {
 export function defaultSandboxHooks(): SandboxHooks {
   return {
     detectRuntime: () => detectContainerRuntime(),
-    egressProbeSucceeds: () => liveEgressProbeSucceeds(),
+    // Host-network probe is not proof of container policy. Until a container egress probe is
+    // injected, treat egress as unverified (succeeds=true → preflight refuses).
+    egressProbeSucceeds: () => true,
     runPhase: async () => ({ ok: false, report: 'no phase runner configured' }),
   };
 }
@@ -293,16 +297,21 @@ export async function runSandboxedStateMachine(input: {
   const run = async (phase: SandboxPhase): Promise<PhaseResult | SandboxRunResult> => {
     const limited = withinLimits();
     if (limited) return limited;
-    const remaining = Math.max(1, input.limits.wallClockMs - (now() - started));
+    const remainingMs = Math.max(1, input.limits.wallClockMs - (now() - started));
+    const remainingOutputBytes = Math.max(0, input.limits.maxOutputBytes - outputBytes);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), remaining);
+    const timer = setTimeout(() => controller.abort(), remainingMs);
+    let phasePromise: Promise<PhaseResult> | undefined;
     let result: PhaseResult;
-    const phasePromise = input.hooks.runPhase(phase, {
-      network: PHASE_NETWORK[phase],
-      attempt: attempts,
-      signal: controller.signal,
-    });
     try {
+      phasePromise = Promise.resolve(
+        input.hooks.runPhase(phase, {
+          network: PHASE_NETWORK[phase],
+          attempt: attempts,
+          signal: controller.signal,
+          remainingOutputBytes,
+        }),
+      );
       const timeoutPromise = new Promise<never>((_, reject) => {
         controller.signal.addEventListener(
           'abort',
@@ -314,8 +323,7 @@ export async function runSandboxedStateMachine(input: {
     } catch (e) {
       const code = (e as { code?: string }).code;
       if (code === 'SANDBOX_DEADLINE' || controller.signal.aborted) {
-        // Drain the phase so callers do not observe the worktree while it is still mutating.
-        await phasePromise.catch(() => undefined);
+        if (phasePromise) await phasePromise.catch(() => undefined);
         return {
           status: 'limit-exceeded',
           runtime: input.mount.runtime,
@@ -332,7 +340,25 @@ export async function runSandboxedStateMachine(input: {
     } finally {
       clearTimeout(timer);
     }
-    outputBytes += result.outputBytes ?? Buffer.byteLength(result.report ?? '', 'utf8');
+    const phaseBytes = result.outputBytes ?? Buffer.byteLength(result.report ?? '', 'utf8');
+    if (phaseBytes > remainingOutputBytes) {
+      outputBytes += phaseBytes;
+      if (result.report) reports.push(result.report);
+      if (result.commits?.length) commits.push(...result.commits);
+      if (result.usage) usage.push(result.usage);
+      return {
+        status: 'limit-exceeded',
+        runtime: input.mount.runtime,
+        attempts,
+        outputBytes,
+        reports,
+        commits,
+        usage,
+        limitName: 'output-size',
+        reason: `output-size limit ${input.limits.maxOutputBytes} bytes exceeded during ${phase}`,
+      };
+    }
+    outputBytes += phaseBytes;
     if (result.report) reports.push(result.report);
     if (result.commits?.length) commits.push(...result.commits);
     if (result.usage) usage.push(result.usage);
@@ -400,6 +426,21 @@ export async function runSandboxedStateMachine(input: {
       commits,
       usage,
       `commit failed: ${commit.report ?? 'unknown'}`,
+    );
+  }
+
+  // Re-run checks against the committed tree so completion evidence matches the committed content.
+  const postCommitChecks = await run('checks');
+  if ('status' in postCommitChecks) return postCommitChecks;
+  if (!postCommitChecks.ok) {
+    return phaseFailed(
+      input.mount,
+      attempts,
+      outputBytes,
+      reports,
+      commits,
+      usage,
+      `post-commit checks failed: ${postCommitChecks.report ?? 'unknown'}`,
     );
   }
 
