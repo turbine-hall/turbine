@@ -74,7 +74,7 @@ describe('agent adapters (FR-D4 / FR-D5 / FR-D7)', () => {
     const stub = join(root, 'stub-cli');
     writeFileSync(stub, '#!/bin/sh\necho stub-ok\nexit 0\n');
     chmodSync(stub, 0o755);
-    const impl = createCodexImplementer({ bin: stub });
+    const impl = createCodexImplementer({ bin: stub, extraArgs: [] });
     const result = await impl.run({
       workId: 'work_3',
       spec: 's',
@@ -87,6 +87,31 @@ describe('agent adapters (FR-D4 / FR-D5 / FR-D7)', () => {
     expect(result.ok).toBe(true);
     expect(result.commits).toEqual(['stubcommit']);
     expect(result.report).toMatch(/stub-ok/);
+  });
+
+  it('FR-D7: host stub respects AbortSignal and does not use spawnSync', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-adapter-abort-'));
+    const wt = join(root, 'wt');
+    mkdirSync(wt);
+    const stub = join(root, 'stub-hang');
+    writeFileSync(stub, '#!/bin/sh\nsleep 30\n');
+    chmodSync(stub, 0o755);
+    const impl = createClaudeCodeImplementer({ bin: stub, extraArgs: [] });
+    const ac = new AbortController();
+    const pending = impl.run({
+      workId: 'work_abort',
+      spec: 's',
+      plan: 'p',
+      context: 'c',
+      knowledge: 'k',
+      worktreePath: wt,
+      signal: ac.signal,
+      listCommits: () => [],
+    });
+    setTimeout(() => ac.abort(), 50);
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.report).toMatch(/abort/i);
   });
 
   it('FR-D5: fixture report is labeled unverified prose', async () => {

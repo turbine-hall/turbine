@@ -1,11 +1,25 @@
 /**
  * Live Docker/Podman phase runner for sandboxed-unattended (Part D follow-up).
- * Mounts only the planned worktree; per-phase network scopes; injectable spawn for tests.
+ * Mounts the task worktree (+ linked-worktree Git admin dir); per-phase network scopes;
+ * injectable spawn for tests.
  */
 import { err } from '@turbine-hall/turbine-contracts';
+import { randomBytes } from 'node:crypto';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import {
   defaultSandboxHooks,
   detectContainerRuntime,
@@ -23,6 +37,8 @@ import {
 export type ContainerRunRequest = {
   runtime: ContainerRuntime;
   args: string[];
+  /** Container name passed to `run --name` so abort can `kill` the daemon container. */
+  containerName?: string;
   signal?: AbortSignal;
   /** Soft cap on captured stdout+stderr; overflow sets outputOverflow. */
   maxOutputBytes: number;
@@ -38,6 +54,8 @@ export type ContainerRunOutcome = {
 };
 
 export type RunContainerFn = (req: ContainerRunRequest) => Promise<ContainerRunOutcome>;
+
+export type BindMount = { host: string; dest: string; mode: 'rw' | 'ro' };
 
 export type ContainerSandboxOptions = {
   worktreePath: string;
@@ -55,9 +73,14 @@ export type ContainerSandboxOptions = {
   checkCommands?: string[];
   /** Optional: run implementer CLI inside the container for implement/fix. */
   agentCommand?: (phase: 'implement' | 'fix', ctx: PhaseContext) => string[];
+  /** Bounded deadline for the in-container egress / allow-network probes (ms). */
+  probeTimeoutMs?: number;
 };
 
-/** Build network argv for a phase. Returns enforced=false when allow-list scopes cannot be proven. */
+const DEFAULT_PROBE_TIMEOUT_MS = 30_000;
+const PROBE_URL = 'https://example.com/';
+
+/** Build network argv for a phase. Returns enforced=false when allow-list scopes cannot be configured. */
 export function phaseNetworkArgs(
   network: PhaseNetwork,
   opts: { allowNetwork?: string; registries: string[]; modelProxyUrl?: string },
@@ -96,7 +119,7 @@ export function phaseNetworkArgs(
   return { args, enforced: true };
 }
 
-/** Assert allow-list network policy is configured before starting a sandboxed run. */
+/** Assert allow-list network policy knobs are configured before starting a sandboxed run. */
 export function assertSandboxNetworkPolicyReady(opts: {
   registries: string[];
   modelProxyUrl?: string;
@@ -113,6 +136,89 @@ export function assertSandboxNetworkPolicyReady(opts: {
   }
 }
 
+/**
+ * Resolve extra bind mounts so linked Git worktrees can run `git` inside the container.
+ * Mounts the common Git directory (contains objects/refs and `worktrees/<name>`).
+ */
+export function resolveLinkedGitMounts(worktreePath: string): BindMount[] {
+  const gitPath = join(worktreePath, '.git');
+  if (!existsSync(gitPath)) return [];
+  let st;
+  try {
+    st = lstatSync(gitPath);
+  } catch {
+    return [];
+  }
+  if (st.isDirectory()) return []; // ordinary repo — already under the worktree mount
+  if (!st.isFile()) return [];
+  let raw: string;
+  try {
+    raw = readFileSync(gitPath, 'utf8');
+  } catch {
+    return [];
+  }
+  const match = /^gitdir:\s*(.+)\s*$/m.exec(raw);
+  if (!match?.[1]) return [];
+  const worktreeGitDir = resolve(dirname(gitPath), match[1].trim());
+  let commonDir = resolve(worktreeGitDir, '..', '..');
+  const commonDirFile = join(worktreeGitDir, 'commondir');
+  if (existsSync(commonDirFile)) {
+    try {
+      commonDir = resolve(worktreeGitDir, readFileSync(commonDirFile, 'utf8').trim());
+    } catch {
+      // keep default
+    }
+  }
+  if (!existsSync(commonDir)) {
+    throw err(
+      'E_UNSAFE_EXECUTION',
+      `linked worktree Git common dir is missing (${commonDir}); cannot mount Git admin data`,
+    );
+  }
+  return [{ host: commonDir, dest: commonDir, mode: 'rw' }];
+}
+
+/** Parse `-v` / `--volume` host paths from container argv (host side only). */
+export function parseBindHostsFromArgv(argv: string[]): string[] {
+  const hosts: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '-v' || a === '--volume') {
+      const spec = argv[i + 1];
+      if (!spec) continue;
+      // host:container[:opts] — host may be absolute; take first segment before unescaped ':'
+      const host = spec.split(':')[0] ?? '';
+      if (host) hosts.push(host);
+      i += 1;
+    }
+  }
+  return hosts;
+}
+
+/**
+ * Refuse argv that would bind a forbidden path. Skips the home directory entry so a
+ * descendant worktree under $HOME is allowed (matches planSandboxMounts).
+ */
+export function findForbiddenBindInArgv(
+  argv: string[],
+  forbiddenMounts: string[],
+  home?: string,
+): string | undefined {
+  const homeCanon = home ? resolve(home) : '';
+  const hosts = parseBindHostsFromArgv(argv);
+  for (const host of hosts) {
+    const hostResolved = resolve(host);
+    for (const f of forbiddenMounts) {
+      if (homeCanon && resolve(f) === homeCanon) continue;
+      const forb = resolve(f);
+      if (hostResolved === forb || hostResolved.startsWith(`${forb}/`) || forb.startsWith(`${hostResolved}/`)) {
+        return f;
+      }
+    }
+  }
+  return undefined;
+}
+
 export function buildContainerArgv(input: {
   runtime: ContainerRuntime;
   image: string;
@@ -122,30 +228,39 @@ export function buildContainerArgv(input: {
   registries: string[];
   modelProxyUrl?: string;
   command: string[];
-}): { argv: string[]; enforced: boolean; reason?: string } {
+  extraMounts?: BindMount[];
+  containerName?: string;
+}): { argv: string[]; enforced: boolean; reason?: string; containerName: string } {
   const net = phaseNetworkArgs(input.network, {
     allowNetwork: input.allowNetwork,
     registries: input.registries,
     modelProxyUrl: input.modelProxyUrl,
   });
-  if (!net.enforced) return { argv: [], enforced: false, reason: net.reason };
-  // Worktree-only bind mount; never pass HOME/SSH/credentials/.turbine/state.
-  const argv = [
-    'run',
-    '--rm',
-    ...net.args,
-    '-v',
-    `${input.worktreePath}:${input.worktreePath}:rw`,
-    '-w',
-    input.worktreePath,
-    input.image,
-    ...input.command,
-  ];
-  return { argv, enforced: true };
+  const containerName = input.containerName ?? `turbine-sbx-${randomBytes(8).toString('hex')}`;
+  if (!net.enforced) return { argv: [], enforced: false, reason: net.reason, containerName };
+  const argv = ['run', '--rm', '--name', containerName, ...net.args, '-v', `${input.worktreePath}:${input.worktreePath}:rw`];
+  for (const m of input.extraMounts ?? []) {
+    argv.push('-v', `${m.host}:${m.dest}:${m.mode}`);
+  }
+  argv.push('-w', input.worktreePath, input.image, ...input.command);
+  return { argv, enforced: true, containerName };
+}
+
+function stopContainer(runtime: ContainerRuntime, name: string): void {
+  try {
+    spawnSync(runtime, ['kill', name], { encoding: 'utf8', timeout: 15_000 });
+  } catch {
+    // ignore
+  }
+  try {
+    spawnSync(runtime, ['rm', '-f', name], { encoding: 'utf8', timeout: 15_000 });
+  } catch {
+    // ignore
+  }
 }
 
 export function defaultRunContainer(req: ContainerRunRequest): Promise<ContainerRunOutcome> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolvePromise, reject) => {
     const child: ChildProcess = spawn(req.runtime, req.args, {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -156,6 +271,7 @@ export function defaultRunContainer(req: ContainerRunRequest): Promise<Container
     let killed = false;
     const onAbort = () => {
       killed = true;
+      if (req.containerName) stopContainer(req.runtime, req.containerName);
       try {
         child.kill('SIGKILL');
       } catch {
@@ -188,7 +304,7 @@ export function defaultRunContainer(req: ContainerRunRequest): Promise<Container
     });
     child.on('close', (code) => {
       req.signal?.removeEventListener('abort', onAbort);
-      resolve({
+      resolvePromise({
         exitCode: code,
         stdout,
         stderr,
@@ -198,6 +314,64 @@ export function defaultRunContainer(req: ContainerRunRequest): Promise<Container
       });
     });
   });
+}
+
+const EGRESS_PROBE_SCRIPT = (url: string) =>
+  `fetch(${JSON.stringify(url)}).then(()=>process.exit(0)).catch((e)=>{const c=e&&e.cause&&e.cause.code||e&&e.code;if(c==='ECONNREFUSED'||c==='ENETUNREACH'||c==='ENOTFOUND'||c==='EAI_AGAIN')process.exit(2);process.exit(1);})`;
+
+async function runBoundedProbe(input: {
+  runtime: ContainerRuntime;
+  image: string;
+  worktreePath: string;
+  network: PhaseNetwork;
+  allowNetwork?: string;
+  registries: string[];
+  modelProxyUrl?: string;
+  extraMounts?: BindMount[];
+  runContainer?: RunContainerFn;
+  timeoutMs: number;
+  /** When true, strip proxy env so we test the network itself (not the proxy). */
+  stripProxy?: boolean;
+}): Promise<'blocked' | 'open' | 'inconclusive'> {
+  const netOpts = {
+    allowNetwork: input.allowNetwork,
+    registries: input.registries,
+    modelProxyUrl: input.stripProxy ? undefined : input.modelProxyUrl,
+  };
+  // For stripProxy verification of allowNetwork, force registries-shaped args without proxy.
+  const network: PhaseNetwork = input.stripProxy ? 'registries' : input.network;
+  const built = buildContainerArgv({
+    runtime: input.runtime,
+    image: input.image,
+    worktreePath: input.worktreePath,
+    network,
+    allowNetwork: netOpts.allowNetwork,
+    registries: netOpts.registries.length ? netOpts.registries : input.registries.length ? input.registries : ['registry.npmjs.org'],
+    modelProxyUrl: netOpts.modelProxyUrl,
+    extraMounts: input.extraMounts,
+    command: ['node', '-e', EGRESS_PROBE_SCRIPT(PROBE_URL)],
+  });
+  if (!built.enforced) return 'inconclusive';
+  const run = input.runContainer ?? defaultRunContainer;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), input.timeoutMs);
+  try {
+    const out = await run({
+      runtime: input.runtime,
+      args: built.argv,
+      containerName: built.containerName,
+      signal: ac.signal,
+      maxOutputBytes: 64_000,
+    });
+    if (out.killed || ac.signal.aborted) return 'inconclusive';
+    if (out.exitCode === 2) return 'blocked';
+    if (out.exitCode === 0) return 'open';
+    return 'inconclusive';
+  } catch {
+    return 'inconclusive';
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -210,39 +384,54 @@ export async function containerEgressProbeSucceeds(input: {
   worktreePath: string;
   runContainer?: RunContainerFn;
   probeUrl?: string;
+  timeoutMs?: number;
+  extraMounts?: BindMount[];
 }): Promise<boolean> {
-  const url = input.probeUrl ?? 'https://example.com/';
-  const built = buildContainerArgv({
+  const outcome = await runBoundedProbe({
     runtime: input.runtime,
     image: input.image,
     worktreePath: input.worktreePath,
     network: 'none',
     registries: [],
-    command: [
-      'node',
-      '-e',
-      `fetch(${JSON.stringify(url)}).then(()=>process.exit(0)).catch((e)=>{const c=e&&e.cause&&e.cause.code||e&&e.code;if(c==='ECONNREFUSED'||c==='ENETUNREACH'||c==='ENOTFOUND'||c==='EAI_AGAIN')process.exit(2);process.exit(1);})`,
-    ],
+    extraMounts: input.extraMounts,
+    runContainer: input.runContainer,
+    timeoutMs: input.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
   });
-  if (!built.enforced) return true;
-  const run = input.runContainer ?? defaultRunContainer;
-  try {
-    const out = await run({
-      runtime: input.runtime,
-      args: built.argv,
-      maxOutputBytes: 64_000,
-    });
-    if (out.exitCode === 2) return false; // confirmed blocked
-    return true; // open (0) or inconclusive
-  } catch {
-    return true;
-  }
+  return outcome !== 'blocked';
 }
 
 /**
- * Build live container hooks. Runs an in-container egress probe under `--network none` first.
- * Callers that inject `runContainer` should prefer {@link createContainerSandboxHooksWithProbe}
- * after computing egress themselves, or pass `egressProbeSucceeds` override via wrapping.
+ * Verify the named allow-network blocks direct egress to a non-allow-listed host.
+ * Open or inconclusive → caller must refuse (fail closed).
+ */
+export async function allowNetworkEgressProbeSucceeds(input: {
+  runtime: ContainerRuntime;
+  image: string;
+  worktreePath: string;
+  allowNetwork: string;
+  registries: string[];
+  runContainer?: RunContainerFn;
+  timeoutMs?: number;
+  extraMounts?: BindMount[];
+}): Promise<boolean> {
+  const outcome = await runBoundedProbe({
+    runtime: input.runtime,
+    image: input.image,
+    worktreePath: input.worktreePath,
+    network: 'registries',
+    allowNetwork: input.allowNetwork,
+    registries: input.registries,
+    extraMounts: input.extraMounts,
+    runContainer: input.runContainer,
+    timeoutMs: input.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
+    stripProxy: true,
+  });
+  return outcome !== 'blocked';
+}
+
+/**
+ * Build live container hooks. Runs in-container egress probes under `--network none` and
+ * under `sandboxAllowNetwork` (direct egress must be blocked). Fail-closed on open/inconclusive.
  */
 export async function createContainerSandboxHooks(opts: ContainerSandboxOptions): Promise<SandboxHooks> {
   assertSandboxNetworkPolicyReady({
@@ -267,13 +456,62 @@ export async function createContainerSandboxHooks(opts: ContainerSandboxOptions)
     runtime,
     home: opts.home,
   });
-  const egressOpen = await containerEgressProbeSucceeds({
+  const extraMounts = resolveLinkedGitMounts(mount.worktreePath);
+  for (const m of extraMounts) {
+    const hit = findForbiddenBindInArgv(
+      ['-v', `${m.host}:${m.dest}:${m.mode}`],
+      mount.forbiddenMounts,
+      opts.home ?? process.env.HOME,
+    );
+    if (hit) {
+      throw err('E_UNSAFE_EXECUTION', `Git admin mount overlaps forbidden path ${hit}`);
+    }
+  }
+  const timeoutMs = opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
+  const noneOpen = await containerEgressProbeSucceeds({
     runtime,
     image: opts.image,
     worktreePath: mount.worktreePath,
     runContainer: opts.runContainer,
+    timeoutMs,
+    extraMounts,
   });
-  return createContainerSandboxHooksWithProbe({ ...opts, runtime, mount, egressOpen });
+  if (noneOpen) {
+    // Still bind hooks that report open egress so preflightSandbox refuses; keep fail-closed.
+    return createContainerSandboxHooksWithProbe({
+      ...opts,
+      runtime,
+      mount,
+      extraMounts,
+      egressOpen: true,
+    });
+  }
+  if (!opts.allowNetwork) {
+    throw err('E_UNSAFE_EXECUTION', 'sandboxAllowNetwork is unset after network policy assert');
+  }
+  const allowOpen = await allowNetworkEgressProbeSucceeds({
+    runtime,
+    image: opts.image,
+    worktreePath: mount.worktreePath,
+    allowNetwork: opts.allowNetwork,
+    registries: opts.registries,
+    runContainer: opts.runContainer,
+    timeoutMs,
+    extraMounts,
+  });
+  if (allowOpen) {
+    throw err(
+      'E_UNSAFE_EXECUTION',
+      `sandboxed-unattended allow-network "${opts.allowNetwork}" does not block non-allow-listed egress (or probe inconclusive). Refusing to start (no unsandboxed fallback).`,
+    );
+  }
+  return createContainerSandboxHooksWithProbe({
+    ...opts,
+    runtime,
+    mount,
+    extraMounts,
+    egressOpen: false,
+  });
 }
 
 /** Sync constructor when egress outcome is already known (tests). */
@@ -282,10 +520,13 @@ export function createContainerSandboxHooksWithProbe(
     runtime: ContainerRuntime;
     mount: SandboxMountPlan;
     egressOpen: boolean;
+    extraMounts?: BindMount[];
   },
 ): SandboxHooks {
   const run = opts.runContainer ?? defaultRunContainer;
   const { runtime, mount } = opts;
+  const extraMounts = opts.extraMounts ?? resolveLinkedGitMounts(mount.worktreePath);
+  const home = opts.home ?? process.env.HOME;
 
   const shellCommands = (commands: string[]): string[] => {
     if (!commands.length) return ['node', '-e', 'process.exit(0)'];
@@ -306,6 +547,8 @@ export function createContainerSandboxHooksWithProbe(
       } else if (phase === 'checks') {
         command = shellCommands(opts.checkCommands ?? []);
       } else if (phase === 'commit') {
+        // Prompt must not dirty the tree; remove it before the cleanliness check.
+        cleanupSandboxPrompt(mount.worktreePath);
         command = [
           'sh',
           '-c',
@@ -333,6 +576,7 @@ export function createContainerSandboxHooksWithProbe(
         registries: opts.registries,
         modelProxyUrl: opts.modelProxyUrl,
         command,
+        extraMounts,
       });
       if (!built.enforced) {
         return {
@@ -341,29 +585,34 @@ export function createContainerSandboxHooksWithProbe(
           outputBytes: 64,
         };
       }
-      // Never mount forbidden paths — argv must only bind the worktree.
-      for (const f of mount.forbiddenMounts) {
-        if (built.argv.some((a) => a === f || a.startsWith(`${f}:`) || a.includes(`:${f}`))) {
-          return {
-            ok: false,
-            report: `${phase}: refused — forbidden mount would be included (${f})`,
-            outputBytes: 64,
-          };
+      const forbidden = findForbiddenBindInArgv(built.argv, mount.forbiddenMounts, home);
+      if (forbidden) {
+        return {
+          ok: false,
+          report: `${phase}: refused — forbidden mount would be included (${forbidden})`,
+          outputBytes: 64,
+        };
+      }
+      try {
+        const outcome = await run({
+          runtime,
+          args: built.argv,
+          containerName: built.containerName,
+          signal: ctx.signal,
+          maxOutputBytes: ctx.remainingOutputBytes,
+        });
+        const report = [outcome.stdout, outcome.stderr].filter(Boolean).join('\n').slice(0, 8_000);
+        return {
+          ok: outcome.exitCode === 0 && !outcome.killed && !outcome.outputOverflow,
+          report: report || `${phase} exit ${outcome.exitCode}`,
+          outputBytes: outcome.outputBytes,
+          outputOverflow: outcome.outputOverflow,
+        };
+      } finally {
+        if (phase === 'implement' || phase === 'fix') {
+          cleanupSandboxPrompt(mount.worktreePath);
         }
       }
-      const outcome = await run({
-        runtime,
-        args: built.argv,
-        signal: ctx.signal,
-        maxOutputBytes: ctx.remainingOutputBytes,
-      });
-      const report = [outcome.stdout, outcome.stderr].filter(Boolean).join('\n').slice(0, 8_000);
-      return {
-        ok: outcome.exitCode === 0 && !outcome.killed && !outcome.outputOverflow,
-        report: report || `${phase} exit ${outcome.exitCode}`,
-        outputBytes: outcome.outputBytes,
-        outputOverflow: outcome.outputOverflow,
-      };
     },
   };
 }
@@ -371,6 +620,89 @@ export function createContainerSandboxHooksWithProbe(
 /** Prompt path written inside the worktree for agent CLIs (never outside the mount). */
 export function sandboxPromptPath(worktreePath: string): string {
   return join(worktreePath, '.turbine-sandbox-prompt.md');
+}
+
+const PROMPT_EXCLUDE_LINE = '.turbine-sandbox-prompt.md';
+
+/** Ensure the sandbox prompt is listed in the worktree's exclude file (linked or plain). */
+export function ensureSandboxPromptExcluded(worktreePath: string): void {
+  const gitPath = join(worktreePath, '.git');
+  if (!existsSync(gitPath)) return;
+  let excludePath: string;
+  try {
+    const st = lstatSync(gitPath);
+    if (st.isDirectory()) {
+      excludePath = join(gitPath, 'info', 'exclude');
+    } else if (st.isFile()) {
+      const raw = readFileSync(gitPath, 'utf8');
+      const match = /^gitdir:\s*(.+)\s*$/m.exec(raw);
+      if (!match?.[1]) return;
+      const worktreeGitDir = resolve(dirname(gitPath), match[1].trim());
+      excludePath = join(worktreeGitDir, 'info', 'exclude');
+    } else {
+      return;
+    }
+  } catch {
+    return;
+  }
+  try {
+    mkdirSync(dirname(excludePath), { recursive: true });
+    let existing = '';
+    if (existsSync(excludePath)) existing = readFileSync(excludePath, 'utf8');
+    if (existing.split(/\r?\n/).includes(PROMPT_EXCLUDE_LINE)) return;
+    writeFileSync(excludePath, `${existing}${existing.endsWith('\n') || !existing ? '' : '\n'}${PROMPT_EXCLUDE_LINE}\n`, 'utf8');
+  } catch {
+    // Best-effort; cleanupSandboxPrompt still removes the file.
+  }
+}
+
+/**
+ * Write the implementer prompt without following a pre-existing symlink (O_NOFOLLOW / unlink+EXCL).
+ */
+export function writeSandboxPrompt(worktreePath: string, body: string): string {
+  const dest = sandboxPromptPath(worktreePath);
+  ensureSandboxPromptExcluded(worktreePath);
+  try {
+    const st = lstatSync(dest);
+    if (st.isSymbolicLink() || st.isFile()) unlinkSync(dest);
+  } catch {
+    // ENOENT
+  }
+  const tmp = join(worktreePath, `.turbine-sandbox-prompt.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
+  const fd = openSync(
+    tmp,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    writeSync(fd, body);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmp, dest);
+  return dest;
+}
+
+/** Remove the sandbox prompt if present (does not follow symlinks for the unlink target name). */
+export function cleanupSandboxPrompt(worktreePath: string): void {
+  const dest = sandboxPromptPath(worktreePath);
+  try {
+    const st = lstatSync(dest);
+    if (st.isSymbolicLink() || st.isFile()) unlinkSync(dest);
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Provider-specific non-interactive CLI argv. Prompt is read from the worktree file inside the container.
+ * Claude Code: `claude -p` with prompt text; Codex: `codex exec` with prompt text.
+ */
+export function agentCliCommand(id: 'claude-code' | 'codex', promptPath: string): string[] {
+  if (id === 'claude-code') {
+    return ['sh', '-c', 'claude -p "$(cat -- "$1")"', 'turbine-claude', promptPath];
+  }
+  return ['sh', '-c', 'codex exec "$(cat -- "$1")"', 'turbine-codex', promptPath];
 }
 
 /** Optional sync probe helper for diagnostics (prefer async {@link containerEgressProbeSucceeds}). */
@@ -385,11 +717,7 @@ export function containerEgressProbeSucceedsSync(input: {
     worktreePath: input.worktreePath,
     network: 'none',
     registries: [],
-    command: [
-      'node',
-      '-e',
-      `fetch("https://example.com/").then(()=>process.exit(0)).catch((e)=>{const c=e&&e.cause&&e.cause.code||e&&e.code;if(c==='ECONNREFUSED'||c==='ENETUNREACH'||c==='ENOTFOUND'||c==='EAI_AGAIN')process.exit(2);process.exit(1);})`,
-    ],
+    command: ['node', '-e', EGRESS_PROBE_SCRIPT(PROBE_URL)],
   });
   if (!built.enforced) return true;
   try {

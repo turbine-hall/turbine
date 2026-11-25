@@ -27,14 +27,23 @@ export {
 } from './sandbox.js';
 
 export {
+  agentCliCommand,
+  allowNetworkEgressProbeSucceeds,
   assertSandboxNetworkPolicyReady,
   buildContainerArgv,
+  cleanupSandboxPrompt,
   containerEgressProbeSucceeds,
   createContainerSandboxHooks,
   createContainerSandboxHooksWithProbe,
   defaultRunContainer,
+  ensureSandboxPromptExcluded,
+  findForbiddenBindInArgv,
+  parseBindHostsFromArgv,
   phaseNetworkArgs,
+  resolveLinkedGitMounts,
   sandboxPromptPath,
+  writeSandboxPrompt,
+  type BindMount,
   type ContainerRunOutcome,
   type ContainerRunRequest,
   type ContainerSandboxOptions,

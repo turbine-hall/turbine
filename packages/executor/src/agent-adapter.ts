@@ -3,9 +3,13 @@
  * Input = SPEC + PLAN + CONTEXT + knowledge index; output = commits + usage.
  * Anything in `report` is unverified prose — only `commits` and later check results are evidence (FR-D5).
  */
-import { spawnSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
-import { sandboxPromptPath } from './container-runner.js';
+import { spawn, type ChildProcess } from 'node:child_process';
+import {
+  agentCliCommand,
+  cleanupSandboxPrompt,
+  sandboxPromptPath,
+  writeSandboxPrompt,
+} from './container-runner.js';
 
 export type ImplementerInput = {
   workId: string;
@@ -94,6 +98,51 @@ export type CliImplementerOpts = {
   containerDelegated?: boolean;
 };
 
+function runAsyncCli(input: {
+  bin: string;
+  args: string[];
+  cwd: string;
+  signal?: AbortSignal;
+  env?: NodeJS.ProcessEnv;
+}): Promise<{ status: number | null; stdout: string; stderr: string; killed: boolean }> {
+  return new Promise((resolve) => {
+    const child: ChildProcess = spawn(input.bin, input.args, {
+      cwd: input.cwd,
+      env: input.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    let killed = false;
+    const onAbort = () => {
+      killed = true;
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // ignore
+      }
+    };
+    if (input.signal) {
+      if (input.signal.aborted) onAbort();
+      else input.signal.addEventListener('abort', onAbort, { once: true });
+    }
+    child.stdout?.on('data', (c: Buffer) => {
+      stdout += c.toString('utf8');
+    });
+    child.stderr?.on('data', (c: Buffer) => {
+      stderr += c.toString('utf8');
+    });
+    child.on('error', (e) => {
+      input.signal?.removeEventListener('abort', onAbort);
+      resolve({ status: null, stdout, stderr: `${stderr}\n${e.message}`.trim(), killed });
+    });
+    child.on('close', (code) => {
+      input.signal?.removeEventListener('abort', onAbort);
+      resolve({ status: code, stdout, stderr, killed });
+    });
+  });
+}
+
 function createCliImplementer(
   id: 'claude-code' | 'codex',
   opts: CliImplementerOpts,
@@ -109,8 +158,7 @@ function createCliImplementer(
       if (!wt) {
         return { ok: false, commits: [], report: `${id} requires worktreePath` };
       }
-      const promptPath = sandboxPromptPath(wt);
-      writeFileSync(promptPath, formatImplementerPrompt(input), 'utf8');
+      const promptPath = writeSandboxPrompt(wt, formatImplementerPrompt(input));
 
       if (opts.containerDelegated) {
         const commits = input.listCommits?.() ?? [];
@@ -123,14 +171,46 @@ function createCliImplementer(
       }
 
       // Host spawn is only for stub/integration tests that intentionally run outside Docker.
-      const args = [...(opts.extraArgs ?? []), '--prompt-file', promptPath];
-      const result = spawnSync(bin, args, {
+      // Use provider-shaped argv unless a custom bin/extraArgs override is supplied for stubs.
+      let argv: string[];
+      if (opts.bin || opts.extraArgs) {
+        argv = [...(opts.extraArgs ?? []), '--prompt-file', promptPath];
+      } else {
+        // agentCliCommand returns [sh, -c, script, name, promptPath] — for host we spawn sh directly.
+        const full = agentCliCommand(id, promptPath);
+        // Replace default binary name inside the shell script when tests inject PATH stubs via opts.bin —
+        // handled above. Live host path uses the stock CLI shape.
+        argv = full.slice(1); // drop 'sh'; we'll spawn sh
+        const result = await runAsyncCli({
+          bin: full[0]!,
+          args: argv,
+          cwd: wt,
+          signal: input.signal,
+          env: { ...process.env, TURBINE_WORK_ID: input.workId },
+        });
+        cleanupSandboxPrompt(wt);
+        if (input.signal?.aborted || result.killed) {
+          return { ok: false, commits: [], report: `${id} aborted during run` };
+        }
+        const commits = input.listCommits?.() ?? [];
+        const report = [result.stdout, result.stderr].filter(Boolean).join('\n').slice(0, 8_000);
+        return {
+          ok: result.status === 0,
+          commits,
+          report: report || `${id} exit ${result.status}`,
+          usage: { modelId: opts.modelId ?? id, provider: opts.provider },
+        };
+      }
+
+      const result = await runAsyncCli({
+        bin,
+        args: argv,
         cwd: wt,
-        encoding: 'utf8',
-        timeout: 600_000,
+        signal: input.signal,
         env: { ...process.env, TURBINE_WORK_ID: input.workId },
       });
-      if (input.signal?.aborted) {
+      cleanupSandboxPrompt(wt);
+      if (input.signal?.aborted || result.killed) {
         return { ok: false, commits: [], report: `${id} aborted during run` };
       }
       const commits = input.listCommits?.() ?? [];
@@ -162,3 +242,5 @@ export function createImplementerFromConfig(
 ): AgentImplementer {
   return id === 'claude-code' ? createClaudeCodeImplementer(opts) : createCodexImplementer(opts);
 }
+
+export { sandboxPromptPath, cleanupSandboxPrompt, writeSandboxPrompt, agentCliCommand };

@@ -150,6 +150,7 @@ import {
   type LanePrTarget,
 } from './lane-pr.js';
 import {
+  agentCliCommand,
   assertSandboxNetworkPolicyReady,
   createContainerSandboxHooks,
   createImplementerFromConfig,
@@ -160,6 +161,7 @@ import {
   preflightSandbox,
   runSandboxedStateMachine,
   sandboxPromptPath,
+  writeSandboxPrompt,
   type AgentImplementer,
   type ContainerRuntime,
   type PhaseResult,
@@ -2590,7 +2592,8 @@ export class Engine {
           modelProxyUrl: execCfg.sandboxModelProxyUrl,
           allowNetwork: execCfg.sandboxAllowNetwork,
         });
-        const agentBin = implementer.id === 'codex' ? 'codex' : implementer.id === 'claude-code' ? 'claude' : undefined;
+        const agentId =
+          implementer.id === 'codex' || implementer.id === 'claude-code' ? implementer.id : undefined;
         customHooks = await createContainerSandboxHooks({
           worktreePath: input.primary.worktreePath,
           projectRoot: this.ctx.projectRoot,
@@ -2601,12 +2604,8 @@ export class Engine {
           runtime: input.preflightRuntime,
           setupCommands: this.ctx.config.quality.setup ?? [],
           checkCommands: this.ctx.config.quality.checks ?? [],
-          agentCommand: agentBin
-            ? (_phase, _ctx) => [
-                agentBin,
-                '--prompt-file',
-                sandboxPromptPath(input.primary.worktreePath),
-              ]
+          agentCommand: agentId
+            ? (_phase, _ctx) => agentCliCommand(agentId, sandboxPromptPath(input.primary.worktreePath))
             : undefined,
         });
       } catch (e) {
@@ -2737,8 +2736,8 @@ export class Engine {
             },
           };
           if (liveContainer && customHooks) {
-            // Write prompt into the worktree, then run the agent CLI inside the container.
-            writeFileSync(sandboxPromptPath(input.primary.worktreePath), formatImplementerPrompt(bundle), 'utf8');
+            // Write prompt into the worktree (no symlink follow), then run the agent CLI inside the container.
+            writeSandboxPrompt(input.primary.worktreePath, formatImplementerPrompt(bundle));
             const phaseResult = await customHooks.runPhase(phase, ctx);
             const commits = bundle.listCommits();
             try {
