@@ -2417,7 +2417,14 @@ export class Engine {
     let work = input.work;
     const customHooks = this.sandboxHooks;
     const hooks = customHooks ?? defaultSandboxHooks();
-    const { runtime } = preflightSandbox(hooks);
+    // Preflight already ran before IMPLEMENTING; only re-resolve runtime (no second egress probe).
+    const runtime = hooks.detectRuntime();
+    if (!runtime) {
+      throw err(
+        'E_UNSAFE_EXECUTION',
+        'sandboxed-unattended lost its container runtime after preflight. Refusing to continue (no unsandboxed fallback).',
+      );
+    }
     const mount = planSandboxMounts({
       worktreePath: input.primary.worktreePath,
       projectRoot: this.ctx.projectRoot,
@@ -2442,14 +2449,6 @@ export class Engine {
       );
     }
 
-    const adapterInput = {
-      workId: work.id,
-      spec: this.ctx.store.getArtifactContent(input.spec.id),
-      plan: this.ctx.store.getArtifactContent(input.plan.id),
-      context: this.promptContext(work, input.taskContext),
-      knowledge,
-    };
-
     // Record worktree ownership before phases so a thrown implementer cannot leave IMPLEMENTING with no repos.
     this.saveChangeSet(work.id, input.repos, {
       status: 'sandboxed-running',
@@ -2470,8 +2469,16 @@ export class Engine {
       },
     });
 
-    const timeoutMs = this.ctx.config.quality.timeoutMs;
-    const runCommandsInWorktree = (commands: string[], phase: 'setup' | 'check'): PhaseResult => {
+    const allow = this.ctx.config.tools.allow;
+    const denied = this.ctx.config.tools.denied;
+    const testsRunAllowed = !denied.includes('tests.run') && (allow.length === 0 || allow.includes('tests.run'));
+
+    /**
+     * Host `runCommand` is not a sandbox. Until a container phase runner is bound via
+     * `sandboxHooks`, refuse to execute configured setup/checks on the host (fail closed).
+     * Empty command lists succeed without running anything. Tests inject `sandboxHooks`.
+     */
+    const refuseHostPhase = (phase: 'setup' | 'checks', commands: string[]): PhaseResult => {
       if (commands.length === 0) {
         return {
           ok: true,
@@ -2479,23 +2486,11 @@ export class Engine {
           outputBytes: 24,
         };
       }
-      const lines: string[] = [];
-      let bytes = 0;
-      for (const command of commands) {
-        const run = runCommand({
-          repo: input.primary.name,
-          command,
-          cwd: input.primary.worktreePath,
-          phase,
-          timeoutMs,
-        });
-        bytes += Buffer.byteLength(run.stdoutTail + run.stderrTail, 'utf8');
-        lines.push(`${command} → exit ${run.exitCode}${run.error ? ` (${run.error})` : ''}`);
-        if (!run.passed) {
-          return { ok: false, report: lines.join('\n'), outputBytes: bytes };
-        }
-      }
-      return { ok: true, report: lines.join('\n'), outputBytes: bytes };
+      return {
+        ok: false,
+        report: `${phase}: host execution refused until the container phase runner is bound (sandboxHooks); ${commands.length} command(s) not run`,
+        outputBytes: 96,
+      };
     };
 
     const phaseHooks: SandboxHooks = {
@@ -2506,10 +2501,17 @@ export class Engine {
         }
         if (phase === 'setup') {
           if (customHooks) return customHooks.runPhase(phase, ctx);
-          return runCommandsInWorktree(this.ctx.config.quality.setup ?? [], 'setup');
+          return refuseHostPhase('setup', this.ctx.config.quality.setup ?? []);
         }
         if (phase === 'implement' || phase === 'fix') {
-          const result = await implementer.run(adapterInput);
+          const result = await implementer.run({
+            workId: work.id,
+            spec: this.ctx.store.getArtifactContent(input.spec.id),
+            plan: this.ctx.store.getArtifactContent(input.plan.id),
+            context: this.promptContext(work, input.taskContext),
+            knowledge,
+            signal: ctx.signal,
+          });
           // FR-D5: report is unverified; only commits + usage are recorded as structured facts.
           if (result.usage) {
             try {
@@ -2541,9 +2543,16 @@ export class Engine {
           } satisfies PhaseResult;
         }
         if (phase === 'checks') {
-          // Deterministic checks with no network (FR-D2). Tests may override via sandboxHooks.runPhase.
+          if (!testsRunAllowed) {
+            return {
+              ok: false,
+              report: 'Capability tests.run is not allowed by tools.allow / tools.denied; sandbox checks not run',
+              outputBytes: 64,
+            };
+          }
+          // Deterministic checks with no network (FR-D2). Host execution is refused without sandboxHooks.
           if (customHooks) return customHooks.runPhase(phase, ctx);
-          return runCommandsInWorktree(this.ctx.config.quality.checks ?? [], 'check');
+          return refuseHostPhase('checks', this.ctx.config.quality.checks ?? []);
         }
         // commit — git commits are produced by the implementer; this phase confirms the worktree is clean.
         if (customHooks) return customHooks.runPhase(phase, ctx);

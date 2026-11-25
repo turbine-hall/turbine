@@ -10,6 +10,8 @@ export type ImplementerInput = {
   plan: string;
   context: string;
   knowledge: string;
+  /** Wall-clock cancellation from the sandbox state machine; adapters must stop and await termination. */
+  signal?: AbortSignal;
 };
 
 export type ImplementerResult = {
@@ -37,6 +39,9 @@ export function createFixtureImplementer(opts: {
   return {
     id: 'fixture',
     async run(input) {
+      if (input.signal?.aborted) {
+        return { ok: false, commits: [], report: 'fixture aborted before start' };
+      }
       opts.onRun?.(input);
       return {
         ok: opts.ok ?? true,

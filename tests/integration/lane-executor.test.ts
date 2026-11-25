@@ -162,6 +162,28 @@ describe('Part D sandboxed-unattended executor', () => {
     engine.ctx.store.close();
   });
 
+  it('FR-D3: sandbox checks respect tools.denied tests.run (same as verify)', async () => {
+    const { engine } = laneProject(dirs);
+    engine.ctx.config.execution.mode = 'sandboxed-unattended';
+    engine.ctx.config.budgets.perTask.maxExecutionAttempts = 1;
+    engine.ctx.config.tools.denied.push('tests.run');
+    engine.sandboxHooks = fixtureHooks({ runtime: 'docker', checksOk: true });
+    engine.sandboxImplementer = createFixtureImplementer({ ok: true, commits: ['x'] });
+    const work = await toPlanApproved(engine);
+    const result = await engine.execute(work.id);
+    expect(result.work.currentState).toBe('CHANGES_REQUESTED');
+    expect(
+      engine.ctx.store.listEvents(work.id).some((e) => {
+        const p = e.payload as { reason?: string; reportsUnverified?: string[] };
+        return (
+          (typeof p.reason === 'string' && /tests\.run/.test(p.reason)) ||
+          p.reportsUnverified?.some((r) => /tests\.run/.test(r))
+        );
+      }),
+    ).toBe(true);
+    engine.ctx.store.close();
+  });
+
   it('FR-D3: sandboxed-unattended without a bound implementer refuses before IMPLEMENTING', async () => {
     const { engine } = laneProject(dirs);
     engine.ctx.config.execution.mode = 'sandboxed-unattended';
