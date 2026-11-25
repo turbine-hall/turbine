@@ -412,6 +412,38 @@ describe('Part D sandboxed-unattended executor', () => {
     if (result.status === 'limit-exceeded') expect(result.limitName).toBe('output-size');
   });
 
+  it('unconfirmed wall-clock termination keeps worktree ownership blocked', async () => {
+    const { engine } = laneProject(dirs);
+    engine.ctx.config.execution.mode = 'sandboxed-unattended';
+    engine.ctx.config.execution.sandboxWallClockMs = 40;
+    engine.sandboxHooks = {
+      detectRuntime: () => 'docker',
+      egressProbeSucceeds: () => false,
+      runPhase: async (_phase, ctx) => {
+        await new Promise<never>(() => {
+          ctx.signal.addEventListener('abort', () => {
+            /* never settle */
+          });
+        });
+        return { ok: false, report: 'unreachable', outputBytes: 0 };
+      },
+    };
+    engine.sandboxImplementer = createFixtureImplementer({ ok: true, commits: ['hang1'] });
+    const work = await toPlanApproved(engine);
+    const result = await engine.execute(work.id);
+    expect(result.work.currentState).toBe('CHANGES_REQUESTED');
+    const change = engine.ctx.store.getLatestArtifact(work.id, 'change-report');
+    const body = JSON.parse(engine.ctx.store.getArtifactContent(change!.id)) as {
+      status: string;
+      modelNotes?: { terminating?: boolean };
+    };
+    expect(body.status).toBe('sandboxed-terminating');
+    expect(body.modelNotes?.terminating).toBe(true);
+    // Supervised re-entry must stay blocked while termination is unconfirmed.
+    await expect(engine.execute(work.id)).rejects.toThrow(/E_CONCURRENT|termination|in flight|orphaned/i);
+    engine.ctx.store.close();
+  }, 20_000);
+
   it('FR-D6: hung phase after abort records termination-not-confirmed', async () => {
     const hooks: SandboxHooks = {
       detectRuntime: () => 'docker',

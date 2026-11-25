@@ -349,16 +349,21 @@ export async function runSandboxedStateMachine(input: {
       if (code === 'SANDBOX_DEADLINE' || controller.signal.aborted) {
         let workloadStopped = true;
         if (phasePromise) {
-          const settled = await Promise.race([
-            phasePromise.then(
-              () => true,
-              () => true,
-            ),
-            new Promise<false>((resolve) => {
-              setTimeout(() => resolve(false), PHASE_TERMINATION_GRACE_MS);
-            }),
-          ]);
-          workloadStopped = settled;
+          let graceTimer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            const settled = await Promise.race([
+              phasePromise.then(
+                () => true,
+                () => true,
+              ),
+              new Promise<false>((resolve) => {
+                graceTimer = setTimeout(() => resolve(false), PHASE_TERMINATION_GRACE_MS);
+              }),
+            ]);
+            workloadStopped = settled;
+          } finally {
+            if (graceTimer !== undefined) clearTimeout(graceTimer);
+          }
         }
         return {
           status: 'limit-exceeded',
