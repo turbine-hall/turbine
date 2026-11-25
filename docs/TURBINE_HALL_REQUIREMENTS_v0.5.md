@@ -890,7 +890,7 @@ Every run receives a task-specific allowlist. Model text is untrusted and cannot
 
 ### NFR-SEC-03 Worktree is not sandbox
 
-For R1, **prefer actual OS-level sandbox or container with no host secrets, bounded mount, disabled network except explicit allowlist and resource controls**. A Git worktree protects against accidental working-tree overlap, not hostile code. If a secure executor cannot be implemented, disable unattended execution: offer a manual handoff to Cursor/IDE and mark execution as human-supervised, not sandboxed or autonomous.
+A Git worktree protects against accidental working-tree overlap, not hostile code. `execution.mode: sandboxed-unattended` runs the implementer in Docker or Podman with only the task worktree mounted (no home, SSH agent, git credentials, or `.turbine/state/`), fail-closed runtime + egress preflight, per-phase network scopes, and wall-clock / output-size limits. Default remains `manual-supervised` handoff. Other modes still raise `E_UNSAFE_EXECUTION` for networked unattended work and never fall back to unsandboxed execution when sandbox preflight fails.
 
 ### NFR-SEC-04 Secrets and logs
 
@@ -982,9 +982,11 @@ tools:
     - pr.merge
     - production.deploy
 execution:
-  mode: manual-supervised       # R0/R1 safe fallback
+  mode: manual-supervised       # or sandboxed-unattended (Docker/Podman; worktree-only mounts; fail-closed preflight)
   requireIsolatedWorktree: true
-  allowNetwork: false
+  allowNetwork: false           # networked unattended work only in sandboxed-unattended after preflight
+  sandboxWallClockMs: 1800000   # sandboxed-unattended wall-clock limit (FR-D6)
+  sandboxMaxOutputBytes: 8000000
 quality:
   checks: []                    # determined from repo and approved by human
 humanGates:                     # these four cannot be false (E_CONFIG); relax gates only via approved lane policies

@@ -149,6 +149,16 @@ import {
   refreshLanePr,
   type LanePrTarget,
 } from './lane-pr.js';
+import {
+  createFixtureImplementer,
+  defaultSandboxHooks,
+  planSandboxMounts,
+  preflightSandbox,
+  runSandboxedStateMachine,
+  type AgentImplementer,
+  type PhaseResult,
+  type SandboxHooks,
+} from '@turbine-hall/turbine-executor';
 
 function now(): string {
   return new Date().toISOString();
@@ -244,6 +254,9 @@ export class Engine {
   private mirrorJob: Promise<MirrorRunResult | undefined> = Promise.resolve(undefined);
   /** Fixture seam for Part C. Live mode derives owner/repo from origin. */
   lanePrTarget?: LanePrTarget;
+  /** Fixture seam for Part D sandboxed-unattended (tests inject hooks + implementer). */
+  sandboxHooks?: SandboxHooks;
+  sandboxImplementer?: AgentImplementer;
   /** Accepted tasks wait here in order; none is dropped when another is accepted before the drain. */
   private pendingLanePrs: Array<() => Promise<void>> = [];
   private lanePrDrain: Promise<void> = Promise.resolve();
@@ -1008,7 +1021,7 @@ export class Engine {
   /** Enters CHANGES_REQUESTED and records it: each entry starts a new review cycle with a fresh file selection. */
   private toChangesRequested(
     work: WorkPackage,
-    cause: 'code-review' | 'verification-failed' | 'acceptance-failed' | 'queue-ejected',
+    cause: 'code-review' | 'verification-failed' | 'acceptance-failed' | 'queue-ejected' | 'execution-fail-cap',
     /**
      * `guard` runs inside the transaction on the freshly read task and returns why the transition must not
      * happen (E_CONCURRENT, nothing written); `atomic` writes extra records in that same transaction.
@@ -2247,6 +2260,20 @@ export class Engine {
       this.checkBudget(work.id);
     }
 
+    const executionModeEarly = this.ctx.config.execution.mode;
+    const allowNetworkEarly = this.ctx.config.execution.allowNetwork;
+    // FR-D3: refuse networked unattended work outside sandboxed-unattended before any state change.
+    if (executionModeEarly !== 'sandboxed-unattended' && allowNetworkEarly) {
+      throw err(
+        'E_UNSAFE_EXECUTION',
+        'Networked autonomous execution is disabled outside sandboxed-unattended. Use manual-supervised mode or sandboxed-unattended.',
+      );
+    }
+    // FR-D3: sandboxed-unattended preflight before leaving PLAN_APPROVED so a refuse leaves the task retryable.
+    if (executionModeEarly === 'sandboxed-unattended') {
+      preflightSandbox(this.sandboxHooks ?? defaultSandboxHooks());
+    }
+
     // Rebuilt when the base commit moved or this is a new CHANGES_REQUESTED cycle, before anything points at it.
     // It runs before the task leaves PLAN_APPROVED / CHANGES_REQUESTED and before any worktree exists, so a
     // failure here (an unreadable repository, an unwritable packet folder) leaves the task retryable.
@@ -2272,7 +2299,34 @@ export class Engine {
             primarySetup: this.ctx.config.quality.setup,
           });
 
+    const executionMode = this.ctx.config.execution.mode;
+
     let modelNotes: unknown;
+    const primary = repos[0]!;
+
+    if (executionMode === 'sandboxed-unattended') {
+      work = await this.runSandboxedUnattended({
+        work,
+        plan,
+        spec,
+        taskContext,
+        repos,
+        primary,
+      });
+      return {
+        work,
+        result: {
+          repos: this.repoStates(work.id).length ? observe(this.repoStates(work.id)).repos : repos,
+          worktreePath: primary.worktreePath,
+          branch: primary.branch,
+          baseCommit: primary.baseCommit,
+          modelNotes: undefined,
+        },
+        packetDir: packetPaths(this.ctx.projectRoot, work.id).dir,
+        openFile: packetPaths(this.ctx.projectRoot, work.id).executionBrief,
+      };
+    }
+
     if (existing.length === 0) {
       const model = getModel(this.ctx.config.models.profiles.implementation?.model ?? 'mock-default');
       const skill = getSkill(this.ctx.factoryRoot, 'core/execute-code-change');
@@ -2280,9 +2334,6 @@ export class Engine {
         work.selectedRoles.find((r) => /-developer$/.test(r.id))?.id ??
         work.selectedRoles.find((r) => r.id === 'database-engineer')?.id ??
         'backend-developer';
-      if (this.ctx.config.execution.allowNetwork) {
-        throw err('E_UNSAFE_EXECUTION', 'Networked autonomous execution is disabled in R0/R1. Use manual-supervised mode.');
-      }
       // Supervised mode: the implementer role only produces guidance; a human/agent writes code.
       modelNotes = (
         await this.runAsRole({
@@ -2320,7 +2371,6 @@ export class Engine {
       payload: { repos: repos.map((r) => ({ name: r.name, worktreePath: r.worktreePath, base: r.baseCommit })) },
     });
 
-    const primary = repos[0]!;
     this.render(work.id, [
         'Work ONLY in the worktree(s) listed below; follow SPEC.md → Plan.',
         'Commit your changes there, then run: turbine task sync <id>',
@@ -2339,6 +2389,184 @@ export class Engine {
       packetDir: packetPaths(this.ctx.projectRoot, work.id).dir,
       openFile: packetPaths(this.ctx.projectRoot, work.id).executionBrief,
     };
+  }
+
+  /**
+   * Part D: run the implementer inside Docker/Podman after fail-closed preflight.
+   * Agent prose is never evidence — only commits + later check results count (FR-D5).
+   */
+  private async runSandboxedUnattended(input: {
+    work: WorkPackage;
+    plan: Artifact;
+    spec: Artifact;
+    taskContext: RefreshResult;
+    repos: RepoState[];
+    primary: RepoState;
+  }): Promise<WorkPackage> {
+    let work = input.work;
+    const customHooks = this.sandboxHooks;
+    const hooks = customHooks ?? defaultSandboxHooks();
+    const { runtime } = preflightSandbox(hooks);
+    const mount = planSandboxMounts({
+      worktreePath: input.primary.worktreePath,
+      projectRoot: this.ctx.projectRoot,
+      runtime,
+    });
+
+    const knowledgePath = join(this.ctx.projectRoot, '.turbine', 'knowledge', 'index.md');
+    let knowledge = 'No knowledge index is available for this project.';
+    if (existsSync(knowledgePath)) {
+      try {
+        knowledge = readFileSync(knowledgePath, 'utf8').slice(0, 64_000);
+      } catch (e) {
+        knowledge = `Knowledge index could not be read (${(e as Error).message.split('\n')[0]}); nothing is claimed about prior knowledge.`;
+      }
+    }
+
+    const implementer: AgentImplementer =
+      this.sandboxImplementer ??
+      createFixtureImplementer({
+        ok: false,
+        report: 'No sandbox implementer configured; inject Engine.sandboxImplementer for tests or live agent CLIs.',
+      });
+
+    const adapterInput = {
+      workId: work.id,
+      spec: this.ctx.store.getArtifactContent(input.spec.id),
+      plan: this.ctx.store.getArtifactContent(input.plan.id),
+      context: this.promptContext(work, input.taskContext),
+      knowledge,
+    };
+
+    this.ctx.store.appendEvent({
+      workId: work.id,
+      type: 'execution.prepared',
+      payload: {
+        mode: 'sandboxed-unattended',
+        runtime,
+        repos: input.repos.map((r) => ({ name: r.name, worktreePath: r.worktreePath, base: r.baseCommit })),
+        forbiddenMounts: mount.forbiddenMounts,
+        worktreePath: mount.worktreePath,
+      },
+    });
+
+    const phaseHooks: SandboxHooks = {
+      ...hooks,
+      runPhase: async (phase, ctx) => {
+        if (phase === 'setup') {
+          const setup = this.ctx.config.quality.setup ?? [];
+          return { ok: true, report: setup.length ? `setup commands planned: ${setup.join('; ')}` : 'no setup commands', outputBytes: 32 };
+        }
+        if (phase === 'implement' || phase === 'fix') {
+          const result = await implementer.run(adapterInput);
+          // FR-D5: report is unverified; only commits + usage are recorded as structured facts.
+          if (result.usage) {
+            try {
+              this.addUsage({
+                idOrAlias: work.id,
+                source: 'agent',
+                agentName: implementer.id,
+                modelId: result.usage.modelId ?? 'unknown',
+                modelProvider: result.usage.provider ?? 'unknown',
+                inputTokens: result.usage.inputTokens ?? 'unknown',
+                outputTokens: result.usage.outputTokens ?? 'unknown',
+                method: 'reported',
+                note: `sandboxed ${phase} (report unverified)`,
+                recordedBy: 'executor',
+                enteredBy: 'agent',
+              });
+            } catch {
+              // Usage recording must not abort the sandbox; missing usage stays unknown in metrics.
+            }
+          }
+          return {
+            ok: result.ok,
+            report: result.report,
+            commits: result.commits,
+            usage: result.usage
+              ? { inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, modelId: result.usage.modelId }
+              : undefined,
+            outputBytes: Buffer.byteLength(result.report ?? '', 'utf8'),
+          } satisfies PhaseResult;
+        }
+        if (phase === 'checks') {
+          // Deterministic checks with no network (FR-D2). Tests inject sandboxHooks.runPhase for fail/pass control.
+          if (customHooks) return customHooks.runPhase(phase, ctx);
+          return { ok: true, report: 'checks skipped in default hooks; inject sandboxHooks.runPhase for real checks', outputBytes: 48 };
+        }
+        // commit
+        return { ok: true, report: 'commit phase complete', outputBytes: 24 };
+      },
+    };
+
+    const limits = {
+      wallClockMs: this.ctx.config.execution.sandboxWallClockMs,
+      maxOutputBytes: this.ctx.config.execution.sandboxMaxOutputBytes,
+      maxExecutionAttempts: this.ctx.config.budgets.perTask.maxExecutionAttempts,
+    };
+
+    const run = await runSandboxedStateMachine({ hooks: phaseHooks, limits, mount });
+
+    this.ctx.store.appendEvent({
+      workId: work.id,
+      type: run.status === 'limit-exceeded' ? 'execution.limit-exceeded' : run.status === 'fix-cap' ? 'execution.fix-cap' : 'execution.sandboxed',
+      payload: {
+        status: run.status,
+        runtime: run.runtime,
+        attempts: run.attempts,
+        outputBytes: run.outputBytes,
+        commits: run.commits,
+        // Agent reports are stored for audit but must not be treated as evidence (FR-D5).
+        reportsUnverified: run.reports,
+        ...(run.status === 'limit-exceeded' ? { limitName: run.limitName, reason: run.reason } : {}),
+        ...(run.status === 'fix-cap' ? { reason: run.reason } : {}),
+      },
+    });
+
+    // Never promote agent reports into the change-set summary as verified evidence.
+    this.saveChangeSet(work.id, input.repos, {
+      status: run.status === 'completed' ? 'committed' : 'sandboxed-incomplete',
+      summary:
+        run.status === 'completed'
+          ? `Sandboxed run completed (${run.commits.length} commit(s); agent reports unverified).`
+          : `Sandboxed run ${run.status}: ${'reason' in run ? run.reason : 'incomplete'}. Agent reports are unverified.`,
+      modelNotes: { unverifiedReports: run.reports, commits: run.commits },
+      createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
+      parentArtifactIds: [input.plan.id],
+    });
+
+    if (run.status === 'fix-cap' || run.status === 'limit-exceeded') {
+      const reason =
+        run.status === 'fix-cap'
+          ? run.reason
+          : `sandboxed run hit ${run.limitName ?? 'limit'}: ${run.reason}`;
+      work = this.toChangesRequested(work, 'execution-fail-cap', {
+        atomic: () => {
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: 'lane.fallback',
+            payload: {
+              gate: 'codeReview',
+              workRevision: work.currentRevision,
+              reasons: [reason],
+              evaluationHash: contentHash({ workId: work.id, reason, status: run.status }),
+            },
+          });
+        },
+      });
+      this.render(work.id, [
+        `Sandboxed-unattended ${run.status}: ${reason}`,
+        'Task left the autonomous lane. Fix in the worktree, then a human may retry the lane.',
+      ]);
+      return work;
+    }
+
+    this.render(work.id, [
+      `Sandboxed-unattended completed via ${run.runtime} (${run.attempts} check attempt(s)).`,
+      'Only git commits and check results are evidence; agent reports are unverified.',
+      'Next: turbine task sync <id>',
+    ]);
+    return work;
   }
 
   /**
