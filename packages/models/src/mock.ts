@@ -12,8 +12,31 @@ function short(text: string, max = 72): string {
   return t.length <= max ? t : `${t.slice(0, max - 1)}…`;
 }
 
+/** Parse `- R1: …` lines; keep continuation lines until the next R-item or a `##` / JSON boundary. */
 function parseRequestItems(prompt: string): Array<{ id: string; text: string }> {
-  return [...prompt.matchAll(/^- (R\d+): (.+)$/gm)].map((m) => ({ id: m[1]!, text: m[2]!.trim() }));
+  const items: Array<{ id: string; text: string }> = [];
+  let cur: { id: string; text: string } | null = null;
+  const flush = () => {
+    if (cur) items.push({ id: cur.id, text: cur.text.trim() });
+    cur = null;
+  };
+  for (const line of prompt.split('\n')) {
+    const start = line.match(/^- (R\d+): (.*)$/);
+    if (start) {
+      flush();
+      cur = { id: start[1]!, text: start[2]! };
+      continue;
+    }
+    if (!cur) continue;
+    if (/^##\s/.test(line) || /^\s*\{/.test(line) || /^REQUEST ITEMS/i.test(line)) {
+      flush();
+      continue;
+    }
+    if (!line.trim()) continue;
+    cur.text += `\n${line}`;
+  }
+  flush();
+  return items;
 }
 
 /** Prefer JSON `sourceText` from the spec-writer context; fall back to `## REQUEST`. */
@@ -85,8 +108,9 @@ function mockSpecification(prompt: string) {
   const title = requestTitle(body, rawItems);
   const usable = rawItems.filter((i) => i.text && !/^\(No body provided\)$/i.test(i.text));
   const seeds = usable.length ? usable : [{ id: 'R1', text: title }];
+  const retained = seeds.slice(0, 8);
 
-  const requirements = seeds.slice(0, 8).map((item, i) => ({
+  const requirements = retained.map((item, i) => ({
     id: `FR-${String(i + 1).padStart(3, '0')}`,
     priority: i < 2 ? ('P0' as const) : ('P1' as const),
     kind: 'behavioral' as const,
@@ -103,14 +127,19 @@ function mockSpecification(prompt: string) {
     });
   }
 
-  const frBySeed = new Map(seeds.map((s, i) => [s.id, `FR-${String(i + 1).padStart(3, '0')}`]));
+  // Only map seeds that produced a real FR — overflow items are explicit non-goals, never ghost IDs.
+  const frBySeed = new Map(retained.map((s, i) => [s.id, `FR-${String(i + 1).padStart(3, '0')}`]));
   const coverageSource = rawItems.length ? rawItems : seeds;
   const requestCoverage = coverageSource.map((item) => {
     if (/^\(No body provided\)$/i.test(item.text)) {
       return { itemId: item.id, requirementIds: [] as string[], nonGoal: 'Empty request body — title used as the requirement seed' };
     }
     const fr = frBySeed.get(item.id);
-    return { itemId: item.id, requirementIds: fr ? [fr] : [requirements[0]!.id] };
+    if (fr) return { itemId: item.id, requirementIds: [fr] };
+    if (seeds.some((s) => s.id === item.id)) {
+      return { itemId: item.id, requirementIds: [] as string[], nonGoal: 'Beyond mock FR cap (8) — review and promote if needed' };
+    }
+    return { itemId: item.id, requirementIds: requirements[0] ? [requirements[0].id] : [] };
   });
 
   const lead = seeds[0]?.text ?? title;

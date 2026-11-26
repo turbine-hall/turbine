@@ -146,10 +146,16 @@ export function parseDecision(markdown: string): { approved: boolean | null } {
   return { approved: raw === 'yes' ? true : raw === 'no' ? false : null };
 }
 
+/**
+ * Body of a `## Heading` section. Uses the *last* matching heading so content under
+ * `## Original request` (which may quote user markdown) cannot supply Requirements /
+ * Open questions / Context / Non-goals.
+ */
 export function sectionBody(markdown: string, heading: string): string {
-  const re = new RegExp(`^##\\s+${heading}[^\\n]*$`, 'im');
-  const match = re.exec(markdown);
-  if (!match) return '';
+  const re = new RegExp(`^##\\s+${heading}[^\\n]*$`, 'gim');
+  const matches = [...markdown.matchAll(re)];
+  const match = matches[matches.length - 1];
+  if (!match || match.index === undefined) return '';
   const rest = markdown.slice(match.index + match[0].length);
   const next = rest.search(/^##\s+/m);
   return (next === -1 ? rest : rest.slice(0, next)).trim();

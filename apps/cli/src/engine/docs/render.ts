@@ -254,6 +254,12 @@ function requirementLine(r: AcceptanceCriterion): string {
   return `- **${r.id}** (${r.priority ?? 'P1'}, ${r.kind}): ${r.statement}`;
 }
 
+/** Neutralize ATX headings in the embedded request so they cannot match sectionBody(^## ). */
+function renderOriginalRequestBody(text: string): string {
+  const raw = text.trim().slice(0, 4000) || '_None_';
+  return raw.replace(/^(\s{0,3})(#{1,6}\s)/gm, '$1\\$2');
+}
+
 export function renderSpec(d: PacketData): string {
   const cap = LIST_CAP[d.track];
   const w = d.work;
@@ -270,7 +276,7 @@ export function renderSpec(d: PacketData): string {
   lines.push(
     '## Original request',
     '',
-    d.sourceText.trim().slice(0, 4000) || '_None_',
+    renderOriginalRequestBody(d.sourceText),
     '',
     `## Requirements (${reqs.length})`,
     '',

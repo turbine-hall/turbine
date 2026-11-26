@@ -55,7 +55,8 @@ const EMPTY_REQUEST_BODY = /^\(No body provided\)$/i;
 /**
  * Number every bullet / numbered line of the request (R1…Rn) so the spec writer must account
  * for each one, and analysis can flag anything silently dropped.
- * Falls back to sentences, then the `# Title` heading, so title-only tasks still get coverage.
+ * Continuation lines (constraints under a bullet) stay on the same item until the next bullet
+ * or a markdown heading. Falls back to sentences, then the `# Title` heading.
  */
 export function extractRequestItems(text: string): RequestItem[] {
   const items: RequestItem[] = [];
@@ -63,10 +64,32 @@ export function extractRequestItems(text: string): RequestItem[] {
     const t = raw.replace(/[*_`]/g, '').trim();
     if (t.length > 3 && !EMPTY_REQUEST_BODY.test(t)) items.push({ id: `R${items.length + 1}`, text: raw.trim() });
   };
+
+  let current: string | null = null;
+  const flush = () => {
+    if (current != null) {
+      push(current);
+      current = null;
+    }
+  };
   for (const line of text.split('\n')) {
-    const m = line.match(/^\s*(?:[*\-•]|\d+[.)])\s+(.+?)\s*$/);
-    if (m) push(m[1]!);
+    const bullet = line.match(/^\s*(?:[*\-•]|\d+[.)])\s+(.+?)\s*$/);
+    if (bullet) {
+      flush();
+      current = bullet[1]!.trimEnd();
+      continue;
+    }
+    if (current == null) continue;
+    // Heading ends the open list item (new section / title).
+    if (/^\s{0,3}#{1,6}\s/.test(line)) {
+      flush();
+      continue;
+    }
+    if (!line.trim()) continue;
+    current += `\n${line.trimEnd()}`;
   }
+  flush();
+
   if (!items.length) {
     for (const sentence of text
       .replace(/^#.*$/gm, '')
