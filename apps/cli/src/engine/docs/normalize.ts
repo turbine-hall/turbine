@@ -50,20 +50,35 @@ export type NormalizedSpec = {
   requestCoverage: RequestCoverage[];
 };
 
+const EMPTY_REQUEST_BODY = /^\(No body provided\)$/i;
+
 /**
  * Number every bullet / numbered line of the request (R1…Rn) so the spec writer must account
  * for each one, and analysis can flag anything silently dropped.
+ * Falls back to sentences, then the `# Title` heading, so title-only tasks still get coverage.
  */
 export function extractRequestItems(text: string): RequestItem[] {
   const items: RequestItem[] = [];
+  const push = (raw: string) => {
+    const t = raw.replace(/[*_`]/g, '').trim();
+    if (t.length > 3 && !EMPTY_REQUEST_BODY.test(t)) items.push({ id: `R${items.length + 1}`, text: raw.trim() });
+  };
   for (const line of text.split('\n')) {
     const m = line.match(/^\s*(?:[*\-•]|\d+[.)])\s+(.+?)\s*$/);
-    if (m && m[1]!.replace(/[*_`]/g, '').trim().length > 3) items.push({ id: `R${items.length + 1}`, text: m[1]!.trim() });
+    if (m) push(m[1]!);
   }
   if (!items.length) {
-    for (const sentence of text.replace(/^#.*$/gm, '').split(/(?<=[.!?])\s+/).map((x) => x.trim()).filter((x) => x.length > 12)) {
-      items.push({ id: `R${items.length + 1}`, text: sentence });
+    for (const sentence of text
+      .replace(/^#.*$/gm, '')
+      .split(/(?<=[.!?])\s+/)
+      .map((x) => x.trim())
+      .filter((x) => x.length > 12)) {
+      push(sentence);
     }
+  }
+  if (!items.length) {
+    const title = text.match(/^#\s+(.+)$/m)?.[1]?.trim();
+    if (title) push(title);
   }
   return items.slice(0, 40);
 }

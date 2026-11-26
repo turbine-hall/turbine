@@ -236,6 +236,7 @@ function requirementLine(r: AcceptanceCriterion): string {
 export function renderSpec(d: PacketData): string {
   const cap = LIST_CAP[d.track];
   const w = d.work;
+  const reqs = w.acceptanceCriteria;
   const lines = [
     `# Spec — ${w.title}`,
     '',
@@ -243,13 +244,19 @@ export function renderSpec(d: PacketData): string {
     '',
   ];
   if (d.spec?.data.summary) lines.push(`> ${d.spec.data.summary}`, '');
+
+  // Task-specific content first: what was asked, then the FR list a developer reads to build.
   lines.push(
-    '## Requirements',
+    '## Original request',
+    '',
+    d.sourceText.trim().slice(0, 4000) || '_None_',
+    '',
+    `## Requirements (${reqs.length})`,
     '',
     '_P0 = must work to accept · P1 = should · P2 = nice to have. Edit lines in this format, then run `turbine task sync`:_',
     '_`- **FR-001** (P0, behavioral): WHEN … THE SYSTEM SHALL …`_',
     '',
-    ...(w.acceptanceCriteria.length ? w.acceptanceCriteria.map(requirementLine) : ['- _None yet_']),
+    ...(reqs.length ? reqs.map(requirementLine) : ['- _None yet_']),
     '',
     '## Open questions',
     '',
@@ -258,27 +265,38 @@ export function renderSpec(d: PacketData): string {
     lines.push('_These block approval. Answer by appending `→ Answer: …` to the line, then `turbine task sync`._', '');
     w.unknowns.forEach((q, i) => lines.push(`- **Q${i + 1}**: ${q}`));
   } else lines.push('- _None_');
-  lines.push('', '## Context', '');
-  const factLines = capped(d.facts, cap, (f) => `- ✅ Verified — ${f.text} _(${f.source})_`, 'see evidence/assessment.json');
-  const assumptionLines = w.assumptions.map((a) => (a.startsWith('Decided: ') ? `- 🟡 Decided — ${a.slice(9)}` : `- 🟡 Assumption — ${a}`));
-  lines.push(...(factLines.length || assumptionLines.length ? [...factLines, ...assumptionLines] : ['- _None_']));
-  lines.push('', '## Non-goals', '', ...(w.nonGoals.length ? w.nonGoals.map((n) => `- ${n}`) : ['- _None_']));
+
   const items = d.spec?.data.requestItems ?? [];
   if (items.length) {
     const cov = new Map((d.spec?.data.requestCoverage ?? []).map((c) => [c.itemId, c]));
-    const ids = new Set(w.acceptanceCriteria.map((r) => r.id));
+    const ids = new Set(reqs.map((r) => r.id));
     lines.push('', '## Request coverage', '', '_Every line of the original request, and where it went. ⚠️ = dropped._', '', '| # | Request item | Covered by |', '|---|---|---|');
     for (const it of items) {
       const c = cov.get(it.id);
-      const reqs = (c?.requirementIds ?? []).filter((x) => ids.has(x));
-      const where = reqs.length ? reqs.join(', ') : c?.nonGoal ? `non-goal: ${esc(c.nonGoal)}` : c?.question ? `question: ${esc(c.question)}` : '⚠️ **not covered**';
+      const mapped = (c?.requirementIds ?? []).filter((x) => ids.has(x));
+      const where = mapped.length ? mapped.join(', ') : c?.nonGoal ? `non-goal: ${esc(c.nonGoal)}` : c?.question ? `question: ${esc(c.question)}` : '⚠️ **not covered**';
       lines.push(`| ${it.id} | ${esc(it.text.length > 110 ? `${it.text.slice(0, 107)}…` : it.text)} | ${where} |`);
     }
   }
+
+  lines.push('', '## Non-goals', '', ...(w.nonGoals.length ? w.nonGoals.map((n) => `- ${n}`) : ['- _None_']));
+
   if (d.track !== 'trivial' && d.spec) {
     const flow = userFlowDiagram(d.spec.data.userFlow);
     if (flow) lines.push('', '## User flow', '', flow);
   }
+
+  // Project facts / assumptions are often generic; keep the heading for lint/parse, fold the list.
+  const factLines = capped(d.facts, cap, (f) => `- ✅ Verified — ${f.text} _(${f.source})_`, 'see evidence/assessment.json');
+  const assumptionLines = w.assumptions.map((a) => (a.startsWith('Decided: ') ? `- 🟡 Decided — ${a.slice(9)}` : `- 🟡 Assumption — ${a}`));
+  const contextBody = factLines.length || assumptionLines.length ? [...factLines, ...assumptionLines] : ['- _None_'];
+  lines.push('', '## Context', '', '_Project facts and assumptions (often shared across tasks)._', '');
+  if (contextBody.length > 4) {
+    lines.push('<details><summary>Verified facts & assumptions</summary>', '', ...contextBody, '', '</details>');
+  } else {
+    lines.push(...contextBody);
+  }
+
   if (d.plan) {
     const p = d.plan.data;
     lines.push('', '## Plan', '');
@@ -314,7 +332,6 @@ export function renderSpec(d: PacketData): string {
     decisionFor(d.decisions, 'requirements', 'Requirements', d.spec?.hash),
   );
   if (d.plan) lines.push('', decisionFor(d.decisions, 'plan', 'Plan', d.plan.hash));
-  lines.push('', '<details><summary>Original request</summary>', '', d.sourceText.trim().slice(0, 4000), '', '</details>');
   return lines.join('\n');
 }
 

@@ -1,5 +1,135 @@
 import type { ModelAdapter } from './types.js';
 
+/** Pull the `## NAME` block from a skill prompt (until the next `## ` heading). */
+function promptSection(prompt: string, name: string): string {
+  const parts = prompt.split(`## ${name}`);
+  if (parts.length < 2) return '';
+  return parts[1]!.split(/\n## /)[0] ?? '';
+}
+
+function short(text: string, max = 72): string {
+  const t = text.replace(/\s+/g, ' ').trim();
+  return t.length <= max ? t : `${t.slice(0, max - 1)}…`;
+}
+
+function parseRequestItems(prompt: string): Array<{ id: string; text: string }> {
+  return [...prompt.matchAll(/^- (R\d+): (.+)$/gm)].map((m) => ({ id: m[1]!, text: m[2]!.trim() }));
+}
+
+/** Prefer JSON `sourceText` from the spec-writer context; fall back to `## REQUEST`. */
+function requestBody(prompt: string): string {
+  const jsonHit = /"sourceText"\s*:\s*"((?:\\.|[^"\\])*)"/.exec(prompt);
+  if (jsonHit) {
+    try {
+      return JSON.parse(`"${jsonHit[1]}"`) as string;
+    } catch {
+      /* ignore malformed escape sequences from truncated prompts */
+    }
+  }
+  return promptSection(prompt, 'REQUEST').trim();
+}
+
+function requestTitle(body: string, items: Array<{ text: string }>): string {
+  const heading = body.match(/^#\s+(.+)$/m)?.[1]?.trim();
+  if (heading) return heading;
+  if (items[0]?.text) return short(items[0].text, 80);
+  const line = body
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l && !l.startsWith('#') && !/^\(No body provided\)$/i.test(l));
+  return line ? short(line, 80) : 'the requested change';
+}
+
+function earsFrom(text: string): string {
+  const t = text.replace(/\s+/g, ' ').trim().replace(/\.$/, '');
+  if (/^(WHEN|IF|THE SYSTEM SHALL)\b/i.test(t)) return t;
+  return `WHEN “${short(t, 100)}” is requested THE SYSTEM SHALL deliver that outcome in an observable way`;
+}
+
+function mockAssessment(prompt: string) {
+  const requestOnly = promptSection(prompt, 'REQUEST').toLowerCase() || prompt.toLowerCase();
+  const body = requestBody(prompt) || promptSection(prompt, 'REQUEST');
+  const items = parseRequestItems(prompt);
+  const title = requestTitle(body, items);
+  const seeds = (items.length ? items.map((i) => i.text) : [title]).filter(
+    (t) => t && !/^\(No body provided\)$/i.test(t),
+  );
+  const proposed = (seeds.length ? seeds : [title]).slice(0, 6).map((text, i) => ({
+    id: `ac_${i + 1}`,
+    statement: earsFrom(text),
+    kind: 'behavioral' as const,
+    priority: i === 0 ? ('P0' as const) : ('P1' as const),
+  }));
+  if (proposed.length === 1) {
+    proposed.push({
+      id: 'ac_2',
+      statement: `IF input for “${short(title, 60)}” is invalid THEN THE SYSTEM SHALL refuse it with an error message`,
+      kind: 'behavioral',
+      priority: 'P1',
+    });
+  }
+  return {
+    readiness: 'needs_clarification_or_ready',
+    facts: [{ text: `Request received: ${short(title, 100)}`, source: 'request' }],
+    assumptions: ['Existing authentication middleware remains unchanged unless specified'],
+    unknowns: requestOnly.includes('auth') ? [] : ['Who is authorized to perform this action?'],
+    proposedAcceptanceCriteria: proposed,
+    nonGoals: ['Unrelated refactors'],
+    riskHints: requestOnly.includes('auth') || requestOnly.includes('permission') ? ['auth-permissions'] : [],
+  };
+}
+
+function mockSpecification(prompt: string) {
+  const rawItems = parseRequestItems(prompt);
+  const body = requestBody(prompt);
+  const title = requestTitle(body, rawItems);
+  const usable = rawItems.filter((i) => i.text && !/^\(No body provided\)$/i.test(i.text));
+  const seeds = usable.length ? usable : [{ id: 'R1', text: title }];
+
+  const requirements = seeds.slice(0, 8).map((item, i) => ({
+    id: `FR-${String(i + 1).padStart(3, '0')}`,
+    priority: i < 2 ? ('P0' as const) : ('P1' as const),
+    kind: 'behavioral' as const,
+    statement: earsFrom(item.text),
+    status: 'proposed' as const,
+  }));
+  if (requirements.length === 1) {
+    requirements.push({
+      id: 'FR-002',
+      priority: 'P1',
+      kind: 'behavioral',
+      statement: `IF input for “${short(title, 60)}” is invalid THEN THE SYSTEM SHALL refuse it with an error message`,
+      status: 'proposed',
+    });
+  }
+
+  const frBySeed = new Map(seeds.map((s, i) => [s.id, `FR-${String(i + 1).padStart(3, '0')}`]));
+  const coverageSource = rawItems.length ? rawItems : seeds;
+  const requestCoverage = coverageSource.map((item) => {
+    if (/^\(No body provided\)$/i.test(item.text)) {
+      return { itemId: item.id, requirementIds: [] as string[], nonGoal: 'Empty request body — title used as the requirement seed' };
+    }
+    const fr = frBySeed.get(item.id);
+    return { itemId: item.id, requirementIds: fr ? [fr] : [requirements[0]!.id] };
+  });
+
+  const lead = seeds[0]?.text ?? title;
+  return {
+    summary: `Deliver “${short(title, 80)}”: ${short(seeds.map((s) => s.text).join('; '), 160)}.`,
+    requirements,
+    nonGoals: ['Drive-by refactors'],
+    userFlow: {
+      steps: [
+        { from: 'User', to: 'App', message: `requests: ${short(title, 48)}` },
+        { from: 'App', to: 'API', message: `handles: ${short(lead, 48)}` },
+        { from: 'App', to: 'User', message: 'shows the observable result' },
+      ],
+    },
+    testIntent: requirements.slice(0, 4).map((r) => `Cover ${r.id}`),
+    requestCoverage,
+  };
+}
+
 export function createMockModelAdapter(id = 'mock-default'): ModelAdapter {
   return {
     id,
@@ -19,33 +149,8 @@ export function createMockModelAdapter(id = 'mock-default'): ModelAdapter {
         };
       }
       if (request.schemaId === 'assessment' || request.skillIds.includes('core/assess-requirements')) {
-        // Decide only from the request itself, not the skill text around it.
-        const requestOnly = (request.prompt.split('## REQUEST')[1] ?? request.prompt).split('\n## ')[0]!.toLowerCase();
         return {
-          content: {
-            readiness: 'needs_clarification_or_ready',
-            facts: [{ text: 'Request received and normalized', source: 'request' }],
-            assumptions: ['Existing authentication middleware remains unchanged unless specified'],
-            unknowns: requestOnly.includes('auth')
-              ? []
-              : ['Who is authorized to perform this action?'],
-            proposedAcceptanceCriteria: [
-              {
-                id: 'ac_1',
-                statement: 'The described behavior is observable via API or UI as specified',
-                kind: 'behavioral',
-              },
-              {
-                id: 'ac_2',
-                statement: 'Unauthorized callers receive an appropriate error response',
-                kind: 'behavioral',
-              },
-            ],
-            nonGoals: ['Unrelated refactors'],
-            riskHints: requestOnly.includes('auth') || requestOnly.includes('permission')
-              ? ['auth-permissions']
-              : [],
-          },
+          content: mockAssessment(request.prompt),
           usage: { inputTokens: 100, outputTokens: 200 },
           providerRequestId: `mock_${Date.now()}`,
         };
@@ -53,35 +158,7 @@ export function createMockModelAdapter(id = 'mock-default'): ModelAdapter {
 
       if (request.schemaId === 'specification' || request.skillIds.includes('core/write-specification')) {
         return {
-          content: {
-            summary: 'Users get the requested behaviour; invalid input is refused.',
-            requirements: [
-              {
-                id: 'FR-001',
-                priority: 'P0',
-                kind: 'behavioral',
-                statement: 'WHEN a user performs the requested action THE SYSTEM SHALL complete it and show the result',
-                status: 'proposed',
-              },
-              {
-                id: 'FR-002',
-                priority: 'P1',
-                kind: 'behavioral',
-                statement: 'IF the input is invalid THEN THE SYSTEM SHALL refuse it with an error message',
-                status: 'proposed',
-              },
-            ],
-            nonGoals: ['Drive-by refactors'],
-            userFlow: {
-              steps: [
-                { from: 'User', to: 'App', message: 'requests the action' },
-                { from: 'App', to: 'API', message: 'checks permission and performs it' },
-                { from: 'App', to: 'User', message: 'shows the result' },
-              ],
-            },
-            testIntent: ['Unit tests for core logic', 'Negative test for unauthorised access'],
-            requestCoverage: [...request.prompt.matchAll(/^- (R\d+): /gm)].map((m) => ({ itemId: m[1], requirementIds: ['FR-001'] })),
-          },
+          content: mockSpecification(request.prompt),
           usage: { inputTokens: 120, outputTokens: 260 },
           providerRequestId: `mock_${Date.now()}`,
         };
