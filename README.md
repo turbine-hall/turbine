@@ -14,13 +14,14 @@
 
 <p align="center">
   <a href="https://github.com/turbine-hall/turbine/actions/workflows/ci.yml"><img src="https://github.com/turbine-hall/turbine/actions/workflows/ci.yml/badge.svg" alt="CI status" /></a>
-  <img src="https://img.shields.io/badge/version-0.5.0-blue" alt="Version 0.5.0" />
+  <img src="https://img.shields.io/badge/version-0.5.2-blue" alt="Version 0.5.2" />
   <img src="https://img.shields.io/badge/node-22.13%E2%80%9322%20%7C%2024.x%20%7C%20%E2%89%A526-brightgreen" alt="Node.js 22.13–22.x, 24.x, or ≥26 (not 23 or 25)" />
   <img src="https://img.shields.io/badge/TypeScript-strict-3178c6" alt="TypeScript" />
   <a href="https://github.com/turbine-hall/turbine/stargazers"><img src="https://img.shields.io/github/stars/turbine-hall/turbine?style=social" alt="GitHub stars" /></a>
 </p>
 
 <p align="center">
+  <a href="#autonomous-lane-and-sandbox">Lane &amp; sandbox</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#who-is-turbine-for">Who it's for</a> ·
@@ -44,6 +45,21 @@ AI coding tools are great at writing code, but they don't give you *process*: un
 - **Right-sized AI roles.** 16 specialist roles (architect, security reviewer, API SQA, and so on) are picked per task based on risk, so a typo fix doesn't pay for a security audit and a file-upload feature doesn't skip one.
 
 > Turbine is not a replacement for Scrum or Kanban. Those decide *what* to build next. Turbine governs *how* a single work item gets built, reviewed and verified by humans and AI.
+
+---
+
+## Autonomous lane and sandbox
+
+Two optional capabilities — both fail-closed, both off by default:
+
+| Feature | In plain terms |
+|---|---|
+| **Autonomous lane** | For *low-risk* work, a human-approved **policy** can pass gates without typing each approval. Two AI reviewers must agree, and the PR lands through GitHub’s merge queue. Anything unclear drops back to a human. |
+| **Sandboxed execution** | Set `execution.mode: sandboxed-unattended` and Turbine can run Claude Code or Codex **inside Docker/Podman**, with tight mounts and separate networks for installs vs. the model proxy. No container runtime → it refuses to start (it will not fall back to an open host run). |
+
+Default behaviour is unchanged: humans still approve requirements, plan, review and acceptance unless you opt into the lane, and `turbine task execute` stays manual-supervised unless you turn on the sandbox.
+
+More detail, config pointers and known gaps: **[docs/autonomous-lane-and-sandbox.md](docs/autonomous-lane-and-sandbox.md)**.
 
 ---
 
@@ -306,13 +322,13 @@ examples/            Plain-text, Jira and backend API sample tasks
 
 ## Project status and roadmap
 
-Turbine is at **v0.5**, a working baseline for pilot use on real projects. Phases 0–6 (scaffold, contracts, workflow/EEC/ARSP, skills, planning + Jira read, executor + review, verify + accept) and hardening phases 1–4 (gate integrity, real evidence, packet doc standard, risk selection and lineage) are implemented and tested. Full details are in [Implementation status](docs/IMPLEMENTATION_STATUS.md).
+Turbine is at **v0.5.2**, a working baseline for pilot use on real projects. Phases 0–6, hardening phases 1–4, repository context / OKF knowledge, and the autonomous lane (policies, dual review, PR landing, metrics, sandboxed unattended execution) are implemented and tested. Full details are in [Implementation status](docs/IMPLEMENTATION_STATUS.md); a shorter narrative is in [Autonomous lane and sandboxed execution](docs/autonomous-lane-and-sandbox.md).
 
 **Known limitations, stated plainly:**
 
 - Local approvals are local attestations, not authenticated identity. For code review and acceptance, `humanGates.requirePrApproval: true` adds a GitHub PR approval that an agent account cannot grant itself.
-- The worktree isolates changes, but it is not a security sandbox.
-- Jira write-back, GitHub PR automation, a web UI and a hosted multi-tenant service are not built yet.
+- A plain git worktree is isolation for changes, not a security sandbox. Use `sandboxed-unattended` (Docker/Podman) when you need container boundaries; that path is single-repo today and still needs your own model-proxy URL.
+- Jira write-back, a web UI and a hosted multi-tenant service are not built yet. Lane PR landing covers create + merge-queue auto-merge for accepted single-repo tasks; fleet scheduling and post-merge revert detection are not.
 - Turbine makes no claims about productivity percentages. Its value is a hypothesis being tested in pilots, and results will be published as they come in.
 
 The binary name (`turbine`) is provisional. The package scope is `@turbine-hall/*`.
@@ -321,6 +337,7 @@ The binary name (`turbine`) is provisional. The package scope is `@turbine-hall/
 
 ## Documentation
 
+- [Autonomous lane and sandboxed execution](docs/autonomous-lane-and-sandbox.md): policy lane, dual review, container sandbox — plain language
 - [Turbine framework specification](docs/TURBINE_FRAMEWORK_v0.5.md): philosophy, lifecycle, EEC, ARSP, roles, governance
 - [Turbine Hall app requirements](docs/TURBINE_HALL_REQUIREMENTS_v0.5.md)
 - [Implementation status](docs/IMPLEMENTATION_STATUS.md)
