@@ -6,6 +6,7 @@ import {
   listFleetLockedWorkIds,
   readFleetLock,
   releaseFleetLock,
+  renewFleetLock,
   type FleetLockBody,
 } from './fleet-lock.js';
 import { DEFAULT_USD_PER_MILLION_TOKENS, measureFleetSpend, type FleetSpend } from './fleet-spend.js';
@@ -20,6 +21,8 @@ const HUMAN_WAIT: ReadonlySet<WorkState> = new Set([
 ]);
 
 const TERMINAL: ReadonlySet<WorkState> = new Set(['ACCEPTED', 'CANCELLED']);
+
+const FAILED_STATES: ReadonlySet<WorkState> = new Set(['CHANGES_REQUESTED', 'CANCELLED', 'FAILED']);
 
 export type FleetRunOptions = {
   maxConcurrent: number;
@@ -37,7 +40,7 @@ export type FleetRunOptions = {
 
 export type FleetTaskOutcome = {
   workId: string;
-  kind: 'advanced' | 'waiting-on-human' | 'terminal' | 'error' | 'left-lane';
+  kind: 'advanced' | 'waiting-on-human' | 'terminal' | 'error' | 'left-lane' | 'deferred';
   state?: WorkState;
   detail?: string;
 };
@@ -74,7 +77,10 @@ function policyIsSuspended(engine: Engine, policyName: string | undefined): bool
   if (!policyName) return false;
   const hit = policyStatuses(engine.ctx.store, engine.ctx.projectRoot).policies.find((p) => p.name === policyName);
   if (!hit) throw err('E_INVALID_CONFIG', `fleet --policy ${policyName}: policy not found`);
-  return hit.state === 'suspended';
+  // Pending file edits still honor the approved snapshot's suspension (FR-E4).
+  if (hit.state === 'suspended') return true;
+  if (hit.state === 'pending' && hit.approved?.status === 'suspended') return true;
+  return false;
 }
 
 function leaveLaneForSuspend(engine: Engine, work: WorkPackage, reason: string): void {
@@ -108,7 +114,7 @@ function logReclaim(engine: Engine, workId: string, runId: string): void {
 export function fleetCandidateWorks(engine: Engine): WorkPackage[] {
   return engine.ctx.store
     .listWork()
-    .filter((w) => !TERMINAL.has(w.currentState) && !HUMAN_WAIT.has(w.currentState));
+    .filter((w) => !TERMINAL.has(w.currentState) && !HUMAN_WAIT.has(w.currentState) && w.currentState !== 'FAILED');
 }
 
 /**
@@ -134,6 +140,8 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
   let finished = 0;
   let stoppedReason: FleetRunReport['stoppedReason'] | undefined;
   const active = new Map<string, Promise<void>>();
+  /** Failed or no-progress tasks are not re-selected for the rest of this run. */
+  const deferred = new Set<string>();
 
   const allIds = () => engine.ctx.store.listWork().map((w) => w.id);
   const spendNow = () => measureFleetSpend(engine.ctx.store, allIds(), usdPerMTok);
@@ -141,23 +149,60 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
   const launch = (work: WorkPackage, lock: FleetLockBody) => {
     started += 1;
     const workId = work.id;
+    const beforeState = work.currentState;
     const promise = (async () => {
+      let lostOwnership = false;
+      const renewEveryMs = Math.max(250, Math.floor(leaseMs / 3));
+      const renewTimer = setInterval(() => {
+        const renewed = renewFleetLock({
+          projectRoot: engine.ctx.projectRoot,
+          workId,
+          owner: lock.owner,
+          leaseMs,
+          now,
+        });
+        if (!renewed.ok) lostOwnership = true;
+      }, renewEveryMs);
       try {
         await step(workId);
+        if (lostOwnership) {
+          deferred.add(workId);
+          outcomes.push({
+            workId,
+            kind: 'error',
+            detail: 'lost lock ownership during step',
+          });
+          return;
+        }
         const after = engine.ctx.store.getWork(workId);
         if (policyIsSuspended(engine, opts.policyName)) {
           leaveLaneForSuspend(engine, after, `policy ${opts.policyName} suspended during fleet run ${runId}`);
           outcomes.push({ workId, kind: 'left-lane', state: after.currentState, detail: 'policy suspended' });
         } else if (TERMINAL.has(after.currentState)) {
           outcomes.push({ workId, kind: 'terminal', state: after.currentState });
-        } else if (HUMAN_WAIT.has(after.currentState)) {
-          outcomes.push({ workId, kind: 'waiting-on-human', state: after.currentState });
+        } else if (HUMAN_WAIT.has(after.currentState) || after.currentState === 'FAILED') {
+          if (after.currentState === 'FAILED') deferred.add(workId);
+          outcomes.push({
+            workId,
+            kind: after.currentState === 'FAILED' ? 'error' : 'waiting-on-human',
+            state: after.currentState,
+          });
+        } else if (after.currentState === beforeState) {
+          deferred.add(workId);
+          outcomes.push({
+            workId,
+            kind: 'deferred',
+            state: after.currentState,
+            detail: 'no state progress this step',
+          });
         } else {
           outcomes.push({ workId, kind: 'advanced', state: after.currentState });
         }
       } catch (e) {
+        deferred.add(workId);
         outcomes.push({ workId, kind: 'error', detail: (e as Error).message.split('\n')[0] });
       } finally {
+        clearInterval(renewTimer);
         releaseFleetLock({ projectRoot: engine.ctx.projectRoot, workId, owner: lock.owner });
         active.delete(workId);
         finished += 1;
@@ -166,63 +211,65 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
     active.set(workId, promise);
   };
 
-  for (let iter = 0; iter < maxIterations; iter++) {
-    if (policyIsSuspended(engine, opts.policyName) && active.size === 0) {
-      stoppedReason = started > 0 ? 'policy-suspended' : 'idle';
-      break;
-    }
+  try {
+    for (let iter = 0; iter < maxIterations; iter++) {
+      if (policyIsSuspended(engine, opts.policyName) && active.size === 0) {
+        stoppedReason = started > 0 ? 'policy-suspended' : 'idle';
+        break;
+      }
 
-    let spend = spendNow();
-    if (spend.knownUsd >= opts.budgetUsd && active.size === 0) {
-      stoppedReason = 'budget';
-      break;
-    }
-
-    while (active.size < opts.maxConcurrent) {
-      spend = spendNow();
-      if (spend.knownUsd >= opts.budgetUsd) {
+      let spend = spendNow();
+      if (spend.knownUsd >= opts.budgetUsd && active.size === 0) {
         stoppedReason = 'budget';
         break;
       }
-      if (policyIsSuspended(engine, opts.policyName)) {
-        // Do not start more; let actives finish (FR-E4).
-        stoppedReason = 'policy-suspended';
-        break;
+
+      while (active.size < opts.maxConcurrent) {
+        spend = spendNow();
+        if (spend.knownUsd >= opts.budgetUsd) {
+          stoppedReason = 'budget';
+          break;
+        }
+        if (policyIsSuspended(engine, opts.policyName)) {
+          stoppedReason = 'policy-suspended';
+          break;
+        }
+
+        const candidates = fleetCandidateWorks(engine).filter((w) => !active.has(w.id) && !deferred.has(w.id));
+        let claimed: { work: WorkPackage; lock: FleetLockBody } | undefined;
+        for (const work of candidates) {
+          const acq = acquireFleetLock({
+            projectRoot: engine.ctx.projectRoot,
+            workId: work.id,
+            runId,
+            leaseMs,
+            now,
+          });
+          if (!acq.ok) continue;
+          if (acq.reclaimed) logReclaim(engine, work.id, runId);
+          claimed = { work, lock: acq.lock };
+          break;
+        }
+        if (!claimed) break;
+        launch(claimed.work, claimed.lock);
       }
 
-      const candidates = fleetCandidateWorks(engine).filter((w) => !active.has(w.id));
-      let claimed: { work: WorkPackage; lock: FleetLockBody } | undefined;
-      for (const work of candidates) {
-        const acq = acquireFleetLock({
-          projectRoot: engine.ctx.projectRoot,
-          workId: work.id,
-          runId,
-          leaseMs,
-          now,
-        });
-        if (!acq.ok) continue;
-        if (acq.reclaimed) logReclaim(engine, work.id, runId);
-        claimed = { work, lock: acq.lock };
-        break;
+      if (active.size > 0) {
+        await Promise.race([...active.values()]);
+        continue;
       }
-      if (!claimed) break;
-      launch(claimed.work, claimed.lock);
+
+      if (stoppedReason === 'budget' || stoppedReason === 'policy-suspended') break;
+
+      // Idle: no claimable candidates left (all deferred, held, or waiting).
+      stoppedReason = 'idle';
+      break;
     }
-
+  } finally {
+    // Drain actives before propagating scheduler errors (store close / corrupt lock).
     if (active.size > 0) {
-      await Promise.race([...active.values()]);
-      continue;
+      await Promise.allSettled([...active.values()]);
     }
-
-    if (stoppedReason === 'budget' || stoppedReason === 'policy-suspended') break;
-
-    // Idle: no ready candidates, or remaining candidates are held by other owners.
-    stoppedReason = 'idle';
-    break;
-  }
-
-  if (active.size > 0) {
-    await Promise.allSettled([...active.values()]);
   }
 
   if (!stoppedReason) stoppedReason = 'max-iterations';
@@ -251,10 +298,14 @@ export function fleetStatus(engine: Engine, now: () => Date = () => new Date()):
     }
   }
   const waitingOnHumanWorkIds = works.filter((w) => HUMAN_WAIT.has(w.currentState)).map((w) => w.id);
-  const failedWorkIds = works
-    .filter((w) => w.currentState === 'CHANGES_REQUESTED' || w.currentState === 'CANCELLED')
-    .map((w) => w.id);
-  const mergedWorkIds = works.filter((w) => w.currentState === 'ACCEPTED').map((w) => w.id);
+  const failedWorkIds = works.filter((w) => FAILED_STATES.has(w.currentState)).map((w) => w.id);
+  const mergedIds = new Set(
+    engine.ctx.store
+      .listLaneMergeRecords()
+      .filter((r) => r.mergeState === 'merged')
+      .map((r) => r.workId),
+  );
+  const mergedWorkIds = works.filter((w) => mergedIds.has(w.id)).map((w) => w.id);
   return {
     running: runningWorkIds.length,
     waitingOnHuman: waitingOnHumanWorkIds.length,

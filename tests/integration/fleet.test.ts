@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import { createId } from '../../packages/contracts/dist/index.js';
 import { Engine } from '../../apps/cli/src/engine/engine.js';
 import { openContext } from '../../apps/cli/src/engine/project.js';
 import {
@@ -9,12 +10,13 @@ import {
   fleetLockPath,
   readFleetLock,
   releaseFleetLock,
+  renewFleetLock,
 } from '../../apps/cli/src/engine/fleet-lock.js';
 import { measureFleetSpend } from '../../apps/cli/src/engine/fleet-spend.js';
 import { fleetStatus, runFleet } from '../../apps/cli/src/engine/fleet.js';
 import { suspendPolicy } from '../../apps/cli/src/engine/lane-policy.js';
 import { cleanup, tempProject } from './fixture.js';
-import { laneProject } from './lane-fixture.js';
+import { laneProject, writePolicy } from './lane-fixture.js';
 
 const dirs: string[] = [];
 afterEach(() => cleanup(dirs));
@@ -259,10 +261,24 @@ describe('fleet scheduler (Part E / #43)', () => {
     const a = mk('Status A');
     const b = mk('Status B');
     const c = mk('Status C');
+    const d = mk('Status D');
 
     engine.ctx.store.saveWork({ ...engine.ctx.store.getWork(a.id), currentState: 'REQUIREMENTS_REVIEW' });
     engine.ctx.store.saveWork({ ...engine.ctx.store.getWork(b.id), currentState: 'CHANGES_REQUESTED' });
     engine.ctx.store.saveWork({ ...engine.ctx.store.getWork(c.id), currentState: 'ACCEPTED' });
+    engine.ctx.store.saveWork({ ...engine.ctx.store.getWork(d.id), currentState: 'FAILED' });
+    const now = new Date().toISOString();
+    engine.ctx.store.saveLaneMergeRecord({
+      id: createId('merge'),
+      workId: c.id,
+      policyId: null,
+      openedAt: now,
+      mergeState: 'merged',
+      mergedAt: now,
+      mergeSha: 'deadbeef',
+      reverted: 'no',
+      recordedAt: now,
+    });
 
     const lock = acquireFleetLock({
       projectRoot: dir,
@@ -275,12 +291,15 @@ describe('fleet scheduler (Part E / #43)', () => {
     const status = fleetStatus(engine);
     expect(status.running).toBeGreaterThanOrEqual(1);
     expect(status.waitingOnHuman).toBeGreaterThanOrEqual(1);
-    expect(status.failed).toBeGreaterThanOrEqual(1);
-    expect(status.merged).toBeGreaterThanOrEqual(1);
+    expect(status.failed).toBeGreaterThanOrEqual(2);
+    expect(status.merged).toBe(1);
     expect(status.runningWorkIds).toContain(a.id);
     expect(status.waitingOnHumanWorkIds).toContain(a.id);
     expect(status.failedWorkIds).toContain(b.id);
+    expect(status.failedWorkIds).toContain(d.id);
     expect(status.mergedWorkIds).toContain(c.id);
+    // ACCEPTED without a merge fact is not counted as merged.
+    expect(status.merged).toBe(status.mergedWorkIds.length);
 
     if (lock.ok) releaseFleetLock({ projectRoot: dir, workId: a.id, owner: lock.lock.owner });
     engine.ctx.store.close();
@@ -294,5 +313,187 @@ describe('fleet scheduler (Part E / #43)', () => {
     expect(status).not.toMatch(/fleet scheduler remain unimplemented/i);
     expect(driver).toMatch(/turbine fleet run/i);
     expect(guide).toMatch(/fleet run/i);
+  });
+
+  it('defers no-progress tasks so another ready task can run', async () => {
+    const dir = tempProject('fleet-defer-', dirs);
+    const engine = new Engine(openContext(dir));
+    const stuck = engine.createTask({
+      title: 'Stuck',
+      file: (() => {
+        const p = join(dir, 'stuck.md');
+        writeFileSync(p, '# Stuck\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    const ready = engine.createTask({
+      title: 'Ready',
+      file: (() => {
+        const p = join(dir, 'ready.md');
+        writeFileSync(p, '# Ready\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    const seen: string[] = [];
+    const report = await runFleet(engine, {
+      maxConcurrent: 1,
+      budgetUsd: 100,
+      step: async (id) => {
+        seen.push(id);
+        // Leave state unchanged → deferred for the rest of the run.
+      },
+      maxIterations: 20,
+    });
+    expect(report.outcomes.some((o) => o.workId === stuck.id && o.kind === 'deferred')).toBe(true);
+    expect(seen).toContain(ready.id);
+    expect(seen.filter((id) => id === stuck.id).length).toBe(1);
+    engine.ctx.store.close();
+  });
+
+  it('renew keeps ownership past the original lease while a step runs', async () => {
+    const dir = tempProject('fleet-renew-', dirs);
+    const { engine } = makeReadyTask(dir, 'Renew lease');
+    let nowMs = Date.parse('2026-06-01T00:00:00.000Z');
+    const now = () => new Date(nowMs);
+    const otherAttempts: boolean[] = [];
+    const report = await runFleet(engine, {
+      maxConcurrent: 1,
+      budgetUsd: 100,
+      leaseMs: 800,
+      now,
+      step: async (id) => {
+        // Advance past the original lease several times; renewals should keep us exclusive.
+        for (let i = 0; i < 4; i++) {
+          nowMs += 500;
+          await new Promise((r) => setTimeout(r, 300));
+          const rival = acquireFleetLock({
+            projectRoot: dir,
+            workId: id,
+            runId: 'rival_run',
+            leaseMs: 800,
+            now,
+          });
+          otherAttempts.push(rival.ok);
+        }
+      },
+      maxIterations: 5,
+    });
+    expect(report.started).toBe(1);
+    expect(otherAttempts.every((ok) => ok === false)).toBe(true);
+    engine.ctx.store.close();
+  });
+
+  it('release after reclaim by another owner does not delete the replacement lock', () => {
+    const dir = tempProject('fleet-release-race-', dirs);
+    const workId = 'work_release_race';
+    let nowMs = Date.parse('2026-07-01T00:00:00.000Z');
+    const now = () => new Date(nowMs);
+    const first = acquireFleetLock({ projectRoot: dir, workId, runId: 'run_a', leaseMs: 500, now });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    nowMs += 1_000;
+    const second = acquireFleetLock({ projectRoot: dir, workId, runId: 'run_b', leaseMs: 5_000, now });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.reclaimed).toBe(true);
+    const staleRelease = releaseFleetLock({ projectRoot: dir, workId, owner: first.lock.owner });
+    expect(staleRelease.released).toBe(false);
+    expect(readFleetLock(dir, workId)?.owner).toBe(second.lock.owner);
+    expect(releaseFleetLock({ projectRoot: dir, workId, owner: second.lock.owner }).released).toBe(true);
+  });
+
+  it('renewFleetLock fails closed when ownership was lost', () => {
+    const dir = tempProject('fleet-renew-lost-', dirs);
+    const workId = 'work_renew_lost';
+    const first = acquireFleetLock({ projectRoot: dir, workId, runId: 'run_a', leaseMs: 60_000 });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(
+      renewFleetLock({
+        projectRoot: dir,
+        workId,
+        owner: 'fleet:other:x',
+        leaseMs: 60_000,
+      }).ok,
+    ).toBe(false);
+    expect(
+      renewFleetLock({
+        projectRoot: dir,
+        workId,
+        owner: first.lock.owner,
+        leaseMs: 60_000,
+      }).ok,
+    ).toBe(true);
+    releaseFleetLock({ projectRoot: dir, workId, owner: first.lock.owner });
+  });
+
+  it('pending policy file still honors approved suspension for fleet', async () => {
+    const { dir, engine } = laneProject(dirs);
+    suspendPolicy(engine.ctx.store, 'routine', 'suspend before edit', 'agent');
+    // Edit YAML so status becomes pending while approved snapshot stays suspended.
+    writePolicy(dir, 'routine', `${readFileSync(join(dir, '.turbine', 'policies', 'routine.yaml'), 'utf8')}\n# edit\n`);
+    const request = join(dir, 'pending-suspend.md');
+    writeFileSync(request, '# Pending suspend\n');
+    engine.createTask({ title: 'Pending suspend', file: request, type: 'maintenance', labels: ['bug'] });
+    const report = await runFleet(engine, {
+      maxConcurrent: 1,
+      budgetUsd: 100,
+      policyName: 'routine',
+      step: async () => {
+        throw new Error('must not start when approved snapshot is suspended');
+      },
+      maxIterations: 5,
+    });
+    expect(report.started).toBe(0);
+    expect(report.stoppedReason).toBe('idle');
+    engine.ctx.store.close();
+  });
+
+  it('drains an in-flight step when the scheduler throws on a later claim', async () => {
+    const dir = tempProject('fleet-drain-', dirs);
+    const engine = new Engine(openContext(dir));
+    const a = engine.createTask({
+      title: 'Drain A',
+      file: (() => {
+        const p = join(dir, 'drain-a.md');
+        writeFileSync(p, '# A\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    const b = engine.createTask({
+      title: 'Drain B',
+      file: (() => {
+        const p = join(dir, 'drain-b.md');
+        writeFileSync(p, '# B\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    let firstId: string | undefined;
+    let firstFinished = false;
+    await expect(
+      runFleet(engine, {
+        maxConcurrent: 2,
+        budgetUsd: 100,
+        step: async (id) => {
+          if (firstId) return;
+          firstId = id;
+          const other = id === a.id ? b.id : a.id;
+          // Corrupt the other lock before yielding so the next acquire throws while we are active.
+          mkdirSync(join(dir, '.turbine', 'fleet', 'locks'), { recursive: true });
+          writeFileSync(fleetLockPath(dir, other), '{not-json');
+          await new Promise((r) => setTimeout(r, 250));
+          firstFinished = true;
+        },
+        maxIterations: 10,
+      }),
+    ).rejects.toThrow(/corrupt|unreadable/i);
+    expect(firstFinished).toBe(true);
+    expect(firstId).toBeTruthy();
+    expect(existsSync(fleetLockPath(dir, firstId!))).toBe(false);
+    engine.ctx.store.close();
   });
 });
