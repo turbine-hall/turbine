@@ -74,13 +74,14 @@ export function userFlowDiagram(steps: FlowStep[]): string | undefined {
   if (steps.length < 2) return undefined;
   const actors = [...new Set(steps.flatMap((s) => [s.from, s.to]))];
   const id = (a: string) => `a${actors.indexOf(a)}`;
-  // Escape Mermaid-significant punctuation (decimal entities) so balance lint stays green
-  // without destroying route/shape meaning such as `GET /users/{id}` or `[]`.
+  // Truncate first, then escape Mermaid-significant punctuation (decimal entities) so
+  // length limits cannot split an entity and route shapes like `{id}` stay meaningful.
   const clean = (s: string, max: number) => {
+    const clipped = s.replace(/\s+/g, ' ').trim().slice(0, max);
     const hash = '\uE000';
     const semi = '\uE001';
     const ent = (n: number) => `${hash}${n}${semi}`;
-    return s
+    return clipped
       .replace(/#/g, ent(35))
       .replace(/;/g, ent(59))
       .replace(/"/g, ent(34))
@@ -92,10 +93,7 @@ export function userFlowDiagram(steps: FlowStep[]): string | undefined {
       .replace(/\{/g, ent(123))
       .replace(/\}/g, ent(125))
       .replace(new RegExp(hash, 'g'), '#')
-      .replace(new RegExp(semi, 'g'), ';')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, max);
+      .replace(new RegExp(semi, 'g'), ';');
   };
   return [
     '```mermaid',

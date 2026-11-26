@@ -375,6 +375,58 @@ describe('fleet scheduler (Part E / #43)', () => {
     expect(guide).toMatch(/fleet run/i);
   });
 
+  it('continues an admitted task past budget and does not admit another', async () => {
+    const dir = tempProject('fleet-continue-budget-', dirs);
+    const engine = new Engine(openContext(dir));
+    const mk = (title: string) => {
+      const request = join(dir, `${title.toLowerCase()}.md`);
+      writeFileSync(request, `# ${title}\n`);
+      return engine.createTask({ title, file: request, type: 'maintenance' });
+    };
+    const a = mk('Continue A');
+    const b = mk('Continue B');
+    const [first, second] = [a, b].sort((x, y) => x.id.localeCompare(y.id));
+    let stepsOnFirst = 0;
+    const report = await runFleet(engine, {
+      maxConcurrent: 1,
+      budgetUsd: 0.5,
+      usdPerMillionTokens: 5,
+      step: async (id) => {
+        if (id !== first.id) throw new Error('second task must not be admitted after budget');
+        stepsOnFirst += 1;
+        if (stepsOnFirst === 1) {
+          engine.addUsage({
+            idOrAlias: id,
+            source: 'agent',
+            agentName: 'cursor',
+            modelId: 'gpt-test',
+            inputTokens: 200_000,
+            outputTokens: 0,
+            method: 'reported',
+            recordedBy: 'tester',
+            enteredBy: 'human',
+          });
+          engine.ctx.store.saveWork({
+            ...engine.ctx.store.getWork(id),
+            currentState: 'PLANNING',
+          });
+        } else {
+          engine.ctx.store.saveWork({
+            ...engine.ctx.store.getWork(id),
+            currentState: 'PLAN_REVIEW',
+          });
+        }
+      },
+      maxIterations: 20,
+    });
+    expect(stepsOnFirst).toBe(2);
+    expect(report.started).toBe(1);
+    expect(report.stoppedReason).toBe('budget');
+    expect(report.outcomes.find((o) => o.workId === first.id)?.kind).toBe('waiting-on-human');
+    expect(report.outcomes.some((o) => o.workId === second.id)).toBe(false);
+    engine.ctx.store.close();
+  });
+
   it('defers no-progress tasks so another ready task can run', async () => {
     const dir = tempProject('fleet-defer-', dirs);
     const engine = new Engine(openContext(dir));

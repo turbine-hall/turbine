@@ -219,7 +219,8 @@ function publishFenceExclusive(fence: string, body: FenceBody): void {
 }
 
 /**
- * Take the shared recover guard for one fence. Recovers a dead recover holder the same way.
+ * Take the shared recover guard for one fence.
+ * Dead-holder takeover uses atomic rename so two recoverers cannot both win.
  * Exported for contention tests.
  */
 export function tryAcquireRecoverGuard(projectRoot: string, workId: string, owner: string): boolean {
@@ -235,26 +236,36 @@ export function tryAcquireRecoverGuard(projectRoot: string, workId: string, owne
   }
   const existing = readFenceFile(recover);
   if (!existing || pidAlive(existing.pid)) return false;
-  // Re-read before unlink so we do not remove a successor's recover guard.
-  const again = readFenceFile(recover);
-  if (!again || again.pid !== existing.pid || again.owner !== existing.owner || pidAlive(again.pid)) {
+  // Atomic rename: only one contender can move the dead guard aside.
+  const tomb = `${recover}.tomb.${process.pid}.${Date.now()}`;
+  try {
+    renameSync(recover, tomb);
+  } catch {
     return false;
   }
-  try {
-    unlinkSync(recover);
-  } catch {
+  const moved = readFenceFile(tomb);
+  if (!moved || moved.pid !== existing.pid || moved.owner !== existing.owner) {
+    // Unexpected content — leave the tomb for an operator; fail closed.
     return false;
   }
   try {
     publishFenceExclusive(recover, body);
-    return true;
   } catch {
+    unlinkQuiet(tomb);
     return false;
   }
+  unlinkQuiet(tomb);
+  return true;
 }
 
-function releaseRecoverGuard(projectRoot: string, workId: string): void {
-  unlinkQuiet(fleetLockRecoverPath(projectRoot, workId));
+/** Remove the recover guard only if we still own it (rule 8). */
+function releaseRecoverGuard(projectRoot: string, workId: string, owner: string): void {
+  const recover = fleetLockRecoverPath(projectRoot, workId);
+  const current = readFenceFile(recover);
+  if (!current || current.owner !== owner || current.pid !== process.pid) return;
+  const again = readFenceFile(recover);
+  if (!again || again.owner !== owner || again.pid !== process.pid) return;
+  unlinkQuiet(recover);
 }
 
 /** Exported for dual-recoverer tests. */
@@ -277,19 +288,27 @@ export function tryAcquireFence(projectRoot: string, workId: string, owner: stri
     if (!again || again.pid !== existing.pid || again.owner !== existing.owner || pidAlive(again.pid)) {
       return false;
     }
+    // Atomic rename of the dead fence — cannot delete a successor published after the check.
+    const tomb = `${fence}.tomb.${process.pid}.${Date.now()}`;
     try {
-      unlinkSync(fence);
+      renameSync(fence, tomb);
     } catch {
+      return false;
+    }
+    const moved = readFenceFile(tomb);
+    if (!moved || moved.pid !== existing.pid || moved.owner !== existing.owner) {
       return false;
     }
     try {
       publishFenceExclusive(fence, body);
-      return true;
     } catch {
+      unlinkQuiet(tomb);
       return false;
     }
+    unlinkQuiet(tomb);
+    return true;
   } finally {
-    releaseRecoverGuard(projectRoot, workId);
+    releaseRecoverGuard(projectRoot, workId, owner);
   }
 }
 

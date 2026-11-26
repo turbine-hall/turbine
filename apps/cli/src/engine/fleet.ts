@@ -157,7 +157,7 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
   const launch = (work: WorkPackage, lock: FleetLockBody) => {
     started += 1;
     const workId = work.id;
-    const beforeState = work.currentState;
+    let beforeState = work.currentState;
     const promise = (async () => {
       // Yield once so active.set below runs before any sync throw from step cleanup.
       await Promise.resolve();
@@ -222,44 +222,53 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
           });
           return;
         }
-        await step(workId);
-        if (renewError) {
-          deferred.add(workId);
-          outcomes.push({ workId, kind: 'error', detail: `lease renew failed: ${renewError}` });
-          return;
-        }
-        if (lostOwnership) {
-          deferred.add(workId);
-          outcomes.push({
-            workId,
-            kind: 'error',
-            detail: 'lost lock ownership during step',
-          });
-          return;
-        }
-        const after = engine.ctx.store.getWork(workId);
-        if (policyIsSuspended(engine, opts.policyName)) {
-          leaveLaneForSuspend(engine, after, `policy ${opts.policyName} suspended during fleet run ${runId}`);
-          outcomes.push({ workId, kind: 'left-lane', state: after.currentState, detail: 'policy suspended' });
-        } else if (TERMINAL.has(after.currentState)) {
-          outcomes.push({ workId, kind: 'terminal', state: after.currentState });
-        } else if (HUMAN_WAIT.has(after.currentState) || after.currentState === 'FAILED') {
-          if (after.currentState === 'FAILED') deferred.add(workId);
-          outcomes.push({
-            workId,
-            kind: after.currentState === 'FAILED' ? 'error' : 'waiting-on-human',
-            state: after.currentState,
-          });
-        } else if (after.currentState === beforeState) {
-          deferred.add(workId);
-          outcomes.push({
-            workId,
-            kind: 'deferred',
-            state: after.currentState,
-            detail: 'no state progress this step',
-          });
-        } else {
-          outcomes.push({ workId, kind: 'advanced', state: after.currentState });
+        // Keep this admitted task until a stopping state. Budget gates new admissions only.
+        for (;;) {
+          await step(workId);
+          if (renewError) {
+            deferred.add(workId);
+            outcomes.push({ workId, kind: 'error', detail: `lease renew failed: ${renewError}` });
+            return;
+          }
+          if (lostOwnership) {
+            deferred.add(workId);
+            outcomes.push({
+              workId,
+              kind: 'error',
+              detail: 'lost lock ownership during step',
+            });
+            return;
+          }
+          const after = engine.ctx.store.getWork(workId);
+          if (policyIsSuspended(engine, opts.policyName)) {
+            leaveLaneForSuspend(engine, after, `policy ${opts.policyName} suspended during fleet run ${runId}`);
+            outcomes.push({ workId, kind: 'left-lane', state: after.currentState, detail: 'policy suspended' });
+            return;
+          }
+          if (TERMINAL.has(after.currentState)) {
+            outcomes.push({ workId, kind: 'terminal', state: after.currentState });
+            return;
+          }
+          if (HUMAN_WAIT.has(after.currentState) || after.currentState === 'FAILED') {
+            if (after.currentState === 'FAILED') deferred.add(workId);
+            outcomes.push({
+              workId,
+              kind: after.currentState === 'FAILED' ? 'error' : 'waiting-on-human',
+              state: after.currentState,
+            });
+            return;
+          }
+          if (after.currentState === beforeState) {
+            deferred.add(workId);
+            outcomes.push({
+              workId,
+              kind: 'deferred',
+              state: after.currentState,
+              detail: 'no state progress this step',
+            });
+            return;
+          }
+          beforeState = after.currentState;
         }
       } catch (e) {
         deferred.add(workId);
