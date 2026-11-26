@@ -226,6 +226,22 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
             });
             return;
           }
+          // Recheck after ownership wait: suspend must not advance another step.
+          if (policyIsSuspended(engine, opts.policyName)) {
+            const current = engine.ctx.store.getWork(workId);
+            leaveLaneForSuspend(
+              engine,
+              current,
+              `policy ${opts.policyName} suspended during fleet run ${runId}`,
+            );
+            outcomes.push({
+              workId,
+              kind: 'left-lane',
+              state: current.currentState,
+              detail: 'policy suspended',
+            });
+            return;
+          }
           await step(workId);
           if (renewError) {
             deferred.add(workId);

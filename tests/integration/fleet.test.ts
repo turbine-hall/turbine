@@ -1,10 +1,11 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createId } from '../../packages/contracts/dist/index.js';
 import { Engine } from '../../apps/cli/src/engine/engine.js';
 import { openContext } from '../../apps/cli/src/engine/project.js';
+import * as fleetLock from '../../apps/cli/src/engine/fleet-lock.js';
 import {
   acquireFleetLock,
   fleetLockPath,
@@ -283,6 +284,51 @@ describe('fleet scheduler (Part E / #43)', () => {
     const fallbacks = engine.ctx.store.listEvents(work.id).filter((e) => e.type === 'lane.fallback');
     expect(fallbacks.length).toBeGreaterThanOrEqual(1);
     engine.ctx.store.close();
+  });
+
+  it('FR-004: suspend during ownership confirm leaves lane without calling step', async () => {
+    const { engine } = laneProject(dirs);
+    const request = join(engine.ctx.projectRoot, 'suspend-before-step.md');
+    writeFileSync(request, '# Suspend before step\n\nSmall chore.\n');
+    const work = engine.createTask({
+      title: 'Suspend before step',
+      file: request,
+      type: 'maintenance',
+      labels: ['bug'],
+    });
+
+    const originalRenew = fleetLock.renewFleetLock;
+    let renewCount = 0;
+    const spy = vi.spyOn(fleetLock, 'renewFleetLock').mockImplementation((input) => {
+      renewCount += 1;
+      if (renewCount === 1) {
+        suspendPolicy(engine.ctx.store, 'routine', 'suspend during ownership confirm', 'agent');
+      }
+      return originalRenew(input);
+    });
+
+    let stepCalls = 0;
+    try {
+      const report = await runFleet(engine, {
+        maxConcurrent: 1,
+        budgetUsd: 100,
+        policyName: 'routine',
+        step: async () => {
+          stepCalls += 1;
+          throw new Error('must not step after suspend during ownership confirm');
+        },
+        maxIterations: 5,
+      });
+
+      expect(stepCalls).toBe(0);
+      expect(report.stoppedReason).toBe('policy-suspended');
+      const left = report.outcomes.find((o) => o.workId === work.id);
+      expect(left?.kind).toBe('left-lane');
+      expect(left?.detail).toBe('policy suspended');
+    } finally {
+      spy.mockRestore();
+      engine.ctx.store.close();
+    }
   });
 
   it('FR-001/FR-007: fleet run drives a ready fixture through one sync step without inventing approvals', async () => {
