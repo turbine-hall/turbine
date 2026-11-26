@@ -53,6 +53,7 @@ export type PacketData = {
   implemented: boolean;
   changeFacts: RepoFacts[];
   review?: ReviewResult;
+  dualReviews?: ReviewResult[];
   runs?: CheckRun[];
   decisions: Decision[];
   gate?: GateDecision;
@@ -63,6 +64,10 @@ export type PacketData = {
   contextFile?: boolean;
   /** Token/model usage from role_runs + usage_records (generated; never hand-edited). */
   usage?: UsageSummary;
+  /** Policy decision id → the human who approved that policy, and when. */
+  policyApprovals?: Record<string, { by: string; on: string }>;
+  /** Set when the task fell back from the autonomous lane to the human flow. */
+  laneFallback?: { gate: string; reasons: string[]; at: string };
 };
 
 function renderUsageSection(usage: UsageSummary | undefined): string[] {
@@ -101,8 +106,8 @@ function latestDecision(decisions: Decision[], gate: Decision['gate']): Decision
     .sort((a, b) => b.decidedAt.localeCompare(a.decidedAt))[0];
 }
 
-function decisionFor(decisions: Decision[], gate: Decision['gate'], label: string, revision?: string): string {
-  const d = latestDecision(decisions, gate);
+function decisionFor(data: PacketData, gate: Decision['gate'], label: string, revision?: string): string {
+  const d = latestDecision(data.decisions, gate);
   const bound = d && revision && !(d.artifactHashes.includes(revision) || d.commitSha === revision) ? undefined : d;
   return [
     `### ${label}`,
@@ -114,6 +119,10 @@ function decisionFor(decisions: Decision[], gate: Decision['gate'], label: strin
       date: bound?.decidedAt.slice(0, 10),
       notes: bound?.rationale && !/^Local attestation/.test(bound.rationale) ? bound.rationale : undefined,
       contentHash: revision,
+      policy:
+        bound?.actorType === 'policy' && bound.policyId
+          ? { name: bound.policyId, approvedBy: data.policyApprovals?.[bound.id]?.by, approvedOn: data.policyApprovals?.[bound.id]?.on }
+          : undefined,
     }),
   ].join('\n');
 }
@@ -185,6 +194,18 @@ export function renderStatus(d: PacketData): string {
     gateFlow(d.work.currentState),
   ];
   if (d.notes.length) lines.push('', '## What just happened', '', ...d.notes.map((n) => `- ${n}`));
+  if (d.laneFallback && d.work.currentState !== 'ACCEPTED') {
+    lines.push(
+      '',
+      '## Autonomous lane: a human decides',
+      '',
+      `At the ${d.laneFallback.gate} gate (${d.laneFallback.at.slice(0, 10)}) no approved lane policy could pass this task:`,
+      '',
+      ...capped(d.laneFallback.reasons, 8, (r) => `- ${esc(r)}`, 'see `turbine task history`'),
+      '',
+      `_The task stays in the human flow. A human may put it back in the lane with \`turbine task lane ${d.work.id} --retry\`._`,
+    );
+  }
   const blocking = d.analysis.filter((a) => a.severity === 'CRITICAL' || a.severity === 'HIGH');
   if (blocking.length) {
     lines.push('', '## Problems to fix', '', '| Severity | Where | Problem |', '|---|---|---|');
@@ -329,7 +350,7 @@ export function renderSpec(d: PacketData): string {
     '',
     DECIDE_HINT,
     '',
-    decisionFor(d.decisions, 'requirements', 'Requirements', d.spec?.hash),
+    decisionFor(d, 'requirements', 'Requirements', d.spec?.hash),
   );
   if (d.plan) lines.push('', decisionFor(d.decisions, 'plan', 'Plan', d.plan.hash));
   return lines.join('\n');
@@ -417,6 +438,32 @@ export function renderReview(d: PacketData, previousChecks: AcceptanceCheck[]): 
       lines.push('', '</details>');
     }
   }
+  const dual = (d.dualReviews ?? []).filter((review) => review.changeSetId === d.changeSetId && review.reviewer);
+  if (dual.length) {
+    lines.push(
+      '',
+      '### Autonomous dual review',
+      '',
+      '_Each reviewer ran every selected lens on this exact change set. These are evidence for a policy decision, not approvals._',
+      '',
+      '| Reviewer 1 | Reviewer 2 |',
+      '|---|---|',
+    );
+    const cells = [0, 1].map((index) => {
+      const review = dual[index];
+      if (!review) return '**Incomplete** — no parseable review was recorded.';
+      const findings = review.findings.length
+        ? review.findings.map((finding) => `${SEVERITY_ICON[finding.severity] ?? finding.severity} ${esc(finding.claim)}`).join('<br>')
+        : 'No kept findings';
+      return [
+        `**${esc(review.reviewer!.profile)}**`,
+        `\`${esc(review.reviewer!.provider)}/${esc(review.reviewer!.model)}\``,
+        review.disposition === 'no-blocking-findings' ? '**No blocking findings**' : '**⚠️ Needs attention**',
+        findings,
+      ].join('<br>');
+    });
+    lines.push(`| ${cells[0]} | ${cells[1]} |`);
+  }
   const codeFindings = d.analysis.filter((a) => a.gate === 'code-review');
   if (codeFindings.length) {
     lines.push('', '**Consistency checks (deterministic):**', '', ...codeFindings.map((a) => `- ${a.severity}: ${a.message}`));
@@ -466,9 +513,9 @@ export function renderReview(d: PacketData, previousChecks: AcceptanceCheck[]): 
     '',
     DECIDE_HINT,
     '',
-    decisionFor(d.decisions, 'code-review', 'Code review', d.changeSetId),
+    decisionFor(d, 'code-review', 'Code review', d.changeSetId),
     '',
-    decisionFor(d.decisions, 'sqa-acceptance', 'Acceptance', d.changeSetId),
+    decisionFor(d, 'sqa-acceptance', 'Acceptance', d.changeSetId),
   );
   if (d.evidenceFiles.length) lines.push('', `Raw evidence: ${d.evidenceFiles.map((f) => `[${f}](evidence/${f})`).join(' · ')}`);
   return lines.join('\n');

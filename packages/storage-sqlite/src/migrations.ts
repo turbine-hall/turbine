@@ -204,4 +204,79 @@ CREATE TABLE IF NOT EXISTS usage_records (
 CREATE INDEX IF NOT EXISTS idx_usage_records_work ON usage_records(work_id);
 `,
   },
+  {
+    version: 9,
+    sql: `
+-- Approved lane policy snapshots. The file in .turbine/policies/ may change; only this approved copy can pass a gate.
+-- "pending" (file drift) is derived by comparing the file's hash with content_hash; it is never stored.
+CREATE TABLE IF NOT EXISTS lane_policies (
+  name TEXT PRIMARY KEY,
+  content_hash TEXT NOT NULL,
+  data TEXT NOT NULL,
+  approved_decision_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('active', 'suspended')),
+  suspended_reason TEXT,
+  updated_at TEXT NOT NULL
+);
+`,
+  },
+  {
+    version: 10,
+    sql: `
+-- Per-lens agreement from completed autonomous dual reviews, retained for later metrics.
+CREATE TABLE IF NOT EXISTS reviewer_agreements (
+  id TEXT PRIMARY KEY,
+  work_id TEXT NOT NULL,
+  change_set_id TEXT NOT NULL,
+  lens TEXT NOT NULL,
+  data TEXT NOT NULL,
+  recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reviewer_agreements_work ON reviewer_agreements(work_id, change_set_id);
+`,
+  },
+  {
+    version: 11,
+    sql: `
+-- Merge facts are deliberately optional until Part C. Absence means unknown, never "not merged".
+CREATE TABLE IF NOT EXISTS lane_merge_records (
+  id TEXT PRIMARY KEY,
+  work_id TEXT NOT NULL,
+  policy_id TEXT,
+  opened_at TEXT NOT NULL,
+  merged_at TEXT,
+  data TEXT NOT NULL,
+  recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lane_merge_policy ON lane_merge_records(policy_id, opened_at);
+CREATE INDEX IF NOT EXISTS idx_lane_merge_work ON lane_merge_records(work_id);
+
+-- Only selected draws enter this queue. The seed, draw and rate make every selection reproducible.
+CREATE TABLE IF NOT EXISTS lane_audit_queue (
+  id TEXT PRIMARY KEY,
+  merge_record_id TEXT NOT NULL UNIQUE REFERENCES lane_merge_records(id),
+  work_id TEXT NOT NULL,
+  policy_id TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN ('queued', 'ok', 'problem')),
+  data TEXT NOT NULL,
+  queued_at TEXT NOT NULL,
+  recorded_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_lane_audit_next ON lane_audit_queue(outcome, queued_at);
+CREATE INDEX IF NOT EXISTS idx_lane_audit_policy ON lane_audit_queue(policy_id, queued_at);
+`,
+  },
+  {
+    version: 12,
+    sql: `
+-- Part C PR state. One task has one current PR; head/status changes replace the row atomically.
+CREATE TABLE IF NOT EXISTS lane_pr_records (
+  work_id TEXT PRIMARY KEY,
+  number INTEGER NOT NULL,
+  head_sha TEXT NOT NULL,
+  data TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`,
+  },
 ];

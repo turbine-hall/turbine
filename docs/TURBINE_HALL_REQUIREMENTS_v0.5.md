@@ -75,7 +75,7 @@
 
 ### 1.2 Hard non-goals in R0/R1
 
-No custom IDE, autonomous multi-agent corporation, agent marketplace, Jira replacement, project-management UI, foundation-model training, arbitrary shell execution from untrusted inputs, self-modifying policy, remote skill auto-install, automatic production deployments, auto-merge, cross-tenant hosted service, enterprise identity claims, unsupported “security certification,” or guaranteed development productivity improvements.
+No custom IDE, autonomous multi-agent corporation, agent marketplace, Jira replacement, project-management UI, foundation-model training, arbitrary shell execution from untrusted inputs, self-modifying policy, remote skill auto-install, automatic production deployments, direct or admin-bypass merges of any kind (the guarded autonomous lane only enables merge-queue auto-merge), cross-tenant hosted service, enterprise identity claims, unsupported “security certification,” or guaranteed development productivity improvements.
 
 ### 1.3 Build-vs-reuse
 
@@ -738,6 +738,43 @@ sf task recover <id-or-alias> --apply  # only approved, safely executable affect
 
 Token usage: every Turbine model call records `modelProvider`, `modelId`, and input/output tokens on its `role_run` (`unknown` when the adapter omits usage — never silent 0). Coding-agent usage is append-only via `turbine task usage add` (`usage_records`, migration v8). Packet STATUS/REVIEW (including ACCEPTED) render a Usage section from the store; `turbine task export` includes usage. Optional `budgets.perTask.maxTokens` is a retrospective cap: subsequent checked Turbine model calls are refused with `E_BUDGET_EXCEEDED` once measured Turbine input+output tokens have already reached the limit (unknown counts do not count toward the cap); a single in-flight call may still finish above the remaining allowance because the check uses completed usage, not a prediction of the next call. Agents may add records but there is no edit/delete API for human-entered rows.
 
+### 8.3A Autonomous lane commands (#26 part A)
+
+```bash
+turbine policy list                       # active / suspended / pending / unapproved / invalid
+turbine policy show <name>                # content, state, and approved → file diff when pending
+turbine policy approve <name>             # HUMAN ONLY: TTY + typed short hash of the file content
+turbine policy suspend <name> --reason T  # anyone, agents included (only removes autonomy)
+turbine policy resume <name>              # HUMAN ONLY: re-activates the approved snapshot
+turbine task lane <id>                    # is the task in the lane, or why it fell back
+turbine task lane <id> --retry            # HUMAN ONLY: put a fallen-back task back in the lane
+```
+
+Policies are `.turbine/policies/<name>.yaml` (schema `LanePolicySchema` in `packages/contracts/src/lane-policy.ts`). Policy passes are `Decision`s with `actorType: 'policy'` and render as "Passed by policy `<name>` (approved by `<human>` on `<date>`)". `humanGates.{requirements,plan,codeReview,sqaAcceptance}` cannot be `false` (`E_CONFIG`); gates are relaxed only through approved lane policies.
+
+For `codeReview`, a policy must name exactly two model profiles that resolve to different provider/model identities. Approval and evaluation both fail closed if either profile is missing or the resolved identities collide. Each reviewer runs every selected lens over the same pinned diff/change-set and is triaged independently. A policy decision may pass code review only when both outputs are complete and parseable and neither has a kept blocking finding. Timeout, refusal, parse or budget failure, disagreement, blocking findings, or a changed HEAD leaves the gate for a human. REVIEW.md renders completed dual reviews side by side, a new commit stales both, and per-lens agreement is retained for later metrics. The ordinary human lane keeps its single advisory AI review.
+
+### 8.3B Autonomous lane metrics and audits (#30 part G)
+
+```bash
+turbine metrics [--policy <name|human>] [--since <date>] [--json]
+turbine audit next
+turbine audit record <id> --ok                         # HUMAN ONLY
+turbine audit record <id> --problem "what went wrong" # HUMAN ONLY
+```
+
+Metrics cover every approved policy plus the human lane: merged PRs/week, merge/revert rates, fix rounds and cost per merged PR, reviewer disagreement, and fallback share with reasons. Every value carries its period, denominator and unknown count. Until Part C records merge/revert facts, merge-dependent values remain `unknown`; reviewer agreement and `lane.fallback` evidence are still reported.
+
+A policy merge is sampled reproducibly at `sampling.rate` (default `0.1`). The merge record stores the SHA-256 seed, numeric draw, rate and selection result; selected merges enter `lane_audit_queue` (migration v11). `audit next` is read-only. `audit record` requires a real TTY, rejects agent markers, is blocked by the installed Cursor guard, and records the human reviewer.
+
+After policy passes, merge records and audit outcomes, Turbine evaluates `suspendWhen`. Omitted thresholds use the safety defaults: revert rate above 2% over the last 50 known merges, at least two problems in the last 20 completed audits, or reviewer disagreement above 30%. Unknown revert facts cannot trigger a rate suspension. Crossing a threshold records an engine reason through `policy suspend`; the policy stays suspended until a human explicitly resumes it, and subsequent eligible tasks follow the human flow.
+
+### 8.3C Autonomous lane PR and merge-queue landing (#32 part C)
+
+When a task reaches `ACCEPTED`, the GitHub adapter creates or reuses the PR for `turbine/<work-id>` when project config allows `pr.create`; a lane task additionally requires that exact capability in its approved policy. The store records the PR number and head SHA. Turbine publishes `turbine/gate` on that SHA: only a PASS bound to the exact head is `success`; a changed head resets it to `pending`. Turbine publishes the status only on the PR head SHA. A merge queue evaluates required checks on the temporary merge-group commit, so the repository must name a trusted publisher (for example a CI workflow on the `merge_group` event) that republishes `turbine/gate` on that merge-group SHA; Turbine does not publish or vouch for it, and a queue without one cannot land the PR.
+
+Before policy acceptance, GitHub rulesets must confirm that the base branch requires both merge queue and `turbine/gate`. Missing rules, API errors or insufficient permissions are `unknown` and leave acceptance to a human. Lane landing requires `pr.merge` in both project config and the approved policy, and only enables GitHub auto-merge into the queue; the task is recorded as queued only when GitHub reports queue membership. Before enabling it, Turbine re-reads the PR and refuses if its repo, base, head branch or head SHA differ from the record and configuration. A PR closed without merging is replaced, never reused. The policy's sampling rate is snapshotted when landing is authorized and is the rate used for the merge record. Auto-merge is enabled for exactly the accepted head (`expectedHeadOid`), and the base branch's rules are read from GitHub's "Get rules for a branch" for that exact branch (never matched locally; unreadable is `unknown`). Automation covers single-repo tasks only. Each queued job acts only if its exact acceptance (decision, revision, commit and worktree head) is still current, and the gate result is bound to the commit it evaluated. Unfinished automation for an ACCEPTED task (including a gate status that never reached GitHub, or a PR closed without merging, at an unchanged head) resumes on the next `sync`, only for the accepted head still in the worktree; a policy acceptance resumes only under the exact policy approval it recorded and on the PR target its protection was evaluated against, so a newer approval, an edit or a suspension blocks the retry and is never treated as human acceptance. A queue removal counts as an ejection only if it is newer than the removal GitHub showed when the landing attempt began and has not already started a fix round. `sync` polls the recorded PR of an ACCEPTED task and `turbine task pr-refresh <id>` does so on demand. It never pushes to the base, invokes direct merge or requests admin bypass. Queue ejection returns the task to `CHANGES_REQUESTED` with the reason and increments its fix-round record. A successful merge writes merged SHA/time to the Part G store; later revert detection and stacked PRs remain deferred.
+
 ### 8.4 R2+ commands (not implemented in R0/R1)
 
 ```bash
@@ -814,9 +851,11 @@ Interactive approval shows: work ID, stage, actor/identity assurance, proposed a
 | Approve requirements/plan | Local **attestation**, clearly labeled | Authenticated PM/tech role |
 | Execute code | Explicit authorized local project | Authenticated bounded worker |
 | Approve own AI output | **Forbidden for AI** | Forbidden |
-| Approve code/SQA | Local human attestations | Independent authenticated human roles |
+| Approve / resume a lane policy, retry the lane | Local human attestation (TTY + typed hash) | Authenticated role |
+| Suspend a lane policy | Anyone, agents included | Anyone |
+| Approve code/SQA | Local human attestations, or a recorded eligible lane-policy pass (dual AI evidence for code review) | Independent authenticated human roles |
 | Sync Jira/edit remote | Disabled until explicit R2 feature | Permission + diff-bound approval |
-| Push/merge/deploy | **Forbidden in R0/R1 engine** | Separate guarded workflows |
+| Push/merge/deploy | Base push, direct/admin merge and deploy are forbidden; an approved lane may enable merge-queue auto-merge under §8.3C | Separate guarded workflows |
 
 ### 9.3 Evidence and invalidation rules
 
@@ -825,7 +864,7 @@ Interactive approval shows: work ID, stage, actor/identity assurance, proposed a
 - If source commit changes after review/verification, affected checks and approvals must rerun.
 - A rejected review links findings to the commit and moves to `CHANGES_REQUESTED` with a valid return target.
 - Passing tests do not override a failed manual acceptance criterion. An LLM statement does not count as a test run.
-- `ACCEPTED` requires completed requirements, plan, implementation, applicable independent review, target checks, human SQA evidence and explicit human acceptance for the current revision.
+- `ACCEPTED` requires completed requirements, plan, implementation, applicable independent review, target checks, human SQA evidence and explicit human acceptance for the current revision. **Exception (autonomous lane, #26/#28/#32):** an active, human-approved lane policy that lists `acceptance` may replace the human SQA evidence and acceptance decision with a `policy` decision for that revision, only when every P0 requirement has FULL traceability, every configured quality check passed at the current commit, no required obligation is unmet or waived, code review for that commit was passed either by a human or by the policy's complete clean dual-review evidence, project config and policy both grant `pr.create`/`pr.merge`, and GitHub confirms the base requires merge queue plus `turbine/gate`. The human approval behind it covers the policy file, not this revision's evidence; any failed or unknown condition sends the task to a human.
 
 ### 9.3A EEC gate and recovery UX
 
@@ -851,7 +890,7 @@ Every run receives a task-specific allowlist. Model text is untrusted and cannot
 
 ### NFR-SEC-03 Worktree is not sandbox
 
-For R1, **prefer actual OS-level sandbox or container with no host secrets, bounded mount, disabled network except explicit allowlist and resource controls**. A Git worktree protects against accidental working-tree overlap, not hostile code. If a secure executor cannot be implemented, disable unattended execution: offer a manual handoff to Cursor/IDE and mark execution as human-supervised, not sandboxed or autonomous.
+A Git worktree protects against accidental working-tree overlap, not hostile code. `execution.mode: sandboxed-unattended` runs the implementer in Docker or Podman with only the task worktree mounted (no home, SSH agent, git credentials, or `.turbine/state/`), fail-closed runtime + egress preflight, per-phase network scopes, and wall-clock / output-size limits. Default remains `manual-supervised` handoff. Other modes still raise `E_UNSAFE_EXECUTION` for networked unattended work and never fall back to unsandboxed execution when sandbox preflight fails.
 
 ### NFR-SEC-04 Secrets and logs
 
@@ -943,12 +982,14 @@ tools:
     - pr.merge
     - production.deploy
 execution:
-  mode: manual-supervised       # R0/R1 safe fallback
+  mode: manual-supervised       # or sandboxed-unattended (Docker/Podman; worktree-only mounts; fail-closed preflight)
   requireIsolatedWorktree: true
-  allowNetwork: false
+  allowNetwork: false           # networked unattended work only in sandboxed-unattended after preflight
+  sandboxWallClockMs: 1800000   # sandboxed-unattended wall-clock limit (FR-D6)
+  sandboxMaxOutputBytes: 8000000
 quality:
   checks: []                    # determined from repo and approved by human
-humanGates:
+humanGates:                     # these four cannot be false (E_CONFIG); relax gates only via approved lane policies
   requirements: true
   plan: true
   codeReview: true

@@ -115,7 +115,21 @@ export function decisionBlock(input: {
   date?: string;
   notes?: string;
   contentHash?: string;
+  /** Set when an approved lane policy passed the gate: rendered as a policy pass, never as an approval. */
+  policy?: { name: string; approvedBy?: string; approvedOn?: string };
 }): string {
+  if (input.policy && input.approved === true) {
+    const by = input.policy.approvedBy ? `\`${input.policy.approvedBy}\`` : '(approval record unreadable)';
+    const on = input.policy.approvedOn ? `\`${input.policy.approvedOn}\`` : '(unknown date)';
+    const lines = [
+      `- Gate: ${input.gate}`,
+      '- Status: **PASSED BY POLICY**',
+      `- Passed by policy \`${input.policy.name}\` (approved by ${by} on ${on})`,
+      `- Date: ${input.date ?? new Date().toISOString().slice(0, 10)}`,
+    ];
+    if (input.contentHash) lines.push(`- Revision: \`${input.contentHash}\``);
+    return lines.join('\n');
+  }
   const status = input.approved === true ? 'APPROVED' : input.approved === false ? 'REJECTED' : 'PENDING';
   const lines = [`- Gate: ${input.gate}`, `- Status: **${status}**`];
   if (input.approved !== undefined) {

@@ -1,4 +1,5 @@
 import type {
+  ApprovedLanePolicy,
   Artifact,
   ArtifactDependencyEdge,
   BriefState,
@@ -9,6 +10,9 @@ import type {
   EngineeringEvidenceContract,
   EngineEvent,
   Evidence,
+  LaneAuditRecord,
+  LaneMergeRecord,
+  LanePrRecord,
   RecoveryPlan,
   RepoSnapshot,
   RoleRun,
@@ -17,6 +21,7 @@ import type {
   WorkPackage,
 } from '@turbine-hall/turbine-contracts';
 import {
+  ApprovedLanePolicySchema,
   ArtifactDependencyEdgeSchema,
   ArtifactSchema,
   BriefStateSchema,
@@ -31,6 +36,9 @@ import {
   EngineEventSchema,
   EvidenceSchema,
   GitObjectIdSchema,
+  LaneAuditRecordSchema,
+  LaneMergeRecordSchema,
+  LanePrRecordSchema,
   RecoveryPlanSchema,
   RepoSnapshotSchema,
   RoleRunSchema,
@@ -85,6 +93,21 @@ type ClaimRow = {
 function now(): string {
   return new Date().toISOString();
 }
+
+export type ReviewerAgreement = {
+  id: string;
+  workId: string;
+  changeSetId: string;
+  /** Absent only on legacy rows written before review pairs persisted policy identity. */
+  policyId?: string;
+  policyHash?: string;
+  lens: string;
+  reviewerProfiles: [string, string];
+  blocking: [boolean, boolean];
+  agreed: boolean;
+  recordedAt: string;
+};
+type AttributedReviewerAgreement = ReviewerAgreement & { policyId: string; policyHash: string };
 
 export class WorkStore {
   readonly db: SqliteDb;
@@ -787,6 +810,229 @@ export class WorkStore {
     return rows.map((r) => UsageRecordSchema.parse(JSON.parse(r.data)));
   }
 
+  /** Save the approved snapshot of a lane policy (approve / suspend / resume all write the whole row). */
+  saveLanePolicy(policy: ApprovedLanePolicy): void {
+    const parsed = ApprovedLanePolicySchema.parse(policy);
+    this.db
+      .prepare(
+        `INSERT INTO lane_policies(name, content_hash, data, approved_decision_id, status, suspended_reason, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(name) DO UPDATE SET content_hash=excluded.content_hash, data=excluded.data,
+           approved_decision_id=excluded.approved_decision_id, status=excluded.status,
+           suspended_reason=excluded.suspended_reason, updated_at=excluded.updated_at`,
+      )
+      .run(
+        parsed.name,
+        parsed.contentHash,
+        JSON.stringify(parsed),
+        parsed.approvedDecisionId,
+        parsed.status,
+        parsed.suspendedReason ?? null,
+        parsed.updatedAt,
+      );
+  }
+
+  /** The approved snapshot, or null when none was ever approved. An unreadable row throws (fail closed). */
+  getLanePolicy(name: string): ApprovedLanePolicy | null {
+    const row = this.db.prepare(`SELECT name, data FROM lane_policies WHERE name = ?`).get(name) as
+      | { name: string; data: string }
+      | undefined;
+    if (!row) return null;
+    return parseLanePolicyRow(row);
+  }
+
+  /** Every approved snapshot. A row that cannot be read is returned with its error, never dropped. */
+  listLanePolicies(): Array<{ name: string; policy?: ApprovedLanePolicy; error?: string }> {
+    const rows = this.db.prepare(`SELECT name, data FROM lane_policies ORDER BY name ASC`).all() as Array<{
+      name: string;
+      data: string;
+    }>;
+    return rows.map((row) => {
+      try {
+        return { name: row.name, policy: parseLanePolicyRow(row) };
+      } catch (e) {
+        return { name: row.name, error: (e as Error).message };
+      }
+    });
+  }
+
+  saveReviewerAgreement(
+    input: Omit<AttributedReviewerAgreement, 'id' | 'recordedAt'>,
+  ): AttributedReviewerAgreement {
+    if (
+      !input.workId ||
+      !input.changeSetId ||
+      !input.policyId ||
+      !input.policyHash ||
+      !input.lens ||
+      input.reviewerProfiles.some((x) => !x)
+    ) {
+      throw err('E_INVALID_CONFIG', 'Reviewer agreement is missing a work, policy, lens, or change-set identity');
+    }
+    const record: AttributedReviewerAgreement = { ...input, id: createId('agreement'), recordedAt: now() };
+    this.db
+      .prepare(
+        `INSERT INTO reviewer_agreements(id, work_id, change_set_id, lens, data, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(record.id, record.workId, record.changeSetId, record.lens, JSON.stringify(record), record.recordedAt);
+    return record;
+  }
+
+  listReviewerAgreements(workId: string, changeSetId?: string): ReviewerAgreement[] {
+    const rows = changeSetId
+      ? (this.db
+          .prepare(`SELECT data FROM reviewer_agreements WHERE work_id = ? AND change_set_id = ? ORDER BY lens ASC`)
+          .all(workId, changeSetId) as Array<{ data: string }>)
+      : (this.db
+          .prepare(`SELECT data FROM reviewer_agreements WHERE work_id = ? ORDER BY recorded_at ASC`)
+          .all(workId) as Array<{ data: string }>);
+    return rows.map((row) => {
+      const value = JSON.parse(row.data) as ReviewerAgreement;
+      const isLegacy = value?.policyId == null && value?.policyHash == null;
+      if (
+        !value ||
+        value.workId !== workId ||
+        !value.changeSetId ||
+        (!isLegacy && (!value.policyId || !value.policyHash)) ||
+        !value.lens ||
+        !Array.isArray(value.reviewerProfiles) ||
+        value.reviewerProfiles.length !== 2 ||
+        !Array.isArray(value.blocking) ||
+        value.blocking.length !== 2 ||
+        typeof value.agreed !== 'boolean'
+      ) {
+        throw err('E_INVALID_CONFIG', `Stored reviewer agreement for ${workId} is unreadable`);
+      }
+      return value;
+    });
+  }
+
+  saveLaneMergeRecord(record: LaneMergeRecord): LaneMergeRecord {
+    const parsed = LaneMergeRecordSchema.parse(record);
+    this.db
+      .prepare(
+        `INSERT INTO lane_merge_records(id, work_id, policy_id, opened_at, merged_at, data, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           work_id = excluded.work_id,
+           policy_id = excluded.policy_id,
+           opened_at = excluded.opened_at,
+           merged_at = excluded.merged_at,
+           data = excluded.data,
+           recorded_at = excluded.recorded_at`,
+      )
+      .run(
+        parsed.id,
+        parsed.workId,
+        parsed.policyId,
+        parsed.openedAt,
+        parsed.mergedAt ?? null,
+        JSON.stringify(parsed),
+        parsed.recordedAt,
+      );
+    return parsed;
+  }
+
+  listLaneMergeRecords(): LaneMergeRecord[] {
+    const rows = this.db.prepare(`SELECT id, data FROM lane_merge_records ORDER BY opened_at ASC, id ASC`).all() as Array<{
+      id: string;
+      data: string;
+    }>;
+    return rows.map((row) => {
+      try {
+        return LaneMergeRecordSchema.parse(JSON.parse(row.data));
+      } catch (e) {
+        throw err('E_INVALID_CONFIG', `Stored lane merge record ${row.id} is unreadable: ${(e as Error).message}`);
+      }
+    });
+  }
+
+  saveLanePrRecord(record: LanePrRecord): LanePrRecord {
+    const parsed = LanePrRecordSchema.parse(record);
+    this.db
+      .prepare(
+        `INSERT INTO lane_pr_records(work_id, number, head_sha, data, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(work_id) DO UPDATE SET
+           number = excluded.number,
+           head_sha = excluded.head_sha,
+           data = excluded.data,
+           updated_at = excluded.updated_at`,
+      )
+      .run(parsed.workId, parsed.number, parsed.headSha, JSON.stringify(parsed), parsed.updatedAt);
+    return parsed;
+  }
+
+  getLanePrRecord(workId: string): LanePrRecord | undefined {
+    const row = this.db.prepare(`SELECT data FROM lane_pr_records WHERE work_id = ?`).get(workId) as
+      | { data: string }
+      | undefined;
+    if (!row) return undefined;
+    try {
+      return LanePrRecordSchema.parse(JSON.parse(row.data));
+    } catch (e) {
+      throw err('E_INVALID_CONFIG', `Stored lane PR record for ${workId} is unreadable: ${(e as Error).message}`);
+    }
+  }
+
+  enqueueLaneAudit(record: LaneAuditRecord): LaneAuditRecord {
+    const parsed = LaneAuditRecordSchema.parse(record);
+    if (parsed.outcome !== 'queued') throw err('E_INVALID_CONFIG', 'A new lane audit must be queued');
+    this.db
+      .prepare(
+        `INSERT INTO lane_audit_queue(id, merge_record_id, work_id, policy_id, outcome, data, queued_at, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+      )
+      .run(parsed.id, parsed.mergeRecordId, parsed.workId, parsed.policyId, parsed.outcome, JSON.stringify(parsed), parsed.queuedAt);
+    return parsed;
+  }
+
+  recordLaneAudit(record: LaneAuditRecord): LaneAuditRecord {
+    const parsed = LaneAuditRecordSchema.parse(record);
+    if (parsed.outcome === 'queued') throw err('E_INVALID_CONFIG', 'A completed lane audit must be ok or problem');
+    const changed = this.db
+      .prepare(
+        `UPDATE lane_audit_queue SET outcome = ?, data = ?, recorded_at = ?
+         WHERE id = ? AND outcome = 'queued'`,
+      )
+      .run(parsed.outcome, JSON.stringify(parsed), parsed.recordedAt!, parsed.id);
+    if (Number(changed.changes) !== 1) {
+      throw err('E_INVALID_TRANSITION', `Audit ${parsed.id} is missing or has already been recorded`);
+    }
+    return parsed;
+  }
+
+  getLaneAudit(id: string): LaneAuditRecord | null {
+    const row = this.db.prepare(`SELECT id, data FROM lane_audit_queue WHERE id = ?`).get(id) as
+      | { id: string; data: string }
+      | undefined;
+    if (!row) return null;
+    try {
+      return LaneAuditRecordSchema.parse(JSON.parse(row.data));
+    } catch (e) {
+      throw err('E_INVALID_CONFIG', `Stored lane audit ${row.id} is unreadable: ${(e as Error).message}`);
+    }
+  }
+
+  listLaneAudits(policyId?: string): LaneAuditRecord[] {
+    const rows = policyId
+      ? (this.db
+          .prepare(`SELECT id, data FROM lane_audit_queue WHERE policy_id = ? ORDER BY queued_at ASC, id ASC`)
+          .all(policyId) as Array<{ id: string; data: string }>)
+      : (this.db.prepare(`SELECT id, data FROM lane_audit_queue ORDER BY queued_at ASC, id ASC`).all() as Array<{
+          id: string;
+          data: string;
+        }>);
+    return rows.map((row) => {
+      try {
+        return LaneAuditRecordSchema.parse(JSON.parse(row.data));
+      } catch (e) {
+        throw err('E_INVALID_CONFIG', `Stored lane audit ${row.id} is unreadable: ${(e as Error).message}`);
+      }
+    });
+  }
+
   getBudget(workId: string): { modelCalls: number; estimatedCost: number } {
     const row = this.db
       .prepare(`SELECT model_calls, estimated_cost FROM budget_counters WHERE work_id = ?`)
@@ -807,6 +1053,20 @@ export class WorkStore {
       )
       .run(workId, modelCalls, estimatedCost);
   }
+}
+
+function parseLanePolicyRow(row: { name: string; data: string }): ApprovedLanePolicy {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(row.data);
+  } catch {
+    throw err('E_INVALID_CONFIG', `Stored lane policy ${row.name} is not valid JSON`);
+  }
+  const parsed = ApprovedLanePolicySchema.safeParse(raw);
+  if (!parsed.success || parsed.data.name !== row.name) {
+    throw err('E_INVALID_CONFIG', `Stored lane policy ${row.name} is unreadable: ${parsed.success ? 'name mismatch' : parsed.error.issues[0]?.message}`);
+  }
+  return parsed.data;
 }
 
 /**

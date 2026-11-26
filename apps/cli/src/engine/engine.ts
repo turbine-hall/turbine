@@ -6,10 +6,14 @@ import {
   contentHashText,
   createId,
   err,
+  LANE_TRIGGER_NAMES,
+  policyDecisionSubject,
   RepoRefSchema,
   parseTaskContext,
   type AcceptanceCriterion,
+  type ApprovedLanePolicy,
   type Artifact,
+  type LaneGate,
   type Decision,
   type Evidence,
   type RiskProfile,
@@ -22,7 +26,19 @@ import {
   type WorkState,
   type WorkType,
 } from '@turbine-hall/turbine-contracts';
-import { assertTransition, contextBudgetFor, getRole, listFrameworks, loadFramework, loadRoles, maxProfile, selectRoles } from '@turbine-hall/turbine-core';
+import {
+  assertTransition,
+  contextBudgetFor,
+  detectHardRiskTriggers,
+  detectSoftTriggers,
+  getRole,
+  listFrameworks,
+  loadFramework,
+  loadRoles,
+  maxProfile,
+  selectRoles,
+} from '@turbine-hall/turbine-core';
+import type { WorkStore } from '@turbine-hall/turbine-storage-sqlite';
 import {
   bumpEecRevision,
   createDraftEec,
@@ -83,6 +99,7 @@ import {
   crossCheckClaims,
   disposition,
   factsBlock,
+  reviewOutputIsParseable,
   selectLenses,
   triage,
   validateCoverage,
@@ -120,6 +137,28 @@ import {
   writeFileAtomic,
 } from './packet.js';
 import { measuredTurbineTokens, summarizeUsage } from './usage.js';
+import { policyStatuses, readPolicyFiles, resolvePolicyReviewers, type PolicyStatus } from './lane-policy.js';
+import { evaluateLaneEligibility, LANE_GATE_FOR_STATE, type LaneEvaluation, type LaneFacts } from './lane-eligibility.js';
+import { evaluateSuspendWhen, policyForReviewPair } from './lane-metrics.js';
+import {
+  configAllows,
+  confirmMergeQueueProtection,
+  ensureAcceptedPr,
+  landingIncomplete,
+  pendingMergeEvaluation,
+  refreshLanePr,
+  type LanePrTarget,
+} from './lane-pr.js';
+import {
+  defaultSandboxHooks,
+  planSandboxMounts,
+  preflightSandbox,
+  runSandboxedStateMachine,
+  type AgentImplementer,
+  type ContainerRuntime,
+  type PhaseResult,
+  type SandboxHooks,
+} from '@turbine-hall/turbine-executor';
 
 function now(): string {
   return new Date().toISOString();
@@ -133,6 +172,33 @@ function transition(work: WorkPackage, to: WorkState): WorkPackage {
 function normalizeAcceptanceCriteria(raw: unknown): AcceptanceCriterion[] {
   return normalizeRequirements(raw);
 }
+
+export type LaneFallback = {
+  gate: LaneGate;
+  reasons: string[];
+  evaluationHash: string;
+  evaluatedChangeSetId?: string;
+  at: string;
+};
+export type LaneOutcome = {
+  status: 'passed' | 'fallback' | 'out-of-lane' | 'retry';
+  work: WorkPackage;
+  gate: LaneGate;
+  reasons: string[];
+  policy?: string;
+  decision?: Decision;
+  evaluatedChangeSetId?: string;
+};
+
+const LANE_GATE_LABEL: Record<LaneGate, string> = {
+  requirements: 'Requirements',
+  plan: 'Plan',
+  codeReview: 'Code review',
+  acceptance: 'Acceptance',
+};
+
+/** Thrown inside the policy-pass transaction to roll it back when a final check fails. */
+class LaneIneligible extends Error {}
 
 export type PrApprovalResult = { approved: boolean; detail: string; url?: string };
 export type PrApprovalChecker = (input: {
@@ -186,6 +252,21 @@ export class Engine {
    */
   mirrorFixtureMode = false;
   private mirrorJob: Promise<MirrorRunResult | undefined> = Promise.resolve(undefined);
+  /** Fixture seam for Part C. Live mode derives owner/repo from origin. */
+  lanePrTarget?: LanePrTarget;
+  /**
+   * Fixture seam for Part D sandboxed-unattended.
+   * Full `sandboxHooks` overrides preflight + phase execution (integration fixtures).
+   * `sandboxPreflightHooks` alone overrides detect/egress while Engine refuses host setup/checks.
+   */
+  sandboxHooks?: SandboxHooks;
+  sandboxPreflightHooks?: Pick<SandboxHooks, 'detectRuntime' | 'egressProbeSucceeds'>;
+  sandboxImplementer?: AgentImplementer;
+  /** Work ids with an in-flight sandboxed run — blocks concurrent capture/sync publication. */
+  private sandboxInFlight = new Set<string>();
+  /** Accepted tasks wait here in order; none is dropped when another is accepted before the drain. */
+  private pendingLanePrs: Array<() => Promise<void>> = [];
+  private lanePrDrain: Promise<void> = Promise.resolve();
 
   constructor(readonly ctx: EngineContext) {
     ensureDefaultMock();
@@ -195,6 +276,356 @@ export class Engine {
   /** Await the latest packet-mirror attempt (tests / sync). */
   async waitForMirror(): Promise<MirrorRunResult | undefined> {
     return this.mirrorJob;
+  }
+
+  async waitForLanePr(): Promise<void> {
+    const jobs = this.pendingLanePrs;
+    this.pendingLanePrs = [];
+    const errors: Error[] = [];
+    this.lanePrDrain = this.lanePrDrain.then(async () => {
+      for (const job of jobs) {
+        try {
+          await job();
+        } catch (e) {
+          errors.push(e as Error);
+        }
+      }
+    });
+    await this.lanePrDrain;
+    if (errors.length) throw errors[0];
+  }
+
+  private lanePrAdapter() {
+    return this.lanePrTarget?.adapter ?? createGitHubAdapter({ apiBaseUrl: process.env.GITHUB_API_BASE_URL });
+  }
+
+  private resolveLanePrTarget(): LanePrTarget | undefined {
+    if (this.lanePrTarget) return this.lanePrTarget;
+    const remote = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: this.ctx.projectRoot, encoding: 'utf8' });
+    if (remote.status !== 0) return undefined;
+    const value = remote.stdout.trim().replace(/\.git$/, '');
+    const match = value.match(/github\.com[/:]([^/]+)\/([^/]+)$/i);
+    if (!match) return undefined;
+    return {
+      adapter: this.lanePrAdapter(),
+      owner: match[1]!,
+      repo: match[2]!,
+      baseBranch: (this.ctx.config as { git?: { defaultBaseBranch?: string } }).git?.defaultBaseBranch ?? 'main',
+    };
+  }
+
+  /**
+   * Who authorized landing the ACCEPTED task, from the recorded acceptance decision only. A policy acceptance is
+   * authorized by the exact policy approval it recorded (hash + approval decision); a newer approval of the same
+   * name, an edit, or a suspension never substitutes for it, and is not human acceptance either.
+   */
+  private acceptanceAuthority(workId: string):
+    | { kind: 'none' }
+    | { kind: 'stale'; reason: string }
+    | { kind: 'blocked'; reason: string; decision: Decision }
+    | { kind: 'human'; decision: Decision }
+    | { kind: 'policy'; decision: Decision; policy: ApprovedLanePolicy } {
+    const work = this.ctx.store.getWork(workId);
+    if (work.currentState !== 'ACCEPTED') return { kind: 'stale', reason: `task is ${work.currentState}, not ACCEPTED` };
+    const decision = this.latestAcceptanceDecision(workId);
+    if (!decision) return { kind: 'none' };
+    // The acceptance transition adds one revision; anything else means the accepted revision is no longer current.
+    if (decision.workRevision + 1 !== work.currentRevision) {
+      return { kind: 'stale', reason: `accepted revision ${decision.workRevision + 1} is not the current revision ${work.currentRevision}` };
+    }
+    if (!decision.commitSha || decision.commitSha !== this.currentCommit(workId)) {
+      return { kind: 'stale', reason: 'the accepted commit is not the current commit' };
+    }
+    if (decision.actorType !== 'policy') return { kind: 'human', decision };
+    const blocked = (reason: string) => ({ kind: 'blocked' as const, reason, decision });
+    if (!decision.policyId || !decision.policyHash || !decision.policyApprovalDecisionId) {
+      return blocked('the policy acceptance does not record which policy approval authorized it');
+    }
+    let snapshot: ApprovedLanePolicy | null;
+    try {
+      snapshot = this.ctx.store.getLanePolicy(decision.policyId);
+    } catch (e) {
+      return blocked(`policy ${decision.policyId} is unreadable: ${(e as Error).message}`);
+    }
+    if (!snapshot) return blocked(`policy ${decision.policyId} is no longer approved`);
+    if (snapshot.status !== 'active') return blocked(`policy ${decision.policyId} is ${snapshot.status}`);
+    if (snapshot.contentHash !== decision.policyHash || snapshot.approvedDecisionId !== decision.policyApprovalDecisionId) {
+      return blocked(`policy ${decision.policyId} was changed or re-approved after this acceptance`);
+    }
+    // A pending edit is not yet approved, so the store still matches. The file on disk is what a human would
+    // approve next: if it no longer hashes to the accepted policy, this acceptance's terms are in doubt.
+    let file: ReturnType<typeof readPolicyFiles>['files'][number] | undefined;
+    try {
+      file = readPolicyFiles(this.ctx.projectRoot).files.find((entry) => entry.name === decision.policyId);
+    } catch (e) {
+      return blocked(`policy file ${decision.policyId} is unreadable: ${(e as Error).message}`);
+    }
+    if (!file || file.hash !== decision.policyHash) {
+      return blocked(`policy file ${decision.policyId} was edited or removed after this acceptance (pending edit)`);
+    }
+    return { kind: 'policy', decision, policy: snapshot };
+  }
+
+  /** The newest live sqa-acceptance approval of a task, human or policy. */
+  private latestAcceptanceDecision(workId: string): Decision | undefined {
+    return this.ctx.store
+      .listDecisions(workId)
+      .filter((entry) => entry.gate === 'sqa-acceptance' && entry.action === 'approve' && !entry.invalidatedAt)
+      .sort((a, b) => a.decidedAt.localeCompare(b.decidedAt) || a.id.localeCompare(b.id))
+      .at(-1);
+  }
+
+  /** The PR target a policy acceptance was evaluated against; never re-resolved from origin mid-flight. */
+  private boundLanePrTarget(workId: string, decisionId: string): LanePrTarget | undefined {
+    const bound = this.ctx.store
+      .listEvents(workId)
+      .filter((event) => event.type === 'lane.acceptance-target-bound' && event.payload.decisionId === decisionId)
+      .at(-1);
+    const { owner, repo, baseBranch } = (bound?.payload ?? {}) as { owner?: string; repo?: string; baseBranch?: string };
+    if (!owner || !repo || !baseBranch) return undefined;
+    return { adapter: this.lanePrAdapter(), owner, repo, baseBranch };
+  }
+
+  private recordLandingEvent(workId: string, type: string, reason: string, dedupe = false): void {
+    if (dedupe) {
+      const last = this.ctx.store.listEvents(workId).filter((event) => event.type === type).at(-1);
+      if (last?.payload.reason === reason) return;
+    }
+    this.ctx.store.appendEvent({ workId, type, payload: { reason } });
+  }
+
+  /** The single worktree is still exactly at the accepted head; a moved head means the acceptance is stale. */
+  private worktreeAtHead(workId: string, headSha: string): boolean {
+    const repos = this.repoStates(workId);
+    if (repos.length !== 1 || !existsSync(repos[0]!.worktreePath)) return false;
+    try {
+      return observe(repos).repos[0]?.headCommit === headSha;
+    } catch {
+      return false;
+    }
+  }
+
+  private queueAcceptedPr(work: WorkPackage, authority = this.acceptanceAuthority(work.id)): void {
+    if (authority.kind === 'none') return;
+    if (authority.kind === 'stale') {
+      this.recordLandingEvent(work.id, 'lane.pr-automation-discarded', authority.reason);
+      return;
+    }
+    if (authority.kind === 'blocked') {
+      this.recordLandingEvent(work.id, 'lane.pr-automation-blocked', authority.reason, true);
+      return;
+    }
+    const policy = authority.kind === 'policy' ? authority.policy : undefined;
+    // Human acceptance only opens a PR when the project opted in; a policy path stays strict.
+    if (!policy && !configAllows(this.ctx.config.tools, 'pr.create')) {
+      this.recordLandingEvent(work.id, 'lane.pr-automation-skipped', 'pr.create is not allowed by project config');
+      return;
+    }
+    const repos = this.repoStates(work.id);
+    // A multi-repo change set id is a hash, not a commit; one PR cannot carry it.
+    if (repos.length > 1) {
+      this.recordLandingEvent(work.id, 'lane.pr-automation-skipped', `PR automation supports one repo; this task changes ${repos.length}`);
+      return;
+    }
+    // A policy acceptance lands on the target its protection was evaluated against; origin is not consulted again.
+    const target = policy ? this.boundLanePrTarget(work.id, authority.decision.id) : this.resolveLanePrTarget();
+    const headSha = this.currentCommit(work.id);
+    if (policy && !target) {
+      this.recordLandingEvent(work.id, 'lane.pr-automation-blocked', 'the PR target evaluated for this policy acceptance was not recorded', true);
+      return;
+    }
+    if (!target || !headSha) return;
+    const acceptedRevision = work.currentRevision;
+    const decisionId = authority.decision.id;
+    this.pendingLanePrs.push(async () => {
+      // Queued jobs outlive the call that queued them: act only if this exact acceptance is still current.
+      const live = this.acceptanceAuthority(work.id);
+      const current = this.ctx.store.getWork(work.id);
+      if (live.kind === 'blocked') {
+        this.recordLandingEvent(work.id, 'lane.pr-automation-blocked', live.reason, true);
+        return;
+      }
+      const stale =
+        live.kind === 'none' || live.kind === 'stale'
+          ? live.kind === 'stale' ? live.reason : 'no acceptance decision'
+          : live.decision.id !== decisionId
+            ? 'the acceptance decision was replaced'
+            : current.currentRevision !== acceptedRevision
+              ? 'the accepted revision is no longer current'
+              : this.currentCommit(work.id) !== headSha || !this.worktreeAtHead(work.id, headSha)
+                ? 'the accepted head moved'
+                : undefined;
+      if (stale) {
+        this.recordLandingEvent(work.id, 'lane.pr-automation-discarded', stale);
+        return;
+      }
+      try {
+        // The gate result is read HERE, after the staleness checks above: a job that waited in the queue must not
+        // publish a PASS computed before evidence changed. It is bound to the commit it evaluated.
+        const gatePassSha = this.gateDecision(work.id).decision === 'PASS' ? headSha : undefined;
+        await ensureAcceptedPr({
+          store: this.ctx.store,
+          work: current,
+          headSha,
+          authorizationId: decisionId,
+          target,
+          tools: this.ctx.config.tools,
+          policy: live.kind === 'policy' ? live.policy : undefined,
+          gatePassSha,
+          // Re-check before every remote write: a suspension mid-flight must not still enqueue.
+          assertStillAuthorized: () => {
+            const now = this.acceptanceAuthority(work.id);
+            if (now.kind === 'blocked') throw err('E_INVALID_CONFIG', now.reason);
+            if (now.kind === 'stale') throw err('E_STALE_REVISION', now.reason);
+            if (now.kind === 'none' || now.decision.id !== decisionId) {
+              throw err('E_STALE_REVISION', 'the acceptance decision no longer authorizes landing');
+            }
+          },
+        });
+      } catch (e) {
+        this.ctx.store.appendEvent({
+          workId: work.id,
+          type: 'lane.pr-automation-failed',
+          payload: { reason: (e as Error).message },
+        });
+        throw e;
+      }
+    });
+  }
+
+  /**
+   * Durable resume: an ACCEPTED task whose PR work is incomplete is queued again on the next sync. The same head
+   * is not enough to call it done: a gate status that never reached GitHub, or a PR closed unmerged, still owes work.
+   */
+  private resumeAcceptedPr(work: WorkPackage): boolean {
+    if (work.currentState !== 'ACCEPTED' || this.repoStates(work.id).length !== 1) return false;
+    const authority = this.acceptanceAuthority(work.id);
+    if (authority.kind === 'blocked') {
+      this.recordLandingEvent(work.id, 'lane.pr-automation-blocked', authority.reason, true);
+      return false;
+    }
+    if (authority.kind !== 'human' && authority.kind !== 'policy') return false;
+    const policy = authority.kind === 'policy';
+    const head = this.currentCommit(work.id);
+    if (!head || (!policy && !configAllows(this.ctx.config.tools, 'pr.create'))) return false;
+    // The recorded head can lag the worktree; only the accepted head, still at the worktree, may be landed.
+    if (!this.worktreeAtHead(work.id, head)) return false;
+    const gatePassSha = this.gateDecision(work.id).decision === 'PASS' ? head : undefined;
+    const record = this.ctx.store.getLanePrRecord(work.id);
+    if (!landingIncomplete(record, { headSha: head, authorizationId: authority.decision.id, gatePassSha, policy })) return false;
+    this.queueAcceptedPr(work, authority);
+    return true;
+  }
+
+  /**
+   * True when a worktree has commits the recorded change set does not know about. Such ACCEPTED work is stale:
+   * the sync step recaptures the head and leaves ACCEPTED, so nothing from GitHub may be applied to it first.
+   * Unreadable worktrees count as moved (nothing can be proved); missing ones do not (a merged PR's worktree
+   * may be gone, and its merge must still be recorded).
+   */
+  private worktreeMovedPastRecorded(workId: string): boolean {
+    const repos = this.repoStates(workId);
+    if (!repos.length || repos.some((r) => !existsSync(r.worktreePath))) return false;
+    try {
+      return changeSetId(observe(repos).repos) !== changeSetId(repos);
+    } catch {
+      return true;
+    }
+  }
+
+  /** Poll the recorded PR of an ACCEPTED task during sync; a failed poll is recorded, never fatal to sync. */
+  private async pollAcceptedPr(work: WorkPackage): Promise<void> {
+    if (work.currentState !== 'ACCEPTED') return;
+    const record = this.ctx.store.getLanePrRecord(work.id);
+    // A merged record is done, unless its post-merge suspension check still has to be retried.
+    if (!record || (record.queueState === 'merged' && !pendingMergeEvaluation(this.ctx.store, work.id))) return;
+    try {
+      await this.refreshLanePullRequest(work.id);
+    } catch (e) {
+      this.recordLandingEvent(work.id, 'lane.pr-refresh-failed', (e as Error).message, true);
+    }
+  }
+
+  /** Poll the recorded PR. Queue ejection starts a fix round; merge writes Part G's merge store. */
+  async refreshLanePullRequest(idOrAlias: string) {
+    const work = this.ctx.store.getWork(idOrAlias);
+    const recorded = this.ctx.store.getLanePrRecord(work.id);
+    if (!recorded) throw err('E_NOT_FOUND', `No PR recorded for ${work.id}`);
+    // Poll the repository stored on the PR — never re-resolve origin (it may be gone or retargeted).
+    const target: LanePrTarget = {
+      adapter: this.lanePrAdapter(),
+      owner: recorded.owner,
+      repo: recorded.repo,
+      baseBranch: recorded.baseBranch,
+    };
+    const authority = work.currentState === 'ACCEPTED' ? this.acceptanceAuthority(work.id) : undefined;
+    const result = await refreshLanePr({
+      store: this.ctx.store,
+      workId: work.id,
+      target,
+      policy: authority?.kind === 'policy' ? authority.policy : undefined,
+    });
+    if (result.kind === 'ejected' && authority && result.removalId) {
+      const removalId = result.removalId;
+      const decisionOf = (a: { kind: string } | undefined) => (a && 'decision' in a ? (a as { decision: Decision }).decision.id : undefined);
+      let fixRound = 0;
+      try {
+        // The task is re-read inside the transition's transaction: GitHub's answer applies only to the exact
+        // acceptance it was polled for. The fix-round event, the handled-removal mark and the state change
+        // commit together or not at all.
+        const next = this.toChangesRequested(work, 'queue-ejected', {
+          guard: (stored) => {
+            if (stored.currentRevision !== work.currentRevision) return 'the accepted revision changed while GitHub was polled';
+            const nowAuthority = this.acceptanceAuthority(work.id);
+            if (nowAuthority.kind === 'stale') return nowAuthority.reason;
+            if (decisionOf(nowAuthority) !== decisionOf(authority)) return 'the acceptance decision was replaced while GitHub was polled';
+            if (this.worktreeMovedPastRecorded(work.id)) return 'the worktree moved past the accepted head';
+            const record = this.ctx.store.getLanePrRecord(work.id);
+            if (
+              !record ||
+              record.number !== result.record.number ||
+              record.authorizationId !== result.record.authorizationId ||
+              record.headSha !== result.record.headSha
+            ) {
+              return 'the recorded PR or landing attempt changed while GitHub was polled';
+            }
+            if (record.queueState === 'merged') return 'the PR already merged';
+            // The removal belongs to an earlier acceptance than the one that is current.
+            if (record.authorizationId && decisionOf(nowAuthority) && record.authorizationId !== decisionOf(nowAuthority)) {
+              return 'the removal belongs to an earlier acceptance';
+            }
+            if (record.handledQueueRemovalId === removalId) return 'the removal already started a fix round';
+            if (this.ctx.store.listEvents(work.id).some((event) => event.type === 'lane.queue-ejected' && event.payload.removalId === removalId)) {
+              return 'the removal already started a fix round';
+            }
+            return undefined;
+          },
+          atomic: () => {
+            const removals = this.ctx.store.listEvents(work.id).filter((event) => event.type === 'lane.queue-ejected');
+            fixRound = removals.length + 1;
+            this.ctx.store.appendEvent({
+              workId: work.id,
+              type: 'lane.queue-ejected',
+              payload: { reason: result.reason, fixRound, prNumber: result.record.number, removalId },
+            });
+            const record = this.ctx.store.getLanePrRecord(work.id)!;
+            this.ctx.store.saveLanePrRecord({
+              ...record,
+              queueState: 'ejected',
+              queueReason: result.reason,
+              handledQueueRemovalId: removalId,
+              updatedAt: new Date().toISOString(),
+            });
+          },
+        });
+        return { ...result, work: next, fixRound };
+      } catch (e) {
+        // Refused inside the transaction: nothing was written, and the removal stays unhandled for a later poll.
+        if ((e as { code?: string }).code !== 'E_CONCURRENT') throw e;
+        return { ...result, work: this.ctx.store.getWork(work.id) };
+      }
+    }
+    return { ...result, work };
   }
 
   /** Turbine role_runs + external usage_records summary for a task. */
@@ -319,6 +750,8 @@ export class Engine {
     file?: string;
     text?: string;
     accountableHuman?: string;
+    /** Labels of the source issue, read by an intake adapter (lane policy eligibility). */
+    labels?: string[];
   }): WorkPackage {
     // Title-only create: the title *is* the request. Avoid "(No body provided)" so assess
     // can seed requirements and request coverage from something real.
@@ -342,6 +775,7 @@ export class Engine {
           provider: input.file ? 'file' : 'text',
           externalId: input.file,
           snapshotHash,
+          ...(input.labels?.length ? { labels: [...new Set(input.labels)] } : {}),
         },
         ...ghLinks.map((l) => ({ ...l.sourceRef, snapshotHash })),
       ],
@@ -448,6 +882,7 @@ export class Engine {
           sourceUpdatedAt: issue.updatedAt,
           sourceVersion: issue.id,
           snapshotHash: work.sourceRefs[0]!.snapshotHash,
+          ...(issue.labels?.length ? { labels: [...new Set(issue.labels)] } : {}),
         },
       ],
       acceptanceCriteria: (issue.acceptanceCriteria ?? []).map((statement, i) => ({
@@ -593,8 +1028,17 @@ export class Engine {
   }
 
   /** Enters CHANGES_REQUESTED and records it: each entry starts a new review cycle with a fresh file selection. */
-  private toChangesRequested(work: WorkPackage, cause: 'code-review' | 'verification-failed' | 'acceptance-failed'): WorkPackage {
-    const next = transition(work, 'CHANGES_REQUESTED');
+  private toChangesRequested(
+    work: WorkPackage,
+    cause: 'code-review' | 'verification-failed' | 'acceptance-failed' | 'queue-ejected' | 'execution-fail-cap',
+    /**
+     * `guard` runs inside the transaction on the freshly read task and returns why the transition must not
+     * happen (E_CONCURRENT, nothing written); `atomic` writes extra records in that same transaction.
+     */
+    opts: { guard?: (stored: WorkPackage) => string | undefined; atomic?: () => void } = {},
+  ): WorkPackage {
+    // Derive the transition from the stored task after the guard so concurrent risk/role updates are kept.
+    let next!: WorkPackage;
     // The event and the state are saved together: a failed state write must not leave an event that would count as
     // a review cycle, and a retried transition must add exactly one.
     this.ctx.store.transaction(() => {
@@ -604,11 +1048,15 @@ export class Engine {
       if (stored.currentState !== work.currentState) {
         throw err('E_CONCURRENT', `${work.id} is ${stored.currentState}, not ${work.currentState}, so changes were not requested. Look at the task again.`);
       }
+      const refusal = opts.guard?.(stored);
+      if (refusal) throw err('E_CONCURRENT', `${work.id}: changes were not requested because ${refusal}. Look at the task again.`);
+      next = transition(stored, 'CHANGES_REQUESTED');
       this.ctx.store.appendEvent({
         workId: work.id,
         type: 'task.changes-requested',
-        payload: { cause, fromState: work.currentState },
+        payload: { cause, fromState: stored.currentState },
       });
+      opts.atomic?.();
       this.ctx.store.saveWork(next);
     });
     return next;
@@ -1823,6 +2271,39 @@ export class Engine {
       this.checkBudget(work.id);
     }
 
+    const executionModeEarly = this.ctx.config.execution.mode;
+    const allowNetworkEarly = this.ctx.config.execution.allowNetwork;
+    // FR-D3: refuse networked unattended work outside sandboxed-unattended before any state change.
+    if (executionModeEarly !== 'sandboxed-unattended' && allowNetworkEarly) {
+      throw err(
+        'E_UNSAFE_EXECUTION',
+        'Networked autonomous execution is disabled outside sandboxed-unattended. Use manual-supervised mode or sandboxed-unattended.',
+      );
+    }
+    // Refuse supervised or sandboxed execute while an unterminated sandbox still owns the worktree.
+    const blocked = this.sandboxWorktreeBlockedReason(work.id);
+    if (blocked) {
+      throw err('E_CONCURRENT', blocked);
+    }
+
+    // FR-D3: sandboxed-unattended preflight before leaving PLAN_APPROVED so a refuse leaves the task retryable.
+    // After a fix-cap / limit leave-lane, require a human `lane.retry` before another autonomous launch.
+    let sandboxedPreflightRuntime: ContainerRuntime | undefined;
+    if (executionModeEarly === 'sandboxed-unattended') {
+      const membership = this.laneState(work.id);
+      if (!membership.inLane) {
+        // Supervised recovery only: prepare/reuse worktrees below without running the sandbox.
+      } else {
+        if (!this.sandboxImplementer) {
+          throw err(
+            'E_UNSAFE_EXECUTION',
+            'sandboxed-unattended requires a bound agent implementer (Engine.sandboxImplementer). It will not start with the default fixture or fall back to unsandboxed execution.',
+          );
+        }
+        sandboxedPreflightRuntime = preflightSandbox(this.resolveSandboxPreflightHooks()).runtime;
+      }
+    }
+
     // Rebuilt when the base commit moved or this is a new CHANGES_REQUESTED cycle, before anything points at it.
     // It runs before the task leaves PLAN_APPROVED / CHANGES_REQUESTED and before any worktree exists, so a
     // failure here (an unreadable repository, an unwritable packet folder) leaves the task retryable.
@@ -1848,7 +2329,35 @@ export class Engine {
             primarySetup: this.ctx.config.quality.setup,
           });
 
+    const executionMode = this.ctx.config.execution.mode;
+
     let modelNotes: unknown;
+    const primary = repos[0]!;
+
+    if (executionMode === 'sandboxed-unattended' && this.laneState(work.id).inLane) {
+      work = await this.runSandboxedUnattended({
+        work,
+        plan,
+        spec,
+        taskContext,
+        repos,
+        primary,
+        preflightRuntime: sandboxedPreflightRuntime!,
+      });
+      return {
+        work,
+        result: {
+          repos: this.repoStates(work.id).length ? observe(this.repoStates(work.id)).repos : repos,
+          worktreePath: primary.worktreePath,
+          branch: primary.branch,
+          baseCommit: primary.baseCommit,
+          modelNotes: undefined,
+        },
+        packetDir: packetPaths(this.ctx.projectRoot, work.id).dir,
+        openFile: packetPaths(this.ctx.projectRoot, work.id).executionBrief,
+      };
+    }
+
     if (existing.length === 0) {
       const model = getModel(this.ctx.config.models.profiles.implementation?.model ?? 'mock-default');
       const skill = getSkill(this.ctx.factoryRoot, 'core/execute-code-change');
@@ -1856,9 +2365,6 @@ export class Engine {
         work.selectedRoles.find((r) => /-developer$/.test(r.id))?.id ??
         work.selectedRoles.find((r) => r.id === 'database-engineer')?.id ??
         'backend-developer';
-      if (this.ctx.config.execution.allowNetwork) {
-        throw err('E_UNSAFE_EXECUTION', 'Networked autonomous execution is disabled in R0/R1. Use manual-supervised mode.');
-      }
       // Supervised mode: the implementer role only produces guidance; a human/agent writes code.
       modelNotes = (
         await this.runAsRole({
@@ -1896,7 +2402,6 @@ export class Engine {
       payload: { repos: repos.map((r) => ({ name: r.name, worktreePath: r.worktreePath, base: r.baseCommit })) },
     });
 
-    const primary = repos[0]!;
     this.render(work.id, [
         'Work ONLY in the worktree(s) listed below; follow SPEC.md → Plan.',
         'Commit your changes there, then run: turbine task sync <id>',
@@ -1915,6 +2420,578 @@ export class Engine {
       packetDir: packetPaths(this.ctx.projectRoot, work.id).dir,
       openFile: packetPaths(this.ctx.projectRoot, work.id).executionBrief,
     };
+  }
+
+  /** Preflight hooks: full sandboxHooks win; otherwise merge optional preflight-only overrides. */
+  private resolveSandboxPreflightHooks(): SandboxHooks {
+    if (this.sandboxHooks) return this.sandboxHooks;
+    const defaults = defaultSandboxHooks();
+    if (!this.sandboxPreflightHooks) return defaults;
+    return {
+      ...defaults,
+      detectRuntime: this.sandboxPreflightHooks.detectRuntime,
+      egressProbeSucceeds: this.sandboxPreflightHooks.egressProbeSucceeds,
+    };
+  }
+
+  /**
+   * Part D: run the implementer inside Docker/Podman after fail-closed preflight.
+   * Agent prose is never evidence — only commits + later check results count (FR-D5).
+   */
+  private async runSandboxedUnattended(input: {
+    work: WorkPackage;
+    plan: Artifact;
+    spec: Artifact;
+    taskContext: RefreshResult;
+    repos: RepoState[];
+    primary: RepoState;
+    preflightRuntime: ContainerRuntime;
+  }): Promise<WorkPackage> {
+    let work = input.work;
+    const startedRevision = work.currentRevision;
+    const claim = this.createSandboxClaim();
+    /** When true, finally must keep the local in-flight marker (unterminated phase still owns the worktree). */
+    let retainInFlight = false;
+    if (this.sandboxInFlight.has(work.id)) {
+      throw err('E_CONCURRENT', `${work.id} already has a sandboxed-unattended run in flight`);
+    }
+    this.sandboxInFlight.add(work.id);
+
+    const stillOwnsExecution = (): boolean => {
+      const live = this.ctx.store.getWork(work.id);
+      return live.currentState === 'IMPLEMENTING' && live.currentRevision === startedRevision;
+    };
+
+    const failWithLeaveLane = (args: {
+      reason: string;
+      observed: RepoState[];
+      eventType: 'execution.phase-failed' | 'execution.fix-cap' | 'execution.limit-exceeded';
+      evaluationStatus: string;
+      payload?: Record<string, unknown>;
+      modelNotes?: unknown;
+      /** Keep worktree ownership blocked until the phase workload is confirmed stopped. */
+      retainWorktreeOwnership?: boolean;
+    }): WorkPackage => {
+      // Keep the capture guard until incomplete/terminating + lane fallback + state transition
+      // publish together so a concurrent capture cannot advance on a clean failure commit.
+      work = this.toChangesRequested(work, 'execution-fail-cap', {
+        guard: (stored) =>
+          stored.currentState === 'IMPLEMENTING' && stored.currentRevision === startedRevision
+            ? undefined
+            : 'execution ownership changed',
+        atomic: () => {
+          this.saveChangeSet(work.id, args.observed, {
+            status: args.retainWorktreeOwnership ? 'sandboxed-terminating' : 'sandboxed-incomplete',
+            summary: `${args.reason}. Worktrees preserved; agent reports unverified.`,
+            modelNotes: {
+              ...(typeof args.modelNotes === 'object' && args.modelNotes !== null
+                ? (args.modelNotes as Record<string, unknown>)
+                : { note: args.modelNotes }),
+              ...(args.retainWorktreeOwnership ? { claim, terminating: true } : {}),
+            },
+            createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
+            parentArtifactIds: [input.plan.id],
+          });
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: args.eventType,
+            payload: { reason: args.reason, runtime: input.preflightRuntime, ...args.payload },
+          });
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: 'lane.fallback',
+            payload: {
+              gate: 'codeReview',
+              workRevision: work.currentRevision,
+              reasons: [args.reason],
+              evaluationHash: contentHash({
+                workId: work.id,
+                reason: args.reason,
+                status: args.evaluationStatus,
+              }),
+            },
+          });
+        },
+      });
+      if (args.retainWorktreeOwnership) retainInFlight = true;
+      return work;
+    };
+
+    const failInit = (reason: string): WorkPackage =>
+      failWithLeaveLane({
+        reason,
+        observed: input.repos,
+        eventType: 'execution.phase-failed',
+        evaluationStatus: 'sandbox-init-failed',
+      });
+
+    try {
+    // Record worktree ownership + recoverable claim before any further init (inside cleanup scope).
+    try {
+      this.saveChangeSet(work.id, input.repos, {
+        status: 'sandboxed-running',
+        summary: 'Sandboxed-unattended run started; worktrees recorded.',
+        modelNotes: { claim },
+        createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
+        parentArtifactIds: [input.plan.id],
+      });
+    } catch (e) {
+      work = failInit(
+        `failed to record sandboxed-running claim: ${(e as Error).message.split('\n')[0]}`,
+      );
+      this.render(work.id, [
+        'Sandboxed-unattended init failed: could not record the running claim.',
+        'Task left the autonomous lane.',
+      ]);
+      return work;
+    }
+
+    const customHooks = this.sandboxHooks;
+    const hooks = this.resolveSandboxPreflightHooks();
+    // Bind the workload to the runtime preflight probed — do not silently switch.
+    const detected = hooks.detectRuntime();
+    if (!detected || detected !== input.preflightRuntime) {
+      work = failInit(
+        `sandboxed-unattended runtime mismatch after preflight (expected ${input.preflightRuntime}, got ${detected ?? 'none'})`,
+      );
+      this.render(work.id, [`Sandboxed-unattended init failed: runtime mismatch.`, 'Task left the autonomous lane.']);
+      return work;
+    }
+    const runtime = input.preflightRuntime;
+    let mount;
+    try {
+      mount = planSandboxMounts({
+        worktreePath: input.primary.worktreePath,
+        projectRoot: this.ctx.projectRoot,
+        runtime,
+      });
+    } catch (e) {
+      work = failInit(`sandbox mount plan refused: ${(e as Error).message.split('\n')[0]}`);
+      this.render(work.id, [`Sandboxed-unattended init failed: mount plan.`, 'Task left the autonomous lane.']);
+      return work;
+    }
+
+    const knowledgePath = join(this.ctx.projectRoot, '.turbine', 'knowledge', 'index.md');
+    let knowledge = 'No knowledge index is available for this project.';
+    if (existsSync(knowledgePath)) {
+      try {
+        knowledge = readFileSync(knowledgePath, 'utf8').slice(0, 64_000);
+      } catch (e) {
+        knowledge = `Knowledge index could not be read (${(e as Error).message.split('\n')[0]}); nothing is claimed about prior knowledge.`;
+      }
+    }
+
+    const implementer = this.sandboxImplementer;
+    if (!implementer) {
+      work = failInit('sandboxed-unattended requires a bound agent implementer (Engine.sandboxImplementer).');
+      this.render(work.id, [`Sandboxed-unattended init failed: no implementer.`, 'Task left the autonomous lane.']);
+      return work;
+    }
+
+    this.ctx.store.appendEvent({
+      workId: work.id,
+      type: 'execution.prepared',
+      payload: {
+        mode: 'sandboxed-unattended',
+        runtime,
+        repos: input.repos.map((r) => ({ name: r.name, worktreePath: r.worktreePath, base: r.baseCommit })),
+        forbiddenMounts: mount.forbiddenMounts,
+        worktreePath: mount.worktreePath,
+      },
+    });
+
+    const allow = this.ctx.config.tools.allow;
+    const denied = this.ctx.config.tools.denied;
+    const testsRunAllowed = !denied.includes('tests.run') && (allow.length === 0 || allow.includes('tests.run'));
+
+    /**
+     * Host `runCommand` is not a sandbox. Until a container phase runner is bound via
+     * `sandboxHooks`, refuse to execute configured setup/checks on the host (fail closed).
+     * Empty command lists succeed without running anything. Tests inject `sandboxHooks`.
+     * Preflight-only overrides use `sandboxPreflightHooks` so this refuse path stays testable.
+     */
+    const refuseHostPhase = (phase: 'setup' | 'checks', commands: string[]): PhaseResult => {
+      if (commands.length === 0) {
+        return {
+          ok: true,
+          report: phase === 'setup' ? 'no setup commands' : 'no quality.checks configured',
+          outputBytes: 24,
+        };
+      }
+      return {
+        ok: false,
+        report: `${phase}: host execution refused until the container phase runner is bound (sandboxHooks); ${commands.length} command(s) not run`,
+        outputBytes: 96,
+      };
+    };
+
+    const phaseHooks: SandboxHooks = {
+      ...hooks,
+      readEvidence: () => {
+        const seen = observe(input.repos);
+        return {
+          heads: Object.fromEntries(seen.repos.map((r) => [r.name, r.headCommit])),
+          dirty: seen.uncommitted.length > 0,
+        };
+      },
+      runPhase: async (phase, ctx) => {
+        if (ctx.signal.aborted) {
+          return { ok: false, report: `${phase} aborted (wall-clock)`, outputBytes: 0 };
+        }
+        // Recheck ownership before every phase so a mid-run requirements edit cannot drive another fix.
+        if (!stillOwnsExecution()) {
+          return {
+            ok: false,
+            report: `${phase} aborted: execution ownership lost (revision or state changed)`,
+            outputBytes: 48,
+          };
+        }
+        if (phase === 'setup') {
+          if (customHooks) return customHooks.runPhase(phase, ctx);
+          return refuseHostPhase('setup', this.ctx.config.quality.setup ?? []);
+        }
+        if (phase === 'implement' || phase === 'fix') {
+          const result = await implementer.run({
+            workId: work.id,
+            spec: this.ctx.store.getArtifactContent(input.spec.id),
+            plan: this.ctx.store.getArtifactContent(input.plan.id),
+            context: this.promptContext(work, input.taskContext),
+            knowledge,
+            signal: ctx.signal,
+          });
+          // FR-D5: report is unverified; only commits + usage are recorded as structured facts.
+          if (result.usage) {
+            try {
+              this.addUsage({
+                idOrAlias: work.id,
+                source: 'agent',
+                agentName: implementer.id,
+                modelId: result.usage.modelId ?? 'unknown',
+                modelProvider: result.usage.provider ?? 'unknown',
+                inputTokens: result.usage.inputTokens ?? 'unknown',
+                outputTokens: result.usage.outputTokens ?? 'unknown',
+                method: 'reported',
+                note: `sandboxed ${phase} (report unverified)`,
+                recordedBy: 'executor',
+                enteredBy: 'agent',
+              });
+            } catch {
+              // Usage recording must not abort the sandbox; missing usage stays unknown in metrics.
+            }
+          }
+          return {
+            ok: result.ok,
+            report: result.report,
+            commits: result.commits,
+            usage: result.usage
+              ? { inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, modelId: result.usage.modelId }
+              : undefined,
+            outputBytes: Buffer.byteLength(result.report ?? '', 'utf8'),
+          } satisfies PhaseResult;
+        }
+        if (phase === 'checks') {
+          if (!testsRunAllowed) {
+            return {
+              ok: false,
+              report: 'Capability tests.run is not allowed by tools.allow / tools.denied; sandbox checks not run',
+              outputBytes: 64,
+            };
+          }
+          // Deterministic checks with no network (FR-D2). Host execution is refused without sandboxHooks.
+          if (customHooks) return customHooks.runPhase(phase, ctx);
+          return refuseHostPhase('checks', this.ctx.config.quality.checks ?? []);
+        }
+        // commit — git commits are produced by the implementer; this phase confirms the worktree is clean.
+        if (customHooks) return customHooks.runPhase(phase, ctx);
+        const dirty = this.uncommitted(work.id);
+        if (dirty.length) {
+          return {
+            ok: false,
+            report: `commit phase refused: uncommitted files remain (${dirty.map((d) => d.repo).join(', ')})`,
+            outputBytes: 64,
+          };
+        }
+        return { ok: true, report: 'commit phase complete', outputBytes: 24 };
+      },
+    };
+
+    const limits = {
+      wallClockMs: this.ctx.config.execution.sandboxWallClockMs,
+      maxOutputBytes: this.ctx.config.execution.sandboxMaxOutputBytes,
+      maxExecutionAttempts: this.ctx.config.budgets.perTask.maxExecutionAttempts,
+    };
+
+    let run: Awaited<ReturnType<typeof runSandboxedStateMachine>>;
+    try {
+      run = await runSandboxedStateMachine({ hooks: phaseHooks, limits, mount });
+    } catch (e) {
+      const reason = `sandboxed phase threw: ${(e as Error).message.split('\n')[0]}`;
+      if (!stillOwnsExecution()) {
+        return this.ctx.store.getWork(work.id);
+      }
+      work = failWithLeaveLane({
+        reason,
+        observed: observe(input.repos).repos,
+        eventType: 'execution.phase-failed',
+        evaluationStatus: 'phase-threw',
+        modelNotes: { error: reason },
+      });
+      this.render(work.id, [
+        `Sandboxed-unattended failed: ${reason}`,
+        'Task left the autonomous lane. Worktrees are preserved for recovery.',
+      ]);
+      return work;
+    }
+
+    if (!stillOwnsExecution()) {
+      // Another sync advanced the task while the implementer ran — clear our running claim only.
+      this.clearOrphanedSandboxClaim(work.id, claim, 'execution ownership lost during sandboxed run');
+      return this.ctx.store.getWork(work.id);
+    }
+
+    if (run.status !== 'completed') {
+      const reason =
+        run.status === 'limit-exceeded'
+          ? `sandboxed run hit ${run.limitName ?? 'limit'}: ${run.reason}`
+          : run.reason;
+      const eventType =
+        run.status === 'limit-exceeded'
+          ? 'execution.limit-exceeded'
+          : run.status === 'fix-cap'
+            ? 'execution.fix-cap'
+            : 'execution.phase-failed';
+      const retainWorktreeOwnership =
+        run.status === 'limit-exceeded' && run.workloadStopped === false;
+      work = failWithLeaveLane({
+        reason,
+        observed: observe(input.repos).repos,
+        eventType,
+        evaluationStatus: run.status,
+        retainWorktreeOwnership,
+        payload: {
+          status: run.status,
+          attempts: run.attempts,
+          outputBytes: run.outputBytes,
+          commits: run.commits,
+          reportsUnverified: run.reports,
+          ...(run.status === 'limit-exceeded'
+            ? { limitName: run.limitName, workloadStopped: run.workloadStopped }
+            : {}),
+        },
+        modelNotes: { unverifiedReports: run.reports, adapterCommits: run.commits },
+      });
+      this.render(work.id, [
+        `Sandboxed-unattended ${run.status}: ${reason}`,
+        retainWorktreeOwnership
+          ? 'Task left the lane; worktree ownership remains blocked until the timed-out phase is confirmed stopped.'
+          : 'Task left the autonomous lane. Fix in the worktree, then a human may retry the lane.',
+      ]);
+      return work;
+    }
+
+    const observedRepos = observe(input.repos).repos;
+    // Pin completion to the commit the post-commit checks read (AGENTS.md rule 5).
+    const evidenceHeads = run.evidenceHeads;
+    const headMismatch = observedRepos.some((r) => evidenceHeads[r.name] !== r.headCommit);
+    if (headMismatch) {
+      work = failWithLeaveLane({
+        reason:
+          'sandboxed completion refused: HEAD changed between post-commit checks and publish (retryable)',
+        observed: observedRepos,
+        eventType: 'execution.phase-failed',
+        evaluationStatus: 'evidence-head-mismatch',
+        modelNotes: {
+          unverifiedReports: run.reports,
+          adapterCommits: run.commits,
+          evidenceHeads,
+          observedHeads: Object.fromEntries(observedRepos.map((r) => [r.name, r.headCommit])),
+        },
+      });
+      this.render(work.id, [
+        'Sandboxed-unattended completion refused: repository HEAD changed after checks.',
+        'Task left the autonomous lane. Re-run when the worktree is stable.',
+      ]);
+      return work;
+    }
+
+    const hasCommitPastBase = changeSetId(observedRepos) !== baseSetId(observedRepos);
+    const completedWithCommit = hasCommitPastBase;
+    // Release the capture guard only once the completed (or incomplete-without-commit) report is ready.
+    // Emit completion only after the HEAD check so a mismatch never records a completed run.
+    this.ctx.store.appendEvent({
+      workId: work.id,
+      type: 'execution.sandboxed',
+      payload: {
+        status: run.status,
+        runtime: run.runtime,
+        attempts: run.attempts,
+        outputBytes: run.outputBytes,
+        commits: run.commits,
+        reportsUnverified: run.reports,
+        evidenceHeads: run.evidenceHeads,
+      },
+    });
+    this.saveChangeSet(work.id, observedRepos, {
+      status: completedWithCommit ? 'committed' : 'sandboxed-incomplete',
+      summary: completedWithCommit
+        ? `Sandboxed run completed (observed commit past base; agent reports unverified).`
+        : 'Sandboxed run finished without an observed commit past the base; agent reports unverified.',
+      modelNotes: {
+        unverifiedReports: run.reports,
+        adapterCommits: run.commits,
+        observedPastBase: hasCommitPastBase,
+        evidenceHeads,
+      },
+      createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
+      parentArtifactIds: [input.plan.id],
+    });
+
+    this.render(
+      work.id,
+      completedWithCommit
+        ? [
+            `Sandboxed-unattended completed via ${run.runtime} (${run.attempts} check attempt(s)).`,
+            'Only git commits and check results are evidence; agent reports are unverified.',
+            'Next: turbine task sync <id>',
+          ]
+        : [
+            `Sandboxed-unattended finished via ${run.runtime} without an observed commit past the base.`,
+            'Agent reports are unverified. Commit in the worktree, then turbine task sync <id>.',
+          ],
+    );
+    return work;
+    } finally {
+      if (!retainInFlight) this.sandboxInFlight.delete(work.id);
+    }
+  }
+
+  private createSandboxClaim(): {
+    pid: number;
+    startedAt: string;
+    processStartedAt?: string;
+  } {
+    return {
+      pid: process.pid,
+      startedAt: now(),
+      processStartedAt: this.readProcessStartedAt(process.pid),
+    };
+  }
+
+  /** Process start time fingerprint (ISO); undefined when `ps` cannot identify the process. */
+  private readProcessStartedAt(pid: number): string | undefined {
+    if (!Number.isInteger(pid) || pid <= 0) return undefined;
+    try {
+      const out = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+        encoding: 'utf8',
+        timeout: 2_000,
+      });
+      if (out.status !== 0) return undefined;
+      const raw = (out.stdout ?? '').trim();
+      if (!raw) return undefined;
+      const ms = Date.parse(raw);
+      return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private sandboxClaimsMatch(
+    a: { pid?: number; startedAt?: string; processStartedAt?: string } | undefined,
+    b: { pid?: number; startedAt?: string; processStartedAt?: string } | undefined,
+  ): boolean {
+    if (!a || !b) return false;
+    return (
+      a.pid === b.pid &&
+      a.startedAt === b.startedAt &&
+      (a.processStartedAt ?? undefined) === (b.processStartedAt ?? undefined)
+    );
+  }
+
+  /**
+   * True when the claim's owner process instance is still alive on this host.
+   * PID alone is not enough (OS reuse); require a matching process start fingerprint when available.
+   */
+  private sandboxClaimOwnerAlive(
+    claim: { pid?: number; startedAt?: string; processStartedAt?: string } | undefined,
+  ): boolean {
+    if (!claim || typeof claim.pid !== 'number' || !Number.isInteger(claim.pid) || claim.pid <= 0) {
+      return false;
+    }
+    try {
+      process.kill(claim.pid, 0);
+    } catch {
+      return false;
+    }
+    const liveStart = this.readProcessStartedAt(claim.pid);
+    if (claim.processStartedAt) {
+      // Fail closed when we cannot re-read start time, or when the live process is a different instance.
+      if (!liveStart) return false;
+      return Math.abs(Date.parse(liveStart) - Date.parse(claim.processStartedAt)) < 2_000;
+    }
+    // Legacy claims without a start fingerprint: do not treat a bare live PID as ownership.
+    return false;
+  }
+
+  /**
+   * Clear a sandboxed-running/terminating report only when it still carries `expectedClaim`.
+   * Caller must hold the store write lock when racing with other Engines (e.g. inside `atomic`).
+   * Returns false when the current report belongs to a different run.
+   */
+  private clearOrphanedSandboxClaim(
+    workId: string,
+    expectedClaim: { pid: number; startedAt: string; processStartedAt?: string } | undefined,
+    reason: string,
+  ): boolean {
+    const latest = this.ctx.store.getLatestArtifact(workId, 'change-report');
+    if (!latest) return false;
+    let body: {
+      status?: string;
+      modelNotes?: { claim?: { pid?: number; startedAt?: string; processStartedAt?: string } };
+    };
+    try {
+      body = JSON.parse(this.ctx.store.getArtifactContent(latest.id)) as typeof body;
+    } catch {
+      return false;
+    }
+    if (body.status !== 'sandboxed-running' && body.status !== 'sandboxed-terminating') return false;
+    if (expectedClaim && !this.sandboxClaimsMatch(body.modelNotes?.claim, expectedClaim)) {
+      return false;
+    }
+    const repos = this.repoStates(workId);
+    if (!repos.length) return false;
+    this.saveChangeSet(workId, observe(repos).repos, {
+      status: 'sandboxed-incomplete',
+      summary: `${reason}. Worktrees preserved for supervised recovery.`,
+      modelNotes: { interruptedClaim: expectedClaim ?? body.modelNotes?.claim, reason },
+      createdBy: { kind: 'tool', identifier: 'sandboxed-executor' },
+    });
+    return true;
+  }
+
+  /** Block supervised execute while a sandbox still owns the worktree (live or orphaned claim). */
+  private sandboxWorktreeBlockedReason(workId: string): string | undefined {
+    if (this.sandboxInFlight.has(workId)) {
+      return 'Sandboxed-unattended run still in flight; wait for it to finish.';
+    }
+    const latest = this.ctx.store.getLatestArtifact(workId, 'change-report');
+    if (!latest) return undefined;
+    try {
+      const body = JSON.parse(this.ctx.store.getArtifactContent(latest.id)) as {
+        status?: string;
+        modelNotes?: { claim?: { pid?: number; startedAt?: string; processStartedAt?: string } };
+      };
+      if (body.status === 'sandboxed-running' || body.status === 'sandboxed-terminating') {
+        if (this.sandboxClaimOwnerAlive(body.modelNotes?.claim)) {
+          return body.status === 'sandboxed-terminating'
+            ? 'Sandboxed-unattended phase termination is not confirmed; worktree remains blocked.'
+            : 'Sandboxed-unattended run still marked running with a live owner claim; wait for it to finish.';
+        }
+        return 'Sandboxed-unattended claim is orphaned; run turbine task sync to recover before execute.';
+      }
+    } catch {
+      return undefined;
+    }
+    return undefined;
   }
 
   /**
@@ -2075,6 +3152,16 @@ export class Engine {
     const repos = this.repoStates(work.id);
     const implemented = repos.length > 0 && changeSetId(repos) !== baseSetId(repos);
     const cs = repos.length ? changeSetId(repos) : undefined;
+    const dualReviews: ReviewResult[] = [];
+    for (const artifact of this.ctx.store.listArtifacts(work.id, 'review')) {
+      if (artifact.relatedCommit !== cs) continue;
+      try {
+        const parsed = JSON.parse(this.ctx.store.getArtifactContent(artifact.id)) as ReviewResult;
+        if (parsed.reviewer && parsed.changeSetId === cs) dualReviews.push(parsed);
+      } catch (e) {
+        notes.push(`Dual review artifact ${artifact.id} is unreadable: ${(e as Error).message}`);
+      }
+    }
     const changeFacts = implemented ? this.factsFor(work.id, repos) : [];
     let gate: PacketData['gate'];
     try {
@@ -2104,6 +3191,7 @@ export class Engine {
       ['plan.json', plan?.content],
       ['change.json', implemented ? { repos, facts: changeFacts } : undefined],
       ['review.json', review?.content],
+      ['dual-reviews.json', dualReviews.length ? dualReviews : undefined],
       ['checks.json', report?.content],
     ];
     const evidenceFiles: string[] = [];
@@ -2126,9 +3214,19 @@ export class Engine {
         this.ctx.store.appendEvent({ workId: work.id, type: 'context.render-failed', payload: { message: (e as Error).message.split('\n')[0] } });
       }
     }
+    const decisions = this.ctx.store.listDecisions(work.id);
+    const policyApprovals: Record<string, { by: string; on: string }> = {};
+    for (const d of decisions) {
+      if (d.actorType !== 'policy' || !d.policyId || !d.policyApprovalDecisionId) continue;
+      const approval = this.ctx.store.listDecisions(policyDecisionSubject(d.policyId)).find((a) => a.id === d.policyApprovalDecisionId);
+      if (approval) policyApprovals[d.id] = { by: approval.actorId, on: approval.decidedAt.slice(0, 10) };
+    }
+    const lane = this.laneState(work.id);
     const data: PacketData = {
       projectRoot: this.ctx.projectRoot,
       work,
+      policyApprovals,
+      laneFallback: lane.fallback,
       track: trackFor(work),
       next: computeNextStep({ projectRoot: this.ctx.projectRoot, work }),
       notes: renderNotes,
@@ -2141,8 +3239,9 @@ export class Engine {
       implemented,
       changeFacts,
       review: review?.content,
+      dualReviews,
       runs: report && report.content.changeSetId === cs ? report.content.runs : undefined,
-      decisions: this.ctx.store.listDecisions(work.id),
+      decisions,
       gate,
       trace: this.traceFor(work.id),
       analysis: this.analyzeWork(work.id),
@@ -2409,6 +3508,105 @@ export class Engine {
     if (work.currentState !== 'IMPLEMENTING') {
       throw err('E_INVALID_TRANSITION', `Cannot capture implementation from ${work.currentState}`);
     }
+    if (this.sandboxInFlight.has(work.id)) {
+      return {
+        work,
+        moved: false,
+        reason: 'Sandboxed-unattended run still in flight; wait for it to finish before capturing commits.',
+      };
+    }
+    // Cross-Engine instances share the store: wait on a live claim; recover orphaned running/terminating claims.
+    const latestChange = this.ctx.store.getLatestArtifact(work.id, 'change-report');
+    if (latestChange) {
+      let body: {
+        status?: string;
+        modelNotes?: { claim?: { pid?: number; startedAt?: string; processStartedAt?: string } };
+      };
+      try {
+        body = JSON.parse(this.ctx.store.getArtifactContent(latestChange.id)) as typeof body;
+      } catch {
+        // Unreadable change report is handled elsewhere; do not block capture here.
+        body = {};
+      }
+      if (body.status === 'sandboxed-running' || body.status === 'sandboxed-terminating') {
+        const claim = body.modelNotes?.claim;
+        if (this.sandboxClaimOwnerAlive(claim)) {
+          return {
+            work,
+            moved: false,
+            reason:
+              body.status === 'sandboxed-terminating'
+                ? 'Sandboxed-unattended phase termination is not confirmed; wait before capturing commits.'
+                : 'Sandboxed-unattended run still marked running with a live owner claim; wait for it to finish.',
+          };
+        }
+        // Owner process is gone (or claim missing) — clear running + leave lane together.
+        const interruptedClaim =
+          claim && typeof claim.pid === 'number' && typeof claim.startedAt === 'string'
+            ? {
+                pid: claim.pid,
+                startedAt: claim.startedAt,
+                processStartedAt: claim.processStartedAt,
+              }
+            : undefined;
+        const observedReportId = latestChange.id;
+        try {
+          work = this.toChangesRequested(work, 'execution-fail-cap', {
+            guard: () => {
+              const current = this.ctx.store.getLatestArtifact(work.id, 'change-report');
+              return current?.id === observedReportId
+                ? undefined
+                : 'the sandboxed run report changed after it was read';
+            },
+            atomic: () => {
+              const cleared = this.clearOrphanedSandboxClaim(
+                work.id,
+                interruptedClaim,
+                'Sandboxed-unattended run interrupted (owner process gone or claim missing)',
+              );
+              if (!cleared) {
+                throw err(
+                  'E_CONCURRENT',
+                  `${work.id}: sandboxed claim changed before orphan recovery could clear it`,
+                );
+              }
+              this.ctx.store.appendEvent({
+                workId: work.id,
+                type: 'lane.fallback',
+                payload: {
+                  gate: 'codeReview',
+                  workRevision: work.currentRevision,
+                  reasons: ['sandboxed-unattended interrupted; owner process gone'],
+                  evaluationHash: contentHash({
+                    workId: work.id,
+                    status: 'sandboxed-interrupted',
+                  }),
+                },
+              });
+              this.ctx.store.appendEvent({
+                workId: work.id,
+                type: 'execution.phase-failed',
+                payload: { reason: 'sandboxed-unattended interrupted; owner process gone' },
+              });
+            },
+          });
+        } catch (e) {
+          // Recovery failed (including E_CONCURRENT) — do not fall through to normal capture.
+          const message = e instanceof Error ? e.message : String(e);
+          return {
+            work: this.ctx.store.getWork(work.id),
+            moved: false,
+            reason: `Sandboxed orphan recovery failed: ${message.split('\n')[0]}`,
+          };
+        }
+        return {
+          work,
+          moved: false,
+          reason:
+            'Sandboxed-unattended run was interrupted (owner gone). Worktrees preserved; task left the lane for supervised recovery.',
+        };
+      }
+    }
     const repos = this.repoStates(work.id);
     if (!repos.length) throw err('E_NOT_FOUND', 'No worktrees recorded; run execute first');
     const seen = observe(repos);
@@ -2472,10 +3670,99 @@ export class Engine {
     return review?.content.changeSetId === changeSetId(repos);
   }
 
+  /** A failed-closed dual-review handoff is valid only for the exact recorded change set. */
+  private dualReviewHandoffIsCurrent(workId: string): boolean {
+    const repos = this.repoStates(workId);
+    if (!repos.length) return false;
+    const handoff = this.ctx.store
+      .listEvents(workId)
+      .filter((event) => event.type === 'review.handed-off')
+      .at(-1);
+    return (
+      handoff?.payload.mode === 'dual-review-failed-closed' &&
+      handoff.payload.changeSetId === changeSetId(repos)
+    );
+  }
+
   /** Uncommitted files in any worktree (approving code with uncommitted work is refused). */
   uncommitted(workId: string): Array<{ repo: string; paths: string[] }> {
     const repos = this.repoStates(workId).filter((r) => existsSync(r.worktreePath));
     return repos.length ? observe(repos).uncommitted : [];
+  }
+
+  private async runReviewWithModel(input: {
+    work: WorkPackage;
+    facts: RepoFacts[];
+    diffText: string;
+    changeSetId: string;
+    model: ModelAdapter;
+    maxOutputTokens: number;
+    reviewer?: ReviewResult['reviewer'];
+    requireParseable?: boolean;
+  }): Promise<ReviewResult> {
+    const { work, facts, diffText } = input;
+    const spec = this.ctx.store.getLatestArtifact(work.id, 'specification');
+    const plan = this.ctx.store.getLatestArtifact(work.id, 'plan');
+    const skill = getSkill(this.ctx.factoryRoot, 'core/review-change');
+    const lenses = selectLenses(work, facts);
+    const findings: Finding[] = [];
+    const discarded: DiscardedFinding[] = [];
+    const claimMismatches: ClaimMismatch[] = [];
+    const summaries: Array<{ lens: Lens; summary: string }> = [];
+    const coverage: CoverageLink[] = [];
+    for (const lens of lenses) {
+      this.checkBudget(work.id);
+      let result: Awaited<ReturnType<Engine['runAsRole']>>;
+      try {
+        result = await this.runAsRole({
+          skill,
+          model: input.model,
+          workId: work.id,
+          roleId: lens === 'security' ? 'security-reviewer' : 'code-reviewer',
+          context: [
+            LENS_INSTRUCTIONS[lens],
+            REVIEW_OUTPUT_CONTRACT,
+            `REQUIREMENTS:\n${work.acceptanceCriteria.map((c) => `- ${c.id} (${c.priority ?? 'P1'}): ${c.statement}`).join('\n')}`,
+            `SPEC:\n${spec ? this.ctx.store.getArtifactContent(spec.id).slice(0, 6000) : '(none)'}`,
+            `PLAN:\n${plan ? this.ctx.store.getArtifactContent(plan.id).slice(0, 4000) : '(none)'}`,
+            `FACTS (from git):\n${factsBlock(facts)}`,
+            `DIFF:\n${diffText}`,
+          ].join('\n\n'),
+          schemaId: 'review',
+          maxOutputTokens: input.maxOutputTokens,
+        });
+      } finally {
+        this.ctx.store.incrementBudget(work.id, 1);
+      }
+      if (input.requireParseable && !reviewOutputIsParseable(result.content)) {
+        throw new LaneIneligible(`${input.reviewer?.profile ?? input.model.id} returned incomplete or unparseable review output for ${lens}`);
+      }
+      const t = triage({ lens, raw: result.content, facts, diffText, startIndex: findings.length });
+      findings.push(...t.findings);
+      discarded.push(...t.discarded);
+      for (const mismatch of crossCheckClaims(result.content, facts)) {
+        if (!claimMismatches.some((x) => x.claim === mismatch.claim)) claimMismatches.push(mismatch);
+      }
+      if (lens === 'tests') {
+        const checked = validateCoverage(result.content, facts, work.acceptanceCriteria.map((c) => c.id));
+        coverage.push(...checked.links);
+        discarded.push(...checked.rejected);
+      }
+      const summary = (result.content as { summary?: unknown })?.summary;
+      if (typeof summary === 'string' && summary.trim()) summaries.push({ lens, summary: summary.trim().slice(0, 400) });
+    }
+    return {
+      changeSetId: input.changeSetId,
+      reviewer: input.reviewer,
+      lenses,
+      findings,
+      discarded,
+      claimMismatches,
+      summaries,
+      truncatedRepos: [],
+      coverage,
+      disposition: disposition(findings, claimMismatches),
+    };
   }
 
   /**
@@ -2501,62 +3788,16 @@ export class Engine {
     }
     const facts = computeFacts(repos);
     const diff = collectDiffs(repos);
-    const spec = this.ctx.store.getLatestArtifact(work.id, 'specification');
-    const plan = this.ctx.store.getLatestArtifact(work.id, 'plan');
     const model = getModel(this.ctx.config.models.profiles.analysis?.model ?? 'mock-default');
-    const skill = getSkill(this.ctx.factoryRoot, 'core/review-change');
-    const lenses = selectLenses(work, facts);
-
-    const findings: Finding[] = [];
-    const discarded: DiscardedFinding[] = [];
-    const claimMismatches: ClaimMismatch[] = [];
-    const summaries: Array<{ lens: Lens; summary: string }> = [];
-    const coverage: CoverageLink[] = [];
-    for (const lens of lenses) {
-      this.checkBudget(work.id);
-      const result = await this.runAsRole({
-        skill,
-        model,
-        workId: work.id,
-        roleId: lens === 'security' ? 'security-reviewer' : 'code-reviewer',
-        context: [
-          LENS_INSTRUCTIONS[lens],
-          REVIEW_OUTPUT_CONTRACT,
-          `REQUIREMENTS:\n${work.acceptanceCriteria.map((c) => `- ${c.id} (${c.priority ?? 'P1'}): ${c.statement}`).join('\n')}`,
-          `SPEC:\n${spec ? this.ctx.store.getArtifactContent(spec.id).slice(0, 6000) : '(none)'}`,
-          `PLAN:\n${plan ? this.ctx.store.getArtifactContent(plan.id).slice(0, 4000) : '(none)'}`,
-          `FACTS (from git):\n${factsBlock(facts)}`,
-          `DIFF:\n${diff.text}`,
-        ].join('\n\n'),
-        schemaId: 'review',
-        maxOutputTokens: 3000,
-      });
-      this.ctx.store.incrementBudget(work.id, 1);
-      const t = triage({ lens, raw: result.content, facts, diffText: diff.text, startIndex: findings.length });
-      findings.push(...t.findings);
-      discarded.push(...t.discarded);
-      for (const m of crossCheckClaims(result.content, facts)) {
-        if (!claimMismatches.some((x) => x.claim === m.claim)) claimMismatches.push(m);
-      }
-      if (lens === 'tests') {
-        const cov = validateCoverage(result.content, facts, work.acceptanceCriteria.map((c) => c.id));
-        coverage.push(...cov.links);
-        discarded.push(...cov.rejected);
-      }
-      const summary = (result.content as { summary?: unknown })?.summary;
-      if (typeof summary === 'string' && summary.trim()) summaries.push({ lens, summary: summary.trim().slice(0, 400) });
-    }
-    const review: ReviewResult = {
+    const review = await this.runReviewWithModel({
+      work,
+      facts,
+      diffText: diff.text,
       changeSetId: changeSet,
-      lenses,
-      findings,
-      discarded,
-      claimMismatches,
-      summaries,
-      truncatedRepos: diff.truncated,
-      coverage,
-      disposition: disposition(findings, claimMismatches),
-    };
+      model,
+      maxOutputTokens: this.ctx.config.models.profiles.analysis?.maxOutputTokens ?? 3000,
+    });
+    review.truncatedRepos = diff.truncated;
 
     const change = this.ctx.store.getLatestArtifact(work.id, 'change-report');
     const reviewArt = this.saveArtifact({
@@ -2601,14 +3842,14 @@ export class Engine {
           reviewArtifactId: reviewArt.id,
           mode: 'ai',
           disposition: review.disposition,
-          kept: findings.length,
-          discarded: discarded.length,
-          claimMismatches: claimMismatches.length,
+          kept: review.findings.length,
+          discarded: review.discarded.length,
+          claimMismatches: review.claimMismatches.length,
         },
       });
     });
     this.render(work.id, [
-        `AI review: ${review.disposition} (${findings.length} finding(s) kept, ${discarded.length} discarded as unverifiable).`,
+        `AI review: ${review.disposition} (${review.findings.length} finding(s) kept, ${review.discarded.length} discarded as unverifiable).`,
         'Read REVIEW.md sections 1–3 and the diff',
         'Then a human runs, in their own terminal: turbine task approve <id>',
       ]);
@@ -2617,6 +3858,157 @@ export class Engine {
       review,
       packetDir: packetPaths(this.ctx.projectRoot, work.id).dir,
       openFile: packetPaths(this.ctx.projectRoot, work.id).review,
+    };
+  }
+
+  private async runDualLaneReview(
+    work: WorkPackage,
+    policy: ApprovedLanePolicy,
+    expectedChangeSetId: string,
+  ): Promise<{
+    reviews: [ReviewResult, ReviewResult];
+    artifacts: Array<{ id: string; contentHash: string }>;
+    clean: boolean;
+    disagreement: boolean;
+  }> {
+    const profiles = resolvePolicyReviewers(policy.policy, this.ctx.config.models.profiles);
+    if (!profiles) throw new LaneIneligible(`policy ${policy.name} does not configure codeReview`);
+    const repos = this.repoStates(work.id);
+    if (!repos.length || changeSetId(repos) !== expectedChangeSetId) {
+      throw new LaneIneligible('the change set moved before dual review started');
+    }
+    const facts = computeFacts(repos);
+    const diff = collectDiffs(repos);
+    if (diff.truncated.length) {
+      throw new LaneIneligible(
+        `dual review cannot cover truncated diff content in: ${diff.truncated.join(', ')}`,
+      );
+    }
+    const reviews: ReviewResult[] = [];
+    for (const profile of profiles) {
+      const model = getModel(profile.model);
+      if (model.provider !== profile.provider) {
+        throw new LaneIneligible(
+          `reviewer profile ${profile.name} requires provider ${profile.provider}, but model ${profile.model} resolved to ${model.provider}`,
+        );
+      }
+      const review = await this.runReviewWithModel({
+        work,
+        facts,
+        diffText: diff.text,
+        changeSetId: expectedChangeSetId,
+        model,
+        maxOutputTokens: profile.maxOutputTokens,
+        reviewer: { profile: profile.name, provider: profile.provider, model: profile.model },
+        requireParseable: true,
+      });
+      review.truncatedRepos = diff.truncated;
+      reviews.push(review);
+      const observed = observe(this.repoStates(work.id));
+      if (observed.uncommitted.length || changeSetId(observed.repos) !== expectedChangeSetId) {
+        throw new LaneIneligible('the change set moved while dual review was running');
+      }
+    }
+    const pair = reviews as [ReviewResult, ReviewResult];
+    const blocking = pair.map((r) => r.disposition === 'needs-attention') as [boolean, boolean];
+    const disagreement = blocking[0] !== blocking[1];
+    const clean = !blocking[0] && !blocking[1];
+    const change = this.ctx.store.getLatestArtifact(work.id, 'change-report');
+    this.dualReviewBeforePublish?.();
+    const artifacts = this.ctx.store.transaction(() => {
+      const current = this.ctx.store.getWork(work.id);
+      if (current.currentState !== work.currentState || current.currentRevision !== work.currentRevision) {
+        throw new LaneIneligible('task state or revision changed while dual review was running');
+      }
+      if (!this.laneState(work.id).inLane) {
+        throw new LaneIneligible('task left the autonomous lane while dual review was running');
+      }
+      const observed = observe(this.repoStates(work.id));
+      if (observed.uncommitted.length || changeSetId(observed.repos) !== expectedChangeSetId) {
+        throw new LaneIneligible('the change set moved before dual review was published');
+      }
+      const artifacts = pair.map((review) =>
+        this.saveArtifact({
+          workId: work.id,
+          type: 'review',
+          content: review,
+          createdBy: { kind: 'agent', identifier: `code-reviewer:${review.reviewer!.profile}` },
+          parentArtifactIds: change ? [change.id] : [],
+          relatedCommit: expectedChangeSetId,
+        }),
+      );
+      if (change) {
+        for (const artifact of artifacts) {
+          this.ctx.store.saveEdge(
+            createEdge({
+              workId: work.id,
+              upstreamArtifactId: change.id,
+              upstreamRevisionHash: change.contentHash,
+              downstreamArtifactId: artifact.id,
+              downstreamRevisionHash: artifact.contentHash,
+              reason: 'change-to-dual-review',
+              affectedObligationIds: ['obl_code_review'],
+            }),
+          );
+        }
+      }
+      pair[0].lenses.forEach((lens) => {
+        const lensBlocking = pair.map(
+          (review) =>
+            review.findings.some((finding) => finding.lens === lens && finding.severity === 'high') ||
+            (lens === 'spec-compliance' && review.claimMismatches.length > 0),
+        ) as [boolean, boolean];
+        this.ctx.store.saveReviewerAgreement({
+          workId: work.id,
+          changeSetId: expectedChangeSetId,
+          policyId: policy.name,
+          policyHash: policy.contentHash,
+          lens,
+          reviewerProfiles: [profiles[0].name, profiles[1].name],
+          blocking: lensBlocking,
+          agreed: lensBlocking[0] === lensBlocking[1],
+        });
+      });
+      artifacts.forEach((artifact, index) => {
+        const review = pair[index]!;
+        this.ctx.store.saveEvidence({
+          id: createId('ev'),
+          workId: work.id,
+          kind: 'review',
+          reviewerId: review.reviewer!.profile,
+          result: review.disposition === 'no-blocking-findings' ? 'passed' : 'failed',
+          commitSha: expectedChangeSetId,
+          observedAt: now(),
+          logArtifactId: artifact.id,
+          limitations: ['Autonomous AI reviewer; policy pass requires both configured reviewers to complete cleanly'],
+        });
+      });
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'review.dual-completed',
+        payload: {
+          policy: policy.name,
+          changeSetId: expectedChangeSetId,
+          reviewers: profiles.map((p) => ({ profile: p.name, provider: p.provider, model: p.model })),
+          artifacts: artifacts.map((a) => a.id),
+          dispositions: pair.map((r) => r.disposition),
+          disagreement,
+        },
+      });
+      return artifacts;
+    });
+    this.render(work.id, [
+      disagreement
+        ? 'Dual reviewers disagree; a human decides code review.'
+        : clean
+          ? `Dual review completed cleanly for policy ${policy.name}.`
+          : 'Both autonomous reviewers found blocking issues; a human decides code review.',
+    ]);
+    return {
+      reviews: pair,
+      artifacts: artifacts.map((artifact) => ({ id: artifact.id, contentHash: artifact.contentHash })),
+      clean,
+      disagreement,
     };
   }
 
@@ -2951,6 +4343,7 @@ export class Engine {
       });
     });
     this.render(work.id, ['Accepted (not deployed). Task complete for R0/R1.']);
+    this.queueAcceptedPr(work);
     return { work, accepted: true };
   }
 
@@ -2959,9 +4352,88 @@ export class Engine {
    * acceptance observations) and advances AI/tool stages. It never records a human
    * decision: Decision blocks in markdown are display-only, because any agent with file
    * access could write "Approved: yes". Humans approve with `turbine task approve` in their
-   * own terminal.
+   * own terminal. When the step leaves the task at a human gate, an approved lane policy may pass it
+   * (recorded as a policy decision, never as a human one).
    */
   async syncFromMarkdown(
+    idOrAlias: string,
+    actorId = 'local-user',
+  ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
+    let pending = this.ctx.store.getWork(idOrAlias);
+    // A worktree that moved past the accepted head makes the ACCEPTED task stale: the sync step recaptures the
+    // head, so neither GitHub's answer (an ejection would send stale work to CHANGES_REQUESTED) nor a landing
+    // retry may be applied to it first.
+    if (pending.currentState !== 'ACCEPTED' || !this.worktreeMovedPastRecorded(pending.id)) {
+      // Reconcile GitHub first: an ejection or merge decides whether a landing retry is still owed at all.
+      await this.pollAcceptedPr(pending);
+      pending = this.ctx.store.getWork(pending.id);
+      // Landing resumes only for the accepted head still in the worktree.
+      if (this.resumeAcceptedPr(pending)) await this.waitForLanePr();
+      pending = this.ctx.store.getWork(pending.id);
+    }
+    if (pending.currentState === 'AI_REVIEW') {
+      pending = this.refreshHeads(pending.id).work;
+      const lane = await this.tryLanePass(pending.id);
+      if (
+        lane &&
+        (lane.status === 'passed' || lane.status === 'retry' || !!lane.evaluatedChangeSetId)
+      ) {
+        return this.finishLaneSync({ action: 'status', work: pending }, lane);
+      }
+    }
+    const result = await this.syncStep(idOrAlias, actorId);
+    const lane = await this.tryLanePass(result.work.id);
+    if (!lane) return result;
+    return this.finishLaneSync(result, lane);
+  }
+
+  private async finishLaneSync(
+    result: { action: string; work: WorkPackage; detail?: unknown },
+    lane: LaneOutcome,
+  ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
+    const laneDetail = { status: lane.status, gate: lane.gate, policy: lane.policy, decisionId: lane.decision?.id, reasons: lane.reasons };
+    const detail = { ...(result.detail && typeof result.detail === 'object' ? result.detail : {}), lane: laneDetail };
+    try {
+      const evaluatedPolicy =
+        lane.policy ??
+        (lane.evaluatedChangeSetId
+          ? policyForReviewPair(this.ctx.store, lane.work.id, lane.evaluatedChangeSetId)
+          : null);
+      if ((lane.status === 'passed' || lane.status === 'fallback') && evaluatedPolicy) {
+        evaluateSuspendWhen(this.ctx.store, evaluatedPolicy);
+      }
+      if (lane.status === 'passed') {
+        return { action: 'lane.passed', work: lane.work, detail };
+      }
+      if (
+        lane.gate === 'codeReview' &&
+        lane.evaluatedChangeSetId &&
+        lane.work.currentState === 'AI_REVIEW' &&
+        (lane.status === 'fallback' || lane.status === 'out-of-lane')
+      ) {
+        this.laneBeforeHandoff?.();
+        const refreshed = this.refreshHeads(lane.work.id).work;
+        const handedOff = this.handoffDualReviewToHuman(
+          refreshed,
+          lane.evaluatedChangeSetId,
+          lane.reasons,
+        );
+        if (handedOff.currentState === 'HUMAN_CODE_REVIEW') {
+          return {
+            action: 'review.human',
+            work: handedOff,
+            detail: { ...detail, openFile: packetPaths(this.ctx.projectRoot, handedOff.id).review },
+          };
+        }
+        return { ...result, work: handedOff, detail };
+      }
+      return { ...result, work: lane.work, detail };
+    } finally {
+      await this.waitForMirror();
+    }
+  }
+
+  private async syncStep(
     idOrAlias: string,
     _actorId = 'local-user',
   ): Promise<{ action: string; work: WorkPackage; detail?: unknown }> {
@@ -3075,7 +4547,11 @@ export class Engine {
       return { action: 'verify', work: verified.work, detail: verified };
     }
 
-    if (work.currentState === 'HUMAN_CODE_REVIEW' && !this.aiReviewIsCurrent(work.id)) {
+    if (
+      work.currentState === 'HUMAN_CODE_REVIEW' &&
+      !this.aiReviewIsCurrent(work.id) &&
+      !this.dualReviewHandoffIsCurrent(work.id)
+    ) {
       // Tasks stuck at code review with a review for an older commit (pre-fix behaviour).
       work = transition(work, 'AI_REVIEW');
       this.ctx.store.saveWork(work);
@@ -3163,7 +4639,7 @@ export class Engine {
       case 'HUMAN_CODE_REVIEW': {
         const head = this.currentCommit(work.id);
         if (!head) throw err('E_EEC_UNSATISFIED', 'No implementation commit recorded');
-        if (!this.aiReviewIsCurrent(work.id)) {
+        if (!this.aiReviewIsCurrent(work.id) && !this.dualReviewHandoffIsCurrent(work.id)) {
           throw err('E_EVIDENCE_STALE', `The AI review is for an older commit. Run: turbine task sync ${work.id} (re-runs the review), then approve.`);
         }
         return { work, gate: 'code-review', subject: head, confirmToken: head.slice(0, 8), openFile: paths.review };
@@ -3254,6 +4730,720 @@ export class Engine {
           { commit: pending.subject, presence: input.presence },
         );
       }
+    }
+  }
+
+  /**
+   * Lane membership from the event log: a `lane.fallback` takes the task out of the lane until a human's
+   * `lane.retry` (turbine task lane <id> --retry) puts it back.
+   */
+  laneState(idOrAlias: string): { inLane: boolean; fallback?: LaneFallback } {
+    const work = this.ctx.store.getWork(idOrAlias);
+    const last = this.ctx.store
+      .listEvents(work.id)
+      .filter((e) => e.type === 'lane.fallback' || e.type === 'lane.retry')
+      .at(-1);
+    if (!last || last.type === 'lane.retry') return { inLane: true };
+    const p = last.payload as Partial<LaneFallback>;
+    if (typeof p.evaluatedChangeSetId === 'string') {
+      const repos = this.repoStates(work.id);
+      if (!repos.length || changeSetId(repos) !== p.evaluatedChangeSetId) return { inLane: true };
+    }
+    return {
+      inLane: false,
+      fallback: {
+        gate: p.gate ?? 'requirements',
+        reasons: Array.isArray(p.reasons) ? p.reasons.map(String) : ['(reasons not recorded)'],
+        evaluationHash: typeof p.evaluationHash === 'string' ? p.evaluationHash : contentHash(last.payload),
+        evaluatedChangeSetId:
+          typeof p.evaluatedChangeSetId === 'string' ? p.evaluatedChangeSetId : undefined,
+        at: last.createdAt,
+      },
+    };
+  }
+
+  /** Human-only (callers establish presence): put a task that fell back to the human flow back in the lane. */
+  laneRetry(idOrAlias: string, input: { actor: string; confirmToken: string; presence: string }) {
+    // Read, token check, and append under one write lock so a newer fallback cannot slip in between.
+    const result = this.ctx.store.transaction(() => {
+      const work = this.ctx.store.getWork(idOrAlias);
+      const state = this.laneState(work.id);
+      if (state.inLane || !state.fallback) {
+        throw err('E_INVALID_TRANSITION', `${work.id} has not fallen back to the human flow; it is still in the lane`);
+      }
+      const token = state.fallback.evaluationHash.replace(/^sha256:/, '').slice(0, 8);
+      if (input.confirmToken.trim() !== token) {
+        throw err('E_STALE_REVISION', `Confirmation "${input.confirmToken}" does not match the fallback being retried (${token}).`);
+      }
+      if (!input.actor.trim()) throw err('E_UNTRUSTED_IDENTITY', 'Reviewer name is required');
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'lane.retry',
+        payload: { by: input.actor.trim(), presence: input.presence, fallbackEvaluationHash: state.fallback.evaluationHash },
+      });
+      return { work, retried: state.fallback, actor: input.actor.trim() };
+    });
+    this.render(result.work.id, [`Put back in the autonomous lane by ${result.actor}. Next: turbine task sync ${result.work.id}`]);
+    return { work: result.work, retried: result.retried };
+  }
+
+  /** The confirmation code `task lane --retry` asks for, with the fallback it retries. */
+  pendingLaneRetry(idOrAlias: string) {
+    const state = this.laneState(idOrAlias);
+    if (state.inLane || !state.fallback) throw err('E_INVALID_TRANSITION', 'This task has not fallen back to the human flow; it is still in the lane');
+    return { fallback: state.fallback, confirmToken: state.fallback.evaluationHash.replace(/^sha256:/, '').slice(0, 8) };
+  }
+
+  /** Every fact the eligibility evaluation needs, read at one commit. Read failures become `readErrors`. */
+  private laneFacts(work: WorkPackage, gate: LaneGate): LaneFacts {
+    const readErrors: string[] = [];
+    const attempt = <T>(label: string, fn: () => T, fallback: T): T => {
+      try {
+        return fn();
+      } catch (e) {
+        readErrors.push(`${label}: ${(e as Error).message.split('\n')[0]}`);
+        return fallback;
+      }
+    };
+    const codeGate = gate === 'codeReview' || gate === 'acceptance';
+    const repos = codeGate ? this.repoStates(work.id) : [];
+    const commit = attempt('commit', () => this.laneCommit(work.id, codeGate), '');
+    const subject = codeGate
+      ? commit
+      : (this.ctx.store.getLatestArtifact(work.id, gate === 'requirements' ? 'specification' : 'plan')?.contentHash ?? '');
+    if (!subject) readErrors.push(`no ${gate === 'requirements' ? 'specification' : gate === 'plan' ? 'plan' : 'change set'} to decide on`);
+    // At AI_REVIEW there is intentionally no advisory review yet. Check the preconditions that
+    // do not depend on that advisory artifact; the lane's own dual pair supplies review evidence.
+    if (work.currentState === 'AI_REVIEW' && gate === 'codeReview') {
+      attempt(
+        'approval preconditions',
+        () => {
+          const dirty = this.uncommitted(work.id);
+          if (dirty.length) throw new Error('worktree has uncommitted changes');
+        },
+        undefined,
+      );
+    } else {
+      attempt('approval preconditions', () => this.pendingApproval(work.id), undefined);
+    }
+    const lintErrors = attempt('task lint', () => this.lintWork(work.id).filter((i) => i.level === 'error').map((i) => `${i.file}: ${i.message}`), []);
+    const analysisGate = gate === 'acceptance' ? undefined : gate === 'codeReview' ? 'code-review' : gate;
+    const criticalFindings = attempt(
+      'task analyze',
+      () => this.analyzeWork(work.id).filter((a) => a.severity === 'CRITICAL' && a.gate === analysisGate).map((a) => a.message),
+      [],
+    );
+    let change: LaneFacts['change'];
+    if (codeGate) {
+      change = attempt(
+        'change facts',
+        () => {
+          if (!repos.length) throw new Error('no worktrees recorded');
+          const facts = computeFacts(repos);
+          return {
+            files: facts.flatMap((f) => f.files.map((x) => x.path)),
+            changedLines: facts.reduce((n, f) => n + f.insertions + f.deletions, 0),
+            dependencyChanges: facts.flatMap((f) => [...f.dependencies.added, ...f.dependencies.changed, ...f.dependencies.removed].map((d) => `${f.repo}:${d.name}`)),
+          };
+        },
+        undefined,
+      );
+    }
+    const triggers = [
+      ...work.risk.reasons,
+      ...detectHardRiskTriggers(work),
+      ...detectSoftTriggers(work),
+      ...(change?.dependencyChanges.length ? ['new-dependency'] : []),
+    ].filter((t) => LANE_TRIGGER_NAMES.includes(t));
+    let acceptance: LaneFacts['acceptance'];
+    if (gate === 'acceptance') {
+      acceptance = attempt(
+        'acceptance evidence',
+        () => {
+          const p0 = this.traceFor(work.id)
+            .filter((r) => r.priority === 'P0')
+            .map((r) => ({ id: r.requirementId, status: r.status ?? ('unknown' as const) }));
+          const evidence = this.ctx.store.listEvidence(work.id).filter((e) => e.commitSha === commit);
+          const checks = repos.flatMap((r) =>
+            (r.primary ? this.ctx.config.quality.checks : r.checks).map((cmd) => {
+              const label = checkLabel(r.name, cmd);
+              const latest = evidence
+                .filter((e) => e.commandOrCheck === label)
+                .sort((a, b) => b.observedAt.localeCompare(a.observedAt))[0];
+              return { command: label, result: latest?.result ?? 'not-run' };
+            }),
+          );
+          // Waivers are a human's risk acceptance: a policy pass needs the obligations actually satisfied.
+          const gateBlocking = this.gateDecision(work.id, ['obl_manual_sqa']).blocking.map((b) => `${b.id} (${b.status})`);
+          return { p0, checks, gateBlocking };
+        },
+        undefined,
+      );
+    }
+    return {
+      gate,
+      workId: work.id,
+      workRevision: work.currentRevision,
+      state: work.currentState,
+      commit,
+      subject,
+      riskProfile: work.risk.profile,
+      triggers: [...new Set(triggers)].sort(),
+      labels: [...new Set(work.sourceRefs.flatMap((s) => s.labels ?? []))].sort(),
+      repoCount: 1 + (work.repositories?.length ?? 0),
+      unknowns: work.unknowns,
+      criteriaCount: work.acceptanceCriteria.length,
+      lintErrors,
+      criticalFindings,
+      change,
+      acceptance,
+      readErrors,
+      reviewerProfiles: this.ctx.config.models.profiles,
+    };
+  }
+
+  /** Project HEAD before code exists; the observed change set id (every worktree HEAD) after. */
+  private laneCommit(workId: string, codeGate: boolean): string {
+    if (!codeGate) {
+      const h = repoHead(this.ctx.projectRoot);
+      if ('error' in h) throw new Error(`project HEAD is unreadable (${h.error})`);
+      return h.head;
+    }
+    const repos = this.repoStates(workId);
+    if (!repos.length) throw new Error('no worktrees recorded');
+    const seen = observe(repos).repos;
+    if (changeSetId(seen) !== changeSetId(repos)) throw new Error('a worktree has commits that are not captured yet; run sync');
+    return changeSetId(seen);
+  }
+
+  /** Move a failed autonomous review to the human gate only for the change set it evaluated. */
+  private handoffDualReviewToHuman(
+    work: WorkPackage,
+    evaluatedChangeSetId: string,
+    reasons: string[],
+  ): WorkPackage {
+    const next = this.ctx.store.transaction(() => {
+      const current = this.ctx.store.getWork(work.id);
+      if (current.currentState !== 'AI_REVIEW' || current.currentRevision !== work.currentRevision) {
+        return current;
+      }
+      const repos = this.repoStates(work.id);
+      const observed = repos.length ? observe(repos) : undefined;
+      if (
+        !observed ||
+        observed.uncommitted.length ||
+        changeSetId(repos) !== evaluatedChangeSetId ||
+        changeSetId(observed.repos) !== evaluatedChangeSetId
+      ) {
+        return current;
+      }
+      const transitioned = transition(current, 'HUMAN_CODE_REVIEW');
+      this.ctx.store.saveWork(transitioned);
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'review.handed-off',
+        payload: {
+          mode: 'dual-review-failed-closed',
+          changeSetId: evaluatedChangeSetId,
+          reasons,
+        },
+      });
+      return transitioned;
+    });
+    this.render(work.id, [
+      'Autonomous dual review did not pass; a human decides code review.',
+      ...reasons.slice(0, 3),
+    ]);
+    return next;
+  }
+
+  /**
+   * At a gate that waits for a human, try to pass it with an approved, active lane policy. Never records a
+   * human decision. Returns undefined when no lane policy has ever been approved (the lane is not in use).
+   */
+  async tryLanePass(idOrAlias: string): Promise<LaneOutcome | undefined> {
+    let work = this.ctx.store.getWork(idOrAlias);
+    const gate = LANE_GATE_FOR_STATE[work.currentState];
+    if (!gate) return undefined;
+    let stored: ReturnType<WorkStore['listLanePolicies']>;
+    try {
+      stored = this.ctx.store.listLanePolicies();
+    } catch (e) {
+      return this.laneFallback(work, gate, [], [`lane policy store unreadable: ${(e as Error).message}`]);
+    }
+    if (!stored.length) return undefined;
+    const lane = this.laneState(work.id);
+    if (!lane.inLane) {
+      return {
+        status: 'out-of-lane',
+        work,
+        gate,
+        reasons: lane.fallback?.reasons ?? [],
+        evaluatedChangeSetId: lane.fallback?.evaluatedChangeSetId,
+      };
+    }
+
+    let statuses: PolicyStatus[];
+    try {
+      statuses = policyStatuses(this.ctx.store, this.ctx.projectRoot).policies;
+    } catch (e) {
+      return this.laneFallback(work, gate, [], [`lane policies unreadable: ${(e as Error).message}`]);
+    }
+    const unusable = statuses
+      .filter((s) => s.approved || s.state === 'invalid')
+      .filter((s) => s.state !== 'active')
+      .map((s) => `policy ${s.name} is ${s.state}${s.reason ? `: ${s.reason}` : ''}`);
+    const active = statuses.filter((s) => s.state === 'active').map((s) => s.approved!);
+
+    let moved = '';
+    let reviewedChangeSet: string | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) {
+        work = this.ctx.store.getWork(work.id);
+        if (LANE_GATE_FOR_STATE[work.currentState] !== gate) return { status: 'retry', work, gate, reasons: [moved] };
+      }
+      let reviewClaim: string | undefined;
+      try {
+      // Re-check membership each attempt: a concurrent sync may have recorded lane.fallback after evaluation.
+      const membership = this.laneState(work.id);
+      if (!membership.inLane) {
+        return {
+          status: 'out-of-lane',
+          work,
+          gate,
+          reasons: membership.fallback?.reasons ?? [moved || 'task left the lane during evaluation'],
+          evaluatedChangeSetId: membership.fallback?.evaluatedChangeSetId,
+        };
+      }
+      const facts = this.laneFacts(work, gate);
+      // The PR target whose protection is evaluated is the one the acceptance lands on.
+      let acceptanceTarget: LanePrTarget | undefined;
+      if (gate === 'acceptance') {
+        const target = (acceptanceTarget = this.resolveLanePrTarget());
+        const protection = target
+          ? await confirmMergeQueueProtection(target, work.id)
+          : {
+              status: 'unknown' as const,
+              mergeQueueRequired: false,
+              turbineGateRequired: false,
+              reason: 'GitHub repository or adapter is unavailable',
+            };
+        facts.lanePr = {
+          configAllowsCreate: configAllows(this.ctx.config.tools, 'pr.create'),
+          configAllowsMerge: configAllows(this.ctx.config.tools, 'pr.merge'),
+          protection,
+        };
+      }
+      let evaluations = active.map((p) => evaluateLaneEligibility(p, facts));
+      const winnerIdx = evaluations.findIndex((e) => e.status === 'eligible');
+      if (winnerIdx < 0) return this.laneFallback(work, gate, evaluations, unusable);
+      const winner = active[winnerIdx]!;
+      if (gate === 'codeReview') {
+        reviewedChangeSet = facts.commit;
+        try {
+          reviewClaim = this.ctx.store.claimWork(work.id, 'dual review');
+        } catch (e) {
+          return {
+            status: 'retry',
+            work: this.ctx.store.getWork(work.id),
+            gate,
+            reasons: [(e as Error).message],
+            evaluatedChangeSetId: facts.commit,
+          };
+        }
+        try {
+          const dual = await this.runDualLaneReview(work, winner, facts.commit);
+          facts.dualReview = {
+            changeSetId: facts.commit,
+            complete: true,
+            clean: dual.clean,
+            disagreement: dual.disagreement,
+            artifacts: dual.artifacts,
+          };
+        } catch (e) {
+          const refreshed = this.refreshHeads(work.id);
+          if (refreshed.changed) {
+            moved = `the change set moved during dual review; recaptured ${this.currentCommit(work.id)?.slice(0, 12) ?? 'new HEAD'}`;
+            this.ctx.store.appendEvent({
+              workId: work.id,
+              type: 'lane.discarded',
+              payload: { gate, reason: moved, evaluationHash: evaluations[winnerIdx]!.evaluationHash },
+            });
+            continue;
+          }
+          facts.dualReview = {
+            changeSetId: facts.commit,
+            complete: false,
+            clean: false,
+            disagreement: false,
+            reason: `dual review incomplete: ${(e as Error).message}`,
+          };
+        }
+        evaluations = active.map((p, index) =>
+          index === winnerIdx ? evaluateLaneEligibility(p, facts, { requireDualReview: true }) : evaluations[index]!,
+        );
+        if (evaluations[winnerIdx]!.status !== 'eligible') {
+          return this.laneFallback(work, gate, evaluations, unusable, facts.commit, winner.name);
+        }
+      }
+      this.laneBeforeSave?.();
+      const saved = this.savePolicyPass(work, facts, winner, evaluations[winnerIdx]!, acceptanceTarget);
+      if ('work' in saved) {
+        this.render(work.id, [`${LANE_GATE_LABEL[gate]} ${saved.decision.rationale}.`]);
+        // The pass is committed: its suspension check must run even when PR automation throws. The landing
+        // error (if any) is rethrown afterwards, so a failing GitHub can neither hide a due suspension nor be
+        // hidden by it.
+        let landingError: unknown;
+        if (saved.work.currentState === 'ACCEPTED') {
+          try {
+            this.queueAcceptedPr(saved.work);
+            await this.waitForLanePr();
+          } catch (e) {
+            landingError = e;
+          }
+        }
+        let suspendError: unknown;
+        try {
+          evaluateSuspendWhen(this.ctx.store, winner.name);
+        } catch (e) {
+          suspendError = e;
+        }
+        if (landingError) throw landingError;
+        if (suspendError) throw suspendError;
+        return { status: 'passed', work: saved.work, gate, policy: winner.name, decision: saved.decision, reasons: [] };
+      }
+      if ('ineligible' in saved) {
+        return this.laneFallback(work, gate, evaluations, [saved.ineligible], reviewedChangeSet, winner.name);
+      }
+      moved = saved.moved;
+      if (gate === 'codeReview') this.refreshHeads(work.id);
+      this.ctx.store.appendEvent({ workId: work.id, type: 'lane.discarded', payload: { gate, reason: moved, evaluationHash: evaluations[winnerIdx]!.evaluationHash } });
+      } finally {
+        if (reviewClaim) this.ctx.store.releaseClaim(work.id, reviewClaim);
+      }
+    }
+    // Facts kept moving: nothing was saved and the task stays in the lane, so the next sync evaluates again.
+    this.render(work.id, [`Autonomous lane: ${moved}; no policy decision was saved. Run sync again.`]);
+    return { status: 'retry', work: this.ctx.store.getWork(work.id), gate, reasons: [moved] };
+  }
+
+  /** Test seam: runs after a lane evaluation and before its decision is saved. */
+  laneBeforeSave?: () => void;
+
+  /** Test seam: runs after model calls and before completed dual reviews are published. */
+  dualReviewBeforePublish?: () => void;
+
+  /** Test seam: runs after lane fallback and before its human handoff. */
+  laneBeforeHandoff?: () => void;
+
+  private laneFallback(
+    work: WorkPackage,
+    gate: LaneGate,
+    evaluations: LaneEvaluation[],
+    extra: string[],
+    evaluatedChangeSetId?: string,
+    evaluatedPolicy?: string,
+  ): LaneOutcome {
+    const reasons = [
+      ...extra,
+      ...evaluations.flatMap((e) => e.reasons.map((r) => `${e.policy}: ${r}`)),
+    ];
+    if (!reasons.length) reasons.push('no active lane policy');
+    const evaluationHash = contentHash({ workId: work.id, revision: work.currentRevision, gate, evaluations: evaluations.map((e) => e.evaluationHash), extra });
+    // Recheck gate / revision / membership under the same write lock as the append so a human
+    // approval that lands mid-sync cannot leave a stale fallback blocking the next gate.
+    const outcome = this.ctx.store.transaction(() => {
+      const current = this.ctx.store.getWork(work.id);
+      if (current.currentState !== work.currentState || current.currentRevision !== work.currentRevision) {
+        return { status: 'retry' as const, work: current, gate, reasons: ['task moved before the fallback was recorded'] };
+      }
+      if (LANE_GATE_FOR_STATE[current.currentState] !== gate) {
+        return { status: 'retry' as const, work: current, gate, reasons: ['gate changed before the fallback was recorded'] };
+      }
+      const membership = this.laneState(work.id);
+      if (!membership.inLane) {
+        return {
+          status: 'out-of-lane' as const,
+          work: current,
+          gate,
+          reasons: membership.fallback?.reasons ?? ['task left the lane before the fallback was recorded'],
+        };
+      }
+      this.ctx.store.appendEvent({
+        workId: work.id,
+        type: 'lane.fallback',
+        payload: {
+          gate,
+          workRevision: current.currentRevision,
+          reasons,
+          evaluationHash,
+          evaluatedChangeSetId,
+          evaluations: evaluations.map((e) => ({ policy: e.policy, policyHash: e.policyHash, status: e.status, evaluationHash: e.evaluationHash })),
+        },
+      });
+      return { status: 'fallback' as const, work: current, gate, reasons, evaluatedChangeSetId, policy: evaluatedPolicy };
+    });
+    if (outcome.status === 'fallback') {
+      this.render(work.id, [`Autonomous lane: a human decides the ${gate} gate — ${reasons.slice(0, 3).join('; ')}${reasons.length > 3 ? '; …' : ''}`]);
+    }
+    return outcome;
+  }
+
+  /**
+   * Save the policy decision and the transition in ONE transaction that first re-reads the task state, the
+   * commit, the subject hash and the policy snapshot. Anything that moved discards the evaluation (rule 5).
+   */
+  private savePolicyPass(
+    work: WorkPackage,
+    facts: LaneFacts,
+    policy: ApprovedLanePolicy,
+    evaluation: LaneEvaluation,
+    /** For the acceptance gate: the PR target whose protection was evaluated; it is recorded with the decision. */
+    acceptanceTarget?: LanePrTarget,
+  ): { work: WorkPackage; decision: Decision } | { moved: string } | { ineligible: string } {
+    const approval = this.ctx.store
+      .listDecisions(policyDecisionSubject(policy.name))
+      .find((d) => d.id === policy.approvedDecisionId && d.actorType === 'human' && d.gate === 'policy');
+    if (!approval) return { ineligible: `policy ${policy.name}: its approval decision ${policy.approvedDecisionId} cannot be read` };
+    const codeGate = facts.gate === 'codeReview' || facts.gate === 'acceptance';
+    try {
+      return this.ctx.store.transaction(() => {
+        const current = this.ctx.store.getWork(work.id);
+        if (current.currentState !== facts.state || current.currentRevision !== facts.workRevision) {
+          return { moved: `${work.id} changed (${facts.state} r${facts.workRevision} → ${current.currentState} r${current.currentRevision}) during evaluation` };
+        }
+        // raiseRisk / reselectRoles can change eligibility without bumping currentRevision.
+        if (current.risk.profile !== facts.riskProfile) {
+          return { moved: `risk changed from ${facts.riskProfile} to ${current.risk.profile} during evaluation` };
+        }
+        // Dependency triggers for code gates come from the pinned commit's change facts, not live HEAD.
+        const triggersNow = [
+          ...current.risk.reasons,
+          ...detectHardRiskTriggers(current),
+          ...detectSoftTriggers(current),
+          ...(facts.change?.dependencyChanges.length ? ['new-dependency'] : []),
+        ].filter((t) => LANE_TRIGGER_NAMES.includes(t));
+        const triggersSorted = [...new Set(triggersNow)].sort();
+        if (JSON.stringify(triggersSorted) !== JSON.stringify(facts.triggers)) {
+          return { moved: 'risk triggers changed during evaluation' };
+        }
+        const labelsNow = [...new Set(current.sourceRefs.flatMap((s) => s.labels ?? []))].sort();
+        if (JSON.stringify(labelsNow) !== JSON.stringify(facts.labels)) {
+          return { moved: 'source labels changed during evaluation' };
+        }
+        if (1 + (current.repositories?.length ?? 0) !== facts.repoCount) {
+          return { moved: 'repository set changed during evaluation' };
+        }
+        if (JSON.stringify(current.unknowns) !== JSON.stringify(facts.unknowns)) {
+          return { moved: 'open questions changed during evaluation' };
+        }
+        if (current.acceptanceCriteria.length !== facts.criteriaCount) {
+          return { moved: 'acceptance criteria changed during evaluation' };
+        }
+        const laneNow = this.laneState(work.id);
+        if (!laneNow.inLane) {
+          return { moved: 'task fell back to the human flow during evaluation' };
+        }
+        let commitNow: string;
+        try {
+          commitNow = this.laneCommit(work.id, codeGate);
+        } catch (e) {
+          return { moved: `commit unreadable before save: ${(e as Error).message}` };
+        }
+        if (commitNow !== facts.commit) return { moved: `HEAD moved from ${facts.commit.slice(0, 12)} to ${commitNow.slice(0, 12)} during evaluation` };
+        let snap: ReturnType<WorkStore['getLanePolicy']>;
+        let file: ReturnType<typeof readPolicyFiles>['files'][number] | undefined;
+        try {
+          snap = this.ctx.store.getLanePolicy(policy.name);
+          file = readPolicyFiles(this.ctx.projectRoot).files.find((f) => f.name === policy.name);
+        } catch (e) {
+          throw new LaneIneligible(`policy ${policy.name} cannot be read: ${(e as Error).message}`);
+        }
+        if (!snap || snap.status !== 'active' || snap.contentHash !== policy.contentHash || file?.hash !== policy.contentHash) {
+          return { moved: `policy ${policy.name} changed during evaluation` };
+        }
+        const base = {
+          id: createId('dec'),
+          workId: work.id,
+          action: 'approve' as const,
+          workRevision: current.currentRevision,
+          actorId: `policy:${policy.name}`,
+          actorType: 'policy' as const,
+          identityAssurance: 'local-attestation' as const,
+          rationale: `Passed by policy ${policy.name} (approved by ${approval.actorId} on ${approval.decidedAt.slice(0, 10)})`,
+          decidedAt: now(),
+          presence: 'lane-policy',
+          policyId: policy.name,
+          policyHash: policy.contentHash,
+          policyApprovalDecisionId: approval.id,
+          evaluationHash: evaluation.evaluationHash,
+        };
+        if (facts.gate === 'requirements') {
+          const spec = this.ctx.store.getLatestArtifact(work.id, 'specification');
+          if (spec?.contentHash !== facts.subject) return { moved: 'the requirements changed during evaluation' };
+          const decision: Decision = { ...base, gate: 'requirements', artifactIds: [spec.id], artifactHashes: [spec.contentHash] };
+          const next = transition(
+            { ...current, acceptanceCriteria: current.acceptanceCriteria.map((c) => ({ ...c, status: 'confirmed' as const })) },
+            'REQUIREMENTS_APPROVED',
+          );
+          this.ctx.store.saveDecision(decision);
+          this.ctx.store.saveWork(next);
+          this.ctx.store.appendEvent({ workId: work.id, type: 'requirements.passed-by-policy', payload: { decisionId: decision.id, hash: spec.contentHash, policy: policy.name } });
+          const eec = this.ctx.store.getLatestEec(work.id)!;
+          this.ctx.store.saveEec(bumpEecRevision(eec, { approvedSpecHash: spec.contentHash, approvalDecisionIds: [...eec.approvalDecisionIds, decision.id] }));
+          return { work: next, decision };
+        }
+        if (facts.gate === 'plan') {
+          const plan = this.ctx.store.getLatestArtifact(work.id, 'plan');
+          if (plan?.contentHash !== facts.subject) return { moved: 'the plan changed during evaluation' };
+          const spec = this.ctx.store.getLatestArtifact(work.id, 'specification');
+          const req = this.ctx.store
+            .listDecisions(work.id)
+            .find((d) => d.gate === 'requirements' && d.action === 'approve' && !d.invalidatedAt && !!spec && d.artifactHashes.includes(spec.contentHash));
+          if (!req) throw new LaneIneligible('requirements approval missing or not bound to the current specification');
+          const decision: Decision = { ...base, gate: 'plan', artifactIds: [plan.id], artifactHashes: [plan.contentHash] };
+          const next = transition(current, 'PLAN_APPROVED');
+          this.ctx.store.saveDecision(decision);
+          this.ctx.store.saveWork(next);
+          this.ctx.store.appendEvent({ workId: work.id, type: 'plan.passed-by-policy', payload: { decisionId: decision.id, hash: plan.contentHash, policy: policy.name } });
+          const eec = this.ctx.store.getLatestEec(work.id)!;
+          this.ctx.store.saveEec(bumpEecRevision(eec, { approvedPlanHash: plan.contentHash, approvalDecisionIds: [...eec.approvalDecisionIds, decision.id] }));
+          return { work: next, decision };
+        }
+        if (facts.gate === 'codeReview') {
+          const profiles = resolvePolicyReviewers(policy.policy, this.ctx.config.models.profiles);
+          if (!profiles) throw new LaneIneligible(`policy ${policy.name} does not configure codeReview`);
+          if (facts.dualReview?.changeSetId !== commitNow || facts.dualReview.artifacts?.length !== 2) {
+            throw new LaneIneligible('the exact evaluated review pair is missing or stale');
+          }
+          const selected = facts.dualReview.artifacts.map((expected, index) => {
+            const artifact = this.ctx.store.listArtifacts(work.id, 'review').find((entry) => entry.id === expected.id);
+            if (
+              !artifact ||
+              artifact.contentHash !== expected.contentHash ||
+              artifact.relatedCommit !== commitNow
+            ) {
+              throw new LaneIneligible(`evaluated review artifact ${expected.id} is no longer current`);
+            }
+            let review: ReviewResult;
+            try {
+              review = JSON.parse(this.ctx.store.getArtifactContent(artifact.id)) as ReviewResult;
+            } catch {
+              throw new LaneIneligible(`review artifact ${artifact.id} is unreadable`);
+            }
+            const profile = profiles[index]!;
+            if (
+              review.changeSetId !== commitNow ||
+              review.reviewer?.profile !== profile.name ||
+              review.reviewer.provider !== profile.provider ||
+              review.reviewer.model !== profile.model
+            ) {
+              throw new LaneIneligible(`evaluated review artifact ${artifact.id} no longer matches reviewer ${profile.name}`);
+            }
+            return { artifact, review };
+          });
+          if (selected.some((entry) => entry!.review.disposition !== 'no-blocking-findings')) {
+            throw new LaneIneligible('both configured reviewers must have no kept blocking findings');
+          }
+          try {
+            this.assertPrApproval(work.id, commitNow);
+          } catch (e) {
+            throw new LaneIneligible((e as Error).message);
+          }
+          // A PR lookup can block while a worktree advances. Never bind its result to newer heads.
+          const afterPr = observe(this.repoStates(work.id));
+          if (afterPr.uncommitted.length) {
+            return { moved: 'a worktree became dirty during the PR check' };
+          }
+          if (changeSetId(afterPr.repos) !== commitNow) {
+            return { moved: 'a worktree advanced during the PR check' };
+          }
+          const decision: Decision = {
+            ...base,
+            gate: 'code-review',
+            artifactIds: selected.map((entry) => entry!.artifact.id),
+            artifactHashes: selected.map((entry) => entry!.artifact.contentHash),
+            commitSha: commitNow,
+          };
+          const next =
+            current.currentState === 'AI_REVIEW'
+              ? transition(transition(current, 'HUMAN_CODE_REVIEW'), 'VERIFYING')
+              : transition(current, 'VERIFYING');
+          this.ctx.store.saveDecision(decision);
+          this.ctx.store.saveWork(next);
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: 'code-review.passed-by-policy',
+            payload: {
+              decisionId: decision.id,
+              commitSha: commitNow,
+              policy: policy.name,
+              reviewers: profiles.map((profile) => profile.name),
+            },
+          });
+          const eec = this.ctx.store.getLatestEec(work.id)!;
+          this.ctx.store.saveEec(
+            bumpEecRevision(eec, {
+              approvalDecisionIds: [...eec.approvalDecisionIds, decision.id],
+            }),
+          );
+          return { work: next, decision };
+        }
+        if (facts.gate === 'acceptance') {
+          if (!acceptanceTarget) throw new LaneIneligible('the PR target whose protection was evaluated is missing');
+          try {
+            this.assertPrApproval(work.id, commitNow);
+          } catch (e) {
+            throw new LaneIneligible((e as Error).message);
+          }
+          // PR landing carries one repository; eligibility already routes multi-repo work to a human.
+          if (this.repoStates(work.id).length !== 1) {
+            throw new LaneIneligible(`PR landing supports one repository; the task changes ${this.repoStates(work.id).length}`);
+          }
+          // assertPrApproval can block on a network call; a worktree may advance meanwhile.
+          if (changeSetId(observe(this.repoStates(work.id)).repos) !== commitNow) {
+            return { moved: 'a worktree advanced during the PR check' };
+          }
+          const change = this.ctx.store.getLatestArtifact(work.id, 'change-report');
+          const decision: Decision = {
+            ...base,
+            gate: 'sqa-acceptance',
+            artifactIds: change ? [change.id] : [],
+            artifactHashes: change ? [change.contentHash] : [],
+            commitSha: this.currentCommit(work.id),
+          };
+          this.ctx.store.saveDecision(decision);
+          // Landing uses exactly this target; a later resume must not re-resolve origin.
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: 'lane.acceptance-target-bound',
+            payload: {
+              decisionId: decision.id,
+              owner: acceptanceTarget.owner,
+              repo: acceptanceTarget.repo,
+              baseBranch: acceptanceTarget.baseBranch,
+              protection: facts.lanePr?.protection,
+            },
+          });
+          // With the decision recorded every required obligation must hold, without waivers; otherwise roll back.
+          const gateNow = this.gateDecision(work.id);
+          if (gateNow.blocking.length) {
+            throw new LaneIneligible(`evidence gate ${gateNow.decision} after the policy decision: ${gateNow.blocking.map((b) => b.id).join(', ')}`);
+          }
+          const next = transition(current, 'ACCEPTED');
+          this.ctx.store.saveWork(next);
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: 'acceptance.decided',
+            payload: { actorId: base.actorId, policy: policy.name, commitSha: decision.commitSha, gateDecision: gateNow.decision, note: 'ACCEPTED does not mean deployed' },
+          });
+          return { work: next, decision };
+        }
+        throw new LaneIneligible(`unsupported lane gate ${facts.gate}`);
+      });
+    } catch (e) {
+      if (e instanceof LaneIneligible) return { ineligible: e.message };
+      throw e;
     }
   }
 
@@ -3416,7 +5606,8 @@ export class Engine {
   }
 
   setConfig(key: string, value: string) {
-    const cfg = this.ctx.config as any;
+    // Edit a copy: a value the schema refuses must not linger in the live config.
+    const cfg = structuredClone(this.ctx.config) as any;
     const parts = key.split('.');
     let cur = cfg;
     for (let i = 0; i < parts.length - 1; i += 1) {
@@ -3430,6 +5621,7 @@ export class Engine {
     else if (!Number.isNaN(Number(value)) && value.trim() !== '') parsed = Number(value);
     cur[last] = parsed;
     saveConfig(this.ctx.paths.configPath, cfg);
+    this.ctx.config = cfg;
     return cfg;
   }
 

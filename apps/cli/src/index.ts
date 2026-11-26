@@ -32,6 +32,17 @@ import { callerCwd, factoryRoot, findProjectRoot, resolveProjectPath } from './p
 import { HUMAN_PRESENCE, ask, askReviewer, assertHumanTerminal, gitUserName } from './human-gate.js';
 import { repoToplevel } from './engine/context/git-read.js';
 import { formatTokenCount, formatUsageQualifiers } from './engine/usage.js';
+import {
+  approvePolicy,
+  pendingPolicyApproval,
+  pendingPolicyResume,
+  policyDiff,
+  policyStatuses,
+  resumePolicy,
+  suspendPolicy,
+} from './engine/lane-policy.js';
+import { computeLaneMetrics, type LaneMetric } from './engine/lane-metrics.js';
+import { nextLaneAudit, recordLaneAuditOutcome } from './engine/lane-audit.js';
 
 function isAgentSession(): boolean {
   return ['TURBINE_AGENT', 'CLAUDECODE', 'CURSOR_AGENT'].some((k) => process.env[k] && process.env[k] !== '0');
@@ -44,6 +55,11 @@ function parseTokenArg(raw: string): number | 'unknown' {
     throw err('E_INVALID_CONFIG', `token count must be a non-negative integer or "unknown" (got ${raw})`);
   }
   return n;
+}
+
+function formatLaneMetric(name: string, value: LaneMetric): string {
+  const rendered = value.value === 'unknown' ? 'unknown' : String(value.value);
+  return `  ${name}: ${rendered} (numerator ${value.numerator}; denominator ${value.denominator}; unknown ${value.unknown}; period ${value.period.since}..${value.period.until})`;
 }
 
 const program = new Command();
@@ -1519,6 +1535,7 @@ async function decideCommand(id: string, action: 'approve' | 'reject', reason?: 
       reason: why,
       presence: HUMAN_PRESENCE,
     });
+    await engine.waitForLanePr();
     out.write('\nRecorded as a local attestation (identity not cryptographically verified).\n');
     const work = (result as { work: { id: string; currentState: string } }).work;
     printResult({ id: work.id, state: work.currentState }, false);
@@ -1607,6 +1624,321 @@ task
       const work = engine.markCommitChanged(id, opts.commit);
       printResult({ id: work.id, state: work.currentState }, !!opts.json);
       engine.ctx.store.close();
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+task
+  .command('lane')
+  .argument('<id>')
+  .option('--retry', 'HUMAN ONLY: put a task that fell back to the human flow back in the autonomous lane')
+  .option('--json')
+  .description('Show whether the task is in the autonomous lane (and why it fell back); --retry is human-only')
+  .action(async (id, opts) => {
+    try {
+      if (opts.retry) assertHumanTerminal('turbine task lane --retry');
+      const engine = withEngine();
+      try {
+        if (!opts.retry) {
+          printResult(engine.laneState(id), !!opts.json);
+          return;
+        }
+        const pending = engine.pendingLaneRetry(id);
+        process.stdout.write(`\nPUT BACK IN THE LANE — fell back at the ${pending.fallback.gate} gate (${pending.fallback.at.slice(0, 10)}):\n`);
+        for (const r of pending.fallback.reasons) process.stdout.write(`  - ${r}\n`);
+        process.stdout.write(`\nType the code ${pending.confirmToken} to confirm.\n`);
+        const token = await ask('Code: ');
+        const reviewer = await askReviewer(engine.ctx.projectRoot);
+        const result = engine.laneRetry(id, { actor: reviewer, confirmToken: token, presence: HUMAN_PRESENCE });
+        printResult({ id: result.work.id, inLane: true, next: `turbine task sync ${result.work.id}` }, false);
+        await engine.waitForMirror();
+      } finally {
+        engine.ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+task
+  .command('pr-refresh')
+  .argument('<id>')
+  .option('--json')
+  .description('Poll the recorded PR: record a merge, or return an ejected task to CHANGES_REQUESTED (also runs on sync)')
+  .action(async (id, opts) => {
+    try {
+      const engine = withEngine();
+      try {
+        const result = await engine.refreshLanePullRequest(id);
+        printResult(
+          {
+            id: result.work.id,
+            state: result.work.currentState,
+            pr: result.record.number,
+            result: result.kind,
+            queueState: result.record.queueState,
+            ...(result.reason ? { reason: result.reason } : {}),
+            ...('fixRound' in result ? { fixRound: result.fixRound } : {}),
+          },
+          !!opts.json,
+        );
+      } finally {
+        engine.ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+program
+  .command('metrics')
+  .option('--policy <name>', 'Policy name, or "human"')
+  .option('--since <date>', 'Start of reporting period (ISO date/time)')
+  .option('--json', 'Machine-readable JSON')
+  .description('Lane safety and delivery metrics with explicit denominators and unknown counts')
+  .action((opts) => {
+    try {
+      const ctx = openContext();
+      try {
+        const report = computeLaneMetrics(ctx.store, { policy: opts.policy, since: opts.since });
+        if (opts.json) {
+          printResult(report, true);
+          return;
+        }
+        process.stdout.write(`Metrics period: ${report.period.since}..${report.period.until}\n`);
+        for (const row of report.rows) {
+          process.stdout.write(`\n${row.lane === 'human' ? 'Human lane' : `Policy ${row.policy}`} (${row.tasks} tasks)\n`);
+          process.stdout.write(`${formatLaneMetric('merged PRs/week', row.mergedPrsPerWeek)}\n`);
+          process.stdout.write(`${formatLaneMetric('merge rate', row.mergeRate)}\n`);
+          process.stdout.write(`${formatLaneMetric('revert rate', row.revertRate)}\n`);
+          process.stdout.write(`${formatLaneMetric('fix rounds/merged PR', row.fixRoundsPerMergedPr)}\n`);
+          process.stdout.write(`${formatLaneMetric('cost/merged PR (USD)', row.costPerMergedPrUsd)}\n`);
+          process.stdout.write(`${formatLaneMetric('reviewer disagreement rate', row.reviewerDisagreementRate)}\n`);
+          process.stdout.write(`${formatLaneMetric('fallback share', row.fallbackShare)}\n`);
+          const reasons = Object.entries(row.fallbackShare.reasons);
+          process.stdout.write(`  fallback reasons: ${reasons.length ? reasons.map(([reason, count]) => `${reason} (${count})`).join('; ') : 'none recorded'}\n`);
+        }
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+const auditCmd = program.command('audit').description('Human audit queue for sampled autonomous policy merges');
+auditCmd
+  .command('next')
+  .option('--json')
+  .description('Show the oldest queued audit')
+  .action((opts) => {
+    try {
+      const ctx = openContext();
+      try {
+        const audit = nextLaneAudit(ctx.store);
+        printResult(audit ?? { status: 'empty', message: 'No queued lane audits' }, !!opts.json);
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+auditCmd
+  .command('record')
+  .argument('<id>')
+  .option('--ok', 'Record that the sampled merge is satisfactory')
+  .option('--problem <text>', 'Record a problem and its explanation')
+  .description('HUMAN ONLY: record an audit outcome')
+  .action(async (id, opts) => {
+    try {
+      assertHumanTerminal('turbine audit record');
+      if (!!opts.ok === !!opts.problem) throw err('E_INVALID_CONFIG', 'Choose exactly one of --ok or --problem "<text>"');
+      const ctx = openContext();
+      try {
+        const reviewer = await askReviewer(ctx.projectRoot);
+        const result = recordLaneAuditOutcome(ctx.store, {
+          id,
+          outcome: opts.ok ? 'ok' : 'problem',
+          note: opts.problem,
+          reviewer,
+        });
+        printResult(
+          {
+            audit: result.audit.id,
+            outcome: result.audit.outcome,
+            policy: result.audit.policyId,
+            autoSuspended: result.suspended,
+            reasons: result.reasons,
+          },
+          false,
+        );
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+const policyCmd = program.command('policy').description('Lane policies (.turbine/policies/*.yaml); no effect until a human approves the exact content');
+policyCmd
+  .command('list')
+  .option('--json')
+  .action((opts) => {
+    try {
+      const ctx = openContext();
+      try {
+        const { policies, errors } = policyStatuses(ctx.store, ctx.projectRoot);
+        const rows = policies.map((p) => ({
+          name: p.name,
+          state: p.state,
+          reason: p.reason,
+          approvedBy: p.approved?.approvedBy,
+          approvedAt: p.approved?.approvedAt,
+          approvedHash: p.approved?.contentHash,
+          fileHash: p.file?.hash,
+        }));
+        printResult({ policies: rows, ...(errors.length ? { errors } : {}) }, !!opts.json);
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+policyCmd
+  .command('show')
+  .argument('<name>')
+  .option('--json')
+  .description('Show a policy, its state, and the diff between the approved and the file content')
+  .action((name, opts) => {
+    try {
+      const ctx = openContext();
+      try {
+        const status = policyStatuses(ctx.store, ctx.projectRoot).policies.find((p) => p.name === name);
+        if (!status) throw err('E_NOT_FOUND', `No policy named ${name}`);
+        const diff =
+          status.approved && status.file?.yaml !== undefined && status.file.hash !== status.approved.contentHash
+            ? policyDiff(status.approved.yaml, status.file.yaml)
+            : undefined;
+        if (opts.json) {
+          printResult({ name, state: status.state, reason: status.reason, approved: status.approved, file: status.file, diff }, true);
+          return;
+        }
+        const out = process.stdout;
+        out.write(`Policy ${name}: ${status.state}${status.reason ? ` — ${status.reason}` : ''}\n`);
+        if (status.approved) out.write(`Approved by ${status.approved.approvedBy} on ${status.approved.approvedAt.slice(0, 10)} (${status.approved.contentHash})\n`);
+        if (status.file?.hash) out.write(`File: ${status.file.path} (${status.file.hash})\n`);
+        if (diff) {
+          out.write('\nDiff (approved → file; the file has NO effect until approved):\n');
+          for (const l of diff) out.write(`${l}\n`);
+        } else if (status.file?.yaml !== undefined) {
+          out.write(`\n${status.file.yaml}\n`);
+        }
+        if (status.state === 'unapproved' || status.state === 'pending') {
+          out.write(`\nA human approves it in their own terminal: turbine policy approve ${name}\n`);
+        }
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+policyCmd
+  .command('approve')
+  .argument('<name>')
+  .description('HUMAN ONLY: approve the exact content of .turbine/policies/<name>.yaml (interactive)')
+  .action(async (name) => {
+    try {
+      assertHumanTerminal('turbine policy approve');
+      const ctx = openContext();
+      try {
+        const pending = pendingPolicyApproval(ctx.store, ctx.projectRoot, name, ctx.config.models.profiles);
+        const out = process.stdout;
+        out.write(`\nAPPROVE LANE POLICY — ${name}\n  File: ${pending.status.file!.path}\n  Hash: ${pending.hash}\n\n`);
+        if (pending.diff) {
+          out.write('Changes since the approved version:\n');
+          for (const l of pending.diff) out.write(`${l}\n`);
+        } else out.write(`${pending.yaml}\n`);
+        for (const w of pending.warnings) out.write(`\nWARNING: ${w}\n`);
+        out.write(`\nTasks that meet this policy will pass its gates without a human. Type the code ${pending.confirmToken} to confirm.\n`);
+        const token = await ask('Code: ');
+        const reviewer = await askReviewer(ctx.projectRoot);
+        const result = approvePolicy(ctx.store, ctx.projectRoot, {
+          name,
+          confirmToken: token,
+          reviewer,
+          presence: HUMAN_PRESENCE,
+          profiles: ctx.config.models.profiles,
+        });
+        out.write('\nRecorded as a local attestation (identity not cryptographically verified).\n');
+        printResult({ policy: name, state: 'active', hash: result.policy.contentHash, decision: result.decision.id }, false);
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+policyCmd
+  .command('suspend')
+  .argument('<name>')
+  .requiredOption('--reason <text>', 'Why the policy is suspended')
+  .option('--actor <actor>', 'Who is suspending (agents may suspend)')
+  .description('Suspend a policy (anyone, agents included: it only removes autonomy)')
+  .action((name, opts) => {
+    try {
+      const ctx = openContext();
+      try {
+        const actor = opts.actor ?? (isAgentSession() ? 'agent' : gitUserName(ctx.projectRoot) || 'local-user');
+        const p = suspendPolicy(ctx.store, name, opts.reason, actor);
+        printResult({ policy: p.name, state: p.status, reason: p.suspendedReason }, false);
+      } finally {
+        ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+policyCmd
+  .command('resume')
+  .argument('<name>')
+  .description('HUMAN ONLY: re-activate a suspended policy (interactive)')
+  .action(async (name) => {
+    try {
+      assertHumanTerminal('turbine policy resume');
+      const ctx = openContext();
+      try {
+        const pending = pendingPolicyResume(ctx.store, name);
+        process.stdout.write(
+          `\nRESUME LANE POLICY — ${name}\n  Suspended: ${pending.policy.suspendedReason ?? '(no reason recorded)'}\n  Approved hash: ${pending.policy.contentHash}\n\nType the code ${pending.confirmToken} to confirm.\n`,
+        );
+        const token = await ask('Code: ');
+        const reviewer = await askReviewer(ctx.projectRoot);
+        const result = resumePolicy(ctx.store, { name, confirmToken: token, reviewer, presence: HUMAN_PRESENCE });
+        // Stored status is "active" after resume, but a drifted file is still pending until re-approved.
+        const effective = policyStatuses(ctx.store, ctx.projectRoot).policies.find((p) => p.name === name);
+        const out: Record<string, unknown> = {
+          policy: name,
+          state: effective?.state ?? result.policy.status,
+          decision: result.decision.id,
+        };
+        if (effective?.reason) out.reason = effective.reason;
+        if (effective?.state === 'pending') {
+          out.next = `turbine policy approve ${name}`;
+        }
+        printResult(out, false);
+      } finally {
+        ctx.store.close();
+      }
     } catch (e) {
       handleError(e);
     }

@@ -9,7 +9,11 @@ export type Capability =
   | 'git.diff'
   | 'git.branch.create'
   | 'pr.create'
+  | 'pr.merge'
+  | 'pr.read'
   | 'pr.review.read'
+  | 'commit.status'
+  | 'repo.rules.read'
   | 'tests.run'
   | 'ci.read'
   | 'secrets.read_ref';

@@ -19,11 +19,30 @@ const stores: WorkStore[] = [];
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(here, '../fixtures/okf-upstream');
 const VALIDATOR = join(FIXTURE, 'validate.py');
+const VENV_PYTHON = join(FIXTURE, '.venv/bin/python');
 
-function pythonBin(): string {
-  const venv = join(FIXTURE, '.venv/bin/python');
-  if (existsSync(venv)) return venv;
-  return 'python3';
+/** Prefer fixture .venv; create it with PyYAML when system python lacks the module (PEP 668). */
+function ensurePythonBin(): string {
+  if (existsSync(VENV_PYTHON)) {
+    const probe = spawnSync(VENV_PYTHON, ['-c', 'import yaml'], { encoding: 'utf8' });
+    if (probe.status === 0) return VENV_PYTHON;
+    const pip = spawnSync(VENV_PYTHON, ['-m', 'pip', 'install', '--quiet', 'pyyaml'], { encoding: 'utf8' });
+    if (pip.status !== 0) {
+      throw new Error(`okf-upstream: failed to repair PyYAML in fixture venv: ${pip.stderr || pip.stdout}`);
+    }
+    return VENV_PYTHON;
+  }
+  const probe = spawnSync('python3', ['-c', 'import yaml'], { encoding: 'utf8' });
+  if (probe.status === 0) return 'python3';
+  const venv = spawnSync('python3', ['-m', 'venv', join(FIXTURE, '.venv')], { encoding: 'utf8' });
+  if (venv.status !== 0) {
+    throw new Error(`okf-upstream: failed to create fixture venv: ${venv.stderr || venv.stdout}`);
+  }
+  const pip = spawnSync(VENV_PYTHON, ['-m', 'pip', 'install', '--quiet', 'pyyaml'], { encoding: 'utf8' });
+  if (pip.status !== 0) {
+    throw new Error(`okf-upstream: failed to install PyYAML in fixture venv: ${pip.stderr || pip.stdout}`);
+  }
+  return VENV_PYTHON;
 }
 
 afterEach(() => {
@@ -59,7 +78,7 @@ function newRepo(): string {
 }
 
 function runUpstream(bundle: string): { status: number | null; stdout: string; stderr: string } {
-  const r = spawnSync(pythonBin(), [VALIDATOR, bundle], { encoding: 'utf8' });
+  const r = spawnSync(ensurePythonBin(), [VALIDATOR, bundle], { encoding: 'utf8' });
   return { status: r.status, stdout: r.stdout || '', stderr: r.stderr || '' };
 }
 

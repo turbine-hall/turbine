@@ -19,6 +19,8 @@ export class TurbineError extends Error {
 
 export const ErrorCodes = {
   E_INVALID_CONFIG: { code: 'E_INVALID_CONFIG', exit: 2 },
+  /** A config value that would weaken a safety rule (e.g. turning a human gate off). */
+  E_CONFIG: { code: 'E_CONFIG', exit: 2 },
   E_REQUIREMENTS_INCOMPLETE: { code: 'E_REQUIREMENTS_INCOMPLETE', exit: 3 },
   E_STALE_REVISION: { code: 'E_STALE_REVISION', exit: 3 },
   E_MISSING_CAPABILITY: { code: 'E_MISSING_CAPABILITY', exit: 3 },

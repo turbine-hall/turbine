@@ -1,5 +1,8 @@
 import { z } from 'zod';
 
+/** Human gates that cannot be switched off in config; they are relaxed only through approved lane policies. */
+export const NON_DISABLEABLE_HUMAN_GATES = ['requirements', 'plan', 'codeReview', 'sqaAcceptance'] as const;
+
 export const ProjectConfigSchema = z.object({
   schemaVersion: z.literal(1),
   project: z.object({
@@ -121,14 +124,24 @@ export const ProjectConfigSchema = z.object({
     }),
   execution: z
     .object({
-      mode: z.enum(['manual-supervised', 'isolated-worktree']).default('manual-supervised'),
+      /**
+       * `sandboxed-unattended` runs the implementer in Docker/Podman with only the task worktree
+       * mounted (Part D). Other modes never run networked unattended work (`E_UNSAFE_EXECUTION`).
+       */
+      mode: z.enum(['manual-supervised', 'isolated-worktree', 'sandboxed-unattended']).default('manual-supervised'),
       requireIsolatedWorktree: z.boolean().default(true),
       allowNetwork: z.boolean().default(false),
+      /** Wall-clock limit for one sandboxed-unattended run (FR-D6). Cap at Node's max timer delay. */
+      sandboxWallClockMs: z.number().int().positive().max(2_147_483_647).default(1_800_000),
+      /** Max combined stdout/stderr bytes from sandbox phases before limit-exceeded (FR-D6). */
+      sandboxMaxOutputBytes: z.number().int().positive().default(8_000_000),
     })
     .default({
       mode: 'manual-supervised',
       requireIsolatedWorktree: true,
       allowNetwork: false,
+      sandboxWallClockMs: 1_800_000,
+      sandboxMaxOutputBytes: 8_000_000,
     }),
   quality: z
     .object({
@@ -147,6 +160,10 @@ export const ProjectConfigSchema = z.object({
     .default({ checks: [], setup: [], timeoutMs: 600_000, dependencyAudit: 'auto' }),
   humanGates: z
     .object({
+      /**
+       * Must be true (or omitted). A false value is refused rather than silently ignored: gates are
+       * relaxed only through lane policies a human approved (`turbine policy approve`).
+       */
       requirements: z.boolean().default(true),
       plan: z.boolean().default(true),
       codeReview: z.boolean().default(true),
@@ -157,6 +174,17 @@ export const ProjectConfigSchema = z.object({
        * A PR author cannot approve their own PR, so an agent account cannot self-approve.
        */
       requirePrApproval: z.boolean().default(false),
+    })
+    .superRefine((g, ctx) => {
+      for (const key of NON_DISABLEABLE_HUMAN_GATES) {
+        if (g[key] === false) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [key],
+            message: `humanGates.${key} cannot be false: human gates are relaxed only through lane policies approved with \`turbine policy approve\` (.turbine/policies/*.yaml)`,
+          });
+        }
+      }
     })
     .default({
       requirements: true,
