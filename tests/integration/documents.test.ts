@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { registerModel, type ModelAdapter } from '../../packages/models/dist/index.js';
 import { openContext } from '../../apps/cli/src/engine/project.js';
 import { Engine } from '../../apps/cli/src/engine/engine.js';
-import { packetPaths } from '../../apps/cli/src/engine/packet.js';
+import { packetPaths, parseSpecMarkdown } from '../../apps/cli/src/engine/packet.js';
 import { lintMermaid } from '../../apps/cli/src/engine/docs/lint.js';
 import { changeMap, gateFlow, userFlowDiagram } from '../../apps/cli/src/engine/docs/visuals.js';
 import { cleanup, commitIn, tempProject } from './fixture.js';
@@ -40,12 +40,83 @@ describe('packet layout', () => {
     const spec = read(p.spec);
     expect(status).toMatch(/```mermaid\nflowchart LR/);
     expect(status).toContain('Waiting on you: approve the requirements');
+    expect(spec).toContain('## Original request');
+    expect(spec.indexOf('## Original request')).toBeLessThan(spec.indexOf('## Requirements'));
+    expect(spec.indexOf('## Requirements')).toBeLessThan(spec.indexOf('## Context'));
+    expect(spec).toMatch(/## Requirements \(\d+\)/);
     expect(spec).toMatch(/- \*\*FR-001\*\* \(P0, behavioral\): WHEN /);
+    expect(spec).toMatch(/export leave requests as CSV/i);
+    expect(spec).not.toContain('Users get the requested behaviour');
     expect(spec).toMatch(/- ✅ Verified — .+ _\(package\.json|git|request\)_/);
     expect(spec).toContain('```mermaid\nsequenceDiagram'); // user flow
     for (const f of [status, spec, read(p.review)]) expect(f).not.toContain('```json');
     expect(engine.lintWork(work.id).filter((i) => i.level === 'error')).toEqual([]);
     expect(existsSync(join(dir, '.turbine', 'GLOSSARY.md'))).toBe(true);
+    engine.ctx.store.close();
+  });
+
+  it('title-only create seeds request items from the title (no empty-body placeholder)', async () => {
+    const dir = tempProject('turbine-docs-', dirs);
+    const engine = new Engine(openContext(dir));
+    const work = engine.createTask({ title: 'Attendance refresh on open', type: 'feature' });
+    await engine.syncFromMarkdown(work.id);
+    const spec = read(packetPaths(dir, work.id).spec);
+    expect(spec).not.toContain('(No body provided)');
+    expect(spec).toMatch(/Attendance refresh on open/);
+    expect(spec).toMatch(/## Request coverage/);
+    expect(spec).toMatch(/\| R1 \| Attendance refresh on open \| FR-001/);
+    expect(spec).toMatch(/- \*\*FR-001\*\* \(P0, behavioral\): WHEN .*Attendance refresh/);
+    engine.ctx.store.close();
+  });
+
+  it('maps each request bullet to its own FR in SPEC.md', async () => {
+    const dir = tempProject('turbine-docs-', dirs);
+    const engine = new Engine(openContext(dir));
+    const work = await assessed(
+      engine,
+      [
+        '# Attendance refresh',
+        '',
+        '* Refresh attendance when the page opens',
+        '* Show last refreshed timestamp',
+        '* Refuse refresh without permission',
+      ].join('\n'),
+    );
+    const spec = read(packetPaths(dir, work.id).spec);
+    expect(spec).toMatch(/## Requirements \(3\)/);
+    expect(spec).toContain('**FR-001**');
+    expect(spec).toContain('**FR-002**');
+    expect(spec).toContain('**FR-003**');
+    expect(spec).toMatch(/\| R1 \| Refresh attendance when the page opens \| FR-001 \|/);
+    expect(spec).toMatch(/\| R2 \| Show last refreshed timestamp \| FR-002 \|/);
+    expect(spec).toMatch(/\| R3 \| Refuse refresh without permission \| FR-003 \|/);
+    expect(work.acceptanceCriteria).toHaveLength(3);
+    engine.ctx.store.close();
+  });
+
+  it('escapes request ATX headings so sync still reads generated Requirements', async () => {
+    const dir = tempProject('turbine-docs-', dirs);
+    const engine = new Engine(openContext(dir));
+    const work = await assessed(
+      engine,
+      [
+        '# Trap',
+        '',
+        '## Requirements',
+        '',
+        '- Real need: export leave CSV for managers with auth permission',
+      ].join('\n'),
+    );
+    const p = packetPaths(dir, work.id);
+    const spec = read(p.spec);
+    expect(spec).toMatch(/## Original request[\s\S]*\\## Requirements/);
+    expect(spec.indexOf('\\## Requirements')).toBeGreaterThan(spec.indexOf('## Original request'));
+    expect(spec.indexOf('\\## Requirements')).toBeLessThan(spec.indexOf('## Requirements ('));
+    // Generated FR list is what sync parses — not the quoted request heading.
+    const parsed = parseSpecMarkdown(spec);
+    expect(parsed.requirements.map((r) => r.id)).toContain('FR-001');
+    expect(parsed.requirements.some((r) => /FR-999|fake/i.test(r.statement))).toBe(false);
+    expect(work.acceptanceCriteria.some((r) => /export leave CSV/i.test(r.statement))).toBe(true);
     engine.ctx.store.close();
   });
 
