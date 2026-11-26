@@ -183,47 +183,49 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
           lostOwnership = true;
         }
       };
-      // Confirm ownership before step: busy fence must not proceed into work.
-      const confirmDeadline = Date.now() + Math.min(leaseMs, 5_000);
-      for (;;) {
-        try {
-          const probe = renewFleetLock({
-            projectRoot: engine.ctx.projectRoot,
-            workId,
-            owner: lock.owner,
-            leaseMs,
-            now,
-          });
-          if (probe.ok) break;
-          if (!probe.busy) {
+      // Confirm ownership before every step (including continuations): busy must not proceed.
+      const confirmOwnership = async (): Promise<boolean> => {
+        const confirmDeadline = Date.now() + Math.min(leaseMs, 5_000);
+        for (;;) {
+          try {
+            const probe = renewFleetLock({
+              projectRoot: engine.ctx.projectRoot,
+              workId,
+              owner: lock.owner,
+              leaseMs,
+              now,
+            });
+            if (probe.ok) return true;
+            if (!probe.busy) {
+              lostOwnership = true;
+              return false;
+            }
+            if (Date.now() >= confirmDeadline) {
+              lostOwnership = true;
+              renewError = 'lease renew stayed busy before step';
+              return false;
+            }
+            await new Promise((r) => setTimeout(r, 20));
+          } catch (e) {
+            renewError = (e as Error).message.split('\n')[0];
             lostOwnership = true;
-            break;
+            return false;
           }
-          if (Date.now() >= confirmDeadline) {
-            lostOwnership = true;
-            renewError = 'initial lease renew stayed busy';
-            break;
-          }
-          await new Promise((r) => setTimeout(r, 20));
-        } catch (e) {
-          renewError = (e as Error).message.split('\n')[0];
-          lostOwnership = true;
-          break;
         }
-      }
+      };
       const renewTimer = setInterval(tryRenew, renewEveryMs);
       try {
-        if (renewError || lostOwnership) {
-          deferred.add(workId);
-          outcomes.push({
-            workId,
-            kind: 'error',
-            detail: renewError ? `lease renew failed: ${renewError}` : 'lost lock ownership during step',
-          });
-          return;
-        }
         // Keep this admitted task until a stopping state. Budget gates new admissions only.
         for (;;) {
+          if (!(await confirmOwnership())) {
+            deferred.add(workId);
+            outcomes.push({
+              workId,
+              kind: 'error',
+              detail: renewError ? `lease renew failed: ${renewError}` : 'lost lock ownership during step',
+            });
+            return;
+          }
           await step(workId);
           if (renewError) {
             deferred.add(workId);
