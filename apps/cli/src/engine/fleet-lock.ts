@@ -51,6 +51,11 @@ function fleetLockFencePath(projectRoot: string, workId: string): string {
   return `${fleetLockPath(projectRoot, workId)}.fence`;
 }
 
+/** Single shared recover guard per fence (not per process). */
+function fleetLockRecoverPath(projectRoot: string, workId: string): string {
+  return `${fleetLockFencePath(projectRoot, workId)}.recover`;
+}
+
 function ensureLocksDir(projectRoot: string): void {
   mkdirSync(fleetLocksDir(projectRoot), { recursive: true });
 }
@@ -58,6 +63,25 @@ function ensureLocksDir(projectRoot: string): void {
 function assertLeaseMs(leaseMs: number): void {
   if (!(leaseMs >= MIN_FLEET_LEASE_MS) || !Number.isFinite(leaseMs)) {
     throw err('E_INVALID_CONFIG', `fleet leaseMs must be a finite number >= ${MIN_FLEET_LEASE_MS}`);
+  }
+}
+
+/** Write the full buffer; throw if the write is incomplete. */
+function writeAllSync(fd: number, data: string): void {
+  const buf = Buffer.from(data, 'utf8');
+  let offset = 0;
+  while (offset < buf.length) {
+    const n = writeSync(fd, buf, offset, buf.length - offset);
+    if (!(n > 0)) throw new Error('short write');
+    offset += n;
+  }
+}
+
+function unlinkQuiet(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch {
+    /* best-effort */
   }
 }
 
@@ -75,8 +99,7 @@ export function readFleetLock(projectRoot: string, workId: string): FleetLockBod
     );
   }
   if (!raw.trim()) {
-    // Writer may still be publishing via tmp→link; treat as busy, not corrupt.
-    return undefined;
+    throw err('E_UNSAFE_EXECUTION', `fleet lock empty at ${path}`);
   }
   try {
     const parsed = JSON.parse(raw) as FleetLockBody;
@@ -93,6 +116,7 @@ export function readFleetLock(projectRoot: string, workId: string): FleetLockBod
     }
     return parsed;
   } catch (e) {
+    if ((e as { code?: string }).code === 'E_UNSAFE_EXECUTION') throw e;
     throw err(
       'E_UNSAFE_EXECUTION',
       `fleet lock corrupt at ${path}: ${(e as Error).message.split('\n')[0]}`,
@@ -105,13 +129,9 @@ function publishLockExclusive(path: string, body: FleetLockBody): void {
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
   const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
   try {
-    writeSync(fd, `${JSON.stringify(body, null, 2)}\n`);
+    writeAllSync(fd, `${JSON.stringify(body, null, 2)}\n`);
   } catch (e) {
-    try {
-      unlinkSync(tmp);
-    } catch {
-      /* best-effort */
-    }
+    unlinkQuiet(tmp);
     throw e;
   } finally {
     closeSync(fd);
@@ -119,75 +139,72 @@ function publishLockExclusive(path: string, body: FleetLockBody): void {
   try {
     linkSync(tmp, path);
   } catch (e) {
-    try {
-      unlinkSync(tmp);
-    } catch {
-      /* best-effort */
-    }
+    unlinkQuiet(tmp);
     throw e;
   }
-  try {
-    unlinkSync(tmp);
-  } catch {
-    /* best-effort */
-  }
+  unlinkQuiet(tmp);
 }
 
 function writeLockReplace(path: string, body: FleetLockBody): void {
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
   const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
   try {
-    writeSync(fd, `${JSON.stringify(body, null, 2)}\n`);
+    writeAllSync(fd, `${JSON.stringify(body, null, 2)}\n`);
   } catch (e) {
-    try {
-      unlinkSync(tmp);
-    } catch {
-      /* best-effort */
-    }
+    unlinkQuiet(tmp);
     throw e;
   } finally {
     closeSync(fd);
   }
-  renameSync(tmp, path);
+  try {
+    renameSync(tmp, path);
+  } catch (e) {
+    unlinkQuiet(tmp);
+    throw e;
+  }
 }
 
-function pidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+/**
+ * Process liveness probe. Invalid PIDs are inconclusive (treated as alive) so they
+ * cannot authorize fence removal. Only ESRCH proves the process is gone.
+ */
+export function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return true;
   try {
     process.kill(pid, 0);
     return true;
   } catch (e) {
-    // Only ESRCH proves the process is gone; EPERM means alive but unsignalable.
     return (e as NodeJS.ErrnoException).code !== 'ESRCH';
   }
 }
 
-function readFence(projectRoot: string, workId: string): FenceBody | undefined {
-  const fence = fleetLockFencePath(projectRoot, workId);
-  if (!existsSync(fence)) return undefined;
+function readFenceFile(path: string): FenceBody | undefined {
+  if (!existsSync(path)) return undefined;
   try {
-    const raw = readFileSync(fence, 'utf8');
+    const raw = readFileSync(path, 'utf8');
+    if (!raw.trim()) return undefined;
     const parsed = JSON.parse(raw) as FenceBody;
     if (typeof parsed.owner !== 'string' || typeof parsed.pid !== 'number' || typeof parsed.at !== 'string') {
       return undefined;
     }
+    if (!Number.isInteger(parsed.pid) || parsed.pid <= 0) return undefined;
     return parsed;
   } catch {
     return undefined;
   }
 }
 
+function readFence(projectRoot: string, workId: string): FenceBody | undefined {
+  return readFenceFile(fleetLockFencePath(projectRoot, workId));
+}
+
 function publishFenceExclusive(fence: string, body: FenceBody): void {
   const tmp = `${fence}.${process.pid}.${Date.now()}.tmp`;
   const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
   try {
-    writeSync(fd, `${JSON.stringify(body)}\n`);
+    writeAllSync(fd, `${JSON.stringify(body)}\n`);
   } catch (e) {
-    try {
-      unlinkSync(tmp);
-    } catch {
-      /* best-effort */
-    }
+    unlinkQuiet(tmp);
     throw e;
   } finally {
     closeSync(fd);
@@ -195,21 +212,53 @@ function publishFenceExclusive(fence: string, body: FenceBody): void {
   try {
     linkSync(tmp, fence);
   } catch (e) {
-    try {
-      unlinkSync(tmp);
-    } catch {
-      /* best-effort */
-    }
+    unlinkQuiet(tmp);
     throw e;
   }
+  unlinkQuiet(tmp);
+}
+
+/**
+ * Take the shared recover guard for one fence. Recovers a dead recover holder the same way.
+ * Exported for contention tests.
+ */
+export function tryAcquireRecoverGuard(projectRoot: string, workId: string, owner: string): boolean {
+  const recover = fleetLockRecoverPath(projectRoot, workId);
+  const body: FenceBody = { owner, pid: process.pid, at: new Date().toISOString() };
   try {
-    unlinkSync(tmp);
+    publishFenceExclusive(recover, body);
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
+      throw err('E_UNSAFE_EXECUTION', `fleet lock recover guard failed: ${(e as Error).message.split('\n')[0]}`);
+    }
+  }
+  const existing = readFenceFile(recover);
+  if (!existing || pidAlive(existing.pid)) return false;
+  // Re-read before unlink so we do not remove a successor's recover guard.
+  const again = readFenceFile(recover);
+  if (!again || again.pid !== existing.pid || again.owner !== existing.owner || pidAlive(again.pid)) {
+    return false;
+  }
+  try {
+    unlinkSync(recover);
   } catch {
-    /* best-effort */
+    return false;
+  }
+  try {
+    publishFenceExclusive(recover, body);
+    return true;
+  } catch {
+    return false;
   }
 }
 
-function tryAcquireFence(projectRoot: string, workId: string, owner: string): boolean {
+function releaseRecoverGuard(projectRoot: string, workId: string): void {
+  unlinkQuiet(fleetLockRecoverPath(projectRoot, workId));
+}
+
+/** Exported for dual-recoverer tests. */
+export function tryAcquireFence(projectRoot: string, workId: string, owner: string): boolean {
   const fence = fleetLockFencePath(projectRoot, workId);
   const body: FenceBody = { owner, pid: process.pid, at: new Date().toISOString() };
   try {
@@ -220,17 +269,9 @@ function tryAcquireFence(projectRoot: string, workId: string, owner: string): bo
       throw err('E_UNSAFE_EXECUTION', `fleet lock fence failed: ${(e as Error).message.split('\n')[0]}`);
     }
   }
-  // Recover only when the recorded holder pid is gone on this host (local CLI).
   const existing = readFence(projectRoot, workId);
   if (!existing || pidAlive(existing.pid)) return false;
-  // Exclusive recover token so two recoverers cannot both unlink a successor fence.
-  const recover = `${fence}.recover.${process.pid}`;
-  try {
-    const fd = openSync(recover, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
-    closeSync(fd);
-  } catch {
-    return false;
-  }
+  if (!tryAcquireRecoverGuard(projectRoot, workId, owner)) return false;
   try {
     const again = readFence(projectRoot, workId);
     if (!again || again.pid !== existing.pid || again.owner !== existing.owner || pidAlive(again.pid)) {
@@ -248,11 +289,7 @@ function tryAcquireFence(projectRoot: string, workId: string, owner: string): bo
       return false;
     }
   } finally {
-    try {
-      unlinkSync(recover);
-    } catch {
-      /* best-effort */
-    }
+    releaseRecoverGuard(projectRoot, workId);
   }
 }
 
@@ -404,11 +441,11 @@ export function releaseFleetLock(input: {
   projectRoot: string;
   workId: string;
   owner: string;
-}): { released: boolean; reason?: string } {
+}): { released: boolean; reason?: string; busy?: boolean } {
   const path = fleetLockPath(input.projectRoot, input.workId);
   if (!existsSync(path)) return { released: true };
   if (!tryAcquireFence(input.projectRoot, input.workId, input.owner)) {
-    return { released: false, reason: 'release fence held; retry' };
+    return { released: false, reason: 'release fence held; retry', busy: true };
   }
   try {
     const current = readFleetLock(input.projectRoot, input.workId);

@@ -183,7 +183,34 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
           lostOwnership = true;
         }
       };
-      tryRenew(); // immediate renew so short leases stay exclusive before first interval
+      // Confirm ownership before step: busy fence must not proceed into work.
+      const confirmDeadline = Date.now() + Math.min(leaseMs, 5_000);
+      for (;;) {
+        try {
+          const probe = renewFleetLock({
+            projectRoot: engine.ctx.projectRoot,
+            workId,
+            owner: lock.owner,
+            leaseMs,
+            now,
+          });
+          if (probe.ok) break;
+          if (!probe.busy) {
+            lostOwnership = true;
+            break;
+          }
+          if (Date.now() >= confirmDeadline) {
+            lostOwnership = true;
+            renewError = 'initial lease renew stayed busy';
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 20));
+        } catch (e) {
+          renewError = (e as Error).message.split('\n')[0];
+          lostOwnership = true;
+          break;
+        }
+      }
       const renewTimer = setInterval(tryRenew, renewEveryMs);
       try {
         if (renewError || lostOwnership) {
@@ -240,7 +267,12 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
       } finally {
         clearInterval(renewTimer);
         try {
-          const rel = releaseFleetLock({ projectRoot: engine.ctx.projectRoot, workId, owner: lock.owner });
+          const deadline = Date.now() + 2_000;
+          let rel = releaseFleetLock({ projectRoot: engine.ctx.projectRoot, workId, owner: lock.owner });
+          while (!rel.released && rel.busy && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 25));
+            rel = releaseFleetLock({ projectRoot: engine.ctx.projectRoot, workId, owner: lock.owner });
+          }
           if (!rel.released) {
             outcomes.push({
               workId,
@@ -297,20 +329,20 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
             now,
           });
           if (!acq.ok) continue;
-          // Re-read under the claim — another runner may have moved the task.
-          const fresh = engine.ctx.store.getWork(work.id);
-          if (!isFleetEligible(fresh) || deferred.has(fresh.id)) {
-            releaseFleetLock({ projectRoot: engine.ctx.projectRoot, workId: work.id, owner: acq.lock.owner });
-            continue;
-          }
+          // Cleanup starts immediately after acquisition — getWork/log may throw.
           try {
+            const fresh = engine.ctx.store.getWork(work.id);
+            if (!isFleetEligible(fresh) || deferred.has(fresh.id)) {
+              releaseFleetLock({ projectRoot: engine.ctx.projectRoot, workId: work.id, owner: acq.lock.owner });
+              continue;
+            }
             if (acq.reclaimed) logReclaim(engine, work.id, runId);
+            claimed = { work: fresh, lock: acq.lock };
+            break;
           } catch (e) {
             releaseFleetLock({ projectRoot: engine.ctx.projectRoot, workId: work.id, owner: acq.lock.owner });
             throw e;
           }
-          claimed = { work: fresh, lock: acq.lock };
-          break;
         }
         if (!claimed) break;
         launch(claimed.work, claimed.lock);

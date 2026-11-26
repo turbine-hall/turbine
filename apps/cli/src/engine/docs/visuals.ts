@@ -74,10 +74,29 @@ export function userFlowDiagram(steps: FlowStep[]): string | undefined {
   if (steps.length < 2) return undefined;
   const actors = [...new Set(steps.flatMap((s) => [s.from, s.to]))];
   const id = (a: string) => `a${actors.indexOf(a)}`;
-  // Strip mermaid-significant punctuation so lintMermaid's balance checks stay green
-  // (assess/mock messages often include "(P1):" / "`code`" / ellipsis cuts mid-paren).
-  const clean = (s: string, max: number) =>
-    s.replace(/[()[\]{};#"`]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+  // Escape Mermaid-significant punctuation (decimal entities) so balance lint stays green
+  // without destroying route/shape meaning such as `GET /users/{id}` or `[]`.
+  const clean = (s: string, max: number) => {
+    const hash = '\uE000';
+    const semi = '\uE001';
+    const ent = (n: number) => `${hash}${n}${semi}`;
+    return s
+      .replace(/#/g, ent(35))
+      .replace(/;/g, ent(59))
+      .replace(/"/g, ent(34))
+      .replace(/`/g, ent(96))
+      .replace(/\(/g, ent(40))
+      .replace(/\)/g, ent(41))
+      .replace(/\[/g, ent(91))
+      .replace(/\]/g, ent(93))
+      .replace(/\{/g, ent(123))
+      .replace(/\}/g, ent(125))
+      .replace(new RegExp(hash, 'g'), '#')
+      .replace(new RegExp(semi, 'g'), ';')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, max);
+  };
   return [
     '```mermaid',
     'sequenceDiagram',

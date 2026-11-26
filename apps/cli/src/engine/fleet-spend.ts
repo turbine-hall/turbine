@@ -55,11 +55,13 @@ export function measureFleetSpend(
     const workUnknown = tot.unknown || summary.grand.hasUnknown;
     hasUnknown = hasUnknown || workUnknown;
     knownTokens += tot.n;
-    const knownUsd = (tot.n / 1_000_000) * usdPerMillionTokens;
+    // Multiply before divide so exact budget boundaries (e.g. 46000 × $5/MTok = $0.23) do not
+    // round below the threshold and admit one extra task.
+    const knownUsd = (tot.n * usdPerMillionTokens) / 1_000_000;
     byWork.push({ workId, knownTokens: tot.n, knownUsd, hasUnknown: workUnknown });
   }
   return {
-    knownUsd: (knownTokens / 1_000_000) * usdPerMillionTokens,
+    knownUsd: (knownTokens * usdPerMillionTokens) / 1_000_000,
     knownTokens,
     hasUnknown,
     usdPerMillionTokens,

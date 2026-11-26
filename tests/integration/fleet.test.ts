@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -8,9 +8,12 @@ import { openContext } from '../../apps/cli/src/engine/project.js';
 import {
   acquireFleetLock,
   fleetLockPath,
+  pidAlive,
   readFleetLock,
   releaseFleetLock,
   renewFleetLock,
+  tryAcquireFence,
+  tryAcquireRecoverGuard,
 } from '../../apps/cli/src/engine/fleet-lock.js';
 import { measureFleetSpend } from '../../apps/cli/src/engine/fleet-spend.js';
 import { fleetStatus, runFleet } from '../../apps/cli/src/engine/fleet.js';
@@ -99,6 +102,57 @@ describe('fleet scheduler (Part E / #43)', () => {
     expect(() =>
       acquireFleetLock({ projectRoot: dir, workId, runId: 'fleet_x', leaseMs: 1_000 }),
     ).toThrow(/corrupt|unreadable/i);
+    writeFileSync(path, '   \n');
+    expect(() => readFleetLock(dir, workId)).toThrow(/empty/i);
+  });
+
+  it('budget boundary: exact token×rate USD stops admission', () => {
+    const dir = tempProject('fleet-budget-boundary-', dirs);
+    const engine = new Engine(openContext(dir));
+    const request = join(dir, 'boundary.md');
+    writeFileSync(request, '# Boundary\n');
+    const work = engine.createTask({ title: 'Boundary', file: request, type: 'maintenance' });
+    // 46_000 × $5 / 1e6 = exactly $0.23
+    engine.addUsage({
+      idOrAlias: work.id,
+      source: 'agent',
+      agentName: 'cursor',
+      modelId: 'gpt-test',
+      inputTokens: 46_000,
+      outputTokens: 0,
+      method: 'reported',
+      recordedBy: 'tester',
+      enteredBy: 'human',
+    });
+    const spend = measureFleetSpend(engine.ctx.store, [work.id], 5);
+    expect(spend.knownUsd).toBe(0.23);
+    expect(spend.knownUsd >= 0.23).toBe(true);
+    // Just below budget still admits.
+    const below = measureFleetSpend(engine.ctx.store, [work.id], 5);
+    expect(below.knownUsd < 0.2300001).toBe(true);
+    engine.ctx.store.close();
+  });
+
+  it('invalid fence pid is inconclusive; shared recover guard serializes two recoverers', () => {
+    expect(pidAlive(0)).toBe(true);
+    expect(pidAlive(-1)).toBe(true);
+    const dir = tempProject('fleet-recover-guard-', dirs);
+    const workId = 'work_recover_shared';
+    mkdirSync(join(dir, '.turbine', 'fleet', 'locks'), { recursive: true });
+    // Plant a fence owned by a definitely-dead pid.
+    writeFileSync(
+      `${fleetLockPath(dir, workId)}.fence`,
+      `${JSON.stringify({ owner: 'fleet:dead:x', pid: 2 ** 22, at: new Date(0).toISOString() })}\n`,
+    );
+    expect(pidAlive(2 ** 22)).toBe(false);
+    const a = tryAcquireRecoverGuard(dir, workId, 'fleet:a:x');
+    const b = tryAcquireRecoverGuard(dir, workId, 'fleet:b:x');
+    expect(a).toBe(true);
+    expect(b).toBe(false);
+    unlinkSync(`${fleetLockPath(dir, workId)}.fence.recover`);
+    // With the shared recover free, fence takeover serializes on that same guard.
+    expect(tryAcquireFence(dir, workId, 'fleet:a:x')).toBe(true);
+    expect(tryAcquireFence(dir, workId, 'fleet:b:x')).toBe(false);
   });
 
   it('FR-003: budget stops starting; running finish; unknown spend separate', async () => {
