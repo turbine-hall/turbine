@@ -1,4 +1,4 @@
-import { constants, existsSync, fchmodSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync, closeSync } from 'node:fs';
+import { constants, existsSync, fchmodSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, writeFileSync, closeSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import {
@@ -273,6 +273,37 @@ export function writeAtomic(file: string, content: string): void {
 }
 
 /**
+ * Stage temps look like `.${pid}-${ms}-${uuid}.tmp`. Lock helpers use `.publish.lock.*.tmp` and
+ * `.publish.lock.stale.*`. A crash can leave any of these beside the published files.
+ */
+const STAGE_TMP_NAME = /^\.\d+-\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/i;
+const LOCK_TMP_NAME = /^\.publish\.lock\.\d+\.[0-9a-f-]+\.tmp$/i;
+const LOCK_STALE_NAME = /^\.publish\.lock\.stale\./;
+/** Representative stage-temp path so ignore probes catch rules that only name snapshot.json / PROJECT.md. */
+const STAGE_TMP_PROBE = `.0-0-00000000-0000-0000-0000-000000000000.tmp`;
+
+/** Remove leftover publish temps from a prior crash. Never touches the live `.publish.lock`. */
+function removeStalePublishTemps(dir: string): void {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (name === '.publish.lock') continue;
+    if (!STAGE_TMP_NAME.test(name) && !LOCK_TMP_NAME.test(name) && !LOCK_STALE_NAME.test(name)) continue;
+    const abs = join(dir, name);
+    try {
+      if (!lstatSync(abs).isFile()) continue;
+      rmSync(abs, { force: true });
+    } catch {
+      /* best-effort cleanup */
+    }
+  }
+}
+
+/**
  * One publisher per project at a time. The lock is an exclusive file holding the owner's pid; a lock whose
  * owner is gone is removed and taken over. A live owner means another `turbine understand` is writing.
  * Shared by context and knowledge publishers.
@@ -281,6 +312,7 @@ export function withContextPublishLock<T>(projectRoot: string, fn: () => T): T {
   const lock = join(contextPaths(projectRoot).dir, '.publish.lock');
   acquireLock(lock);
   try {
+    removeStalePublishTemps(contextPaths(projectRoot).dir);
     return fn();
   } finally {
     rmSync(lock, { force: true });
@@ -385,35 +417,55 @@ export class HeadMovedError extends Error {}
  * Write snapshot.json and the Facts section of PROJECT.md. Returns the files written.
  * `stillCurrent` is asked, under the lock and after everything is rendered, whether the snapshot is still
  * the one for HEAD. If HEAD moved, nothing is published (the caller rebuilds for the new HEAD).
+ *
+ * PROJECT.md is re-read under the lock before staging and again before rename. If notes were saved
+ * while the Facts section was rendered, the document is rebuilt from the new file instead of
+ * overwriting those notes (same pattern as CONTEXT.md). `afterProjectRead` is for tests only.
  */
 export function writeContextFiles(
   projectRoot: string,
   s: RepoSnapshot,
   stillCurrent: () => boolean = () => true,
   record?: () => void,
+  afterProjectRead?: () => void,
 ): string[] {
   const p = contextPaths(projectRoot);
   assertRealDirs(projectRoot, p.dir);
   mkdirSync(p.dir, { recursive: true });
   assertRealDirs(projectRoot, p.dir);
   return withPublishLock(projectRoot, () => {
-    // Build and stage both files completely before anything is renamed into place, so the HEAD check below
-    // happens after both are ready. Staging touches only temp files.
-    const project = renderProjectMd(s, readRegular(p.project));
-    // Every staged temp file is removed if anything after it fails, including staging the second output.
-    const staged: Array<{ file: string; tmp: string }> = [];
-    try {
-      staged.push(stage(p.snapshot, `${JSON.stringify(s, null, 2)}\n`));
-      staged.push(stage(p.project, project));
-      if (!stillCurrent()) throw new HeadMovedError('HEAD changed while the project context was being written; nothing was published. Run again.');
-    } catch (e) {
-      for (const t of staged) rmSync(t.tmp, { force: true });
-      throw e;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      // Build and stage both files completely before anything is renamed into place, so the HEAD check
+      // below happens after both are ready. Staging touches only temp files.
+      const existing = readRegular(p.project);
+      afterProjectRead?.();
+      const project = renderProjectMd(s, existing);
+      // Notes saved while rendering: rebuild from the new file instead of publishing the stale read.
+      if (readRegular(p.project) !== existing) continue;
+
+      // Every staged temp file is removed if anything after it fails, including staging the second output.
+      const staged: Array<{ file: string; tmp: string }> = [];
+      try {
+        staged.push(stage(p.snapshot, `${JSON.stringify(s, null, 2)}\n`));
+        staged.push(stage(p.project, project));
+        // Last check before rename: an editor can still save between the re-read and publish.
+        if (readRegular(p.project) !== existing) {
+          for (const t of staged) rmSync(t.tmp, { force: true });
+          continue;
+        }
+        if (!stillCurrent()) throw new HeadMovedError('HEAD changed while the project context was being written; nothing was published. Run again.');
+      } catch (e) {
+        for (const t of staged) rmSync(t.tmp, { force: true });
+        throw e;
+      }
+      publish(staged);
+      ensureContextIgnored(projectRoot);
+      record?.(); // the store is updated only after the files are in place, still under the lock
+      return [p.snapshot, p.project];
     }
-    publish(staged);
-    ensureContextIgnored(projectRoot);
-    record?.(); // the store is updated only after the files are in place, still under the lock
-    return [p.snapshot, p.project];
+    throw new Error(
+      '.turbine/context/PROJECT.md kept changing while it was regenerated, so it was not replaced. Retry once nothing else is writing it.',
+    );
   });
 }
 
@@ -450,7 +502,11 @@ function lastRuleLine(gitignore: string): string | undefined {
 }
 
 /** Paths inside the generated directory, used to ask git whether each generated output is ignored. */
-const GENERATED_PROBES = [`.turbine/${CONTEXT_DIR}/snapshot.json`, `.turbine/${CONTEXT_DIR}/PROJECT.md`];
+const GENERATED_PROBES = [
+  `.turbine/${CONTEXT_DIR}/snapshot.json`,
+  `.turbine/${CONTEXT_DIR}/PROJECT.md`,
+  `.turbine/${CONTEXT_DIR}/${STAGE_TMP_PROBE}`,
+];
 const GENERATED_KNOWLEDGE_PROBES = [`.turbine/${KNOWLEDGE_IGNORE}/index.md`];
 
 /** Git applies ignore rules in order, so the LAST rule that mentions the directory decides. */
