@@ -1,6 +1,6 @@
 {
   "name": "@turbine-hall/turbine-skills",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
