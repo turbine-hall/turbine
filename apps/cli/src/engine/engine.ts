@@ -2218,11 +2218,18 @@ export class Engine {
         this.writeTaskContext(work, { unavailable: `the selection could not be rebuilt: ${(e as Error).message.split('\n')[0]}` });
       }
     }
+    let confirmToken: string | undefined;
+    try {
+      confirmToken = this.pendingApproval(work.id).confirmToken;
+    } catch {
+      confirmToken = undefined;
+    }
     return computeNextStep({
       projectRoot: this.ctx.projectRoot,
       work,
       defaultBaseBranch: baseBranch,
       briefUnavailable: !briefOk,
+      confirmToken,
     });
   }
 
@@ -4440,7 +4447,7 @@ export class Engine {
     try {
     let work = this.ctx.store.getWork(idOrAlias);
     const paths = packetPaths(this.ctx.projectRoot, work.id);
-    const approveHint = `Human approves in their own terminal: turbine task approve ${work.id}`;
+    const approveHint = `Human approves (terminal or mediated): turbine task approve ${work.id} [--confirm <token> --by <name>]`;
 
     // Any new commit in a worktree after implementation is a code change.
     const refreshed = this.refreshHeads(work.id);

@@ -25,9 +25,24 @@ export const HUMAN_ONLY_PATTERNS: string[] = [
   String.raw`>\s*[^|;&]*\.turbine/state\b`,
 ];
 
+/**
+ * Bare approve/reject stay human-only. With `--confirm <token> --by <name>`, the human already
+ * reviewed the revision in chat and asked the agent to record it — allow that mediated form.
+ */
+export function isMediatedApproveOrReject(command: string): boolean {
+  return (
+    /\btask\s+(approve|reject)\b/i.test(command) &&
+    /--confirm\s+\S+/.test(command) &&
+    /--by\s+\S+/.test(command)
+  );
+}
+
 export function isHumanOnlyCommand(command: string): boolean {
   const segments = command.split(/&&|\|\||;|\|/);
-  return segments.some((seg) => HUMAN_ONLY_PATTERNS.some((p) => new RegExp(p, 'i').test(seg)));
+  return segments.some((seg) => {
+    if (isMediatedApproveOrReject(seg)) return false;
+    return HUMAN_ONLY_PATTERNS.some((p) => new RegExp(p, 'i').test(seg));
+  });
 }
 
 export const GUARD_SCRIPT_PATH = '.cursor/hooks/turbine-guard.mjs';
@@ -48,15 +63,20 @@ process.stdin.on('end', () => {
   } catch {
     command = '';
   }
-  const hit = command.split(/&&|\\|\\||;|\\|/).some((seg) => PATTERNS.some((re) => re.test(seg)));
+  const mediated = (seg) =>
+    /\\btask\\s+(approve|reject)\\b/i.test(seg) && /--confirm\\s+\\S+/.test(seg) && /--by\\s+\\S+/.test(seg);
+  const hit = command
+    .split(/&&|\\|\\||;|\\|/)
+    .some((seg) => !mediated(seg) && PATTERNS.some((re) => re.test(seg)));
   if (hit) {
     process.stdout.write(
       JSON.stringify({
         continue: true,
         permission: 'deny',
-        user_message: 'Blocked: this Turbine Hall command is a human decision. Run it yourself in your own terminal.',
+        user_message:
+          'Blocked: this Turbine Hall command is a human decision. Either run it in your terminal, or tell the agent to use: turbine task approve <id> --confirm <token> --by <your-name>.',
         agent_message:
-          'You must not run approval, rejection, waiver, cancel, policy approve/resume, audit record or lane retry commands, or modify .turbine/state. Summarise what the human is deciding and ask them to run it themselves.',
+          'Do not run bare approve/reject/waive/cancel. After the human explicitly approves in chat, you may run: turbine task approve <id> --confirm <token> --by <their-name> (token from turbine task next <id> --json). Still never waive, cancel, policy approve/resume, audit record, lane retry, or modify .turbine/state.',
       }),
     );
     process.exit(0);

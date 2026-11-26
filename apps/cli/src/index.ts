@@ -29,7 +29,16 @@ import { initProject, openContext } from './engine/project.js';
 import { ensureBoard } from './board/launch.js';
 import { handleError, printResult } from './output.js';
 import { callerCwd, factoryRoot, findProjectRoot, resolveProjectPath } from './paths.js';
-import { HUMAN_PRESENCE, ask, askReviewer, assertHumanTerminal, gitUserName } from './human-gate.js';
+import {
+  CONFIRM_PRESENCE,
+  HUMAN_PRESENCE,
+  ask,
+  askReviewer,
+  assertHumanTerminal,
+  assertMediatedConfirm,
+  gitUserName,
+  isAgentSession,
+} from './human-gate.js';
 import { repoToplevel } from './engine/context/git-read.js';
 import { formatTokenCount, formatUsageQualifiers } from './engine/usage.js';
 import {
@@ -43,10 +52,6 @@ import {
 } from './engine/lane-policy.js';
 import { computeLaneMetrics, type LaneMetric } from './engine/lane-metrics.js';
 import { nextLaneAudit, recordLaneAuditOutcome } from './engine/lane-audit.js';
-
-function isAgentSession(): boolean {
-  return ['TURBINE_AGENT', 'CLAUDECODE', 'CURSOR_AGENT'].some((k) => process.env[k] && process.env[k] !== '0');
-}
 
 function parseTokenArg(raw: string): number | 'unknown' {
   if (raw === 'unknown' || raw === '?') return 'unknown';
@@ -1496,8 +1501,16 @@ repoCmd
     }
   });
 
-async function decideCommand(id: string, action: 'approve' | 'reject', reason?: string) {
-  assertHumanTerminal(`turbine task ${action}`);
+async function decideCommand(
+  id: string,
+  action: 'approve' | 'reject',
+  opts: { reason?: string; confirm?: string; by?: string } = {},
+) {
+  const mediated = Boolean(opts.confirm || opts.by);
+  if (!mediated) assertHumanTerminal(`turbine task ${action}`);
+  const mediatedIds = mediated
+    ? assertMediatedConfirm(`turbine task ${action}`, opts.confirm, opts.by)
+    : null;
   const engine = withEngine();
   try {
     const pending = engine.pendingApproval(id);
@@ -1523,20 +1536,42 @@ async function decideCommand(id: string, action: 'approve' | 'reject', reason?: 
       out.write(`  Expected:  ${pending.notes?.expected || '(empty)'}\n`);
       out.write(`  Actual:    ${pending.notes?.actual || '(empty)'}\n`);
     }
-    out.write(`\nType the code ${pending.confirmToken} to confirm you reviewed exactly this revision.\n`);
-    const token = await ask('Code: ');
-    const reviewer = await askReviewer(engine.ctx.projectRoot);
-    let why = reason;
-    if (action === 'reject' && !why) why = await ask('Reason: ');
+    let confirmToken: string;
+    let reviewer: string;
+    let presence: string;
+    if (mediatedIds) {
+      confirmToken = mediatedIds.confirmToken;
+      reviewer = mediatedIds.reviewer;
+      presence = CONFIRM_PRESENCE;
+      out.write(
+        `\nMediated confirm ${confirmToken} by ${reviewer} (revision under review: ${pending.confirmToken}).\n`,
+      );
+    } else {
+      out.write(`\nType the code ${pending.confirmToken} to confirm you reviewed exactly this revision.\n`);
+      confirmToken = await ask('Code: ');
+      reviewer = await askReviewer(engine.ctx.projectRoot);
+      presence = HUMAN_PRESENCE;
+    }
+    let why = opts.reason;
+    if (action === 'reject' && !why) {
+      if (mediatedIds) {
+        throw err('E_UNTRUSTED_IDENTITY', 'Non-interactive reject needs --reason <text>');
+      }
+      why = await ask('Reason: ');
+    }
     const result = engine.decide(id, {
       action,
       reviewer,
-      confirmToken: token,
+      confirmToken,
       reason: why,
-      presence: HUMAN_PRESENCE,
+      presence,
     });
     await engine.waitForLanePr();
-    out.write('\nRecorded as a local attestation (identity not cryptographically verified).\n');
+    out.write(
+      mediatedIds
+        ? '\nRecorded via --confirm/--by (local attestation; identity not cryptographically verified).\n'
+        : '\nRecorded as a local attestation (identity not cryptographically verified).\n',
+    );
     const work = (result as { work: { id: string; currentState: string } }).work;
     printResult({ id: work.id, state: work.currentState }, false);
     await engine.waitForMirror();
@@ -1548,10 +1583,12 @@ async function decideCommand(id: string, action: 'approve' | 'reject', reason?: 
 task
   .command('approve')
   .argument('<id>')
-  .description('HUMAN ONLY: approve the gate currently waiting on you (interactive)')
-  .action(async (id) => {
+  .option('--confirm <token>', 'Non-interactive: short hash of the revision (from task next --json)')
+  .option('--by <name>', 'Non-interactive: name of the human who approved in chat')
+  .description('Approve the pending gate (interactive, or --confirm + --by after human review in chat)')
+  .action(async (id, opts) => {
     try {
-      await decideCommand(id, 'approve');
+      await decideCommand(id, 'approve', { confirm: opts.confirm, by: opts.by });
     } catch (e) {
       handleError(e);
     }
@@ -1561,10 +1598,12 @@ task
   .command('reject')
   .argument('<id>')
   .option('--reason <text>')
-  .description('HUMAN ONLY: reject / request changes on the pending gate (interactive)')
+  .option('--confirm <token>', 'Non-interactive: short hash of the revision (from task next --json)')
+  .option('--by <name>', 'Non-interactive: name of the human who rejected in chat')
+  .description('Reject / request changes on the pending gate (interactive, or --confirm + --by + --reason)')
   .action(async (id, opts) => {
     try {
-      await decideCommand(id, 'reject', opts.reason);
+      await decideCommand(id, 'reject', { reason: opts.reason, confirm: opts.confirm, by: opts.by });
     } catch (e) {
       handleError(e);
     }
