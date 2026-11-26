@@ -753,9 +753,11 @@ export class Engine {
     /** Labels of the source issue, read by an intake adapter (lane policy eligibility). */
     labels?: string[];
   }): WorkPackage {
+    // Title-only create: the title *is* the request. Avoid "(No body provided)" so assess
+    // can seed requirements and request coverage from something real.
     const sourceText =
       input.text ??
-      (input.file ? readFileSync(input.file, 'utf8') : `# ${input.title}\n\n(No body provided)`);
+      (input.file ? readFileSync(input.file, 'utf8') : `# ${input.title}\n\n${input.title}`);
     const snapshotHash = contentHashText(sourceText);
     const workId = createId('work');
     const createdAt = now();
