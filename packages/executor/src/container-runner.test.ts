@@ -148,6 +148,18 @@ describe('container phase runner', () => {
     expect(parseBindHostsFromArgv(argv)).toEqual([wt]);
   });
 
+  it('FR-D1: forbidden-mount scan follows symlinks to the canonical host path', () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-bind-'));
+    const secret = join(root, 'secret');
+    const link = join(root, 'link');
+    mkdirSync(secret);
+    writeFileSync(join(secret, 'x'), 'x');
+    symlinkSync(secret, link);
+    expect(
+      findForbiddenBindInArgv(['run', '-v', `${link}:/mnt:ro`, 'img', 't'], [secret], undefined),
+    ).toBe(secret);
+  });
+
   it('FR-D4: agentCliCommand uses provider-specific non-interactive shapes via stdin', () => {
     const p = '/wt/.turbine-sandbox/prompt.md';
     expect(agentCliCommand('claude-code', p)[0]).toBe('sh');

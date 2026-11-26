@@ -19,7 +19,7 @@ import {
   unlinkSync,
   writeSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import {
   defaultSandboxHooks,
   detectContainerRuntime,
@@ -242,6 +242,16 @@ export function resolveLinkedGitLayout(
   if (projectRoot) {
     worktreeGitDir = assertPathUnderProject(worktreeGitDir, projectRoot, 'worktree git dir');
     commonDir = assertPathUnderProject(commonDir, projectRoot, 'git common dir');
+    // Linked admin/common dirs must stay under this project's `.git` (not an arbitrary in-tree path).
+    const projectGit = assertPathUnderProject(join(projectRoot, '.git'), projectRoot, 'project .git');
+    for (const [label, p] of [
+      ['worktree git dir', worktreeGitDir],
+      ['git common dir', commonDir],
+    ] as const) {
+      if (p !== projectGit && !p.startsWith(`${projectGit}/`)) {
+        throw err('E_UNSAFE_EXECUTION', `${label} escapes project .git (${p})`);
+      }
+    }
   } else {
     try {
       worktreeGitDir = realpathSync(worktreeGitDir);
@@ -300,18 +310,39 @@ export function parseBindHostsFromArgv(argv: string[]): string[] {
  * Refuse argv that would bind a forbidden path. Skips the home directory entry so a
  * descendant worktree under $HOME is allowed (matches planSandboxMounts).
  */
+/** Canonicalize an existing path; if missing, realpath the longest existing ancestor and join the rest. */
+function canonicalizeBindPath(path: string): string {
+  const abs = resolve(path);
+  try {
+    return realpathSync(abs);
+  } catch {
+    const parts: string[] = [];
+    let cur = abs;
+    while (cur !== dirname(cur)) {
+      parts.unshift(basename(cur));
+      cur = dirname(cur);
+      try {
+        return parts.reduce((acc, p) => join(acc, p), realpathSync(cur));
+      } catch {
+        // keep walking
+      }
+    }
+    return abs;
+  }
+}
+
 export function findForbiddenBindInArgv(
   argv: string[],
   forbiddenMounts: string[],
   home?: string,
 ): string | undefined {
-  const homeCanon = home ? resolve(home) : '';
+  const homeCanon = home ? canonicalizeBindPath(home) : '';
   const hosts = parseBindHostsFromArgv(argv);
   for (const host of hosts) {
-    const hostResolved = resolve(host);
+    const hostResolved = canonicalizeBindPath(host);
     for (const f of forbiddenMounts) {
-      if (homeCanon && resolve(f) === homeCanon) continue;
-      const forb = resolve(f);
+      const forb = canonicalizeBindPath(f);
+      if (homeCanon && forb === homeCanon) continue;
       if (hostResolved === forb || hostResolved.startsWith(`${forb}/`) || forb.startsWith(`${hostResolved}/`)) {
         return f;
       }
