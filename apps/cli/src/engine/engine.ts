@@ -2306,6 +2306,15 @@ export class Engine {
             'sandboxed-unattended requires Engine.sandboxImplementer or execution.sandboxImplementer (claude-code|codex). It will not start with the default fixture or fall back to unsandboxed execution.',
           );
         }
+        // Live runner mounts a single primary worktree; refuse multi-repo before IMPLEMENTING.
+        // `work.repositories` are extras beyond the project repo.
+        const extraRepos = work.repositories?.length ?? 0;
+        if (extraRepos > 0) {
+          throw err(
+            'E_UNSAFE_EXECUTION',
+            `sandboxed-unattended supports a single repository; this task declares ${extraRepos + 1}. It will not fall back to unsandboxed execution.`,
+          );
+        }
         if (!this.sandboxHooks) {
           // Worktree may not exist yet — declare network policy + detect runtime here.
           // In-container egress probe runs in runSandboxedUnattended after the worktree exists.

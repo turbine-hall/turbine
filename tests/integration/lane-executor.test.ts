@@ -219,6 +219,21 @@ describe('Part D sandboxed-unattended executor', () => {
     engine.ctx.store.close();
   });
 
+  it('FR-D1: multi-repo tasks refuse before IMPLEMENTING under sandboxed-unattended', async () => {
+    const { engine } = laneProject(dirs);
+    engine.ctx.config.execution.mode = 'sandboxed-unattended';
+    engine.sandboxHooks = fixtureHooks({ runtime: 'docker' });
+    engine.sandboxImplementer = createFixtureImplementer({ commits: ['abc'] });
+    const work = await toPlanApproved(engine);
+    engine.ctx.store.saveWork({
+      ...work,
+      repositories: [{ name: 'other', path: '/tmp/other-repo', checks: [], setup: [] }],
+    });
+    await expect(engine.execute(work.id)).rejects.toThrow(/single repository|E_UNSAFE_EXECUTION/);
+    expect(engine.ctx.store.getWork(work.id).currentState).toBe('PLAN_APPROVED');
+    engine.ctx.store.close();
+  });
+
   it('AC15 / FR-D2: fix cap leaves lane — after maxExecutionAttempts failed checks → CHANGES_REQUESTED + out of lane', async () => {
     const { engine } = laneProject(dirs);
     engine.ctx.config.execution.mode = 'sandboxed-unattended';

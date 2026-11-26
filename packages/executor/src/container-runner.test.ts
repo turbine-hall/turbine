@@ -63,6 +63,13 @@ describe('container phase runner', () => {
         modelProxyNetwork: 'm',
       }),
     ).toThrow(/sandboxAllowNetwork/i);
+    expect(() =>
+      assertSandboxNetworkPolicyReady({
+        registries: ['registry.npmjs.org'],
+        modelProxyUrl: 'https://proxy.example.com',
+        allowNetwork: 'turbine-allow',
+      }),
+    ).toThrow(/sandboxModelProxyNetwork|not enforceable/i);
   });
 
   it('FR-D1: buildContainerArgv bind-mounts worktree, names the container, and can add Git mounts', () => {
@@ -86,13 +93,13 @@ describe('container phase runner', () => {
     expect(built.argv.join(' ')).not.toMatch(/hooks|\.ssh|\.turbine\/state/);
   });
 
-  it('setup command script uses set -e so a failed command is not masked', async () => {
+  it('setup commands are positional args so shell metacharacters are not expanded by the outer shell', async () => {
     const root = mkdtempSync(join(tmpdir(), 'turbine-shell-'));
     const wt = join(root, 'wt');
     mkdirSync(wt);
     writeFileSync(join(wt, 'README'), 'x');
     const mount = planSandboxMounts({ worktreePath: wt, projectRoot: root, runtime: 'docker', home: '/tmp/no-home' });
-    let script = '';
+    let captured: string[] = [];
     const hooks = createContainerSandboxHooksWithProbe({
       worktreePath: wt,
       projectRoot: root,
@@ -106,7 +113,7 @@ describe('container phase runner', () => {
       home: '/tmp/no-home',
       setupCommands: ['false', 'echo skipped; true'],
       runContainer: async (req) => {
-        script = req.args.find((a) => typeof a === 'string' && a.includes('|| exit $?')) ?? '';
+        captured = req.args;
         return {
           exitCode: 1,
           stdout: '',
@@ -123,9 +130,10 @@ describe('container phase runner', () => {
       signal: new AbortController().signal,
       remainingOutputBytes: 1000,
     });
-    expect(script).toContain('|| exit $?');
-    expect(script).toContain('false');
-    expect(script).toContain('echo skipped; true');
+    const scriptIdx = captured.indexOf('for cmd; do sh -c "$cmd" || exit $?; done');
+    expect(scriptIdx).toBeGreaterThan(-1);
+    expect(captured[scriptIdx + 1]).toBe('turbine-phase');
+    expect(captured.slice(scriptIdx + 2)).toEqual(['false', 'echo skipped; true']);
   });
 
   it('FR-D1: forbidden-mount scan uses bind hosts and skips home so worktrees under $HOME work', () => {

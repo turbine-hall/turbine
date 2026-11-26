@@ -83,7 +83,8 @@ export type ContainerSandboxOptions = {
 };
 
 const DEFAULT_PROBE_TIMEOUT_MS = 30_000;
-const PROBE_URL = 'https://example.com/';
+/** Literal IP so DNS failure under `--network none` is not mistaken for inconclusive. */
+const PROBE_URL = 'http://1.1.1.1/';
 
 /** Build network argv for a phase. Returns enforced=false when allow-list scopes cannot be configured. */
 export function phaseNetworkArgs(
@@ -603,6 +604,7 @@ export async function createContainerSandboxHooks(opts: ContainerSandboxOptions)
     registries: opts.registries,
     modelProxyUrl: opts.modelProxyUrl,
     allowNetwork: opts.allowNetwork,
+    modelProxyNetwork: opts.modelProxyNetwork,
   });
   const runtime = opts.runtime ?? detectContainerRuntime();
   if (!runtime) {
@@ -695,9 +697,9 @@ export function createContainerSandboxHooksWithProbe(
 
   const shellCommands = (commands: string[]): string[] => {
     if (!commands.length) return ['node', '-e', 'process.exit(0)'];
-    // Each configured entry runs in its own shell so `false && true` fails the entry as a whole.
-    const script = commands.map((c) => `sh -c ${JSON.stringify(c)} || exit $?`).join('\n');
-    return ['sh', '-c', script];
+    // Pass each entry as a positional arg so the outer shell never expands `$` / backticks in it.
+    // `for cmd; do` walks `$1..$#` (after `$0` = turbine-phase); a nonzero entry fails the phase.
+    return ['sh', '-c', 'for cmd; do sh -c "$cmd" || exit $?; done', 'turbine-phase', ...commands];
   };
 
   return {
