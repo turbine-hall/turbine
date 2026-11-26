@@ -116,7 +116,10 @@ function logReclaim(engine: Engine, workId: string, runId: string): void {
 
 /** Tasks the fleet may still advance (not terminal, not already waiting on a human). */
 export function fleetCandidateWorks(engine: Engine): WorkPackage[] {
-  return engine.ctx.store.listWork().filter(isFleetEligible);
+  return engine.ctx.store
+    .listWork()
+    .filter(isFleetEligible)
+    .sort((a, b) => a.id.localeCompare(b.id));
 }
 
 /**
@@ -156,6 +159,8 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
     const workId = work.id;
     const beforeState = work.currentState;
     const promise = (async () => {
+      // Yield once so active.set below runs before any sync throw from step cleanup.
+      await Promise.resolve();
       let lostOwnership = false;
       let renewError: string | undefined;
       // Renew often enough that at least one tick lands before lease expiry.
@@ -181,6 +186,15 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
       tryRenew(); // immediate renew so short leases stay exclusive before first interval
       const renewTimer = setInterval(tryRenew, renewEveryMs);
       try {
+        if (renewError || lostOwnership) {
+          deferred.add(workId);
+          outcomes.push({
+            workId,
+            kind: 'error',
+            detail: renewError ? `lease renew failed: ${renewError}` : 'lost lock ownership during step',
+          });
+          return;
+        }
         await step(workId);
         if (renewError) {
           deferred.add(workId);

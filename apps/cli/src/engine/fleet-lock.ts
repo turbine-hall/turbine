@@ -68,6 +68,7 @@ export function readFleetLock(projectRoot: string, workId: string): FleetLockBod
   try {
     raw = readFileSync(path, 'utf8');
   } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw err(
       'E_UNSAFE_EXECUTION',
       `fleet lock unreadable at ${path}: ${(e as Error).message.split('\n')[0]}`,
@@ -155,8 +156,9 @@ function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (e) {
+    // Only ESRCH proves the process is gone; EPERM means alive but unsignalable.
+    return (e as NodeJS.ErrnoException).code !== 'ESRCH';
   }
 }
 
@@ -175,26 +177,43 @@ function readFence(projectRoot: string, workId: string): FenceBody | undefined {
   }
 }
 
+function publishFenceExclusive(fence: string, body: FenceBody): void {
+  const tmp = `${fence}.${process.pid}.${Date.now()}.tmp`;
+  const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
+  try {
+    writeSync(fd, `${JSON.stringify(body)}\n`);
+  } catch (e) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* best-effort */
+    }
+    throw e;
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    linkSync(tmp, fence);
+  } catch (e) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* best-effort */
+    }
+    throw e;
+  }
+  try {
+    unlinkSync(tmp);
+  } catch {
+    /* best-effort */
+  }
+}
+
 function tryAcquireFence(projectRoot: string, workId: string, owner: string): boolean {
   const fence = fleetLockFencePath(projectRoot, workId);
   const body: FenceBody = { owner, pid: process.pid, at: new Date().toISOString() };
-  const writeFence = () => {
-    const fd = openSync(fence, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
-    try {
-      writeSync(fd, `${JSON.stringify(body)}\n`);
-    } catch (e) {
-      try {
-        unlinkSync(fence);
-      } catch {
-        /* best-effort */
-      }
-      throw e;
-    } finally {
-      closeSync(fd);
-    }
-  };
   try {
-    writeFence();
+    publishFenceExclusive(fence, body);
     return true;
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
@@ -203,20 +222,38 @@ function tryAcquireFence(projectRoot: string, workId: string, owner: string): bo
   }
   // Recover only when the recorded holder pid is gone on this host (local CLI).
   const existing = readFence(projectRoot, workId);
-  if (existing && !pidAlive(existing.pid)) {
+  if (!existing || pidAlive(existing.pid)) return false;
+  // Exclusive recover token so two recoverers cannot both unlink a successor fence.
+  const recover = `${fence}.recover.${process.pid}`;
+  try {
+    const fd = openSync(recover, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
+    closeSync(fd);
+  } catch {
+    return false;
+  }
+  try {
+    const again = readFence(projectRoot, workId);
+    if (!again || again.pid !== existing.pid || again.owner !== existing.owner || pidAlive(again.pid)) {
+      return false;
+    }
     try {
       unlinkSync(fence);
     } catch {
       return false;
     }
     try {
-      writeFence();
+      publishFenceExclusive(fence, body);
       return true;
     } catch {
       return false;
     }
+  } finally {
+    try {
+      unlinkSync(recover);
+    } catch {
+      /* best-effort */
+    }
   }
-  return false;
 }
 
 function releaseFence(projectRoot: string, workId: string): void {

@@ -479,19 +479,16 @@ describe('fleet scheduler (Part E / #43)', () => {
       })(),
       type: 'maintenance',
     });
-    let firstId: string | undefined;
+    const [first, second] = [a, b].sort((x, y) => x.id.localeCompare(y.id));
+    mkdirSync(join(dir, '.turbine', 'fleet', 'locks'), { recursive: true });
+    writeFileSync(fleetLockPath(dir, second.id), '{not-json');
     let firstFinished = false;
     await expect(
       runFleet(engine, {
         maxConcurrent: 2,
         budgetUsd: 100,
         step: async (id) => {
-          if (firstId) return;
-          firstId = id;
-          const other = id === a.id ? b.id : a.id;
-          // Corrupt the other lock before yielding so the next acquire throws while we are active.
-          mkdirSync(join(dir, '.turbine', 'fleet', 'locks'), { recursive: true });
-          writeFileSync(fleetLockPath(dir, other), '{not-json');
+          if (id !== first.id) return;
           await new Promise((r) => setTimeout(r, 250));
           firstFinished = true;
         },
@@ -499,8 +496,7 @@ describe('fleet scheduler (Part E / #43)', () => {
       }),
     ).rejects.toThrow(/corrupt|unreadable/i);
     expect(firstFinished).toBe(true);
-    expect(firstId).toBeTruthy();
-    expect(existsSync(fleetLockPath(dir, firstId!))).toBe(false);
+    expect(existsSync(fleetLockPath(dir, first.id))).toBe(false);
     engine.ctx.store.close();
   });
 });
