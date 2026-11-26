@@ -235,13 +235,18 @@ describe('fleet scheduler (Part E / #43)', () => {
     const dir = tempProject('fleet-drive-', dirs);
     const { engine, work } = makeReadyTask(dir, 'Drive sync');
     const decisionsBefore = engine.ctx.store.listDecisions(work.id).length;
+    const beforeState = work.currentState;
     const report = await runFleet(engine, {
       maxConcurrent: 1,
       budgetUsd: 100,
       maxIterations: 20,
     });
     expect(report.started).toBeGreaterThanOrEqual(1);
-    expect(report.outcomes.some((o) => o.workId === work.id)).toBe(true);
+    const outcome = report.outcomes.find((o) => o.workId === work.id);
+    expect(outcome).toBeTruthy();
+    expect(outcome?.kind).not.toBe('error');
+    const after = engine.ctx.store.getWork(work.id);
+    expect(after.currentState).not.toBe(beforeState);
     const humanApprovals = engine.ctx.store
       .listDecisions(work.id)
       .slice(decisionsBefore)
@@ -262,11 +267,13 @@ describe('fleet scheduler (Part E / #43)', () => {
     const b = mk('Status B');
     const c = mk('Status C');
     const d = mk('Status D');
+    const e = mk('Status E');
 
     engine.ctx.store.saveWork({ ...engine.ctx.store.getWork(a.id), currentState: 'REQUIREMENTS_REVIEW' });
     engine.ctx.store.saveWork({ ...engine.ctx.store.getWork(b.id), currentState: 'CHANGES_REQUESTED' });
     engine.ctx.store.saveWork({ ...engine.ctx.store.getWork(c.id), currentState: 'ACCEPTED' });
     engine.ctx.store.saveWork({ ...engine.ctx.store.getWork(d.id), currentState: 'FAILED' });
+    engine.ctx.store.saveWork({ ...engine.ctx.store.getWork(e.id), currentState: 'ACCEPTED' });
     const now = new Date().toISOString();
     engine.ctx.store.saveLaneMergeRecord({
       id: createId('merge'),
@@ -297,9 +304,8 @@ describe('fleet scheduler (Part E / #43)', () => {
     expect(status.waitingOnHumanWorkIds).toContain(a.id);
     expect(status.failedWorkIds).toContain(b.id);
     expect(status.failedWorkIds).toContain(d.id);
-    expect(status.mergedWorkIds).toContain(c.id);
-    // ACCEPTED without a merge fact is not counted as merged.
-    expect(status.merged).toBe(status.mergedWorkIds.length);
+    expect(status.mergedWorkIds).toEqual([c.id]);
+    // ACCEPTED without a merge fact (e) is not counted as merged.
 
     if (lock.ok) releaseFleetLock({ projectRoot: dir, workId: a.id, owner: lock.lock.owner });
     engine.ctx.store.close();
@@ -361,7 +367,7 @@ describe('fleet scheduler (Part E / #43)', () => {
     const report = await runFleet(engine, {
       maxConcurrent: 1,
       budgetUsd: 100,
-      leaseMs: 800,
+      leaseMs: 900,
       now,
       step: async (id) => {
         // Advance past the original lease several times; renewals should keep us exclusive.
@@ -372,7 +378,7 @@ describe('fleet scheduler (Part E / #43)', () => {
             projectRoot: dir,
             workId: id,
             runId: 'rival_run',
-            leaseMs: 800,
+            leaseMs: 900,
             now,
           });
           otherAttempts.push(rival.ok);
@@ -381,7 +387,8 @@ describe('fleet scheduler (Part E / #43)', () => {
       maxIterations: 5,
     });
     expect(report.started).toBe(1);
-    expect(otherAttempts.every((ok) => ok === false)).toBe(true);
+    expect(report.outcomes.some((o) => o.kind === 'error')).toBe(false);
+    expect(otherAttempts).toEqual([false, false, false, false]);
     engine.ctx.store.close();
   });
 
@@ -390,7 +397,7 @@ describe('fleet scheduler (Part E / #43)', () => {
     const workId = 'work_release_race';
     let nowMs = Date.parse('2026-07-01T00:00:00.000Z');
     const now = () => new Date(nowMs);
-    const first = acquireFleetLock({ projectRoot: dir, workId, runId: 'run_a', leaseMs: 500, now });
+    const first = acquireFleetLock({ projectRoot: dir, workId, runId: 'run_a', leaseMs: 800, now });
     expect(first.ok).toBe(true);
     if (!first.ok) return;
     nowMs += 1_000;

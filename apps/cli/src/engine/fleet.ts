@@ -4,6 +4,7 @@ import {
   acquireFleetLock,
   DEFAULT_FLEET_LEASE_MS,
   listFleetLockedWorkIds,
+  MIN_FLEET_LEASE_MS,
   readFleetLock,
   releaseFleetLock,
   renewFleetLock,
@@ -77,10 +78,13 @@ function policyIsSuspended(engine: Engine, policyName: string | undefined): bool
   if (!policyName) return false;
   const hit = policyStatuses(engine.ctx.store, engine.ctx.projectRoot).policies.find((p) => p.name === policyName);
   if (!hit) throw err('E_INVALID_CONFIG', `fleet --policy ${policyName}: policy not found`);
-  // Pending file edits still honor the approved snapshot's suspension (FR-E4).
-  if (hit.state === 'suspended') return true;
-  if (hit.state === 'pending' && hit.approved?.status === 'suspended') return true;
-  return false;
+  // Honor the approved snapshot's suspension even when the file is pending or invalid.
+  if (hit.approved?.status === 'suspended') return true;
+  return hit.state === 'suspended';
+}
+
+function isFleetEligible(work: WorkPackage): boolean {
+  return !TERMINAL.has(work.currentState) && !HUMAN_WAIT.has(work.currentState) && work.currentState !== 'FAILED';
 }
 
 function leaveLaneForSuspend(engine: Engine, work: WorkPackage, reason: string): void {
@@ -112,9 +116,7 @@ function logReclaim(engine: Engine, workId: string, runId: string): void {
 
 /** Tasks the fleet may still advance (not terminal, not already waiting on a human). */
 export function fleetCandidateWorks(engine: Engine): WorkPackage[] {
-  return engine.ctx.store
-    .listWork()
-    .filter((w) => !TERMINAL.has(w.currentState) && !HUMAN_WAIT.has(w.currentState) && w.currentState !== 'FAILED');
+  return engine.ctx.store.listWork().filter(isFleetEligible);
 }
 
 /**
@@ -126,6 +128,9 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
   assertBudget(opts.budgetUsd);
   const runId = createId('fleet');
   const leaseMs = opts.leaseMs ?? DEFAULT_FLEET_LEASE_MS;
+  if (leaseMs < MIN_FLEET_LEASE_MS) {
+    throw err('E_INVALID_CONFIG', `fleet leaseMs must be >= ${MIN_FLEET_LEASE_MS}`);
+  }
   const usdPerMTok = opts.usdPerMillionTokens ?? DEFAULT_USD_PER_MILLION_TOKENS;
   const now = opts.now ?? (() => new Date());
   const step =
@@ -152,19 +157,36 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
     const beforeState = work.currentState;
     const promise = (async () => {
       let lostOwnership = false;
-      const renewEveryMs = Math.max(250, Math.floor(leaseMs / 3));
-      const renewTimer = setInterval(() => {
-        const renewed = renewFleetLock({
-          projectRoot: engine.ctx.projectRoot,
-          workId,
-          owner: lock.owner,
-          leaseMs,
-          now,
-        });
-        if (!renewed.ok) lostOwnership = true;
-      }, renewEveryMs);
+      let renewError: string | undefined;
+      // Renew often enough that at least one tick lands before lease expiry.
+      const renewEveryMs = Math.max(50, Math.min(Math.floor(leaseMs / 3), leaseMs - 50));
+      const tryRenew = () => {
+        try {
+          const renewed = renewFleetLock({
+            projectRoot: engine.ctx.projectRoot,
+            workId,
+            owner: lock.owner,
+            leaseMs,
+            now,
+          });
+          if (!renewed.ok) {
+            if (renewed.busy) return; // fence contention — retry next tick
+            lostOwnership = true;
+          }
+        } catch (e) {
+          renewError = (e as Error).message.split('\n')[0];
+          lostOwnership = true;
+        }
+      };
+      tryRenew(); // immediate renew so short leases stay exclusive before first interval
+      const renewTimer = setInterval(tryRenew, renewEveryMs);
       try {
         await step(workId);
+        if (renewError) {
+          deferred.add(workId);
+          outcomes.push({ workId, kind: 'error', detail: `lease renew failed: ${renewError}` });
+          return;
+        }
         if (lostOwnership) {
           deferred.add(workId);
           outcomes.push({
@@ -203,7 +225,22 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
         outcomes.push({ workId, kind: 'error', detail: (e as Error).message.split('\n')[0] });
       } finally {
         clearInterval(renewTimer);
-        releaseFleetLock({ projectRoot: engine.ctx.projectRoot, workId, owner: lock.owner });
+        try {
+          const rel = releaseFleetLock({ projectRoot: engine.ctx.projectRoot, workId, owner: lock.owner });
+          if (!rel.released) {
+            outcomes.push({
+              workId,
+              kind: 'error',
+              detail: `lock release failed: ${rel.reason ?? 'unknown'}`,
+            });
+          }
+        } catch (e) {
+          outcomes.push({
+            workId,
+            kind: 'error',
+            detail: `lock release threw: ${(e as Error).message.split('\n')[0]}`,
+          });
+        }
         active.delete(workId);
         finished += 1;
       }
@@ -246,8 +283,19 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
             now,
           });
           if (!acq.ok) continue;
-          if (acq.reclaimed) logReclaim(engine, work.id, runId);
-          claimed = { work, lock: acq.lock };
+          // Re-read under the claim — another runner may have moved the task.
+          const fresh = engine.ctx.store.getWork(work.id);
+          if (!isFleetEligible(fresh) || deferred.has(fresh.id)) {
+            releaseFleetLock({ projectRoot: engine.ctx.projectRoot, workId: work.id, owner: acq.lock.owner });
+            continue;
+          }
+          try {
+            if (acq.reclaimed) logReclaim(engine, work.id, runId);
+          } catch (e) {
+            releaseFleetLock({ projectRoot: engine.ctx.projectRoot, workId: work.id, owner: acq.lock.owner });
+            throw e;
+          }
+          claimed = { work: fresh, lock: acq.lock };
           break;
         }
         if (!claimed) break;
@@ -261,12 +309,10 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
 
       if (stoppedReason === 'budget' || stoppedReason === 'policy-suspended') break;
 
-      // Idle: no claimable candidates left (all deferred, held, or waiting).
       stoppedReason = 'idle';
       break;
     }
   } finally {
-    // Drain actives before propagating scheduler errors (store close / corrupt lock).
     if (active.size > 0) {
       await Promise.allSettled([...active.values()]);
     }

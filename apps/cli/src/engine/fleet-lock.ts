@@ -2,6 +2,7 @@ import {
   closeSync,
   constants,
   existsSync,
+  linkSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -16,6 +17,9 @@ import { err } from '@turbine-hall/turbine-contracts';
 /** Default lease for a fleet claim (10 minutes). */
 export const DEFAULT_FLEET_LEASE_MS = 10 * 60 * 1000;
 
+/** Minimum lease so at least one renewal can fire before expiry. */
+export const MIN_FLEET_LEASE_MS = 750;
+
 export type FleetLockBody = {
   owner: string;
   workId: string;
@@ -24,6 +28,12 @@ export type FleetLockBody = {
   claimedAt: string;
   expiresAt: string;
   leaseMs: number;
+};
+
+type FenceBody = {
+  owner: string;
+  pid: number;
+  at: string;
 };
 
 export function fleetLocksDir(projectRoot: string): string {
@@ -37,13 +47,18 @@ export function fleetLockPath(projectRoot: string, workId: string): string {
   return join(fleetLocksDir(projectRoot), `${workId}.lock`);
 }
 
-/** Coordination fence: serialize reclaim / release / renew for one work id (rule 8). */
 function fleetLockFencePath(projectRoot: string, workId: string): string {
   return `${fleetLockPath(projectRoot, workId)}.fence`;
 }
 
 function ensureLocksDir(projectRoot: string): void {
   mkdirSync(fleetLocksDir(projectRoot), { recursive: true });
+}
+
+function assertLeaseMs(leaseMs: number): void {
+  if (!(leaseMs >= MIN_FLEET_LEASE_MS) || !Number.isFinite(leaseMs)) {
+    throw err('E_INVALID_CONFIG', `fleet leaseMs must be a finite number >= ${MIN_FLEET_LEASE_MS}`);
+  }
 }
 
 export function readFleetLock(projectRoot: string, workId: string): FleetLockBody | undefined {
@@ -57,6 +72,10 @@ export function readFleetLock(projectRoot: string, workId: string): FleetLockBod
       'E_UNSAFE_EXECUTION',
       `fleet lock unreadable at ${path}: ${(e as Error).message.split('\n')[0]}`,
     );
+  }
+  if (!raw.trim()) {
+    // Writer may still be publishing via tmp→link; treat as busy, not corrupt.
+    return undefined;
   }
   try {
     const parsed = JSON.parse(raw) as FleetLockBody;
@@ -80,7 +99,40 @@ export function readFleetLock(projectRoot: string, workId: string): FleetLockBod
   }
 }
 
-function writeLockAtomic(path: string, body: FleetLockBody): void {
+/** Write complete metadata to a temp file, then publish with link (never replaces an existing claim). */
+function publishLockExclusive(path: string, body: FleetLockBody): void {
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
+  try {
+    writeSync(fd, `${JSON.stringify(body, null, 2)}\n`);
+  } catch (e) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* best-effort */
+    }
+    throw e;
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    linkSync(tmp, path);
+  } catch (e) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* best-effort */
+    }
+    throw e;
+  }
+  try {
+    unlinkSync(tmp);
+  } catch {
+    /* best-effort */
+  }
+}
+
+function writeLockReplace(path: string, body: FleetLockBody): void {
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
   const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
   try {
@@ -98,12 +150,38 @@ function writeLockAtomic(path: string, body: FleetLockBody): void {
   renameSync(tmp, path);
 }
 
+function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readFence(projectRoot: string, workId: string): FenceBody | undefined {
+  const fence = fleetLockFencePath(projectRoot, workId);
+  if (!existsSync(fence)) return undefined;
+  try {
+    const raw = readFileSync(fence, 'utf8');
+    const parsed = JSON.parse(raw) as FenceBody;
+    if (typeof parsed.owner !== 'string' || typeof parsed.pid !== 'number' || typeof parsed.at !== 'string') {
+      return undefined;
+    }
+    return parsed;
+  } catch {
+    return undefined;
+  }
+}
+
 function tryAcquireFence(projectRoot: string, workId: string, owner: string): boolean {
   const fence = fleetLockFencePath(projectRoot, workId);
-  try {
+  const body: FenceBody = { owner, pid: process.pid, at: new Date().toISOString() };
+  const writeFence = () => {
     const fd = openSync(fence, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
     try {
-      writeSync(fd, `${owner}\n`);
+      writeSync(fd, `${JSON.stringify(body)}\n`);
     } catch (e) {
       try {
         unlinkSync(fence);
@@ -114,11 +192,31 @@ function tryAcquireFence(projectRoot: string, workId: string, owner: string): bo
     } finally {
       closeSync(fd);
     }
+  };
+  try {
+    writeFence();
     return true;
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false;
-    throw err('E_UNSAFE_EXECUTION', `fleet lock fence failed: ${(e as Error).message.split('\n')[0]}`);
+    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
+      throw err('E_UNSAFE_EXECUTION', `fleet lock fence failed: ${(e as Error).message.split('\n')[0]}`);
+    }
   }
+  // Recover only when the recorded holder pid is gone on this host (local CLI).
+  const existing = readFence(projectRoot, workId);
+  if (existing && !pidAlive(existing.pid)) {
+    try {
+      unlinkSync(fence);
+    } catch {
+      return false;
+    }
+    try {
+      writeFence();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 function releaseFence(projectRoot: string, workId: string): void {
@@ -150,9 +248,7 @@ export function acquireFleetLock(input: {
   ensureLocksDir(input.projectRoot);
   const now = input.now ?? (() => new Date());
   const leaseMs = input.leaseMs ?? DEFAULT_FLEET_LEASE_MS;
-  if (!(leaseMs > 0) || !Number.isFinite(leaseMs)) {
-    throw err('E_INVALID_CONFIG', 'fleet leaseMs must be a positive finite number');
-  }
+  assertLeaseMs(leaseMs);
   const path = fleetLockPath(input.projectRoot, input.workId);
   const owner = `fleet:${input.runId}:${input.workId}`;
   const at = now();
@@ -167,23 +263,9 @@ export function acquireFleetLock(input: {
   };
 
   try {
-    const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
-    try {
-      writeSync(fd, `${JSON.stringify(body, null, 2)}\n`);
-    } catch (e) {
-      // Clean up only this attempt's lock if writing the owner fails (rule 8).
-      try {
-        unlinkSync(path);
-      } catch {
-        /* best-effort */
-      }
-      throw err('E_UNSAFE_EXECUTION', `fleet lock write failed: ${(e as Error).message.split('\n')[0]}`);
-    } finally {
-      closeSync(fd);
-    }
+    publishLockExclusive(path, body);
     return { ok: true, lock: body };
   } catch (e) {
-    if ((e as { code?: string }).code === 'E_UNSAFE_EXECUTION') throw e;
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
       throw err('E_UNSAFE_EXECUTION', `fleet lock create failed: ${(e as Error).message.split('\n')[0]}`);
     }
@@ -191,7 +273,7 @@ export function acquireFleetLock(input: {
 
   const existing = readFleetLock(input.projectRoot, input.workId);
   if (!existing) {
-    return { ok: false, reason: 'lock disappeared during contend; retry' };
+    return { ok: false, reason: 'lock busy or disappeared during contend; retry' };
   }
   if (existing.owner === owner) {
     return { ok: true, lock: existing };
@@ -204,7 +286,6 @@ export function acquireFleetLock(input: {
     return { ok: false, reason: `held by ${existing.owner} until ${existing.expiresAt}` };
   }
 
-  // Lease expired: fence serializes ownership check + replacement (rule 8).
   if (!tryAcquireFence(input.projectRoot, input.workId, owner)) {
     return { ok: false, reason: 'reclaim fence held; retry' };
   }
@@ -225,21 +306,8 @@ export function acquireFleetLock(input: {
       }
     }
     try {
-      const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
-      try {
-        writeSync(fd, `${JSON.stringify(body, null, 2)}\n`);
-      } catch (e) {
-        try {
-          unlinkSync(path);
-        } catch {
-          /* best-effort */
-        }
-        throw err('E_UNSAFE_EXECUTION', `fleet lock reclaim write failed: ${(e as Error).message.split('\n')[0]}`);
-      } finally {
-        closeSync(fd);
-      }
+      publishLockExclusive(path, body);
     } catch (e) {
-      if ((e as { code?: string }).code === 'E_UNSAFE_EXECUTION') throw e;
       if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
         return { ok: false, reason: 'reclaim lost race; retry' };
       }
@@ -255,6 +323,10 @@ export function acquireFleetLock(input: {
   }
 }
 
+export type RenewFleetLockResult =
+  | { ok: true; lock: FleetLockBody }
+  | { ok: false; reason: string; busy?: boolean };
+
 /** Extend expiresAt while still owning the lock (keeps a long step exclusive). */
 export function renewFleetLock(input: {
   projectRoot: string;
@@ -262,13 +334,11 @@ export function renewFleetLock(input: {
   owner: string;
   leaseMs: number;
   now?: () => Date;
-}): AcquireFleetLockResult {
+}): RenewFleetLockResult {
   const now = input.now ?? (() => new Date());
-  if (!(input.leaseMs > 0) || !Number.isFinite(input.leaseMs)) {
-    throw err('E_INVALID_CONFIG', 'fleet leaseMs must be a positive finite number');
-  }
+  assertLeaseMs(input.leaseMs);
   if (!tryAcquireFence(input.projectRoot, input.workId, input.owner)) {
-    return { ok: false, reason: 'renew fence held; retry' };
+    return { ok: false, reason: 'renew fence held; retry', busy: true };
   }
   try {
     const current = readFleetLock(input.projectRoot, input.workId);
@@ -281,7 +351,7 @@ export function renewFleetLock(input: {
       expiresAt: new Date(at.getTime() + input.leaseMs).toISOString(),
       leaseMs: input.leaseMs,
     };
-    writeLockAtomic(fleetLockPath(input.projectRoot, input.workId), body);
+    writeLockReplace(fleetLockPath(input.projectRoot, input.workId), body);
     const verify = readFleetLock(input.projectRoot, input.workId);
     if (!verify || verify.owner !== input.owner) {
       return { ok: false, reason: 'lost ownership after renew' };
