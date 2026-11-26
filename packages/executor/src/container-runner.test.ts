@@ -6,6 +6,7 @@ import {
   agentCliCommand,
   assertSandboxNetworkPolicyReady,
   buildContainerArgv,
+  cleanupSandboxPrompt,
   createContainerSandboxHooksWithProbe,
   findForbiddenBindInArgv,
   parseBindHostsFromArgv,
@@ -178,6 +179,20 @@ describe('container phase runner', () => {
     writeSandboxPrompt(wt, 'SAFE_PROMPT');
     expect(readFileSync(sandboxPromptPath(wt), 'utf8')).toBe('SAFE_PROMPT');
     expect(readFileSync(outside, 'utf8')).toBe('secret');
+  });
+
+  it('FR-D3: cleanupSandboxPrompt refuses when .turbine-sandbox is replaced with a symlink', () => {
+    const root = mkdtempSync(join(tmpdir(), 'turbine-prompt-clean-'));
+    const wt = join(root, 'wt');
+    const outsideDir = join(root, 'private');
+    mkdirSync(wt);
+    mkdirSync(outsideDir);
+    const outsidePrompt = join(outsideDir, 'prompt.md');
+    writeFileSync(outsidePrompt, 'HOST_SECRET');
+    // Workload replaces runner-owned dir with a symlink to a host directory.
+    symlinkSync(outsideDir, join(wt, '.turbine-sandbox'));
+    cleanupSandboxPrompt(wt);
+    expect(readFileSync(outsidePrompt, 'utf8')).toBe('HOST_SECRET');
   });
 
   it('FR-D3: injected runContainer egress blocked → egressOpen false allows preflight', async () => {

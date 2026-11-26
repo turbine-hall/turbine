@@ -949,9 +949,21 @@ export function writeSandboxPrompt(worktreePath: string, body: string): string {
   return dest;
 }
 
-/** Remove the sandbox prompt if present (does not follow symlinks for the unlink target name). */
+/**
+ * Remove the sandbox prompt if present.
+ * Re-validates `.turbine-sandbox` before unlink so a workload that replaced that directory
+ * with a symlink cannot trick cleanup into deleting a host file outside the mount.
+ */
 export function cleanupSandboxPrompt(worktreePath: string): void {
-  const dest = sandboxPromptPath(worktreePath);
+  const dir = join(worktreePath, SANDBOX_PROMPT_DIR);
+  try {
+    // Refuse symlink / non-dir parents: O_NOFOLLOW fails when `.turbine-sandbox` is a symlink.
+    const dirFd = openSync(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    closeSync(dirFd);
+  } catch {
+    return;
+  }
+  const dest = join(dir, SANDBOX_PROMPT_FILE);
   try {
     const st = lstatSync(dest);
     if (st.isSymbolicLink() || st.isFile()) unlinkSync(dest);
