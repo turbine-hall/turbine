@@ -74,11 +74,15 @@ export function userFlowDiagram(steps: FlowStep[]): string | undefined {
   if (steps.length < 2) return undefined;
   const actors = [...new Set(steps.flatMap((s) => [s.from, s.to]))];
   const id = (a: string) => `a${actors.indexOf(a)}`;
+  // Strip mermaid-significant punctuation so lintMermaid's balance checks stay green
+  // (assess/mock messages often include "(P1):" / "`code`" / ellipsis cuts mid-paren).
+  const clean = (s: string, max: number) =>
+    s.replace(/[()[\]{};#"`]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
   return [
     '```mermaid',
     'sequenceDiagram',
-    ...actors.map((a) => `  participant ${id(a)} as ${a.replace(/[:;"]/g, ' ').slice(0, 30)}`),
-    ...steps.slice(0, 15).map((s) => `  ${id(s.from)}->>${id(s.to)}: ${s.message.replace(/[;#]/g, ' ').slice(0, 70)}`),
+    ...actors.map((a) => `  participant ${id(a)} as ${clean(a, 30)}`),
+    ...steps.slice(0, 15).map((s) => `  ${id(s.from)}->>${id(s.to)}: ${clean(s.message, 70)}`),
     '```',
   ].join('\n');
 }

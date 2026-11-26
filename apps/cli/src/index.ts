@@ -43,6 +43,9 @@ import {
 } from './engine/lane-policy.js';
 import { computeLaneMetrics, type LaneMetric } from './engine/lane-metrics.js';
 import { nextLaneAudit, recordLaneAuditOutcome } from './engine/lane-audit.js';
+import { fleetStatus, runFleet } from './engine/fleet.js';
+import { DEFAULT_USD_PER_MILLION_TOKENS } from './engine/fleet-spend.js';
+import { DEFAULT_FLEET_LEASE_MS } from './engine/fleet-lock.js';
 
 function isAgentSession(): boolean {
   return ['TURBINE_AGENT', 'CLAUDECODE', 'CURSOR_AGENT'].some((k) => process.env[k] && process.env[k] !== '0');
@@ -1682,6 +1685,76 @@ task
             ...('fixRound' in result ? { fixRound: result.fixRound } : {}),
           },
           !!opts.json,
+        );
+      } finally {
+        engine.ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+const fleetCmd = program.command('fleet').description('Drive many tasks under concurrency + spend budget (Part E)');
+fleetCmd
+  .command('run')
+  .requiredOption('--max-concurrent <n>', 'Max tasks claimed at once', (v) => Number(v))
+  .requiredOption('--budget <usd>', 'Stop starting tasks once known spend reaches this USD amount', (v) => Number(v))
+  .option('--policy <name>', 'Lane policy to watch; if suspended mid-run, finish current steps then leave the lane')
+  .option('--lease-ms <ms>', `Lock lease before reclaim (default ${DEFAULT_FLEET_LEASE_MS})`, (v) => Number(v))
+  .option(
+    '--usd-per-mtok <n>',
+    `USD per million measured tokens for budget accounting (default ${DEFAULT_USD_PER_MILLION_TOKENS})`,
+    (v) => Number(v),
+  )
+  .option('--json', 'Machine-readable JSON')
+  .description('Pick ready tasks, claim with locks, run sync/next steps until idle, budget, or policy suspend')
+  .action(async (opts) => {
+    try {
+      const engine = withEngine();
+      try {
+        const report = await runFleet(engine, {
+          maxConcurrent: opts.maxConcurrent,
+          budgetUsd: opts.budget,
+          policyName: opts.policy,
+          leaseMs: opts.leaseMs,
+          usdPerMillionTokens: opts.usdPerMtok,
+        });
+        if (opts.json) {
+          printResult(report, true);
+          return;
+        }
+        process.stdout.write(`Fleet run ${report.runId} stopped: ${report.stoppedReason}\n`);
+        process.stdout.write(
+          `Started ${report.started}, finished ${report.finished}; known spend $${report.spend.knownUsd.toFixed(4)}` +
+            ` (${report.spend.knownTokens} tokens` +
+            `${report.spend.hasUnknown ? '; UNKNOWN usage present — not summed as 0' : ''})\n`,
+        );
+        for (const o of report.outcomes) {
+          process.stdout.write(`  ${o.workId}: ${o.kind}${o.state ? ` → ${o.state}` : ''}${o.detail ? ` (${o.detail})` : ''}\n`);
+        }
+      } finally {
+        engine.ctx.store.close();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+fleetCmd
+  .command('status')
+  .option('--json')
+  .description('Counts: running (live locks), waiting-on-human, failed, merged')
+  .action((opts) => {
+    try {
+      const engine = withEngine();
+      try {
+        const report = fleetStatus(engine);
+        if (opts.json) {
+          printResult(report, true);
+          return;
+        }
+        process.stdout.write(
+          `running ${report.running}; waiting-on-human ${report.waitingOnHuman}; failed ${report.failed}; merged ${report.merged}\n`,
         );
       } finally {
         engine.ctx.store.close();

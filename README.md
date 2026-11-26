@@ -322,13 +322,13 @@ examples/            Plain-text, Jira and backend API sample tasks
 
 ## Project status and roadmap
 
-Turbine is at **v0.5.2**, a working baseline for pilot use on real projects. Phases 0–6, hardening phases 1–4, repository context / OKF knowledge, and the autonomous lane (policies, dual review, PR landing, metrics, sandboxed unattended execution) are implemented and tested. Full details are in [Implementation status](docs/IMPLEMENTATION_STATUS.md); a shorter narrative is in [Autonomous lane and sandboxed execution](docs/autonomous-lane-and-sandbox.md).
+Turbine is at **v0.5.2**, a working baseline for pilot use on real projects. Phases 0–6, hardening phases 1–4, repository context / OKF knowledge, and the autonomous lane (policies, dual review, PR landing, metrics, fleet scheduler, sandboxed unattended execution) are implemented and tested. Full details are in [Implementation status](docs/IMPLEMENTATION_STATUS.md); a shorter narrative is in [Autonomous lane and sandboxed execution](docs/autonomous-lane-and-sandbox.md).
 
 **Known limitations, stated plainly:**
 
 - Local approvals are local attestations, not authenticated identity. For code review and acceptance, `humanGates.requirePrApproval: true` adds a GitHub PR approval that an agent account cannot grant itself.
 - A plain git worktree is isolation for changes, not a security sandbox. Use `sandboxed-unattended` (Docker/Podman) when you need container boundaries; that path is single-repo today and still needs your own model-proxy URL.
-- Jira write-back, a web UI and a hosted multi-tenant service are not built yet. Lane PR landing covers create + merge-queue auto-merge for accepted single-repo tasks; fleet scheduling and post-merge revert detection are not.
+- Jira write-back, a web UI and a hosted multi-tenant service are not built yet. Lane PR landing covers create + merge-queue auto-merge for accepted single-repo tasks; `turbine fleet run` / `fleet status` cover concurrency + spend budget (file-set overlap scheduling and post-merge revert detection are not).
 - Turbine makes no claims about productivity percentages. Its value is a hypothesis being tested in pilots, and results will be published as they come in.
 
 The binary name (`turbine`) is provisional. The package scope is `@turbine-hall/*`.
