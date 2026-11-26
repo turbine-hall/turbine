@@ -66,6 +66,8 @@ export function defaultConfig(projectRoot: string, name?: string): ProjectConfig
       allowNetwork: false,
       sandboxWallClockMs: 1_800_000,
       sandboxMaxOutputBytes: 8_000_000,
+      sandboxImage: 'docker.io/library/node:22-bookworm',
+      sandboxRegistries: [],
     },
     quality: { checks: [] },
     humanGates: {

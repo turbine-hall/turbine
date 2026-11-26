@@ -5,11 +5,34 @@ import { err } from '@turbine-hall/turbine-contracts';
 import type { Capability, ToolAdapter } from '@turbine-hall/turbine-tools';
 
 function git(cwd: string, args: string[]): { stdout: string; stderr: string; status: number } {
-  const result = spawnSync('git', args, {
-    cwd,
-    encoding: 'utf8',
-    shell: false,
-  });
+  // Strip inherited GIT_* so an agent cannot redirect the host client via the environment.
+  // Disable hook/fsmonitor/ssh helpers so agent-writable repo config cannot run host commands.
+  // Do not set diff.external= (empty value makes git try to exec "" and fail); use --no-ext-diff on diffs.
+  const env: NodeJS.ProcessEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')),
+  );
+  env.GIT_TERMINAL_PROMPT = '0';
+  const result = spawnSync(
+    'git',
+    [
+      '--no-replace-objects',
+      '-c',
+      'core.fsmonitor=',
+      '-c',
+      'core.fsmonitorHook=',
+      '-c',
+      'core.sshCommand=',
+      '-c',
+      'core.hooksPath=/dev/null',
+      ...args,
+    ],
+    {
+      cwd,
+      encoding: 'utf8',
+      shell: false,
+      env,
+    },
+  );
   return {
     stdout: result.stdout?.toString() ?? '',
     stderr: result.stderr?.toString() ?? '',
@@ -89,7 +112,7 @@ export function uncommittedPaths(path: string): string[] {
 export type ChangedFile = { status: string; path: string };
 
 export function changedFiles(path: string, base: string, head = 'HEAD'): ChangedFile[] {
-  const r = git(path, ['diff', '--name-status', '--no-renames', `${base}...${head}`]);
+  const r = git(path, ['diff', '--no-ext-diff', '--name-status', '--no-renames', `${base}...${head}`]);
   if (r.status !== 0) throw err('E_ADAPTER', r.stderr || 'git diff --name-status failed');
   return r.stdout
     .split('\n')
@@ -101,7 +124,7 @@ export function changedFiles(path: string, base: string, head = 'HEAD'): Changed
 }
 
 export function diffStat(path: string, base: string, head = 'HEAD'): { insertions: number; deletions: number } {
-  const r = git(path, ['diff', '--numstat', `${base}...${head}`]);
+  const r = git(path, ['diff', '--no-ext-diff', '--numstat', `${base}...${head}`]);
   let insertions = 0;
   let deletions = 0;
   for (const line of r.stdout.split('\n').filter(Boolean)) {
@@ -119,7 +142,7 @@ export function fileAt(path: string, commit: string, file: string): string | und
 }
 
 export function diffWorktree(worktreePath: string, baseCommit: string, headCommit = 'HEAD'): string {
-  const result = git(worktreePath, ['diff', `${baseCommit}...${headCommit}`]);
+  const result = git(worktreePath, ['diff', '--no-ext-diff', `${baseCommit}...${headCommit}`]);
   if (result.status !== 0) throw err('E_ADAPTER', result.stderr || 'git diff failed');
   return result.stdout;
 }

@@ -27,9 +27,39 @@ export {
 } from './sandbox.js';
 
 export {
+  agentCliCommand,
+  allowNetworkEgressProbeSucceeds,
+  assertSandboxNetworkPolicyReady,
+  buildContainerArgv,
+  cleanupSandboxPrompt,
+  containerEgressProbeSucceeds,
+  createContainerSandboxHooks,
+  createContainerSandboxHooksWithProbe,
+  defaultRunContainer,
+  ensureSandboxPromptExcluded,
+  findForbiddenBindInArgv,
+  parseBindHostsFromArgv,
+  phaseNetworkArgs,
+  resolveLinkedGitLayout,
+  resolveLinkedGitMounts,
+  stopContainer,
+  sandboxPromptPath,
+  writeSandboxPrompt,
+  type BindMount,
+  type ContainerRunOutcome,
+  type ContainerRunRequest,
+  type ContainerSandboxOptions,
+  type RunContainerFn,
+} from './container-runner.js';
+
+export {
+  createClaudeCodeImplementer,
+  createCodexImplementer,
   createFixtureImplementer,
+  createImplementerFromConfig,
   formatImplementerPrompt,
   type AgentImplementer,
+  type AgentImplementerId,
   type ImplementerInput,
   type ImplementerResult,
 } from './agent-adapter.js';

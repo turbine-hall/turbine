@@ -3,6 +3,38 @@ import { z } from 'zod';
 /** Human gates that cannot be switched off in config; they are relaxed only through approved lane policies. */
 export const NON_DISABLEABLE_HUMAN_GATES = ['requirements', 'plan', 'codeReview', 'sqaAcceptance'] as const;
 
+/** Hostname allow-list entry: labels and dots only (no scheme, path, or credentials). */
+const sandboxHostname = z
+  .string()
+  .min(1)
+  .max(253)
+  .regex(/^(?=.{1,253}$)([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$|^localhost$/, {
+    message: 'sandbox registry/proxy host must be a hostname (no scheme, path, or credentials)',
+  });
+
+/** http(s) URL whose host is allow-listed for model-proxy phases; rejects file:// and credentials. */
+const sandboxProxyUrl = z
+  .string()
+  .refine((u) => {
+    // Reject traversal in the raw string before URL normalization removes `..`.
+    if (/(^|\/)\.\.(\/|$)/.test(u) || /%2e%2e/i.test(u)) return false;
+    try {
+      const parsed = new URL(u);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+      if (parsed.username || parsed.password) return false;
+      if (parsed.pathname.includes('..')) return false;
+      return sandboxHostname.safeParse(parsed.hostname).success;
+    } catch {
+      return false;
+    }
+  }, { message: 'sandboxModelProxyUrl must be http(s) without credentials or path traversal' });
+
+const sandboxNetworkName = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/, { message: 'sandbox network must be a network name' });
+
 export const ProjectConfigSchema = z.object({
   schemaVersion: z.literal(1),
   project: z.object({
@@ -135,6 +167,34 @@ export const ProjectConfigSchema = z.object({
       sandboxWallClockMs: z.number().int().positive().max(2_147_483_647).default(1_800_000),
       /** Max combined stdout/stderr bytes from sandbox phases before limit-exceeded (FR-D6). */
       sandboxMaxOutputBytes: z.number().int().positive().default(8_000_000),
+      /** Container image for sandboxed-unattended phases (no path traversal or leading '-'). */
+      sandboxImage: z
+        .string()
+        .min(1)
+        .max(512)
+        .refine((s) => !s.includes('..') && !s.startsWith('/') && !s.startsWith('-') && !s.includes('\\'), {
+          message: 'sandboxImage must not be an absolute path, start with -, or contain ..',
+        })
+        .default('docker.io/library/node:22-bookworm'),
+      /** Hostnames allowed during setup (registries network scope). Empty → allow-list phases refuse. */
+      sandboxRegistries: z.array(sandboxHostname).default([]),
+      /**
+       * Model-proxy base URL for implement/fix network scope. Required for live sandboxed-unattended
+       * allow-list enforcement; operators supply the proxy (Turbine does not ship one).
+       */
+      sandboxModelProxyUrl: sandboxProxyUrl.optional(),
+      /** Live implementer adapter id. Tests may still inject Engine.sandboxImplementer. */
+      sandboxImplementer: z.enum(['claude-code', 'codex']).optional(),
+      /**
+       * Docker/Podman network for the registries (setup) scope. When unset, that scope is not
+       * enforceable and preflight refuses (fail closed). Checks/commit use `--network none`.
+       */
+      sandboxAllowNetwork: sandboxNetworkName.optional(),
+      /**
+       * Docker/Podman network for the model-proxy (implement/fix) scope. Must be set and must
+       * differ from `sandboxAllowNetwork` so the two scopes are not the same bridge.
+       */
+      sandboxModelProxyNetwork: sandboxNetworkName.optional(),
     })
     .default({
       mode: 'manual-supervised',
@@ -142,6 +202,8 @@ export const ProjectConfigSchema = z.object({
       allowNetwork: false,
       sandboxWallClockMs: 1_800_000,
       sandboxMaxOutputBytes: 8_000_000,
+      sandboxImage: 'docker.io/library/node:22-bookworm',
+      sandboxRegistries: [],
     }),
   quality: z
     .object({
