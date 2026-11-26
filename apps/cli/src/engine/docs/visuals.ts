@@ -74,32 +74,11 @@ export function userFlowDiagram(steps: FlowStep[]): string | undefined {
   if (steps.length < 2) return undefined;
   const actors = [...new Set(steps.flatMap((s) => [s.from, s.to]))];
   const id = (a: string) => `a${actors.indexOf(a)}`;
-  // Truncate first, then escape Mermaid-significant punctuation (decimal entities) so
-  // length limits cannot split an entity and route shapes like `{id}` stay meaningful.
-  const clean = (s: string, max: number) => {
-    const clipped = s.replace(/\s+/g, ' ').trim().slice(0, max);
-    const hash = '\uE000';
-    const semi = '\uE001';
-    const ent = (n: number) => `${hash}${n}${semi}`;
-    return clipped
-      .replace(/#/g, ent(35))
-      .replace(/;/g, ent(59))
-      .replace(/"/g, ent(34))
-      .replace(/`/g, ent(96))
-      .replace(/\(/g, ent(40))
-      .replace(/\)/g, ent(41))
-      .replace(/\[/g, ent(91))
-      .replace(/\]/g, ent(93))
-      .replace(/\{/g, ent(123))
-      .replace(/\}/g, ent(125))
-      .replace(new RegExp(hash, 'g'), '#')
-      .replace(new RegExp(semi, 'g'), ';');
-  };
   return [
     '```mermaid',
     'sequenceDiagram',
-    ...actors.map((a) => `  participant ${id(a)} as ${clean(a, 30)}`),
-    ...steps.slice(0, 15).map((s) => `  ${id(s.from)}->>${id(s.to)}: ${clean(s.message, 70)}`),
+    ...actors.map((a) => `  participant ${id(a)} as ${a.replace(/[:;"]/g, ' ').slice(0, 30)}`),
+    ...steps.slice(0, 15).map((s) => `  ${id(s.from)}->>${id(s.to)}: ${s.message.replace(/[;#]/g, ' ').slice(0, 70)}`),
     '```',
   ].join('\n');
 }

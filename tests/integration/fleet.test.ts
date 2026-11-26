@@ -13,6 +13,7 @@ import {
   readFleetLock,
   releaseFleetLock,
   renewFleetLock,
+  takeoverDeadHolder,
   tryAcquireFence,
   tryAcquireRecoverGuard,
 } from '../../apps/cli/src/engine/fleet-lock.js';
@@ -154,6 +155,23 @@ describe('fleet scheduler (Part E / #43)', () => {
     // With the shared recover free, fence takeover serializes on that same guard.
     expect(tryAcquireFence(dir, workId, 'fleet:a:x')).toBe(true);
     expect(tryAcquireFence(dir, workId, 'fleet:b:x')).toBe(false);
+  });
+
+  it('dead-holder takeover restores path when renamed content mismatches stale expected', () => {
+    const dir = tempProject('fleet-tomb-restore-', dirs);
+    const workId = 'work_tomb_restore';
+    mkdirSync(join(dir, '.turbine', 'fleet', 'locks'), { recursive: true });
+    const recover = `${fleetLockPath(dir, workId)}.fence.recover`;
+    const dead = { owner: 'fleet:dead:x', pid: 2 ** 22, at: new Date(0).toISOString() };
+    const live = { owner: 'fleet:live:x', pid: process.pid, at: new Date().toISOString() };
+    const attacker = { owner: 'fleet:attacker:x', pid: process.pid, at: new Date().toISOString() };
+    // Disk holds a live successor; stale expected still names the dead holder.
+    writeFileSync(recover, `${JSON.stringify(live)}\n`);
+    expect(takeoverDeadHolder(recover, dead, attacker)).toBe(false);
+    const restored = JSON.parse(readFileSync(recover, 'utf8')) as { owner: string; pid: number };
+    expect(restored.owner).toBe('fleet:live:x');
+    expect(restored.pid).toBe(process.pid);
+    expect(existsSync(recover)).toBe(true);
   });
 
   it('FR-003: budget stops starting; running finish; unknown spend separate', async () => {

@@ -219,6 +219,41 @@ function publishFenceExclusive(fence: string, body: FenceBody): void {
 }
 
 /**
+ * Move a dead holder aside for exclusive takeover. On content mismatch or publish
+ * failure, restore the path so a live successor is never left empty (rule 8).
+ * Exported for mismatch-restore regressions.
+ */
+export function takeoverDeadHolder(path: string, expected: FenceBody, next: FenceBody): boolean {
+  const tomb = `${path}.tomb.${process.pid}.${Date.now()}`;
+  try {
+    renameSync(path, tomb);
+  } catch {
+    return false;
+  }
+  const moved = readFenceFile(tomb);
+  if (!moved || moved.pid !== expected.pid || moved.owner !== expected.owner) {
+    try {
+      renameSync(tomb, path);
+    } catch {
+      // Path occupied by a newer publisher; keep tomb for forensics.
+    }
+    return false;
+  }
+  try {
+    publishFenceExclusive(path, next);
+  } catch {
+    try {
+      renameSync(tomb, path);
+    } catch {
+      unlinkQuiet(tomb);
+    }
+    return false;
+  }
+  unlinkQuiet(tomb);
+  return true;
+}
+
+/**
  * Take the shared recover guard for one fence.
  * Dead-holder takeover uses atomic rename so two recoverers cannot both win.
  * Exported for contention tests.
@@ -236,26 +271,7 @@ export function tryAcquireRecoverGuard(projectRoot: string, workId: string, owne
   }
   const existing = readFenceFile(recover);
   if (!existing || pidAlive(existing.pid)) return false;
-  // Atomic rename: only one contender can move the dead guard aside.
-  const tomb = `${recover}.tomb.${process.pid}.${Date.now()}`;
-  try {
-    renameSync(recover, tomb);
-  } catch {
-    return false;
-  }
-  const moved = readFenceFile(tomb);
-  if (!moved || moved.pid !== existing.pid || moved.owner !== existing.owner) {
-    // Unexpected content — leave the tomb for an operator; fail closed.
-    return false;
-  }
-  try {
-    publishFenceExclusive(recover, body);
-  } catch {
-    unlinkQuiet(tomb);
-    return false;
-  }
-  unlinkQuiet(tomb);
-  return true;
+  return takeoverDeadHolder(recover, existing, body);
 }
 
 /** Remove the recover guard only if we still own it (rule 8). */
@@ -288,39 +304,20 @@ export function tryAcquireFence(projectRoot: string, workId: string, owner: stri
     if (!again || again.pid !== existing.pid || again.owner !== existing.owner || pidAlive(again.pid)) {
       return false;
     }
-    // Atomic rename of the dead fence — cannot delete a successor published after the check.
-    const tomb = `${fence}.tomb.${process.pid}.${Date.now()}`;
-    try {
-      renameSync(fence, tomb);
-    } catch {
-      return false;
-    }
-    const moved = readFenceFile(tomb);
-    if (!moved || moved.pid !== existing.pid || moved.owner !== existing.owner) {
-      return false;
-    }
-    try {
-      publishFenceExclusive(fence, body);
-    } catch {
-      unlinkQuiet(tomb);
-      return false;
-    }
-    unlinkQuiet(tomb);
-    return true;
+    return takeoverDeadHolder(fence, existing, body);
   } finally {
     releaseRecoverGuard(projectRoot, workId, owner);
   }
 }
 
-function releaseFence(projectRoot: string, workId: string): void {
+/** Remove the fence only if we still own it (rule 8). */
+function releaseFence(projectRoot: string, workId: string, owner: string): void {
   const fence = fleetLockFencePath(projectRoot, workId);
-  try {
-    unlinkSync(fence);
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw err('E_UNSAFE_EXECUTION', `fleet lock fence unlink failed: ${(e as Error).message.split('\n')[0]}`);
-    }
-  }
+  const current = readFenceFile(fence);
+  if (!current || current.owner !== owner || current.pid !== process.pid) return;
+  const again = readFenceFile(fence);
+  if (!again || again.owner !== owner || again.pid !== process.pid) return;
+  unlinkQuiet(fence);
 }
 
 export type AcquireFleetLockResult =
@@ -391,28 +388,54 @@ export function acquireFleetLock(input: {
     if (!Number.isFinite(exp2) || now().getTime() < exp2) {
       return { ok: false, reason: 'lock no longer expired during reclaim; retry' };
     }
+    // Rename-aside + verify so a successor published after the re-read is restored, not deleted.
+    const tomb = `${path}.tomb.${process.pid}.${Date.now()}`;
     try {
-      unlinkSync(path);
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
-        throw err('E_UNSAFE_EXECUTION', `fleet lock reclaim unlink failed: ${(e as Error).message.split('\n')[0]}`);
+      renameSync(path, tomb);
+    } catch {
+      return { ok: false, reason: 'reclaim lost race; retry' };
+    }
+    let moved: FleetLockBody | undefined;
+    try {
+      const raw = readFileSync(tomb, 'utf8');
+      moved = JSON.parse(raw) as FleetLockBody;
+    } catch {
+      try {
+        renameSync(tomb, path);
+      } catch {
+        /* keep tomb */
       }
+      return { ok: false, reason: 'reclaim tomb unreadable; retry' };
+    }
+    if (!moved || moved.owner !== existing.owner) {
+      try {
+        renameSync(tomb, path);
+      } catch {
+        /* keep tomb */
+      }
+      return { ok: false, reason: 'reclaim saw successor lock; retry' };
     }
     try {
       publishLockExclusive(path, body);
     } catch (e) {
+      try {
+        renameSync(tomb, path);
+      } catch {
+        unlinkQuiet(tomb);
+      }
       if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
         return { ok: false, reason: 'reclaim lost race; retry' };
       }
       throw err('E_UNSAFE_EXECUTION', `fleet lock reclaim create failed: ${(e as Error).message.split('\n')[0]}`);
     }
+    unlinkQuiet(tomb);
     const verify = readFleetLock(input.projectRoot, input.workId);
     if (!verify || verify.owner !== owner) {
       return { ok: false, reason: 'reclaim lost race; retry' };
     }
     return { ok: true, lock: body, reclaimed: true };
   } finally {
-    releaseFence(input.projectRoot, input.workId);
+    releaseFence(input.projectRoot, input.workId, owner);
   }
 }
 
@@ -451,7 +474,7 @@ export function renewFleetLock(input: {
     }
     return { ok: true, lock: verify };
   } finally {
-    releaseFence(input.projectRoot, input.workId);
+    releaseFence(input.projectRoot, input.workId, input.owner);
   }
 }
 
@@ -480,7 +503,7 @@ export function releaseFleetLock(input: {
     }
     return { released: true };
   } finally {
-    releaseFence(input.projectRoot, input.workId);
+    releaseFence(input.projectRoot, input.workId, input.owner);
   }
 }
 
