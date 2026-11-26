@@ -14,6 +14,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeSync,
@@ -65,8 +66,10 @@ export type ContainerSandboxOptions = {
   image: string;
   registries: string[];
   modelProxyUrl?: string;
-  /** Docker/Podman network for registries/model-proxy; required for those scopes to be enforceable. */
+  /** Docker/Podman network for registries (setup) scope. */
   allowNetwork?: string;
+  /** Docker/Podman network for model-proxy (implement/fix); must differ from allowNetwork. */
+  modelProxyNetwork?: string;
   runtime?: ContainerRuntime;
   home?: string;
   runContainer?: RunContainerFn;
@@ -85,40 +88,69 @@ const PROBE_URL = 'https://example.com/';
 /** Build network argv for a phase. Returns enforced=false when allow-list scopes cannot be configured. */
 export function phaseNetworkArgs(
   network: PhaseNetwork,
-  opts: { allowNetwork?: string; registries: string[]; modelProxyUrl?: string },
+  opts: {
+    allowNetwork?: string;
+    modelProxyNetwork?: string;
+    registries: string[];
+    modelProxyUrl?: string;
+  },
 ): { args: string[]; enforced: boolean; reason?: string } {
   if (network === 'none') {
     return { args: ['--network', 'none'], enforced: true };
   }
-  if (!opts.allowNetwork) {
+  if (network === 'registries') {
+    if (!opts.allowNetwork) {
+      return {
+        args: [],
+        enforced: false,
+        reason: 'sandboxAllowNetwork is unset; registries scope is not enforceable',
+      };
+    }
+    if (opts.registries.length === 0) {
+      return {
+        args: [],
+        enforced: false,
+        reason: 'sandboxRegistries is empty; registries scope cannot be allow-listed',
+      };
+    }
+    return {
+      args: ['--network', opts.allowNetwork, '-e', `TURBINE_SANDBOX_REGISTRIES=${opts.registries.join(',')}`],
+      enforced: true,
+    };
+  }
+  // model-proxy
+  if (!opts.modelProxyNetwork) {
     return {
       args: [],
       enforced: false,
-      reason: 'sandboxAllowNetwork is unset; registries/model-proxy scopes are not enforceable',
+      reason: 'sandboxModelProxyNetwork is unset; model-proxy scope is not enforceable',
     };
   }
-  if (network === 'registries' && opts.registries.length === 0) {
-    return {
-      args: [],
-      enforced: false,
-      reason: 'sandboxRegistries is empty; registries scope cannot be allow-listed',
-    };
-  }
-  if (network === 'model-proxy' && !opts.modelProxyUrl) {
+  if (!opts.modelProxyUrl) {
     return {
       args: [],
       enforced: false,
       reason: 'sandboxModelProxyUrl is unset; model-proxy scope cannot be allow-listed',
     };
   }
-  const args = ['--network', opts.allowNetwork];
-  if (network === 'model-proxy' && opts.modelProxyUrl) {
-    args.push('-e', `HTTPS_PROXY=${opts.modelProxyUrl}`, '-e', `HTTP_PROXY=${opts.modelProxyUrl}`);
+  if (opts.allowNetwork && opts.modelProxyNetwork === opts.allowNetwork) {
+    return {
+      args: [],
+      enforced: false,
+      reason: 'sandboxModelProxyNetwork must differ from sandboxAllowNetwork',
+    };
   }
-  if (network === 'registries' && opts.registries.length) {
-    args.push('-e', `TURBINE_SANDBOX_REGISTRIES=${opts.registries.join(',')}`);
-  }
-  return { args, enforced: true };
+  return {
+    args: [
+      '--network',
+      opts.modelProxyNetwork,
+      '-e',
+      `HTTPS_PROXY=${opts.modelProxyUrl}`,
+      '-e',
+      `HTTP_PROXY=${opts.modelProxyUrl}`,
+    ],
+    enforced: true,
+  };
 }
 
 /** Assert allow-list network policy knobs are configured before starting a sandboxed run. */
@@ -126,6 +158,7 @@ export function assertSandboxNetworkPolicyReady(opts: {
   registries: string[];
   modelProxyUrl?: string;
   allowNetwork?: string;
+  modelProxyNetwork?: string;
 }): void {
   for (const network of ['registries', 'model-proxy'] as const) {
     const { enforced, reason } = phaseNetworkArgs(network, opts);
@@ -142,7 +175,29 @@ export function assertSandboxNetworkPolicyReady(opts: {
  * Resolve linked-worktree Git layout (common dir + per-worktree admin dir).
  * Mounts are selective: objects/refs/worktree admin (+ config/HEAD read-only). Hooks are never mounted.
  */
-export function resolveLinkedGitLayout(worktreePath: string): {
+function assertPathUnderProject(candidate: string, projectRoot: string, label: string): string {
+  let real: string;
+  try {
+    real = realpathSync(candidate);
+  } catch {
+    throw err('E_UNSAFE_EXECUTION', `${label} is unreadable: ${candidate}`);
+  }
+  let root: string;
+  try {
+    root = realpathSync(projectRoot);
+  } catch {
+    root = resolve(projectRoot);
+  }
+  if (real !== root && !real.startsWith(`${root}/`)) {
+    throw err('E_UNSAFE_EXECUTION', `${label} escapes project root (${real})`);
+  }
+  return real;
+}
+
+export function resolveLinkedGitLayout(
+  worktreePath: string,
+  projectRoot?: string,
+): {
   commonDir: string;
   worktreeGitDir: string;
 } | undefined {
@@ -164,14 +219,17 @@ export function resolveLinkedGitLayout(worktreePath: string): {
   }
   const match = /^gitdir:\s*(.+)\s*$/m.exec(raw);
   if (!match?.[1]) return undefined;
-  const worktreeGitDir = resolve(dirname(gitPath), match[1].trim());
+  let worktreeGitDir = resolve(dirname(gitPath), match[1].trim());
   let commonDir = resolve(worktreeGitDir, '..', '..');
   const commonDirFile = join(worktreeGitDir, 'commondir');
   if (existsSync(commonDirFile)) {
     try {
+      if (lstatSync(commonDirFile).isSymbolicLink()) {
+        throw err('E_UNSAFE_EXECUTION', 'linked worktree commondir must not be a symlink');
+      }
       commonDir = resolve(worktreeGitDir, readFileSync(commonDirFile, 'utf8').trim());
-    } catch {
-      // keep default
+    } catch (e) {
+      if ((e as { code?: string }).code === 'E_UNSAFE_EXECUTION') throw e;
     }
   }
   if (!existsSync(commonDir)) {
@@ -180,6 +238,17 @@ export function resolveLinkedGitLayout(worktreePath: string): {
       `linked worktree Git common dir is missing (${commonDir}); cannot mount Git admin data`,
     );
   }
+  if (projectRoot) {
+    worktreeGitDir = assertPathUnderProject(worktreeGitDir, projectRoot, 'worktree git dir');
+    commonDir = assertPathUnderProject(commonDir, projectRoot, 'git common dir');
+  } else {
+    try {
+      worktreeGitDir = realpathSync(worktreeGitDir);
+      commonDir = realpathSync(commonDir);
+    } catch {
+      // keep resolved paths
+    }
+  }
   return { commonDir, worktreeGitDir };
 }
 
@@ -187,8 +256,12 @@ export function resolveLinkedGitLayout(worktreePath: string): {
  * Bind mounts so linked Git worktrees can run `git` inside the container.
  * @param writeable when false (setup/checks), objects/refs/admin are read-only.
  */
-export function resolveLinkedGitMounts(worktreePath: string, writeable = true): BindMount[] {
-  const layout = resolveLinkedGitLayout(worktreePath);
+export function resolveLinkedGitMounts(
+  worktreePath: string,
+  writeable = true,
+  projectRoot?: string,
+): BindMount[] {
+  const layout = resolveLinkedGitLayout(worktreePath, projectRoot);
   if (!layout) return [];
   const { commonDir, worktreeGitDir } = layout;
   const mode = writeable ? 'rw' : 'ro';
@@ -252,24 +325,57 @@ export function buildContainerArgv(input: {
   worktreePath: string;
   network: PhaseNetwork;
   allowNetwork?: string;
+  modelProxyNetwork?: string;
   registries: string[];
   modelProxyUrl?: string;
   command: string[];
   extraMounts?: BindMount[];
   containerName?: string;
+  /** Host uid:gid mapped into the container when supported (avoids dubious ownership). */
+  user?: string;
 }): { argv: string[]; enforced: boolean; reason?: string; containerName: string } {
+  if (input.image.startsWith('-')) {
+    return {
+      argv: [],
+      enforced: false,
+      reason: 'sandboxImage must not start with - (argument injection)',
+      containerName: input.containerName ?? 'invalid',
+    };
+  }
   const net = phaseNetworkArgs(input.network, {
     allowNetwork: input.allowNetwork,
+    modelProxyNetwork: input.modelProxyNetwork,
     registries: input.registries,
     modelProxyUrl: input.modelProxyUrl,
   });
   const containerName = input.containerName ?? `turbine-sbx-${randomBytes(8).toString('hex')}`;
   if (!net.enforced) return { argv: [], enforced: false, reason: net.reason, containerName };
-  const argv = ['run', '--rm', '--name', containerName, ...net.args, '-v', `${input.worktreePath}:${input.worktreePath}:rw`];
+  // Clear client-inherited proxy env so Docker does not inject host proxy credentials.
+  const argv = [
+    'run',
+    '--rm',
+    '--name',
+    containerName,
+    '-e',
+    'HTTP_PROXY=',
+    '-e',
+    'HTTPS_PROXY=',
+    '-e',
+    'http_proxy=',
+    '-e',
+    'https_proxy=',
+    '-e',
+    'ALL_PROXY=',
+    '-e',
+    'all_proxy=',
+    ...net.args,
+  ];
+  if (input.user) argv.push('--user', input.user);
+  argv.push('-v', `${input.worktreePath}:${input.worktreePath}:rw`);
   for (const m of input.extraMounts ?? []) {
     argv.push('-v', `${m.host}:${m.dest}:${m.mode}`);
   }
-  argv.push('-w', input.worktreePath, input.image, ...input.command);
+  argv.push('-w', input.worktreePath, '--', input.image, ...input.command);
   return { argv, enforced: true, containerName };
 }
 
@@ -290,10 +396,15 @@ export function stopContainer(runtime: ContainerRuntime, name: string): boolean 
       encoding: 'utf8',
       timeout: 10_000,
     });
-    // Missing container → status non-zero → confirmed stopped.
-    if (inspect.status !== 0) return true;
+    // Timeout / spawn failure → unconfirmed.
+    if (inspect.error || inspect.status === null) return false;
+    const errText = `${inspect.stderr ?? ''}${inspect.stdout ?? ''}`;
+    // Authoritative not-found.
+    if (inspect.status !== 0) {
+      return /no such (object|container)/i.test(errText) || inspect.status === 1;
+    }
     const running = (inspect.stdout ?? '').trim();
-    return running !== 'true';
+    return running === 'false' || running === '';
   } catch {
     return false;
   }
@@ -371,7 +482,7 @@ export function defaultRunContainer(req: ContainerRunRequest): Promise<Container
 }
 
 const EGRESS_PROBE_SCRIPT = (url: string) =>
-  `fetch(${JSON.stringify(url)}).then(()=>process.exit(0)).catch((e)=>{const c=e&&e.cause&&e.cause.code||e&&e.code;if(c==='ECONNREFUSED'||c==='ENETUNREACH'||c==='ENOTFOUND'||c==='EAI_AGAIN')process.exit(2);process.exit(1);})`;
+  `fetch(${JSON.stringify(url)}).then(()=>process.exit(0)).catch((e)=>{const c=e&&e.cause&&e.cause.code||e&&e.code;if(c==='ECONNREFUSED'||c==='ENETUNREACH')process.exit(2);process.exit(1);})`;
 
 async function runBoundedProbe(input: {
   runtime: ContainerRuntime;
@@ -510,8 +621,9 @@ export async function createContainerSandboxHooks(opts: ContainerSandboxOptions)
     runtime,
     home: opts.home,
   });
-  const extraMounts = resolveLinkedGitMounts(mount.worktreePath);
-  for (const m of extraMounts) {
+  // Probe mounts use read-only Git admin; phase mounts are resolved per-phase (rw only for implement/fix/commit).
+  const probeMounts = resolveLinkedGitMounts(mount.worktreePath, false, opts.projectRoot);
+  for (const m of probeMounts) {
     const hit = findForbiddenBindInArgv(
       ['-v', `${m.host}:${m.dest}:${m.mode}`],
       mount.forbiddenMounts,
@@ -528,7 +640,7 @@ export async function createContainerSandboxHooks(opts: ContainerSandboxOptions)
     worktreePath: mount.worktreePath,
     runContainer: opts.runContainer,
     timeoutMs,
-    extraMounts,
+    extraMounts: probeMounts,
   });
   if (noneOpen) {
     // Still bind hooks that report open egress so preflightSandbox refuses; keep fail-closed.
@@ -536,34 +648,34 @@ export async function createContainerSandboxHooks(opts: ContainerSandboxOptions)
       ...opts,
       runtime,
       mount,
-      extraMounts,
       egressOpen: true,
     });
   }
-  if (!opts.allowNetwork) {
-    throw err('E_UNSAFE_EXECUTION', 'sandboxAllowNetwork is unset after network policy assert');
+  if (!opts.allowNetwork || !opts.modelProxyNetwork) {
+    throw err('E_UNSAFE_EXECUTION', 'sandboxAllowNetwork / sandboxModelProxyNetwork unset after network policy assert');
   }
-  const allowOpen = await allowNetworkEgressProbeSucceeds({
-    runtime,
-    image: opts.image,
-    worktreePath: mount.worktreePath,
-    allowNetwork: opts.allowNetwork,
-    registries: opts.registries,
-    runContainer: opts.runContainer,
-    timeoutMs,
-    extraMounts,
-  });
-  if (allowOpen) {
-    throw err(
-      'E_UNSAFE_EXECUTION',
-      `sandboxed-unattended allow-network "${opts.allowNetwork}" does not block non-allow-listed egress (or probe inconclusive). Refusing to start (no unsandboxed fallback).`,
-    );
+  for (const netName of [opts.allowNetwork, opts.modelProxyNetwork]) {
+    const allowOpen = await allowNetworkEgressProbeSucceeds({
+      runtime,
+      image: opts.image,
+      worktreePath: mount.worktreePath,
+      allowNetwork: netName,
+      registries: opts.registries,
+      runContainer: opts.runContainer,
+      timeoutMs,
+      extraMounts: probeMounts,
+    });
+    if (allowOpen) {
+      throw err(
+        'E_UNSAFE_EXECUTION',
+        `sandboxed-unattended allow-network "${netName}" does not block non-allow-listed egress (or probe inconclusive). Refusing to start (no unsandboxed fallback).`,
+      );
+    }
   }
   return createContainerSandboxHooksWithProbe({
     ...opts,
     runtime,
     mount,
-    extraMounts,
     egressOpen: false,
   });
 }
@@ -583,8 +695,9 @@ export function createContainerSandboxHooksWithProbe(
 
   const shellCommands = (commands: string[]): string[] => {
     if (!commands.length) return ['node', '-e', 'process.exit(0)'];
-    // set -e: each line's nonzero status stops the script (avoids `a && b; true` masking).
-    return ['sh', '-c', ['set -e', ...commands].join('\n')];
+    // Each configured entry runs in its own shell so `false && true` fails the entry as a whole.
+    const script = commands.map((c) => `sh -c ${JSON.stringify(c)} || exit $?`).join('\n');
+    return ['sh', '-c', script];
   };
 
   return {
@@ -596,7 +709,7 @@ export function createContainerSandboxHooksWithProbe(
       }
       const network = PHASE_NETWORK[phase];
       const gitWriteable = phase === 'implement' || phase === 'fix' || phase === 'commit';
-      const extraMounts = opts.extraMounts ?? resolveLinkedGitMounts(mount.worktreePath, gitWriteable);
+      const extraMounts = resolveLinkedGitMounts(mount.worktreePath, gitWriteable, opts.projectRoot);
       let command: string[];
       if (phase === 'setup') {
         command = shellCommands(opts.setupCommands ?? []);
@@ -623,16 +736,22 @@ export function createContainerSandboxHooksWithProbe(
         command = ['node', '-e', 'process.exit(0)'];
       }
 
+      const user =
+        typeof process.getuid === 'function' && typeof process.getgid === 'function'
+          ? `${process.getuid()}:${process.getgid()}`
+          : undefined;
       const built = buildContainerArgv({
         runtime,
         image: opts.image,
         worktreePath: mount.worktreePath,
         network,
         allowNetwork: opts.allowNetwork,
+        modelProxyNetwork: opts.modelProxyNetwork,
         registries: opts.registries,
         modelProxyUrl: opts.modelProxyUrl,
         command,
         extraMounts,
+        user,
       });
       if (!built.enforced) {
         return {
@@ -677,12 +796,15 @@ export function createContainerSandboxHooksWithProbe(
   };
 }
 
+const SANDBOX_PROMPT_DIR = '.turbine-sandbox';
+const SANDBOX_PROMPT_FILE = 'prompt.md';
+
 /** Prompt path written inside the worktree for agent CLIs (never outside the mount). */
 export function sandboxPromptPath(worktreePath: string): string {
-  return join(worktreePath, '.turbine-sandbox-prompt.md');
+  return join(worktreePath, SANDBOX_PROMPT_DIR, SANDBOX_PROMPT_FILE);
 }
 
-const PROMPT_EXCLUDE_LINE = '.turbine-sandbox-prompt.md';
+const PROMPT_EXCLUDE_LINE = '.turbine-sandbox/';
 
 /** True when path or any ancestor is a symlink (reject before writing metadata). */
 function pathHasSymlinkComponent(target: string): boolean {
@@ -752,7 +874,26 @@ export function ensureSandboxPromptExcluded(worktreePath: string): void {
  * Write the implementer prompt without following a pre-existing symlink (O_NOFOLLOW / unlink+EXCL).
  */
 export function writeSandboxPrompt(worktreePath: string, body: string): string {
+  const dir = join(worktreePath, SANDBOX_PROMPT_DIR);
+  if (existsSync(dir)) {
+    try {
+      if (lstatSync(dir).isSymbolicLink()) {
+        throw err('E_UNSAFE_EXECUTION', 'sandbox prompt directory must not be a symlink');
+      }
+    } catch (e) {
+      if ((e as { code?: string }).code === 'E_UNSAFE_EXECUTION') throw e;
+    }
+  } else {
+    mkdirSync(dir, { recursive: true });
+  }
   const dest = sandboxPromptPath(worktreePath);
+  // Refuse to clobber a path already tracked in git.
+  const tracked = spawnSync('git', ['-C', worktreePath, 'ls-files', '--', `${SANDBOX_PROMPT_DIR}/${SANDBOX_PROMPT_FILE}`], {
+    encoding: 'utf8',
+  });
+  if ((tracked.stdout ?? '').trim()) {
+    throw err('E_UNSAFE_EXECUTION', 'sandbox prompt path is tracked in git; refuse to overwrite');
+  }
   ensureSandboxPromptExcluded(worktreePath);
   try {
     const st = lstatSync(dest);
@@ -760,7 +901,7 @@ export function writeSandboxPrompt(worktreePath: string, body: string): string {
   } catch {
     // ENOENT
   }
-  const tmp = join(worktreePath, `.turbine-sandbox-prompt.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
+  const tmp = join(dir, `prompt.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
   const fd = openSync(
     tmp,
     constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -791,10 +932,23 @@ export function cleanupSandboxPrompt(worktreePath: string): void {
  * Claude Code: `claude -p` with prompt text; Codex: `codex exec` with prompt text.
  */
 export function agentCliCommand(id: 'claude-code' | 'codex', promptPath: string): string[] {
+  // Prompt via stdin (avoids ARG_MAX). Non-interactive write access limited to the mounted worktree.
   if (id === 'claude-code') {
-    return ['sh', '-c', 'claude -p "$(cat -- "$1")"', 'turbine-claude', promptPath];
+    return [
+      'sh',
+      '-c',
+      'test -f "$1" || exit 2; claude -p --dangerously-skip-permissions < "$1"',
+      'turbine-claude',
+      promptPath,
+    ];
   }
-  return ['sh', '-c', 'codex exec "$(cat -- "$1")"', 'turbine-codex', promptPath];
+  return [
+    'sh',
+    '-c',
+    'test -f "$1" || exit 2; codex exec --full-auto - < "$1"',
+    'turbine-codex',
+    promptPath,
+  ];
 }
 
 /** Optional sync probe helper for diagnostics (prefer async {@link containerEgressProbeSucceeds}). */

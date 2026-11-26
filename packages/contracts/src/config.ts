@@ -15,8 +15,9 @@ const sandboxHostname = z
 /** http(s) URL whose host is allow-listed for model-proxy phases; rejects file:// and credentials. */
 const sandboxProxyUrl = z
   .string()
-  .url()
   .refine((u) => {
+    // Reject traversal in the raw string before URL normalization removes `..`.
+    if (/(^|\/)\.\.(\/|$)/.test(u) || /%2e%2e/i.test(u)) return false;
     try {
       const parsed = new URL(u);
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
@@ -27,6 +28,12 @@ const sandboxProxyUrl = z
       return false;
     }
   }, { message: 'sandboxModelProxyUrl must be http(s) without credentials or path traversal' });
+
+const sandboxNetworkName = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/, { message: 'sandbox network must be a network name' });
 
 export const ProjectConfigSchema = z.object({
   schemaVersion: z.literal(1),
@@ -160,13 +167,13 @@ export const ProjectConfigSchema = z.object({
       sandboxWallClockMs: z.number().int().positive().max(2_147_483_647).default(1_800_000),
       /** Max combined stdout/stderr bytes from sandbox phases before limit-exceeded (FR-D6). */
       sandboxMaxOutputBytes: z.number().int().positive().default(8_000_000),
-      /** Container image for sandboxed-unattended phases (no path traversal). */
+      /** Container image for sandboxed-unattended phases (no path traversal or leading '-'). */
       sandboxImage: z
         .string()
         .min(1)
         .max(512)
-        .refine((s) => !s.includes('..') && !s.startsWith('/') && !s.includes('\\'), {
-          message: 'sandboxImage must not be an absolute path or contain ..',
+        .refine((s) => !s.includes('..') && !s.startsWith('/') && !s.startsWith('-') && !s.includes('\\'), {
+          message: 'sandboxImage must not be an absolute path, start with -, or contain ..',
         })
         .default('docker.io/library/node:22-bookworm'),
       /** Hostnames allowed during setup (registries network scope). Empty → allow-list phases refuse. */
@@ -179,15 +186,15 @@ export const ProjectConfigSchema = z.object({
       /** Live implementer adapter id. Tests may still inject Engine.sandboxImplementer. */
       sandboxImplementer: z.enum(['claude-code', 'codex']).optional(),
       /**
-       * Docker/Podman network name used for registries/model-proxy phases. When unset, those phases
-       * are not enforceable and preflight refuses (fail closed). Checks/commit use `--network none`.
+       * Docker/Podman network for the registries (setup) scope. When unset, that scope is not
+       * enforceable and preflight refuses (fail closed). Checks/commit use `--network none`.
        */
-      sandboxAllowNetwork: z
-        .string()
-        .min(1)
-        .max(128)
-        .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/, { message: 'sandboxAllowNetwork must be a network name' })
-        .optional(),
+      sandboxAllowNetwork: sandboxNetworkName.optional(),
+      /**
+       * Docker/Podman network for the model-proxy (implement/fix) scope. Must be set and must
+       * differ from `sandboxAllowNetwork` so the two scopes are not the same bridge.
+       */
+      sandboxModelProxyNetwork: sandboxNetworkName.optional(),
     })
     .default({
       mode: 'manual-supervised',

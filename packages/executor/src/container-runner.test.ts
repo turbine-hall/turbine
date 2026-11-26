@@ -18,34 +18,49 @@ import {
 import { planSandboxMounts } from './sandbox.js';
 
 describe('container phase runner', () => {
-  it('FR-D2: none network is always enforced; allow-list scopes need sandboxAllowNetwork', () => {
+  it('FR-D2: none network is always enforced; allow-list scopes need distinct networks', () => {
     expect(phaseNetworkArgs('none', { registries: [] }).enforced).toBe(true);
     expect(phaseNetworkArgs('registries', { registries: ['registry.npmjs.org'] }).enforced).toBe(false);
     expect(
       phaseNetworkArgs('registries', {
         registries: ['registry.npmjs.org'],
-        allowNetwork: 'turbine-allow',
+        allowNetwork: 'turbine-reg',
       }).enforced,
     ).toBe(true);
     expect(
       phaseNetworkArgs('model-proxy', {
         registries: [],
-        allowNetwork: 'turbine-allow',
+        allowNetwork: 'turbine-reg',
+        modelProxyNetwork: 'turbine-proxy',
         modelProxyUrl: 'https://proxy.example.com',
       }).args,
     ).toEqual(
-      expect.arrayContaining(['--network', 'turbine-allow', '-e', 'HTTPS_PROXY=https://proxy.example.com']),
+      expect.arrayContaining(['--network', 'turbine-proxy', '-e', 'HTTPS_PROXY=https://proxy.example.com']),
     );
+    expect(
+      phaseNetworkArgs('model-proxy', {
+        registries: [],
+        allowNetwork: 'same',
+        modelProxyNetwork: 'same',
+        modelProxyUrl: 'https://proxy.example.com',
+      }).enforced,
+    ).toBe(false);
   });
 
   it('FR-D2: assertSandboxNetworkPolicyReady refuses incomplete allow-list config', () => {
     expect(() =>
-      assertSandboxNetworkPolicyReady({ registries: [], allowNetwork: 'n', modelProxyUrl: 'https://p.example.com' }),
+      assertSandboxNetworkPolicyReady({
+        registries: [],
+        allowNetwork: 'n',
+        modelProxyNetwork: 'm',
+        modelProxyUrl: 'https://p.example.com',
+      }),
     ).toThrow(/registries/i);
     expect(() =>
       assertSandboxNetworkPolicyReady({
         registries: ['registry.npmjs.org'],
         modelProxyUrl: 'https://proxy.example.com',
+        modelProxyNetwork: 'm',
       }),
     ).toThrow(/sandboxAllowNetwork/i);
   });
@@ -91,7 +106,7 @@ describe('container phase runner', () => {
       home: '/tmp/no-home',
       setupCommands: ['false', 'echo skipped; true'],
       runContainer: async (req) => {
-        script = req.args.filter((a) => typeof a === 'string' && a.includes('set -e')).join('\n');
+        script = req.args.find((a) => typeof a === 'string' && a.includes('|| exit $?')) ?? '';
         return {
           exitCode: 1,
           stdout: '',
@@ -108,7 +123,9 @@ describe('container phase runner', () => {
       signal: new AbortController().signal,
       remainingOutputBytes: 1000,
     });
-    expect(script).toMatch(/^set -e\nfalse\necho skipped; true$/m);
+    expect(script).toContain('|| exit $?');
+    expect(script).toContain('false');
+    expect(script).toContain('echo skipped; true');
   });
 
   it('FR-D1: forbidden-mount scan uses bind hosts and skips home so worktrees under $HOME work', () => {
@@ -123,11 +140,11 @@ describe('container phase runner', () => {
     expect(parseBindHostsFromArgv(argv)).toEqual([wt]);
   });
 
-  it('FR-D4: agentCliCommand uses provider-specific non-interactive shapes', () => {
-    const p = '/wt/.turbine-sandbox-prompt.md';
+  it('FR-D4: agentCliCommand uses provider-specific non-interactive shapes via stdin', () => {
+    const p = '/wt/.turbine-sandbox/prompt.md';
     expect(agentCliCommand('claude-code', p)[0]).toBe('sh');
-    expect(agentCliCommand('claude-code', p).join(' ')).toMatch(/claude -p/);
-    expect(agentCliCommand('codex', p).join(' ')).toMatch(/codex exec/);
+    expect(agentCliCommand('claude-code', p).join(' ')).toMatch(/claude -p --dangerously-skip-permissions </);
+    expect(agentCliCommand('codex', p).join(' ')).toMatch(/codex exec --full-auto - </);
     expect(agentCliCommand('claude-code', p).join(' ')).not.toMatch(/--prompt-file/);
   });
 
@@ -135,7 +152,7 @@ describe('container phase runner', () => {
     const root = mkdtempSync(join(tmpdir(), 'turbine-prompt-'));
     const wt = join(root, 'wt');
     const outside = join(root, 'outside.txt');
-    mkdirSync(wt);
+    mkdirSync(join(wt, '.turbine-sandbox'), { recursive: true });
     writeFileSync(outside, 'secret');
     symlinkSync(outside, sandboxPromptPath(wt));
     writeSandboxPrompt(wt, 'SAFE_PROMPT');

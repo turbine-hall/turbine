@@ -137,12 +137,16 @@ function runAsyncCli(input: {
       if (input.signal.aborted) onAbort();
       else input.signal.addEventListener('abort', onAbort, { once: true });
     }
-    child.stdout?.on('data', (c: Buffer) => {
-      stdout += c.toString('utf8');
-    });
-    child.stderr?.on('data', (c: Buffer) => {
-      stderr += c.toString('utf8');
-    });
+    const maxCapture = 256_000;
+    const take = (chunk: Buffer, dest: 'out' | 'err') => {
+      const room = maxCapture - (dest === 'out' ? stdout.length : stderr.length);
+      if (room <= 0) return;
+      const text = chunk.toString('utf8', 0, Math.min(chunk.byteLength, room));
+      if (dest === 'out') stdout += text;
+      else stderr += text;
+    };
+    child.stdout?.on('data', (c: Buffer) => take(c, 'out'));
+    child.stderr?.on('data', (c: Buffer) => take(c, 'err'));
     child.on('error', (e) => {
       input.signal?.removeEventListener('abort', onAbort);
       resolve({ status: null, stdout, stderr: `${stderr}\n${e.message}`.trim(), killed });
@@ -182,9 +186,9 @@ function createCliImplementer(
       }
 
       // Host spawn is only for stub/integration tests that intentionally run outside Docker.
-      // Use provider-shaped argv unless a custom bin/extraArgs override is supplied for stubs.
+      // Stub protocol only when an explicit stub binary is supplied (empty extraArgs alone is not a stub).
       let argv: string[];
-      if (opts.bin || opts.extraArgs) {
+      if (opts.bin) {
         argv = [...(opts.extraArgs ?? []), '--prompt-file', promptPath];
       } else {
         // agentCliCommand returns [sh, -c, script, name, promptPath] — for host we spawn sh directly.

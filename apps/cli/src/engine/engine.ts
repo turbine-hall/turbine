@@ -2314,6 +2314,7 @@ export class Engine {
             registries: execCfg.sandboxRegistries,
             modelProxyUrl: execCfg.sandboxModelProxyUrl,
             allowNetwork: execCfg.sandboxAllowNetwork,
+            modelProxyNetwork: execCfg.sandboxModelProxyNetwork,
           });
           const runtime = detectContainerRuntime();
           if (!runtime) {
@@ -2584,6 +2585,17 @@ export class Engine {
       return work;
     }
 
+    if (input.repos.length > 1) {
+      work = failInit(
+        `sandboxed-unattended supports a single repository worktree; this task has ${input.repos.length}. Refuse before live runner start.`,
+      );
+      this.render(work.id, [
+        'Sandboxed-unattended init failed: multi-repository tasks are not supported in the live container runner.',
+        'Task left the autonomous lane.',
+      ]);
+      return work;
+    }
+
     let customHooks = this.sandboxHooks;
     if (!customHooks) {
       try {
@@ -2591,6 +2603,7 @@ export class Engine {
           registries: execCfg.sandboxRegistries,
           modelProxyUrl: execCfg.sandboxModelProxyUrl,
           allowNetwork: execCfg.sandboxAllowNetwork,
+          modelProxyNetwork: execCfg.sandboxModelProxyNetwork,
         });
         const agentId =
           implementer.id === 'codex' || implementer.id === 'claude-code' ? implementer.id : undefined;
@@ -2601,6 +2614,7 @@ export class Engine {
           registries: execCfg.sandboxRegistries,
           modelProxyUrl: execCfg.sandboxModelProxyUrl,
           allowNetwork: execCfg.sandboxAllowNetwork,
+          modelProxyNetwork: execCfg.sandboxModelProxyNetwork,
           runtime: input.preflightRuntime,
           setupCommands: this.ctx.config.quality.setup ?? [],
           checkCommands: this.ctx.config.quality.checks ?? [],

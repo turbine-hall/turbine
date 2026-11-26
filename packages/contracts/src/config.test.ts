@@ -19,17 +19,19 @@ describe('execution sandbox config (FR-D6)', () => {
         sandboxRegistries: ['registry.npmjs.org', 'localhost'],
         sandboxModelProxyUrl: 'https://proxy.example.com/v1',
         sandboxImplementer: 'claude-code',
-        sandboxAllowNetwork: 'turbine-allow',
+        sandboxAllowNetwork: 'turbine-reg',
+        sandboxModelProxyNetwork: 'turbine-proxy',
       },
     });
     expect(cfg.execution.sandboxImage).toBe('docker.io/library/node:22-bookworm');
     expect(cfg.execution.sandboxRegistries).toEqual(['registry.npmjs.org', 'localhost']);
     expect(cfg.execution.sandboxModelProxyUrl).toBe('https://proxy.example.com/v1');
     expect(cfg.execution.sandboxImplementer).toBe('claude-code');
-    expect(cfg.execution.sandboxAllowNetwork).toBe('turbine-allow');
+    expect(cfg.execution.sandboxAllowNetwork).toBe('turbine-reg');
+    expect(cfg.execution.sandboxModelProxyNetwork).toBe('turbine-proxy');
   });
 
-  it('refuses sandboxImage with path traversal or absolute path', () => {
+  it('refuses sandboxImage with path traversal, absolute path, or leading hyphen', () => {
     expect(() =>
       ProjectConfigSchema.parse({
         ...base,
@@ -42,9 +44,15 @@ describe('execution sandbox config (FR-D6)', () => {
         execution: { sandboxImage: '/var/run/docker.sock' },
       }),
     ).toThrow(/sandboxImage/);
+    expect(() =>
+      ProjectConfigSchema.parse({
+        ...base,
+        execution: { sandboxImage: '-eEVIL=1' },
+      }),
+    ).toThrow(/sandboxImage/);
   });
 
-  it('refuses sandboxModelProxyUrl with credentials or non-http scheme', () => {
+  it('refuses sandboxModelProxyUrl with credentials, non-http scheme, or raw traversal', () => {
     expect(() =>
       ProjectConfigSchema.parse({
         ...base,
@@ -55,6 +63,12 @@ describe('execution sandbox config (FR-D6)', () => {
       ProjectConfigSchema.parse({
         ...base,
         execution: { sandboxModelProxyUrl: 'file:///etc/passwd' },
+      }),
+    ).toThrow();
+    expect(() =>
+      ProjectConfigSchema.parse({
+        ...base,
+        execution: { sandboxModelProxyUrl: 'https://proxy.example.com/api/../v1' },
       }),
     ).toThrow();
   });
