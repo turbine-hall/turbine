@@ -36,7 +36,7 @@ Default execution is still **manual-supervised**: Turbine prepares a worktree an
 When you set `execution.mode: sandboxed-unattended` (and the rest of the knobs), Turbine can run the implement loop **inside a container**:
 
 - **Runtime:** Docker or Podman required. No runtime → refuse start (no unsandboxed fallback).
-- **Mounts:** task worktree plus selective linked-worktree Git paths (including `.git/config` read-only). Home, SSH keys, credential files, and `.turbine/state` are never mounted. If a remote URL in that mounted config embeds a token, task commands can still read it — keep secrets out of Git config (use a credential helper or env instead).
+- **Mounts:** task worktree plus selective linked-worktree Git paths (including `.git/config` read-only). Home, SSH keys, host credential files outside the worktree, and `.turbine/state` are never mounted. The whole task worktree is mounted read-write, so task commands can read any credential file in it (for example `.env`) — keep secrets out of the worktree. If a remote URL in the mounted Git config embeds a token, task commands can also read it; use a credential helper or env instead.
 - **Networks:** separate Docker/Podman network *names* for package registries vs the model proxy; checks and commit use `--network none`. Turbine does not build the allow-list itself — operators must create and validate filtering on both networks. Incomplete config refuses start.
 - **Egress probe:** an in-container probe to one destination must show isolation before the run continues. Passing that probe is not proof of the full allow-list policy.
 - **Agents:** Claude Code and Codex adapters run non-interactively via stdin inside the container when configured.
