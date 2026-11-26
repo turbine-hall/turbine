@@ -8,6 +8,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeSync,
 } from 'node:fs';
@@ -219,34 +220,61 @@ function publishFenceExclusive(fence: string, body: FenceBody): void {
 }
 
 /**
- * Move a dead holder aside for exclusive takeover. On content mismatch or publish
- * failure, restore the path so a live successor is never left empty (rule 8).
- * Exported for mismatch-restore regressions.
+ * Restore tomb via hardlink (no-replace). If path is already occupied, leave it.
+ */
+function restoreTombNoReplace(tomb: string, path: string): void {
+  try {
+    linkSync(tomb, path);
+  } catch {
+    // Successor occupies path — do not clobber.
+  }
+  unlinkQuiet(tomb);
+}
+
+/**
+ * Dead-holder takeover without vacating a live successor: hardlink the current
+ * file to a tomb, confirm inode + expected owner, unlink the path name only when
+ * it still names that inode, then publish exclusively. Restore uses link (EEXIST
+ * preserves a successor). Exported for mismatch-restore regressions.
  */
 export function takeoverDeadHolder(path: string, expected: FenceBody, next: FenceBody): boolean {
   const tomb = `${path}.tomb.${process.pid}.${Date.now()}`;
   try {
-    renameSync(path, tomb);
+    linkSync(path, tomb);
   } catch {
     return false;
   }
   const moved = readFenceFile(tomb);
-  if (!moved || moved.pid !== expected.pid || moved.owner !== expected.owner) {
-    try {
-      renameSync(tomb, path);
-    } catch {
-      // Path occupied by a newer publisher; keep tomb for forensics.
-    }
+  if (!moved || moved.pid !== expected.pid || moved.owner !== expected.owner || pidAlive(moved.pid)) {
+    unlinkQuiet(tomb);
+    return false;
+  }
+  let pathStat;
+  let tombStat;
+  try {
+    pathStat = statSync(path);
+    tombStat = statSync(tomb);
+  } catch {
+    unlinkQuiet(tomb);
+    return false;
+  }
+  if (pathStat.ino !== tombStat.ino || pathStat.dev !== tombStat.dev) {
+    unlinkQuiet(tomb);
     return false;
   }
   try {
+    unlinkSync(path);
+  } catch {
+    unlinkQuiet(tomb);
+    return false;
+  }
+  // If another publisher won the empty path, exclusive publish fails and we must
+  // not rename-over them — only restore when path is still absent.
+  try {
     publishFenceExclusive(path, next);
   } catch {
-    try {
-      renameSync(tomb, path);
-    } catch {
-      unlinkQuiet(tomb);
-    }
+    if (!existsSync(path)) restoreTombNoReplace(tomb, path);
+    else unlinkQuiet(tomb);
     return false;
   }
   unlinkQuiet(tomb);
@@ -375,6 +403,13 @@ export function acquireFleetLock(input: {
   if (now().getTime() < expires) {
     return { ok: false, reason: `held by ${existing.owner} until ${existing.expiresAt}` };
   }
+  // Lease expiry alone is not enough while the holder process may still write (rule 8).
+  if (pidAlive(existing.pid)) {
+    return {
+      ok: false,
+      reason: `held by ${existing.owner} (lease expired but pid ${existing.pid} still alive)`,
+    };
+  }
 
   if (!tryAcquireFence(input.projectRoot, input.workId, owner)) {
     return { ok: false, reason: 'reclaim fence held; retry' };
@@ -388,10 +423,16 @@ export function acquireFleetLock(input: {
     if (!Number.isFinite(exp2) || now().getTime() < exp2) {
       return { ok: false, reason: 'lock no longer expired during reclaim; retry' };
     }
-    // Rename-aside + verify so a successor published after the re-read is restored, not deleted.
+    if (pidAlive(again.pid)) {
+      return {
+        ok: false,
+        reason: `held by ${again.owner} (lease expired but pid ${again.pid} still alive)`,
+      };
+    }
+    // Hardlink + inode check: never rename-over a successor; restore is no-replace.
     const tomb = `${path}.tomb.${process.pid}.${Date.now()}`;
     try {
-      renameSync(path, tomb);
+      linkSync(path, tomb);
     } catch {
       return { ok: false, reason: 'reclaim lost race; retry' };
     }
@@ -400,29 +441,37 @@ export function acquireFleetLock(input: {
       const raw = readFileSync(tomb, 'utf8');
       moved = JSON.parse(raw) as FleetLockBody;
     } catch {
-      try {
-        renameSync(tomb, path);
-      } catch {
-        /* keep tomb */
-      }
+      unlinkQuiet(tomb);
       return { ok: false, reason: 'reclaim tomb unreadable; retry' };
     }
     if (!moved || moved.owner !== existing.owner) {
-      try {
-        renameSync(tomb, path);
-      } catch {
-        /* keep tomb */
-      }
+      unlinkQuiet(tomb);
       return { ok: false, reason: 'reclaim saw successor lock; retry' };
+    }
+    let pathStat;
+    let tombStat;
+    try {
+      pathStat = statSync(path);
+      tombStat = statSync(tomb);
+    } catch {
+      unlinkQuiet(tomb);
+      return { ok: false, reason: 'reclaim lost race; retry' };
+    }
+    if (pathStat.ino !== tombStat.ino || pathStat.dev !== tombStat.dev) {
+      unlinkQuiet(tomb);
+      return { ok: false, reason: 'reclaim saw successor lock; retry' };
+    }
+    try {
+      unlinkSync(path);
+    } catch {
+      unlinkQuiet(tomb);
+      return { ok: false, reason: 'reclaim lost race; retry' };
     }
     try {
       publishLockExclusive(path, body);
     } catch (e) {
-      try {
-        renameSync(tomb, path);
-      } catch {
-        unlinkQuiet(tomb);
-      }
+      if (!existsSync(path)) restoreTombNoReplace(tomb, path);
+      else unlinkQuiet(tomb);
       if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
         return { ok: false, reason: 'reclaim lost race; retry' };
       }

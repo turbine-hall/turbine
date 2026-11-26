@@ -56,6 +56,19 @@ describe('fleet scheduler (Part E / #43)', () => {
     expect(readFleetLock(dir, workId)?.owner).toBe(first.lock.owner);
 
     nowMs += 2_000;
+    // Expired lease while holder pid is still alive must not reclaim.
+    const aliveHold = acquireFleetLock({ projectRoot: dir, workId, runId: 'fleet_run_b', leaseMs: 1_000, now });
+    expect(aliveHold.ok).toBe(false);
+    expect(aliveHold.ok === false && /still alive/.test(aliveHold.reason)).toBe(true);
+
+    // Simulate a crashed holder: same claim metadata, dead pid.
+    const crashed = readFleetLock(dir, workId);
+    expect(crashed).toBeTruthy();
+    if (!crashed) return;
+    writeFileSync(
+      fleetLockPath(dir, workId),
+      `${JSON.stringify({ ...crashed, pid: 2 ** 22 }, null, 2)}\n`,
+    );
     const reclaim = acquireFleetLock({ projectRoot: dir, workId, runId: 'fleet_run_b', leaseMs: 1_000, now });
     expect(reclaim.ok).toBe(true);
     if (!reclaim.ok) return;
@@ -74,7 +87,7 @@ describe('fleet scheduler (Part E / #43)', () => {
         owner: 'fleet:stale:owner',
         workId: work.id,
         runId: 'stale',
-        pid: 1,
+        pid: 2 ** 22,
         claimedAt: new Date(nowMs - 10_000).toISOString(),
         expiresAt: new Date(nowMs - 1_000).toISOString(),
         leaseMs: 1_000,
@@ -571,6 +584,13 @@ describe('fleet scheduler (Part E / #43)', () => {
     expect(first.ok).toBe(true);
     if (!first.ok) return;
     nowMs += 1_000;
+    const crashed = readFleetLock(dir, workId);
+    expect(crashed).toBeTruthy();
+    if (!crashed) return;
+    writeFileSync(
+      fleetLockPath(dir, workId),
+      `${JSON.stringify({ ...crashed, pid: 2 ** 22 }, null, 2)}\n`,
+    );
     const second = acquireFleetLock({ projectRoot: dir, workId, runId: 'run_b', leaseMs: 5_000, now });
     expect(second.ok).toBe(true);
     if (!second.ok) return;
