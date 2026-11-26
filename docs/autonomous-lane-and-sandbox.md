@@ -42,7 +42,7 @@ When you set `execution.mode: sandboxed-unattended` (and the rest of the knobs),
 - **Agents:** Claude Code and Codex adapters run non-interactively via stdin inside the container when configured.
 - **Fix cap:** too many failed check rounds leave the lane; another sandboxed launch needs a human `lane.retry`.
 
-Multi-repo tasks are refused on this path today (single primary worktree). Host `VERIFYING` still runs your configured quality checks outside the sandbox as the human/lane gate.
+Multi-repo tasks are refused on this path today (single primary worktree). Host `VERIFYING` runs your configured `quality.setup` and `quality.checks` outside the sandbox, in the task worktree, after approval. Commands such as `npm test` and `npm ci` execute scripts from the task's `package.json` and lockfile on the host — review changes to those files before approving.
 
 Config knobs live under `execution` in `.turbine/project.yaml` (image, registries, model-proxy URL/network, allow-network, implementer id). The model-proxy **server** itself is operator-supplied.
 
