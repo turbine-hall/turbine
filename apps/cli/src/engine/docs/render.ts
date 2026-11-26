@@ -352,7 +352,7 @@ export function renderSpec(d: PacketData): string {
     '',
     decisionFor(d, 'requirements', 'Requirements', d.spec?.hash),
   );
-  if (d.plan) lines.push('', decisionFor(d.decisions, 'plan', 'Plan', d.plan.hash));
+  if (d.plan) lines.push('', decisionFor(d, 'plan', 'Plan', d.plan.hash));
   return lines.join('\n');
 }
 
