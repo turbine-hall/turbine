@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from '
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createId } from '../../packages/contracts/dist/index.js';
+import { contentHash, createId } from '../../packages/contracts/dist/index.js';
 import { Engine } from '../../apps/cli/src/engine/engine.js';
 import { openContext } from '../../apps/cli/src/engine/project.js';
 import * as fleetLock from '../../apps/cli/src/engine/fleet-lock.js';
@@ -19,6 +19,15 @@ import {
 } from '../../apps/cli/src/engine/fleet-lock.js';
 import { measureFleetSpend } from '../../apps/cli/src/engine/fleet-spend.js';
 import { fleetStatus, runFleet } from '../../apps/cli/src/engine/fleet.js';
+import {
+  actualPathsFromChangeReport,
+  blocksAdmit,
+  buildFilePrediction,
+  comparePredictionToActual,
+  parseFilePrediction,
+  type FilePrediction,
+} from '../../apps/cli/src/engine/file-prediction.js';
+import { computeLaneMetrics } from '../../apps/cli/src/engine/lane-metrics.js';
 import { suspendPolicy } from '../../apps/cli/src/engine/lane-policy.js';
 import { cleanup, tempProject } from './fixture.js';
 import { laneProject, writePolicy } from './lane-fixture.js';
@@ -34,6 +43,30 @@ function makeReadyTask(dir: string, title: string) {
   const engine = new Engine(openContext(dir));
   const work = engine.createTask({ title, file: request, type: 'maintenance' });
   return { engine, work };
+}
+
+function plantPrediction(engine: Engine, workId: string, prediction: FilePrediction) {
+  const body = `${JSON.stringify(prediction, null, 2)}\n`;
+  const prev = engine.ctx.store.getLatestArtifact(workId, 'file-prediction');
+  const revision = (prev?.revision ?? 0) + 1;
+  const location = join(engine.ctx.projectRoot, `.turbine/artifacts/${workId}-pred-r${revision}.json`);
+  mkdirSync(dirname(location), { recursive: true });
+  engine.ctx.store.saveArtifact(
+    {
+      id: createId('art'),
+      workId,
+      type: 'file-prediction',
+      revision,
+      contentHash: contentHash(prediction),
+      contentType: 'application/json',
+      location,
+      createdBy: { kind: 'tool', identifier: 'test' },
+      createdAt: new Date().toISOString(),
+      parentArtifactIds: [],
+    },
+    body,
+  );
+  writeFileSync(location, body);
 }
 
 describe('fleet scheduler (Part E / #43)', () => {
@@ -648,9 +681,458 @@ describe('fleet scheduler (Part E / #43)', () => {
     engine.ctx.store.close();
   });
 
+  it('FR-F3: overlapping or unknown predictions are not admitted concurrently', async () => {
+    const dir = tempProject('fleet-overlap-', dirs);
+    const engine = new Engine(openContext(dir));
+    mkdirSync(join(dir, '.turbine', 'artifacts'), { recursive: true });
+    const mk = (title: string) => {
+      const p = join(dir, `${title.toLowerCase()}.md`);
+      writeFileSync(p, `# ${title}\n`);
+      return engine.createTask({ title, file: p, type: 'maintenance' });
+    };
+    const a = mk('Overlap A');
+    const b = mk('Overlap B');
+    const c = mk('Overlap C');
+    plantPrediction(engine, a.id, {
+      kind: 'selection',
+      paths: ['apps/cli/src/engine/fleet.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+    plantPrediction(engine, b.id, {
+      kind: 'selection',
+      paths: ['apps/cli/src/engine/fleet.ts', 'README.md'],
+      sources: { context: true, plan: true },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+    plantPrediction(engine, c.id, {
+      kind: 'selection',
+      paths: ['docs/AGENT_DRIVER.md'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+
+    const started: string[] = [];
+    const report = await runFleet(engine, {
+      maxConcurrent: 2,
+      budgetUsd: 100,
+      step: async (id) => {
+        started.push(id);
+        await new Promise((r) => setTimeout(r, 80));
+      },
+      maxIterations: 20,
+    });
+    expect(report.started).toBeGreaterThanOrEqual(2);
+    // A and B share a path — they must never both be active; C can pair with either.
+    const blocked = engine.ctx.store
+      .listWork()
+      .flatMap((w) => engine.ctx.store.listEvents(w.id))
+      .filter((e) => e.type === 'fleet.prediction-blocked');
+    expect(blocked.length).toBeGreaterThanOrEqual(1);
+
+    // Unknown never pairs with an active task.
+    const dir2 = tempProject('fleet-unknown-pred-', dirs);
+    const engine2 = new Engine(openContext(dir2));
+    mkdirSync(join(dir2, '.turbine', 'artifacts'), { recursive: true });
+    const u1 = engine2.createTask({
+      title: 'Unknown 1',
+      file: (() => {
+        const p = join(dir2, 'u1.md');
+        writeFileSync(p, '# u1\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    engine2.createTask({
+      title: 'Unknown 2',
+      file: (() => {
+        const p = join(dir2, 'u2.md');
+        writeFileSync(p, '# u2\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    plantPrediction(engine2, u1.id, {
+      kind: 'selection',
+      paths: ['a.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+    // u2 left without prediction → unknown
+    let concurrent = 0;
+    let maxSeen = 0;
+    await runFleet(engine2, {
+      maxConcurrent: 2,
+      budgetUsd: 100,
+      step: async () => {
+        concurrent += 1;
+        maxSeen = Math.max(maxSeen, concurrent);
+        await new Promise((r) => setTimeout(r, 50));
+        concurrent -= 1;
+      },
+      maxIterations: 15,
+    });
+    expect(maxSeen).toBe(1);
+    engine.ctx.store.close();
+    engine2.ctx.store.close();
+  });
+
+  it('retires expired dead-owner locks on non-candidates so they do not block admit', async () => {
+    const dir = tempProject('fleet-stale-accepted-', dirs);
+    const engine = new Engine(openContext(dir));
+    mkdirSync(join(dir, '.turbine', 'artifacts'), { recursive: true });
+    const done = engine.createTask({
+      title: 'Accepted leftover',
+      file: (() => {
+        const p = join(dir, 'accepted.md');
+        writeFileSync(p, '# accepted\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    engine.ctx.store.saveWork({
+      ...engine.ctx.store.getWork(done.id),
+      currentState: 'ACCEPTED',
+      updatedAt: new Date().toISOString(),
+    });
+    plantPrediction(engine, done.id, {
+      kind: 'selection',
+      paths: ['shared.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+
+    let nowMs = Date.parse('2026-01-01T00:00:00.000Z');
+    const held = acquireFleetLock({
+      projectRoot: dir,
+      workId: done.id,
+      runId: 'dead_run',
+      leaseMs: 1_000,
+      now: () => new Date(nowMs),
+    });
+    expect(held.ok).toBe(true);
+    if (!held.ok) return;
+    nowMs += 5_000;
+    const crashed = readFleetLock(dir, done.id)!;
+    writeFileSync(fleetLockPath(dir, done.id), `${JSON.stringify({ ...crashed, pid: 2 ** 22 }, null, 2)}\n`);
+
+    const ready = engine.createTask({
+      title: 'Ready overlap',
+      file: (() => {
+        const p = join(dir, 'ready.md');
+        writeFileSync(p, '# ready\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    plantPrediction(engine, ready.id, {
+      kind: 'selection',
+      paths: ['shared.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+
+    const report = await runFleet(engine, {
+      maxConcurrent: 1,
+      budgetUsd: 100,
+      now: () => new Date(nowMs),
+      step: async () => {},
+      maxIterations: 10,
+    });
+    expect(report.started).toBe(1);
+    expect(existsSync(fleetLockPath(dir, done.id))).toBe(false);
+    engine.ctx.store.close();
+  });
+
+  it('does not emit prediction-miss events for exact prediction matches', () => {
+    const dir = tempProject('fleet-exact-match-', dirs);
+    const engine = new Engine(openContext(dir));
+    const work = engine.createTask({
+      title: 'Exact match',
+      file: (() => {
+        const p = join(dir, 'exact.md');
+        writeFileSync(p, '# exact\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    plantPrediction(engine, work.id, {
+      kind: 'selection',
+      paths: ['a.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+    const changeBody = {
+      status: 'complete',
+      summary: 'done',
+      filesTouched: ['repo:a.ts'],
+    };
+    const location = join(dir, `.turbine/artifacts/${work.id}-change.json`);
+    mkdirSync(dirname(location), { recursive: true });
+    writeFileSync(location, `${JSON.stringify(changeBody, null, 2)}\n`);
+    engine.ctx.store.saveArtifact(
+      {
+        id: createId('art'),
+        workId: work.id,
+        type: 'change-report',
+        revision: 1,
+        contentHash: contentHash(changeBody),
+        contentType: 'application/json',
+        location,
+        createdBy: { kind: 'tool', identifier: 'test' },
+        createdAt: new Date().toISOString(),
+        parentArtifactIds: [],
+      },
+      `${JSON.stringify(changeBody, null, 2)}\n`,
+    );
+    const miss = engine.recordPredictionMisses(work.id);
+    expect(miss?.misses).toEqual([]);
+    expect(miss?.extras).toEqual([]);
+    expect(engine.ctx.store.listEvents(work.id).filter((e) => e.type === 'fleet.prediction-miss')).toHaveLength(0);
+    engine.ctx.store.close();
+  });
+
+  it('refreshes a stale file-prediction when the selection is already current', () => {
+    const dir = tempProject('fleet-pred-sync-', dirs);
+    const engine = new Engine(openContext(dir));
+    const work = engine.createTask({
+      title: 'Prediction sync',
+      file: (() => {
+        const p = join(dir, 'pred-sync.md');
+        writeFileSync(p, '# sync\n\nTouch README.md in this chore.\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    const first = engine.ensureTaskContext(work);
+    expect(first.status === 'rebuilt' || first.status === 'current').toBe(true);
+    plantPrediction(engine, work.id, {
+      kind: 'selection',
+      paths: ['stale-only.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: '2020-01-01T00:00:00.000Z',
+    });
+    const again = engine.ensureTaskContext(engine.ctx.store.getWork(work.id));
+    expect(again.status).toBe('current');
+    // ensureTaskContext(current) must refresh prediction itself — do not call refreshFilePrediction here.
+    const art = engine.ctx.store.getLatestArtifact(work.id, 'file-prediction')!;
+    const stored = parseFilePrediction(JSON.parse(engine.ctx.store.getArtifactContent(art.id)));
+    expect(stored.kind).toBe('selection');
+    if (stored.kind === 'selection') {
+      expect(stored.paths).not.toContain('stale-only.ts');
+    }
+    engine.ctx.store.close();
+  });
+
+  it('does not record prediction misses for awaiting-commits change reports', () => {
+    const dir = tempProject('fleet-awaiting-miss-', dirs);
+    const engine = new Engine(openContext(dir));
+    const work = engine.createTask({
+      title: 'Awaiting miss',
+      file: (() => {
+        const p = join(dir, 'awaiting.md');
+        writeFileSync(p, '# awaiting\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    plantPrediction(engine, work.id, {
+      kind: 'selection',
+      paths: ['a.ts', 'b.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+    const changeBody = {
+      status: 'awaiting-commits',
+      summary: 'waiting',
+      filesTouched: [] as string[],
+    };
+    const location = join(dir, `.turbine/artifacts/${work.id}-change.json`);
+    mkdirSync(dirname(location), { recursive: true });
+    writeFileSync(location, `${JSON.stringify(changeBody, null, 2)}\n`);
+    engine.ctx.store.saveArtifact(
+      {
+        id: createId('art'),
+        workId: work.id,
+        type: 'change-report',
+        revision: 1,
+        contentHash: contentHash(changeBody),
+        contentType: 'application/json',
+        location,
+        createdBy: { kind: 'tool', identifier: 'test' },
+        createdAt: new Date().toISOString(),
+        parentArtifactIds: [],
+      },
+      `${JSON.stringify(changeBody, null, 2)}\n`,
+    );
+    expect(engine.recordPredictionMisses(work.id)).toBeUndefined();
+    const misses = engine.ctx.store.listEvents(work.id).filter((e) => e.type === 'fleet.prediction-miss');
+    expect(misses).toHaveLength(0);
+    engine.ctx.store.close();
+  });
+
+  it('FR-F2/F4: prediction is labelled selection; misses feed metrics without blocking', () => {
+    const selection = parseFilePrediction({
+      kind: 'selection',
+      paths: ['a.ts', 'b.ts', 'src/../shared.ts'],
+      sources: { context: true, plan: true },
+      labelled: 'selection',
+      at: '2026-01-01T00:00:00.000Z',
+    });
+    expect(selection.kind).toBe('selection');
+    if (selection.kind === 'selection') {
+      expect(selection.labelled).toBe('selection');
+      expect(selection.paths).toContain('shared.ts');
+      expect(selection.paths).not.toContain('src/../shared.ts');
+    }
+    expect(
+      parseFilePrediction({
+        kind: 'selection',
+        paths: [],
+        sources: { context: true, plan: false },
+        labelled: 'selection',
+        at: 't',
+      }).kind,
+    ).toBe('selection');
+    expect(() =>
+      parseFilePrediction({
+        kind: 'selection',
+        paths: [' '],
+        sources: { context: true, plan: false },
+        labelled: 'selection',
+        at: 't',
+      }),
+    ).toThrow(/empty after normalize/i);
+
+    const dirBlank = tempProject('fleet-blank-ctx-', dirs);
+    const engineBlank = new Engine(openContext(dirBlank));
+    const blankWork = engineBlank.createTask({
+      title: 'Blank ctx',
+      file: (() => {
+        const p = join(dirBlank, 'blank-ctx.md');
+        writeFileSync(p, '# blank\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    const ctxLoc = join(dirBlank, `.turbine/artifacts/${blankWork.id}-ctx.json`);
+    mkdirSync(dirname(ctxLoc), { recursive: true });
+    const blankCtx = {
+      files: [{ path: ' ' }],
+      snapshot: { commit: 'abc', hash: 'h' },
+      trigger: 'initial',
+      changesCycle: 0,
+    };
+    writeFileSync(ctxLoc, `${JSON.stringify(blankCtx, null, 2)}\n`);
+    engineBlank.ctx.store.saveArtifact(
+      {
+        id: createId('art'),
+        workId: blankWork.id,
+        type: 'repo-context',
+        revision: 1,
+        contentHash: contentHash(blankCtx),
+        contentType: 'application/json',
+        location: ctxLoc,
+        createdBy: { kind: 'tool', identifier: 'test' },
+        createdAt: new Date().toISOString(),
+        parentArtifactIds: [],
+      },
+      `${JSON.stringify(blankCtx, null, 2)}\n`,
+    );
+    expect(buildFilePrediction(engineBlank.ctx.store, blankWork.id).kind).toBe('unknown');
+    engineBlank.ctx.store.close();
+
+    const dirPlan = tempProject('fleet-plan-steps-', dirs);
+    const enginePlan = new Engine(openContext(dirPlan));
+    const planWork = enginePlan.createTask({
+      title: 'Plan steps',
+      file: (() => {
+        const p = join(dirPlan, 'plan-steps.md');
+        writeFileSync(p, '# plan\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    const planLoc = join(dirPlan, `.turbine/artifacts/${planWork.id}-plan.json`);
+    mkdirSync(dirname(planLoc), { recursive: true });
+    const badPlan = { summary: 'no steps field' };
+    writeFileSync(planLoc, `${JSON.stringify(badPlan, null, 2)}\n`);
+    enginePlan.ctx.store.saveArtifact(
+      {
+        id: createId('art'),
+        workId: planWork.id,
+        type: 'plan',
+        revision: 1,
+        contentHash: contentHash(badPlan),
+        contentType: 'application/json',
+        location: planLoc,
+        createdBy: { kind: 'tool', identifier: 'test' },
+        createdAt: new Date().toISOString(),
+        parentArtifactIds: [],
+      },
+      `${JSON.stringify(badPlan, null, 2)}\n`,
+    );
+    const fromBadPlan = buildFilePrediction(enginePlan.ctx.store, planWork.id);
+    expect(fromBadPlan.kind).toBe('unknown');
+    if (fromBadPlan.kind === 'unknown') expect(fromBadPlan.reason).toMatch(/steps array/i);
+    enginePlan.ctx.store.close();
+
+    expect(blocksAdmit(selection, [])).toBe(false);
+    expect(
+      blocksAdmit(
+        { kind: 'selection', paths: ['shared.ts'], sources: { context: true, plan: false }, labelled: 'selection', at: 't' },
+        [selection],
+      ),
+    ).toBe(true);
+
+    const miss = comparePredictionToActual(['a.ts', 'b.ts'], ['a.ts', 'c.ts']);
+    expect(miss.misses).toEqual(['b.ts']);
+    expect(miss.extras).toEqual(['c.ts']);
+    expect(actualPathsFromChangeReport({ filesTouched: ['repo:a.ts', 'c.ts'] })).toEqual(['a.ts', 'c.ts']);
+
+    const dir = tempProject('fleet-miss-metrics-', dirs);
+    const engine = new Engine(openContext(dir));
+    const work = engine.createTask({
+      title: 'Miss metrics',
+      file: (() => {
+        const p = join(dir, 'miss.md');
+        writeFileSync(p, '# miss\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    engine.ctx.store.appendEvent({
+      workId: work.id,
+      type: 'fleet.prediction-miss',
+      payload: {
+        predicted: ['a.ts', 'b.ts'],
+        actual: ['a.ts'],
+        misses: ['b.ts'],
+        extras: [],
+        at: new Date().toISOString(),
+        predictionKind: 'selection',
+      },
+    });
+    const report = computeLaneMetrics(engine.ctx.store);
+    expect(report.predictionMisses.missEvents).toBe(1);
+    expect(report.predictionMisses.missedPaths).toBe(1);
+    expect(report.predictionMisses.tasksWithMisses).toBe(1);
+    engine.ctx.store.close();
+  });
+
   it('drains an in-flight step when the scheduler throws on a later claim', async () => {
     const dir = tempProject('fleet-drain-', dirs);
     const engine = new Engine(openContext(dir));
+    mkdirSync(join(dir, '.turbine', 'artifacts'), { recursive: true });
     const a = engine.createTask({
       title: 'Drain A',
       file: (() => {
@@ -670,6 +1152,21 @@ describe('fleet scheduler (Part E / #43)', () => {
       type: 'maintenance',
     });
     const [first, second] = [a, b].sort((x, y) => x.id.localeCompare(y.id));
+    // Disjoint selections so Part F admit does not block before the corrupt-lock throw.
+    plantPrediction(engine, first.id, {
+      kind: 'selection',
+      paths: ['drain-a.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+    plantPrediction(engine, second.id, {
+      kind: 'selection',
+      paths: ['drain-b.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
     mkdirSync(join(dir, '.turbine', 'fleet', 'locks'), { recursive: true });
     writeFileSync(fleetLockPath(dir, second.id), '{not-json');
     let firstFinished = false;

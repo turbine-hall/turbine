@@ -178,6 +178,14 @@ import {
   type PhaseResult,
   type SandboxHooks,
 } from '@turbine-hall/turbine-executor';
+import {
+  actualPathsFromChangeReport,
+  buildFilePrediction,
+  comparePredictionToActual,
+  readFilePrediction,
+  type FilePrediction,
+  type PredictionMiss,
+} from './file-prediction.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -779,6 +787,8 @@ export class Engine {
     accountableHuman?: string;
     /** Labels of the source issue, read by an intake adapter (lane policy eligibility). */
     labels?: string[];
+    /** Extra aliases persisted in the same create transaction (e.g. jira:KEY on import). */
+    aliases?: string[];
   }): WorkPackage {
     // Title-only create: the title *is* the request. Avoid "(No body provided)" so assess
     // can seed requirements and request coverage from something real.
@@ -789,6 +799,7 @@ export class Engine {
     const workId = createId('work');
     const createdAt = now();
     const ghLinks = githubLinksFromText(sourceText);
+    const extraAliases = (input.aliases ?? []).map((a) => a.trim()).filter(Boolean);
 
     const work: WorkPackage = {
       id: workId,
@@ -816,7 +827,7 @@ export class Engine {
       selectedRoles: [],
       currentState: 'IMPORTED',
       currentRevision: 1,
-      aliases: ghLinks.map((l) => l.alias),
+      aliases: [...new Set([...ghLinks.map((l) => l.alias), ...extraAliases])],
       createdAt,
       updatedAt: createdAt,
     };
@@ -1120,9 +1131,9 @@ export class Engine {
   /** Records a selection as the next `repo-context` artifact, pinned to the Layer 1 snapshot it was read at. */
   private saveTaskContext(work: WorkPackage, selection: TaskContext): void {
     const source = this.ctx.store.getLatestArtifact(work.id, 'source');
-    // The record and its audit event are one unit: if the event cannot be written, the record is rolled back too,
-    // so a retry saves both instead of finding a "current" selection whose event is missing for good.
-    const written: { location?: string } = {};
+    // Selection + prediction + their audit events are one unit: a failed prediction refresh must not leave a
+    // current selection paired with an older file-prediction (fleet would miss conflicts).
+    const written: { location?: string; predictionLocation?: string } = {};
     try {
       this.ctx.store.transaction(() => {
         written.location = this.saveArtifact({
@@ -1145,11 +1156,111 @@ export class Engine {
             changesCycle: selection.changesCycle,
           },
         });
+        const prediction = buildFilePrediction(this.ctx.store, work.id);
+        written.predictionLocation = this.saveArtifact({
+          workId: work.id,
+          type: 'file-prediction',
+          content: prediction,
+          createdBy: { kind: 'tool', identifier: 'file-prediction' },
+        }).location;
+        this.ctx.store.appendEvent({
+          workId: work.id,
+          type: 'fleet.prediction-recorded',
+          payload: {
+            kind: prediction.kind,
+            pathCount: prediction.kind === 'selection' ? prediction.paths.length : 0,
+            reason: prediction.kind === 'unknown' ? prediction.reason : undefined,
+            at: prediction.at,
+          },
+        });
       });
     } catch (e) {
       if (written.location) rmSync(written.location, { force: true }); // the rolled-back revision's file
+      if (written.predictionLocation) rmSync(written.predictionLocation, { force: true });
       throw e;
     }
+  }
+
+  /** Persist a selection-labelled predicted file set (or unknown) for fleet conflict checks. */
+  refreshFilePrediction(idOrAlias: string): FilePrediction {
+    const work = this.ctx.store.getWork(idOrAlias);
+    const prediction = buildFilePrediction(this.ctx.store, work.id);
+    this.saveArtifact({
+      workId: work.id,
+      type: 'file-prediction',
+      content: prediction,
+      createdBy: { kind: 'tool', identifier: 'file-prediction' },
+    });
+    this.ctx.store.appendEvent({
+      workId: work.id,
+      type: 'fleet.prediction-recorded',
+      payload: {
+        kind: prediction.kind,
+        pathCount: prediction.kind === 'selection' ? prediction.paths.length : 0,
+        reason: prediction.kind === 'unknown' ? prediction.reason : undefined,
+        at: prediction.at,
+      },
+    });
+    return prediction;
+  }
+
+  /**
+   * Fail closed for fleet: never leave a current selection paired with a stale prediction after a refresh error.
+   * Writes an `unknown` prediction so admit refuses overlap checks until a successful refresh.
+   */
+  private recordUnknownPrediction(workId: string, reason: string): void {
+    const at = now();
+    this.saveArtifact({
+      workId,
+      type: 'file-prediction',
+      content: { kind: 'unknown', reason, labelled: 'selection', at },
+      createdBy: { kind: 'tool', identifier: 'file-prediction' },
+    });
+    this.ctx.store.appendEvent({
+      workId,
+      type: 'fleet.prediction-recorded',
+      payload: { kind: 'unknown', pathCount: 0, reason, at },
+    });
+  }
+
+  /** Compare prediction to the latest change-report; record misses without blocking. */
+  recordPredictionMisses(idOrAlias: string): PredictionMiss | undefined {
+    const work = this.ctx.store.getWork(idOrAlias);
+    const change = this.ctx.store.getLatestArtifact(work.id, 'change-report');
+    if (!change) return undefined;
+    let changeContent: unknown;
+    try {
+      changeContent = JSON.parse(this.ctx.store.getArtifactContent(change.id));
+    } catch (e) {
+      throw err(
+        'E_UNSAFE_EXECUTION',
+        `prediction miss: unreadable change-report for ${work.id}: ${(e as Error).message.split('\n')[0]}`,
+      );
+    }
+    // awaiting-commits reports still carry filesTouched: [] — do not count every predicted path as a miss yet.
+    if (
+      changeContent &&
+      typeof changeContent === 'object' &&
+      (changeContent as { status?: unknown }).status === 'awaiting-commits'
+    ) {
+      return undefined;
+    }
+    const prediction = readFilePrediction(this.ctx.store, work.id);
+    const predicted = prediction.kind === 'selection' ? prediction.paths : [];
+    const actual = actualPathsFromChangeReport(changeContent);
+    const miss = comparePredictionToActual(predicted, actual);
+    // Exact matches are comparisons, not miss events — only record when something disagreed.
+    if (miss.misses.length === 0 && miss.extras.length === 0) return miss;
+    this.ctx.store.appendEvent({
+      workId: work.id,
+      type: 'fleet.prediction-miss',
+      payload: {
+        ...miss,
+        predictionKind: prediction.kind,
+        changeArtifactId: change.id,
+      },
+    });
+    return miss;
   }
 
   /**
@@ -1170,6 +1281,19 @@ export class Engine {
       previous: this.latestTaskContext(work.id),
       save: (selection) => this.saveTaskContext(work, selection),
     });
+    // Rebuilt selections refresh prediction inside saveTaskContext. A current selection still needs a refresh
+    // so a stale/out-of-band file-prediction cannot survive the next ensure.
+    if (result.status === 'current') {
+      try {
+        this.refreshFilePrediction(work.id);
+      } catch (e) {
+        this.recordUnknownPrediction(
+          work.id,
+          `prediction refresh failed: ${(e as Error).message.split('\n')[0]}`,
+        );
+        throw e;
+      }
+    }
     this.writeTaskContext(
       work,
       result.status === 'unavailable' ? { unavailable: result.reason } : { selection: result.selection, stale: [] },
@@ -1834,6 +1958,8 @@ export class Engine {
         });
         this.ctx.store.saveEdge(edge);
       }
+
+      this.refreshFilePrediction(work.id);
 
       const next = transition(current, 'PLAN_REVIEW');
       this.ctx.store.saveWork(next);
@@ -3894,6 +4020,16 @@ export class Engine {
           affectedObligationIds: ['obl_code_review', 'obl_automated_checks', 'obl_manual_sqa'],
         }),
       );
+    }
+    try {
+      this.recordPredictionMisses(workId);
+    } catch (e) {
+      // Miss recording must not block the change-report publish; surface via event.
+      this.ctx.store.appendEvent({
+        workId,
+        type: 'fleet.prediction-miss-failed',
+        payload: { reason: (e as Error).message.split('\n')[0], changeArtifactId: saved.id },
+      });
     }
     return saved;
   }
