@@ -33,6 +33,21 @@ function nowIso(): string {
 }
 
 /**
+ * Neutralize GitHub issue URLs in import body text so `createTask` does not attach
+ * another issue's `github:owner/repo#n` alias to this task.
+ */
+export function scrubForeignGitHubIssueUrls(body: string, keepExternalId?: string): string {
+  return body.replace(
+    /https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/issues\/(\d+)/gi,
+    (full, owner: string, repo: string, num: string) => {
+      const key = `${owner}/${repo}#${num}`;
+      if (keepExternalId && key.toLowerCase() === keepExternalId.toLowerCase()) return full;
+      return `github-issue ${owner}/${repo}#${num}`;
+    },
+  );
+}
+
+/**
  * Bulk-create tasks from tracker issues. Skips issues that already have a task and
  * records a non-silent reason for every skip (AGENTS.md rule 9).
  */
@@ -76,7 +91,16 @@ export function importTasks(engine: Engine, issues: ImportIssue[]): ImportReport
       continue;
     }
 
-    const text = `# ${issue.title}\n\n${issue.body ?? ''}\n`;
+    const keepId = issue.provider === 'github' ? issue.externalId : undefined;
+    const body = scrubForeignGitHubIssueUrls(issue.body ?? '', keepId);
+    // Include this issue's own URL so createTask can record the matching github alias in one save.
+    const ownUrl =
+      issue.provider === 'github' && issue.url
+        ? `\n\nSource: ${issue.url}\n`
+        : issue.provider === 'github'
+          ? `\n\nSource: https://github.com/${issue.externalId.replace('#', '/issues/')}\n`
+          : '';
+    const text = `# ${issue.title}\n\n${body}${ownUrl}`;
     const work = engine.createTask({
       title: issue.title,
       type: 'feature',
@@ -84,7 +108,8 @@ export function importTasks(engine: Engine, issues: ImportIssue[]): ImportReport
       labels: issue.labels,
     });
 
-    const aliases = [...new Set([...(work.aliases ?? []), issue.alias])];
+    // Only this issue's tracker identity — never keep aliases mined from body links to other issues.
+    const aliases = [issue.alias];
     if (issue.provider === 'jira' && !aliases.includes(issue.externalId)) {
       aliases.push(issue.externalId);
     }
@@ -100,7 +125,6 @@ export function importTasks(engine: Engine, issues: ImportIssue[]): ImportReport
           snapshotHash: work.sourceRefs[0]!.snapshotHash,
           ...(issue.labels?.length ? { labels: [...new Set(issue.labels)] } : {}),
         },
-        ...work.sourceRefs.filter((r) => r.provider !== issue.provider),
       ],
       updatedAt: nowIso(),
     };

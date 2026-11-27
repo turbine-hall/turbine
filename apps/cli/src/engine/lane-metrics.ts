@@ -207,7 +207,8 @@ export function computeLaneMetrics(
     };
   });
 
-  const missEvents = work.flatMap((item) =>
+  // Use allWork so misses on older tasks still count when their event time is in-period.
+  const missEvents = allWork.flatMap((item) =>
     store
       .listEvents(item.id)
       .filter((event) => event.type === 'fleet.prediction-miss')

@@ -5,6 +5,7 @@ import {
   importTasks,
   issuesFromGitHubFixture,
   issuesFromJiraFixture,
+  scrubForeignGitHubIssueUrls,
 } from '../../apps/cli/src/engine/task-import.js';
 import { cleanup, tempProject } from './fixture.js';
 
@@ -12,6 +13,34 @@ const dirs: string[] = [];
 afterEach(() => cleanup(dirs));
 
 describe('task import (Part F / #50)', () => {
+  it('does not let a body link claim another issue alias', () => {
+    const dir = tempProject('import-link-', dirs);
+    const engine = new Engine(openContext(dir));
+    const issues = issuesFromGitHubFixture('acme', 'widgets', {
+      issues: [
+        {
+          number: 1,
+          title: 'First',
+          body: 'See https://github.com/acme/widgets/issues/2 for context',
+          labels: ['bug'],
+        },
+        { number: 2, title: 'Second', body: 'standalone', labels: ['bug'] },
+      ],
+    });
+    const report = importTasks(engine, issues);
+    expect(report.created).toHaveLength(2);
+    expect(report.skipped).toHaveLength(0);
+    const first = engine.ctx.store.getWork('github:acme/widgets#1');
+    const second = engine.ctx.store.getWork('github:acme/widgets#2');
+    expect(first.id).not.toBe(second.id);
+    expect(first.aliases).toEqual(['github:acme/widgets#1']);
+    expect(second.aliases).toEqual(['github:acme/widgets#2']);
+    expect(scrubForeignGitHubIssueUrls('see https://github.com/acme/widgets/issues/9', 'acme/widgets#1')).toContain(
+      'github-issue acme/widgets#9',
+    );
+    engine.ctx.store.close();
+  });
+
   it('FR-001: creates tasks for new GitHub issues and skips existing with a recorded reason', () => {
     const dir = tempProject('import-gh-', dirs);
     const engine = new Engine(openContext(dir));

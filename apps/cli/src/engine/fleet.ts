@@ -365,8 +365,13 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
               continue;
             }
             // Part F: refuse admit when predicted file sets overlap or either is unknown.
+            // Include locks held by other fleet runs, not only this process's `active` map.
             const candidatePred = readFilePrediction(engine.ctx.store, fresh.id);
-            const activePreds: FilePrediction[] = [...active.keys()].map((id) =>
+            const lockedIds = new Set([
+              ...active.keys(),
+              ...listFleetLockedWorkIds(engine.ctx.projectRoot).filter((id) => id !== fresh.id),
+            ]);
+            const activePreds: FilePrediction[] = [...lockedIds].map((id) =>
               readFilePrediction(engine.ctx.store, id),
             );
             if (blocksAdmit(candidatePred, activePreds)) {

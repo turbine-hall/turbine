@@ -687,7 +687,7 @@ task
   .option('--jira <jql>', 'Import Jira issues matching JQL (requires --fixture in CI; JQL recorded for operators)')
   .option('--fixture <path>', 'JSON fixture of issues (required without live tokens)')
   .option('--json')
-  .action((opts) => {
+  .action(async (opts) => {
     try {
       const engine = withEngine();
       const hasGh = Boolean(opts.github);
@@ -712,6 +712,7 @@ task
         issues = issuesFromJiraFixture(fixture);
       }
       const report = importTasks(engine, issues);
+      await engine.waitForMirror();
       printResult(report, !!opts.json);
       engine.ctx.store.close();
     } catch (e) {

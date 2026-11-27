@@ -779,14 +779,24 @@ describe('fleet scheduler (Part E / #43)', () => {
   it('FR-F2/F4: prediction is labelled selection; misses feed metrics without blocking', () => {
     const selection = parseFilePrediction({
       kind: 'selection',
-      paths: ['a.ts', 'b.ts'],
+      paths: ['a.ts', 'b.ts', 'src/../shared.ts'],
       sources: { context: true, plan: true },
       labelled: 'selection',
       at: '2026-01-01T00:00:00.000Z',
     });
     expect(selection.kind).toBe('selection');
-    if (selection.kind === 'selection') expect(selection.labelled).toBe('selection');
+    if (selection.kind === 'selection') {
+      expect(selection.labelled).toBe('selection');
+      expect(selection.paths).toContain('shared.ts');
+      expect(selection.paths).not.toContain('src/../shared.ts');
+    }
     expect(blocksAdmit(selection, [])).toBe(false);
+    expect(
+      blocksAdmit(
+        { kind: 'selection', paths: ['shared.ts'], sources: { context: true, plan: false }, labelled: 'selection', at: 't' },
+        [selection],
+      ),
+    ).toBe(true);
 
     const miss = comparePredictionToActual(['a.ts', 'b.ts'], ['a.ts', 'c.ts']);
     expect(miss.misses).toEqual(['b.ts']);
@@ -826,6 +836,7 @@ describe('fleet scheduler (Part E / #43)', () => {
   it('drains an in-flight step when the scheduler throws on a later claim', async () => {
     const dir = tempProject('fleet-drain-', dirs);
     const engine = new Engine(openContext(dir));
+    mkdirSync(join(dir, '.turbine', 'artifacts'), { recursive: true });
     const a = engine.createTask({
       title: 'Drain A',
       file: (() => {
@@ -845,6 +856,21 @@ describe('fleet scheduler (Part E / #43)', () => {
       type: 'maintenance',
     });
     const [first, second] = [a, b].sort((x, y) => x.id.localeCompare(y.id));
+    // Disjoint selections so Part F admit does not block before the corrupt-lock throw.
+    plantPrediction(engine, first.id, {
+      kind: 'selection',
+      paths: ['drain-a.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+    plantPrediction(engine, second.id, {
+      kind: 'selection',
+      paths: ['drain-b.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
     mkdirSync(join(dir, '.turbine', 'fleet', 'locks'), { recursive: true });
     writeFileSync(fleetLockPath(dir, second.id), '{not-json');
     let firstFinished = false;

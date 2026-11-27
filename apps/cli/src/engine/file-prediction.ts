@@ -33,10 +33,21 @@ export type PredictionMiss = {
 function normalizePath(raw: string): string {
   const trimmed = raw.trim().replace(/\\/g, '/');
   const colon = trimmed.indexOf(':');
-  if (colon > 0 && /^[a-z0-9._-]+$/i.test(trimmed.slice(0, colon))) {
-    return trimmed.slice(colon + 1).replace(/^\.\//, '');
+  let path =
+    colon > 0 && /^[a-z0-9._-]+$/i.test(trimmed.slice(0, colon))
+      ? trimmed.slice(colon + 1)
+      : trimmed;
+  path = path.replace(/\/+/g, '/').replace(/^\.\//, '');
+  const parts: string[] = [];
+  for (const seg of path.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') {
+      if (parts.length > 0) parts.pop();
+      continue;
+    }
+    parts.push(seg);
   }
-  return trimmed.replace(/^\.\//, '');
+  return parts.join('/');
 }
 
 function readArtifactJson(store: WorkStore, art: { id: string }): unknown {
