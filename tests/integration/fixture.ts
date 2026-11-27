@@ -15,7 +15,8 @@ export function git(cwd: string, ...args: string[]) {
 export function makeRepo(prefix: string, dirs: string[]): string {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   dirs.push(dir);
-  git(dir, 'init', '-q');
+  // Explicit `main` so resolveBaseCommit(git.defaultBaseBranch) finds refs/heads/main.
+  git(dir, 'init', '-q', '-b', 'main');
   git(dir, 'config', 'user.email', 'test@example.com');
   git(dir, 'config', 'user.name', 'Test');
   writeFileSync(join(dir, 'README.md'), '# fixture\n');

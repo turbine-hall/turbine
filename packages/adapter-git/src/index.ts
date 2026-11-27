@@ -159,6 +159,9 @@ export function changedFiles(path: string, base: string, head = 'HEAD'): Changed
 
 export function diffStat(path: string, base: string, head = 'HEAD'): { insertions: number; deletions: number } {
   const r = git(path, ['diff', '--no-ext-diff', '--numstat', `${base}...${head}`]);
+  if (r.status !== 0) {
+    throw err('E_ADAPTER', r.stderr.trim() || `git diff --numstat failed for ${base}...${head}`);
+  }
   let insertions = 0;
   let deletions = 0;
   for (const line of r.stdout.split('\n').filter(Boolean)) {

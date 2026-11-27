@@ -210,6 +210,11 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
             if (remoteSha !== headSha) {
               throw err('E_STALE_REVISION', `Remote branch ${head} is ${remoteSha.slice(0, 8)}, not ${headSha.slice(0, 8)}`);
             }
+            // Match GitHub: refuse PRs with no commits between base and head when base tip is known.
+            const baseTip = config.fixtures.refs[repoKey]?.[base];
+            if (baseTip && baseTip === headSha) {
+              throw err('E_ADAPTER', 'No commits between base and head');
+            }
           }
           const list = (config.fixtures.pullRequests ??= {})[repoKey] ??= [];
           const existing = list.find((pr) => pr.head === head && pr.base === base && pr.state === 'open');
