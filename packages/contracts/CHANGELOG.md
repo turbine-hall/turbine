@@ -1,5 +1,11 @@
 # @turbine-hall/turbine-contracts
 
+## 0.6.1
+
+### Patch Changes
+
+- Harden defaultBaseBranch resolution, prepare worktrees before IMPLEMENTING, and open distinct subtask PR heads from the configured base.
+
 ## 0.6.0
 
 ### Minor Changes
