@@ -56,6 +56,10 @@ export function defaultConfig(projectRoot: string, name?: string): ProjectConfig
         maxExecutionAttempts: 2,
       },
     },
+    git: {
+      defaultBaseBranch: 'main',
+      maxSubtaskPrChangedLines: 400,
+    },
     tools: {
       allow: ['issue.read', 'repo.inspect', 'repo.read', 'git.diff', 'tests.run'],
       denied: ['issue.edit', 'issue.transition', 'pr.merge', 'production.deploy'],

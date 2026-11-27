@@ -329,7 +329,15 @@ export class Engine {
       adapter: this.lanePrAdapter(),
       owner: match[1]!,
       repo: match[2]!,
-      baseBranch: (this.ctx.config as { git?: { defaultBaseBranch?: string } }).git?.defaultBaseBranch ?? 'main',
+      baseBranch: this.gitDefaults().defaultBaseBranch,
+    };
+  }
+
+  private gitDefaults(): { defaultBaseBranch: string; maxSubtaskPrChangedLines: number } {
+    const git = this.ctx.config.git;
+    return {
+      defaultBaseBranch: git?.defaultBaseBranch ?? 'main',
+      maxSubtaskPrChangedLines: git?.maxSubtaskPrChangedLines ?? 400,
     };
   }
 
@@ -2223,9 +2231,7 @@ export class Engine {
 
   next(idOrAlias: string): NextStep {
     let work = this.ctx.store.getWork(idOrAlias);
-    const baseBranch =
-      (this.ctx.config as { git?: { defaultBaseBranch?: string } }).git?.defaultBaseBranch ??
-      'staging';
+    const baseBranch = this.gitDefaults().defaultBaseBranch;
     // Before anything points at CONTEXT.md, make it true for the checkout as it is now: rebuilt when the base
     // commit moved or the task re-entered CHANGES_REQUESTED. If the rebuild cannot run, the file says so;
     // the old selection is never left in place as if it were current.
@@ -2376,8 +2382,7 @@ export class Engine {
   ): Promise<TaskDecomposition> {
     // Contract: reject (do not skip) when pr.create is unavailable.
     assertPrCreateAllowed(this.ctx.config.tools);
-    const baseBranch =
-      (this.ctx.config as { git?: { defaultBaseBranch?: string } }).git?.defaultBaseBranch ?? 'main';
+    const { defaultBaseBranch: baseBranch, maxSubtaskPrChangedLines } = this.gitDefaults();
     const target = resolveDecomposerPrTarget({
       lanePrTarget: this.lanePrTarget,
       resolveFromGit: () => this.resolveLanePrTarget(),
@@ -2438,11 +2443,23 @@ export class Engine {
     }
 
     this.assertExecuteStillOwns({ workId: work.id, ...ownership });
+    // Surface breakdown before PR opens so agents/humans see the subtask count.
+    writeDecompositionPacket(this.ctx.projectRoot, work.id, renderDecompositionMarkdown(work, decomposition));
+    this.ctx.store.appendEvent({
+      workId: work.id,
+      type: 'task.decomposition-ready',
+      payload: {
+        subtaskCount: decomposition.subtasks.length,
+        subtaskIds: decomposition.subtasks.map((s) => s.id),
+        summary: decomposition.summary,
+      },
+    });
     decomposition = await openSubtaskPrs({
       work,
       decomposition,
       target,
       projectRoot: this.ctx.projectRoot,
+      maxChangedLines: maxSubtaskPrChangedLines,
       assertStillOwns: () => {
         this.assertExecuteStillOwns({ workId: work.id, ...ownership });
       },
@@ -2571,8 +2588,42 @@ export class Engine {
     // Contract: rejects when pr.create is unavailable (does not skip).
     await this.runTaskDecomposer(work, plan, spec, taskContext, ownership);
 
-    // Revalidate before the IMPLEMENTING transition so async decomposition cannot overwrite a moved task.
+    // Revalidate before worktree prep / IMPLEMENTING so async decomposition cannot overwrite a moved task.
     work = this.assertExecuteStillOwns({ workId: work.id, ...ownership });
+
+    // Prepare worktrees before IMPLEMENTING so mid-prep failures stay retryable and partial trees are recorded.
+    let repos: RepoState[];
+    if (existing.length > 0) {
+      repos = observe(existing).repos;
+    } else {
+      try {
+        repos = prepareWorktrees({
+          projectRoot: this.ctx.projectRoot,
+          work,
+          primaryChecks: this.ctx.config.quality.checks,
+          primarySetup: this.ctx.config.quality.setup,
+          baseBranch: this.gitDefaults().defaultBaseBranch,
+        });
+      } catch (e) {
+        const partial = (e as { partialRepos?: RepoState[] }).partialRepos;
+        if (partial?.length) {
+          this.saveChangeSet(work.id, partial, {
+            status: 'awaiting-commits',
+            summary: 'Partial worktrees prepared; fix repository config and retry.',
+            createdBy: { kind: 'tool', identifier: 'executor' },
+            parentArtifactIds: [plan.id],
+          });
+        }
+        throw e;
+      }
+      this.saveChangeSet(work.id, repos, {
+        status: 'awaiting-commits',
+        summary: 'Worktrees prepared. No code committed yet.',
+        createdBy: { kind: 'tool', identifier: 'executor' },
+        parentArtifactIds: [plan.id],
+      });
+    }
+
     work = transition(work, 'IMPLEMENTING');
     this.ctx.store.saveWork(work);
 
@@ -2581,16 +2632,6 @@ export class Engine {
       eec = extendEecForImplementation(eec);
       this.ctx.store.saveEec(eec);
     }
-
-    const repos =
-      existing.length > 0
-        ? observe(existing).repos
-        : prepareWorktrees({
-            projectRoot: this.ctx.projectRoot,
-            work,
-            primaryChecks: this.ctx.config.quality.checks,
-            primarySetup: this.ctx.config.quality.setup,
-          });
 
     const executionMode = this.ctx.config.execution.mode;
 
@@ -3586,7 +3627,11 @@ export class Engine {
       policyApprovals,
       laneFallback: lane.fallback,
       track: trackFor(work),
-      next: computeNextStep({ projectRoot: this.ctx.projectRoot, work }),
+      next: computeNextStep({
+        projectRoot: this.ctx.projectRoot,
+        work,
+        defaultBaseBranch: this.gitDefaults().defaultBaseBranch,
+      }),
       notes: renderNotes,
       sourceText: source?.content.text ?? work.objective,
       facts: normalizeAssessment(assessment?.content).facts,

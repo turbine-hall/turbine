@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { diffStat, resolveBaseCommit } from '@turbine-hall/turbine-adapter-git';
 import { createId, err, type WorkPackage } from '@turbine-hall/turbine-contracts';
 import type { Capability, ToolAdapter } from '@turbine-hall/turbine-tools';
 import { configAllows, type LanePrTarget } from './lane-pr.js';
@@ -114,10 +115,13 @@ export function normalizeDecomposition(content: unknown, planHash: string): Task
 }
 
 export function renderDecompositionMarkdown(work: WorkPackage, decomposition: TaskDecomposition): string {
+  const count = decomposition.subtasks.length;
   const lines = [
     `# Decomposition — ${work.title}`,
     '',
     `Parent task: \`${work.id}\``,
+    '',
+    `**Subtasks: ${count}** (${decomposition.subtasks.map((s) => s.id).join(', ') || 'none'})`,
     '',
     decomposition.summary,
     '',
@@ -194,7 +198,70 @@ export function currentHeadSha(projectRoot: string): string {
 
 /** Best-effort local branch for the subtask; remote prep is separate. */
 export function ensureLocalSubtaskBranch(projectRoot: string, branch: string, headSha: string): void {
-  spawnSync('git', ['branch', '-f', branch, headSha], { cwd: projectRoot, encoding: 'utf8' });
+  const moved = spawnSync('git', ['branch', '-f', branch, headSha], { cwd: projectRoot, encoding: 'utf8' });
+  if (moved.status !== 0) {
+    throw err(
+      'E_ADAPTER',
+      `task-decomposer could not point ${branch} at ${headSha.slice(0, 12)}: ${moved.stderr || moved.stdout}`,
+    );
+  }
+}
+
+/** Tip of an existing local branch, if present. */
+export function existingBranchTip(projectRoot: string, branch: string): string | undefined {
+  const tip = spawnSync('git', ['rev-parse', '--verify', `refs/heads/${branch}^{commit}`], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+  });
+  if (tip.status !== 0) return undefined;
+  const sha = tip.stdout.trim();
+  return sha || undefined;
+}
+
+/** Child commit of `baseSha` with the same tree so the PR head differs without product diffs. */
+export function scaffoldSubtaskHead(projectRoot: string, branch: string, baseSha: string): string {
+  const tree = spawnSync('git', ['rev-parse', `${baseSha}^{tree}`], { cwd: projectRoot, encoding: 'utf8' });
+  if (tree.status !== 0 || !tree.stdout.trim()) {
+    throw err('E_ADAPTER', `task-decomposer could not read tree for ${baseSha.slice(0, 12)}: ${tree.stderr || tree.stdout}`);
+  }
+  const commit = spawnSync('git', ['commit-tree', tree.stdout.trim(), '-p', baseSha, '-m', `turbine: scaffold ${branch}`], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'Turbine',
+      GIT_AUTHOR_EMAIL: 'turbine@local',
+      GIT_COMMITTER_NAME: 'Turbine',
+      GIT_COMMITTER_EMAIL: 'turbine@local',
+    },
+  });
+  if (commit.status !== 0 || !commit.stdout.trim()) {
+    throw err(
+      'E_ADAPTER',
+      `task-decomposer could not scaffold ${branch}: ${commit.stderr || commit.stdout}`,
+    );
+  }
+  const headSha = commit.stdout.trim();
+  ensureLocalSubtaskBranch(projectRoot, branch, headSha);
+  return headSha;
+}
+
+/** Fail closed when a subtask tip would open a mega-PR vs the configured base. */
+export function assertSubtaskPrSize(
+  projectRoot: string,
+  baseSha: string,
+  headSha: string,
+  maxChangedLines: number,
+  label: string,
+): void {
+  const { insertions, deletions } = diffStat(projectRoot, baseSha, headSha);
+  const total = insertions + deletions;
+  if (total > maxChangedLines) {
+    throw err(
+      'E_INVALID_CONFIG',
+      `Subtask ${label} would open a PR with ${total} changed lines vs base (${insertions}+/${deletions}-); git.maxSubtaskPrChangedLines is ${maxChangedLines}. Fork from git.defaultBaseBranch and keep PRs small.`,
+    );
+  }
 }
 
 /** Publish the branch tip to the remote (or fixture) so pr.create can reference it. */
@@ -233,12 +300,15 @@ export async function openSubtaskPrs(input: {
   decomposition: TaskDecomposition;
   target: LanePrTarget;
   projectRoot: string;
+  /** Max insertions+deletions vs configured base (git.maxSubtaskPrChangedLines). */
+  maxChangedLines: number;
   /** Re-check ownership before each remote write; throw to refuse stale completion. */
   assertStillOwns: () => void;
   /** Persist after each PR so a mid-loop failure can resume without re-calling the model. */
   persistProgress: (decomposition: TaskDecomposition) => void;
 }): Promise<TaskDecomposition> {
-  const headSha = currentHeadSha(input.projectRoot);
+  // Base tip comes from git.defaultBaseBranch — not the arbitrary checkout HEAD.
+  const baseSha = resolveBaseCommit(input.projectRoot, input.target.baseBranch);
   const subtasks: DecompositionSubtask[] = [];
   for (const st of input.decomposition.subtasks) {
     if (st.pr?.number && st.pr.url) {
@@ -250,7 +320,23 @@ export async function openSubtaskPrs(input: {
     const head = st.branchName.startsWith(`turbine/${input.work.id}-`)
       ? st.branchName
       : `turbine/${input.work.id}-${st.branchName}`;
-    ensureLocalSubtaskBranch(input.projectRoot, head, headSha);
+    const existingTip = existingBranchTip(input.projectRoot, head);
+    let headSha: string;
+    if (existingTip && existingTip !== baseSha) {
+      // Size-check the commits the PR will contain before any branch move/publish.
+      assertSubtaskPrSize(input.projectRoot, baseSha, existingTip, input.maxChangedLines, st.id);
+      headSha = existingTip;
+    } else {
+      // New (or at-base) branch: fork from configured base, then scaffold a distinct head for GitHub.
+      headSha = scaffoldSubtaskHead(input.projectRoot, head, baseSha);
+      assertSubtaskPrSize(input.projectRoot, baseSha, headSha, input.maxChangedLines, st.id);
+    }
+    if (headSha === baseSha) {
+      throw err(
+        'E_ADAPTER',
+        `Subtask ${st.id} PR head matches base ${input.target.baseBranch}; need at least one commit on ${head} before opening the PR`,
+      );
+    }
     await ensureRemoteSubtaskBranch({
       target: input.target,
       workId: input.work.id,

@@ -104,3 +104,54 @@ describe('execution sandbox config (FR-D6)', () => {
     expect(cfg.execution.sandboxImplementer).toBeUndefined();
   });
 });
+
+describe('git.defaultBaseBranch', () => {
+  it('defaults to main and retains an explicit base branch', () => {
+    const defaults = ProjectConfigSchema.parse(base);
+    expect(defaults.git.defaultBaseBranch).toBe('main');
+    expect(defaults.git.maxSubtaskPrChangedLines).toBe(400);
+
+    const cfg = ProjectConfigSchema.parse({
+      ...base,
+      git: { defaultBaseBranch: 'test', maxSubtaskPrChangedLines: 200 },
+    });
+    expect(cfg.git.defaultBaseBranch).toBe('test');
+    expect(cfg.git.maxSubtaskPrChangedLines).toBe(200);
+  });
+
+  it('refuses empty or invalid defaultBaseBranch', () => {
+    expect(() =>
+      ProjectConfigSchema.parse({
+        ...base,
+        git: { defaultBaseBranch: '' },
+      }),
+    ).toThrow();
+    expect(() =>
+      ProjectConfigSchema.parse({
+        ...base,
+        git: { defaultBaseBranch: 'main;rm -rf /' },
+      }),
+    ).toThrow(/git.defaultBaseBranch/);
+    expect(() =>
+      ProjectConfigSchema.parse({
+        ...base,
+        git: { defaultBaseBranch: 'foo..bar' },
+      }),
+    ).toThrow(/git.defaultBaseBranch/);
+    expect(() =>
+      ProjectConfigSchema.parse({
+        ...base,
+        git: { defaultBaseBranch: 'release/' },
+      }),
+    ).toThrow(/git.defaultBaseBranch/);
+    expect(() =>
+      ProjectConfigSchema.parse({
+        ...base,
+        git: { defaultBaseBranch: 'heads/main.lock' },
+      }),
+    ).toThrow(/git.defaultBaseBranch/);
+    expect(ProjectConfigSchema.parse({ ...base, git: { defaultBaseBranch: 'release/next' } }).git.defaultBaseBranch).toBe(
+      'release/next',
+    );
+  });
+});
