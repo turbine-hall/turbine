@@ -92,6 +92,7 @@ export function importTasks(engine: Engine, issues: ImportIssue[]): ImportReport
     }
 
     const keepId = issue.provider === 'github' ? issue.externalId : undefined;
+    const safeTitle = scrubForeignGitHubIssueUrls(issue.title, keepId);
     const body = scrubForeignGitHubIssueUrls(issue.body ?? '', keepId);
     // Include this issue's own URL so createTask can record the matching github alias in one save.
     const ownUrl =
@@ -100,20 +101,19 @@ export function importTasks(engine: Engine, issues: ImportIssue[]): ImportReport
         : issue.provider === 'github'
           ? `\n\nSource: https://github.com/${issue.externalId.replace('#', '/issues/')}\n`
           : '';
-    const text = `# ${issue.title}\n\n${body}${ownUrl}`;
+    const text = `# ${safeTitle}\n\n${body}${ownUrl}`;
+    const seedAliases = [issue.alias];
+    if (issue.provider === 'jira') seedAliases.push(issue.externalId);
     const work = engine.createTask({
-      title: issue.title,
+      title: safeTitle,
       type: 'feature',
       text,
       labels: issue.labels,
+      aliases: seedAliases,
     });
 
-    // Only this issue's tracker identity — never keep aliases mined from body links to other issues.
-    const aliases = [issue.alias];
-    if (issue.provider === 'jira' && !aliases.includes(issue.externalId)) {
-      aliases.push(issue.externalId);
-    }
-
+    // Keep only this issue's tracker identity (drop any residual foreign ghLinks).
+    const aliases = [...new Set(seedAliases)];
     const withAlias: WorkPackage = {
       ...work,
       aliases,
@@ -168,6 +168,12 @@ export function issuesFromGitHubFixture(
     if (!issue || !Number.isInteger(issue.number) || issue.number < 1) {
       throw err('E_INVALID_CONFIG', 'GitHub fixture issue needs a positive integer number');
     }
+    if (issue.labels != null && !Array.isArray(issue.labels)) {
+      throw err('E_INVALID_CONFIG', `GitHub fixture #${issue.number} labels must be a string array`);
+    }
+    if (Array.isArray(issue.labels) && issue.labels.some((l) => typeof l !== 'string')) {
+      throw err('E_INVALID_CONFIG', `GitHub fixture #${issue.number} labels must be strings`);
+    }
     const labels = issue.labels ?? [];
     if (label && !labels.includes(label)) continue;
     const externalId = `${owner}/${repo}#${issue.number}`;
@@ -197,6 +203,12 @@ export function issuesFromJiraFixture(
   return issues.map((issue) => {
     if (!issue?.key?.trim() || !issue.summary?.trim()) {
       throw err('E_INVALID_CONFIG', 'Jira fixture issue needs key and summary');
+    }
+    if (issue.labels != null && !Array.isArray(issue.labels)) {
+      throw err('E_INVALID_CONFIG', `Jira fixture ${issue.key} labels must be a string array`);
+    }
+    if (Array.isArray(issue.labels) && issue.labels.some((l) => typeof l !== 'string')) {
+      throw err('E_INVALID_CONFIG', `Jira fixture ${issue.key} labels must be strings`);
     }
     return {
       alias: `jira:${issue.key}`,

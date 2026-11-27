@@ -13,14 +13,14 @@ const dirs: string[] = [];
 afterEach(() => cleanup(dirs));
 
 describe('task import (Part F / #50)', () => {
-  it('does not let a body link claim another issue alias', () => {
+  it('does not let a body or title link claim another issue alias', () => {
     const dir = tempProject('import-link-', dirs);
     const engine = new Engine(openContext(dir));
     const issues = issuesFromGitHubFixture('acme', 'widgets', {
       issues: [
         {
           number: 1,
-          title: 'First',
+          title: 'First see https://github.com/acme/widgets/issues/2',
           body: 'See https://github.com/acme/widgets/issues/2 for context',
           labels: ['bug'],
         },
@@ -35,9 +35,39 @@ describe('task import (Part F / #50)', () => {
     expect(first.id).not.toBe(second.id);
     expect(first.aliases).toEqual(['github:acme/widgets#1']);
     expect(second.aliases).toEqual(['github:acme/widgets#2']);
+    expect(first.title).toContain('github-issue acme/widgets#2');
+    expect(first.title).not.toMatch(/github\.com\/acme\/widgets\/issues\/2/i);
     expect(scrubForeignGitHubIssueUrls('see https://github.com/acme/widgets/issues/9', 'acme/widgets#1')).toContain(
       'github-issue acme/widgets#9',
     );
+    engine.ctx.store.close();
+  });
+
+  it('rejects non-array fixture labels fail-closed', () => {
+    expect(() =>
+      issuesFromGitHubFixture('acme', 'widgets', {
+        issues: [{ number: 1, title: 'x', labels: 'bug' as unknown as string[] }],
+      }),
+    ).toThrow(/labels must be a string array/i);
+    expect(() =>
+      issuesFromJiraFixture({
+        issues: [{ key: 'OPS-9', summary: 'x', labels: 'chore' as unknown as string[] }],
+      }),
+    ).toThrow(/labels must be a string array/i);
+  });
+
+  it('FR-001: Jira create records jira:KEY and KEY aliases in one save', () => {
+    const dir = tempProject('import-jira-alias-', dirs);
+    const engine = new Engine(openContext(dir));
+    const issues = issuesFromJiraFixture({
+      issues: [{ key: 'OPS-7', summary: 'Gamma', description: 'g', labels: ['chore'] }],
+    });
+    const report = importTasks(engine, issues);
+    expect(report.created).toHaveLength(1);
+    const work = engine.ctx.store.getWork(report.created[0]!.workId);
+    expect(work.aliases.sort()).toEqual(['OPS-7', 'jira:OPS-7'].sort());
+    expect(engine.ctx.store.tryGetWork('OPS-7')?.id).toBe(work.id);
+    expect(engine.ctx.store.tryGetWork('jira:OPS-7')?.id).toBe(work.id);
     engine.ctx.store.close();
   });
 

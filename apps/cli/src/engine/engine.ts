@@ -787,6 +787,8 @@ export class Engine {
     accountableHuman?: string;
     /** Labels of the source issue, read by an intake adapter (lane policy eligibility). */
     labels?: string[];
+    /** Extra aliases persisted in the same create transaction (e.g. jira:KEY on import). */
+    aliases?: string[];
   }): WorkPackage {
     // Title-only create: the title *is* the request. Avoid "(No body provided)" so assess
     // can seed requirements and request coverage from something real.
@@ -797,6 +799,7 @@ export class Engine {
     const workId = createId('work');
     const createdAt = now();
     const ghLinks = githubLinksFromText(sourceText);
+    const extraAliases = (input.aliases ?? []).map((a) => a.trim()).filter(Boolean);
 
     const work: WorkPackage = {
       id: workId,
@@ -824,7 +827,7 @@ export class Engine {
       selectedRoles: [],
       currentState: 'IMPORTED',
       currentRevision: 1,
-      aliases: ghLinks.map((l) => l.alias),
+      aliases: [...new Set([...ghLinks.map((l) => l.alias), ...extraAliases])],
       createdAt,
       updatedAt: createdAt,
     };
