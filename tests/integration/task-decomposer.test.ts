@@ -115,7 +115,10 @@ describe('task-decomposer role', () => {
 
     const md = join(dir, '.turbine', 'tasks', work.id, 'DECOMPOSITION.md');
     expect(existsSync(md)).toBe(true);
-    expect(readFileSync(md, 'utf8')).toContain(work.id);
+    const mdText = readFileSync(md, 'utf8');
+    expect(mdText).toContain(work.id);
+    expect(mdText).toMatch(/\*\*Subtasks: \d+\*\*/);
+    expect(mdText).toContain(`**Subtasks: ${decomposition.subtasks.length}**`);
 
     const repoKey = 'fixture/project';
     const prs = github.pullRequests?.[repoKey] ?? [];
@@ -123,11 +126,16 @@ describe('task-decomposer role', () => {
     for (const pr of prs) {
       // Fixture adapter stores created PRs without body; re-read via event payload + artifact.
       expect(pr.head.startsWith(`turbine/${work.id}-`)).toBe(true);
+      // Opened from configured base tip (fixture HEAD), not an arbitrary divergent checkout.
+      expect(pr.base).toBe('main');
     }
     for (const st of decomposition.subtasks) {
       expect(st.pr!.url).toContain('/pull/');
       expect(st.requirementIds.length).toBeGreaterThan(0);
     }
+    const ready = engine.ctx.store.listEvents(work.id).filter((e) => e.type === 'task.decomposition-ready');
+    expect(ready).toHaveLength(1);
+    expect((ready[0]!.payload as { subtaskCount: number }).subtaskCount).toBe(decomposition.subtasks.length);
     const events = engine.ctx.store.listEvents(work.id).filter((e) => e.type === 'task.decomposed');
     expect(events).toHaveLength(1);
   });

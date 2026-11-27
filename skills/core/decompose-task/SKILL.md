@@ -24,8 +24,10 @@ Produce structured JSON matching schema `task-decomposition`:
 
 - Prefer 2–6 subtasks for normal work; a single subtask is allowed when the change is already small.
 - Every requirement ID from the approved plan/spec must appear in at least one subtask.
-- Each subtask must be small enough for one focused PR (one concern, limited files).
+- Each subtask must be small enough for one focused PR (one concern, limited files; aim under ~200–400 changed lines vs the configured base branch).
+- Split backend vs frontend (or other repos) into separate subtasks when both are in scope.
 - `title` becomes the PR title; `description` becomes the PR body (engine adds work id + requirement list).
 - `branchName` is optional; when omitted the engine uses `st-<id>` (lowercased).
 - Do not invent business decisions. Do not approve requirements, plans, merges, or deployments.
 - Do not claim tool grants.
+- The engine opens each PR against `git.defaultBaseBranch` from a tip at that base — do not assume the current checkout branch.

@@ -329,7 +329,15 @@ export class Engine {
       adapter: this.lanePrAdapter(),
       owner: match[1]!,
       repo: match[2]!,
-      baseBranch: (this.ctx.config as { git?: { defaultBaseBranch?: string } }).git?.defaultBaseBranch ?? 'main',
+      baseBranch: this.gitDefaults().defaultBaseBranch,
+    };
+  }
+
+  private gitDefaults(): { defaultBaseBranch: string; maxSubtaskPrChangedLines: number } {
+    const git = this.ctx.config.git;
+    return {
+      defaultBaseBranch: git?.defaultBaseBranch ?? 'main',
+      maxSubtaskPrChangedLines: git?.maxSubtaskPrChangedLines ?? 400,
     };
   }
 
@@ -2223,9 +2231,7 @@ export class Engine {
 
   next(idOrAlias: string): NextStep {
     let work = this.ctx.store.getWork(idOrAlias);
-    const baseBranch =
-      (this.ctx.config as { git?: { defaultBaseBranch?: string } }).git?.defaultBaseBranch ??
-      'staging';
+    const baseBranch = this.gitDefaults().defaultBaseBranch;
     // Before anything points at CONTEXT.md, make it true for the checkout as it is now: rebuilt when the base
     // commit moved or the task re-entered CHANGES_REQUESTED. If the rebuild cannot run, the file says so;
     // the old selection is never left in place as if it were current.
@@ -2376,8 +2382,7 @@ export class Engine {
   ): Promise<TaskDecomposition> {
     // Contract: reject (do not skip) when pr.create is unavailable.
     assertPrCreateAllowed(this.ctx.config.tools);
-    const baseBranch =
-      (this.ctx.config as { git?: { defaultBaseBranch?: string } }).git?.defaultBaseBranch ?? 'main';
+    const { defaultBaseBranch: baseBranch, maxSubtaskPrChangedLines } = this.gitDefaults();
     const target = resolveDecomposerPrTarget({
       lanePrTarget: this.lanePrTarget,
       resolveFromGit: () => this.resolveLanePrTarget(),
@@ -2438,11 +2443,23 @@ export class Engine {
     }
 
     this.assertExecuteStillOwns({ workId: work.id, ...ownership });
+    // Surface breakdown before PR opens so agents/humans see the subtask count.
+    writeDecompositionPacket(this.ctx.projectRoot, work.id, renderDecompositionMarkdown(work, decomposition));
+    this.ctx.store.appendEvent({
+      workId: work.id,
+      type: 'task.decomposition-ready',
+      payload: {
+        subtaskCount: decomposition.subtasks.length,
+        subtaskIds: decomposition.subtasks.map((s) => s.id),
+        summary: decomposition.summary,
+      },
+    });
     decomposition = await openSubtaskPrs({
       work,
       decomposition,
       target,
       projectRoot: this.ctx.projectRoot,
+      maxChangedLines: maxSubtaskPrChangedLines,
       assertStillOwns: () => {
         this.assertExecuteStillOwns({ workId: work.id, ...ownership });
       },
@@ -2590,6 +2607,7 @@ export class Engine {
             work,
             primaryChecks: this.ctx.config.quality.checks,
             primarySetup: this.ctx.config.quality.setup,
+            baseBranch: this.gitDefaults().defaultBaseBranch,
           });
 
     const executionMode = this.ctx.config.execution.mode;

@@ -80,10 +80,12 @@ function computeNextStepRaw(input: {
   confirmToken?: string;
 }): NextStep {
   const { projectRoot, work } = input;
-  const base = input.defaultBaseBranch ?? 'staging';
+  const base = input.defaultBaseBranch ?? 'main';
   const paths = packetPaths(projectRoot, work.id);
   const wt = worktreePathFor(projectRoot, work.id);
   const branch = branchFor(work.id);
+  const decompositionPath = join(projectRoot, '.turbine', 'tasks', work.id, 'DECOMPOSITION.md');
+  const hasDecomposition = existsSync(decompositionPath);
   // The files an agent reads before it plans or implements (only those that exist).
   const roleIds = new Set(work.selectedRoles.map((r) => r.id));
   const roleBrief = briefSectionsFor(loadRoles(factoryRoot()).filter((r) => roleIds.has(r.id)));
@@ -212,21 +214,23 @@ function computeNextStepRaw(input: {
     case 'PLAN_APPROVED':
       return {
         ...baseStep,
-        summary: 'Create supervised worktree handoff.',
+        summary: 'Create supervised worktree handoff (decompose into small PRs from the configured base).',
         who: 'either',
-        doNow: 'Run sync (execute). Then implement ONLY in the worktree listed in STATUS.md.',
+        doNow: `Run sync (execute). Confirm git.defaultBaseBranch is ${base}. After decompose, read DECOMPOSITION.md for the subtask count, then implement ONLY in the worktree.`,
         commands: [sync, next],
         openFiles: [paths.status, ...contextFiles],
         worktreePath: wt,
         branch,
         important: [
           ...commonImportant,
-          `After execute, open ${paths.executionBrief} and cd into the worktree — not the main checkout.`,
+          `Worktrees/PRs fork from git.defaultBaseBranch (${base}), not the current checkout.`,
+          `After execute, open DECOMPOSITION.md (subtask count) and ${paths.executionBrief}; cd into the worktree — not the main checkout.`,
         ],
         agentPlaybook: [
           readFirst('implementing', knowledgeOk),
           briefNote,
           'Run turbine task sync <id> (execute).',
+          'Tell the human the DECOMPOSITION.md subtask count and each ST* / PR url.',
           'Read SPEC.md → Requirements and PLAN.md; follow the plan steps and file list.',
           'Make all code changes in the worktree path.',
           'Commit on the turbine/* branch in the worktree.',
@@ -238,20 +242,34 @@ function computeNextStepRaw(input: {
     case 'CHANGES_REQUESTED':
       return {
         ...baseStep,
-        summary: 'Write and commit the code in the worktree; sync captures the commit.',
+        summary: hasDecomposition
+          ? 'Task breakdown is ready; write and commit code in the worktree (small PRs).'
+          : 'Write and commit the code in the worktree; sync captures the commit.',
         who: 'agent',
         doNow: existsSync(wt)
-          ? `Work in worktree ${wt} on ${branch}. Commit there. Then sync.`
+          ? `${hasDecomposition ? `Read DECOMPOSITION.md (subtask count), then w` : 'W'}ork in worktree ${wt} on ${branch}. Commit there. Then sync.`
           : 'Run sync to (re)create worktree, then implement there.',
         commands: existsSync(wt)
           ? [`cd "${wt}"`, 'git status', 'git log -1 --oneline', `cd "${projectRoot}"`, sync, next]
           : [sync, next],
-        openFiles: [...[paths.executionBrief, paths.status].filter((p) => existsSync(p)), ...contextFiles],
+        openFiles: [
+          ...[paths.executionBrief, paths.status, ...(hasDecomposition ? [decompositionPath] : [])].filter((p) =>
+            existsSync(p),
+          ),
+          ...contextFiles,
+        ],
         worktreePath: existsSync(wt) ? wt : undefined,
         branch,
+        important: [
+          ...commonImportant,
+          `PRs target ${base} (git.defaultBaseBranch). Keep each subtask PR small.`,
+        ],
         agentPlaybook: [
           readFirst('implementing', knowledgeOk),
           briefNote,
+          hasDecomposition
+            ? 'Open DECOMPOSITION.md and report subtask count + ST* list to the human.'
+            : 'If DECOMPOSITION.md is missing, re-run sync/execute.',
           'Never commit on staging/main for this task.',
           'Implement + typecheck in worktree.',
           'Commit on turbine/* branch.',

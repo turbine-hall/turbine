@@ -62,10 +62,16 @@ export function prepareWorktrees(input: {
   work: WorkPackage;
   primaryChecks: string[];
   primarySetup: string[];
+  /** Fork from this branch (git.defaultBaseBranch), not the current checkout. */
+  baseBranch?: string;
 }): RepoState[] {
   const { projectRoot, work } = input;
   const out: RepoState[] = [];
-  const primary = createWorktree({ repoRoot: projectRoot, workId: work.id });
+  const primary = createWorktree({
+    repoRoot: projectRoot,
+    workId: work.id,
+    baseBranch: input.baseBranch,
+  });
   out.push({
     name: primaryName(projectRoot),
     root: inspectRepo(projectRoot).root,
@@ -78,17 +84,23 @@ export function prepareWorktrees(input: {
     primary: true,
   });
   for (const repo of work.repositories ?? []) {
-    out.push(prepareExtra(projectRoot, work.id, repo));
+    out.push(prepareExtra(projectRoot, work.id, repo, input.baseBranch));
   }
   return out;
 }
 
-function prepareExtra(projectRoot: string, workId: string, repo: RepoRef): RepoState {
+function prepareExtra(
+  projectRoot: string,
+  workId: string,
+  repo: RepoRef,
+  baseBranch?: string,
+): RepoState {
   if (!existsSync(repo.path)) throw err('E_NOT_FOUND', `Repository ${repo.name} not found at ${repo.path}`);
   const wt = createWorktree({
     repoRoot: repo.path,
     workId,
     worktreePath: worktreePathFor(projectRoot, workId, repo.name),
+    baseBranch,
   });
   return {
     name: repo.name,

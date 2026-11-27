@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { diffStat, resolveBaseCommit } from '@turbine-hall/turbine-adapter-git';
 import { createId, err, type WorkPackage } from '@turbine-hall/turbine-contracts';
 import type { Capability, ToolAdapter } from '@turbine-hall/turbine-tools';
 import { configAllows, type LanePrTarget } from './lane-pr.js';
@@ -114,10 +115,13 @@ export function normalizeDecomposition(content: unknown, planHash: string): Task
 }
 
 export function renderDecompositionMarkdown(work: WorkPackage, decomposition: TaskDecomposition): string {
+  const count = decomposition.subtasks.length;
   const lines = [
     `# Decomposition — ${work.title}`,
     '',
     `Parent task: \`${work.id}\``,
+    '',
+    `**Subtasks: ${count}** (${decomposition.subtasks.map((s) => s.id).join(', ') || 'none'})`,
     '',
     decomposition.summary,
     '',
@@ -194,7 +198,31 @@ export function currentHeadSha(projectRoot: string): string {
 
 /** Best-effort local branch for the subtask; remote prep is separate. */
 export function ensureLocalSubtaskBranch(projectRoot: string, branch: string, headSha: string): void {
-  spawnSync('git', ['branch', '-f', branch, headSha], { cwd: projectRoot, encoding: 'utf8' });
+  const moved = spawnSync('git', ['branch', '-f', branch, headSha], { cwd: projectRoot, encoding: 'utf8' });
+  if (moved.status !== 0) {
+    throw err(
+      'E_ADAPTER',
+      `task-decomposer could not point ${branch} at ${headSha.slice(0, 12)}: ${moved.stderr || moved.stdout}`,
+    );
+  }
+}
+
+/** Fail closed when a subtask tip would open a mega-PR vs the configured base. */
+export function assertSubtaskPrSize(
+  projectRoot: string,
+  baseSha: string,
+  headSha: string,
+  maxChangedLines: number,
+  label: string,
+): void {
+  const { insertions, deletions } = diffStat(projectRoot, baseSha, headSha);
+  const total = insertions + deletions;
+  if (total > maxChangedLines) {
+    throw err(
+      'E_INVALID_CONFIG',
+      `Subtask ${label} would open a PR with ${total} changed lines vs base (${insertions}+/${deletions}-); git.maxSubtaskPrChangedLines is ${maxChangedLines}. Fork from git.defaultBaseBranch and keep PRs small.`,
+    );
+  }
 }
 
 /** Publish the branch tip to the remote (or fixture) so pr.create can reference it. */
@@ -233,12 +261,16 @@ export async function openSubtaskPrs(input: {
   decomposition: TaskDecomposition;
   target: LanePrTarget;
   projectRoot: string;
+  /** Max insertions+deletions vs configured base (git.maxSubtaskPrChangedLines). */
+  maxChangedLines: number;
   /** Re-check ownership before each remote write; throw to refuse stale completion. */
   assertStillOwns: () => void;
   /** Persist after each PR so a mid-loop failure can resume without re-calling the model. */
   persistProgress: (decomposition: TaskDecomposition) => void;
 }): Promise<TaskDecomposition> {
-  const headSha = currentHeadSha(input.projectRoot);
+  // Subtask PR tips start at the configured base — not whatever the main checkout has checked out.
+  const baseSha = resolveBaseCommit(input.projectRoot, input.target.baseBranch);
+  const headSha = baseSha;
   const subtasks: DecompositionSubtask[] = [];
   for (const st of input.decomposition.subtasks) {
     if (st.pr?.number && st.pr.url) {
@@ -251,6 +283,7 @@ export async function openSubtaskPrs(input: {
       ? st.branchName
       : `turbine/${input.work.id}-${st.branchName}`;
     ensureLocalSubtaskBranch(input.projectRoot, head, headSha);
+    assertSubtaskPrSize(input.projectRoot, baseSha, headSha, input.maxChangedLines, st.id);
     await ensureRemoteSubtaskBranch({
       target: input.target,
       workId: input.work.id,
