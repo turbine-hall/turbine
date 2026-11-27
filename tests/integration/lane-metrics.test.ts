@@ -135,7 +135,7 @@ describe('autonomous lane metrics and audits (Part G)', () => {
     engine.ctx.store.close();
     const denied = run(dir, ['audit', 'record', recorded.audit!.id, '--ok']);
     expect(denied.status).not.toBe(0);
-    expect(`${denied.stdout}${denied.stderr}`).toMatch(/human decision|interactive terminal/i);
+    expect(`${denied.stdout}${denied.stderr}`).toMatch(/needs a TTY/i);
   });
 
   it('AC18 / FR-G4: audit threshold auto-suspends and the next eligible task falls back to humans', async () => {

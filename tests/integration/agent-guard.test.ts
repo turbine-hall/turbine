@@ -23,6 +23,11 @@ const blocked = [
   'turbine task accept work_1',
   'sqlite3 .turbine/state/engine.db "update approvals set data=1"',
   'echo x > .turbine/state/engine.db',
+  // Mediated approve must not exempt a redirect into protected state.
+  'turbine task approve work_1 --confirm abcdef12 --by Ada > .turbine/state/engine.db',
+  'turbine task approve work_1 --confirm abcdef12 --by Ada && echo x > .turbine/state/x',
+  // Text that only mentions mediated flags inside an argument is not the decision operation.
+  'echo "task approve --confirm abcdef12 --by Ada" > .turbine/state/engine.db',
 ];
 const allowed = [
   'turbine task next work_1',
@@ -30,6 +35,7 @@ const allowed = [
   'turbine task gate work_1',
   'turbine task approve work_1 --confirm abcdef12 --by Ada',
   'turbine task reject work_1 --confirm abcdef12 --by Ada --reason no',
+  'pnpm --dir /x/factory turbine task approve work_1 --confirm abcdef12 --by Ada',
   'git commit -m "approve the plan"',
   'cat .turbine/tasks/work_1/03-PLAN.md',
   'npm run build',

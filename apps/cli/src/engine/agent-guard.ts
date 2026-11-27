@@ -28,20 +28,35 @@ export const HUMAN_ONLY_PATTERNS: string[] = [
 /**
  * Bare approve/reject stay human-only. With `--confirm <token> --by <name>`, the human already
  * reviewed the revision in chat and asked the agent to record it — allow that mediated form.
+ * `task approve|reject` must appear as a shell word (not only inside `"…"`), and the exemption
+ * applies only to that verb — not to state-file redirects or other human-only patterns.
  */
 export function isMediatedApproveOrReject(command: string): boolean {
+  // `(^|[\s;&|])task` rejects `echo "task approve …"` (quote before task) while allowing
+  // `turbine task approve …` / `pnpm … turbine task approve …`.
   return (
-    /\btask\s+(approve|reject)\b/i.test(command) &&
+    /(^|[\s;&|])task\s+(approve|reject)\b/i.test(command) &&
     /--confirm\s+\S+/.test(command) &&
     /--by\s+\S+/.test(command)
   );
 }
 
+/** Patterns that mediated approve/reject may bypass. Everything else (state writes, waive, …) still denies. */
+const MEDIATED_EXEMPT_PATTERN = String.raw`\btask\s+(approve|reject|waive|cancel|changes-requested)\b`;
+
 export function isHumanOnlyCommand(command: string): boolean {
   const segments = command.split(/&&|\|\||;|\|/);
   return segments.some((seg) => {
-    if (isMediatedApproveOrReject(seg)) return false;
-    return HUMAN_ONLY_PATTERNS.some((p) => new RegExp(p, 'i').test(seg));
+    const mediated = isMediatedApproveOrReject(seg);
+    return HUMAN_ONLY_PATTERNS.some((p) => {
+      if (!new RegExp(p, 'i').test(seg)) return false;
+      // Mediated form only skips the approve/reject task verb — not redirects or other gates.
+      if (mediated && p === MEDIATED_EXEMPT_PATTERN) {
+        const verb = seg.match(/\btask\s+(approve|reject|waive|cancel|changes-requested)\b/i)?.[1]?.toLowerCase();
+        if (verb === 'approve' || verb === 'reject') return false;
+      }
+      return true;
+    });
   });
 }
 
@@ -53,7 +68,8 @@ export function guardScriptSource(): string {
 // Installed by \`turbine init\`. Blocks AI agents from running human-only Turbine Hall
 // commands (approvals, waivers, cancel) or editing engine state. Humans run these in
 // their own terminal, where Cursor hooks do not apply.
-const PATTERNS = ${JSON.stringify(HUMAN_ONLY_PATTERNS, null, 2)}.map((p) => new RegExp(p, 'i'));
+const PATTERN_SOURCES = ${JSON.stringify(HUMAN_ONLY_PATTERNS, null, 2)};
+const EXEMPT = ${JSON.stringify(MEDIATED_EXEMPT_PATTERN)};
 let input = '';
 process.stdin.on('data', (c) => (input += c));
 process.stdin.on('end', () => {
@@ -64,10 +80,20 @@ process.stdin.on('end', () => {
     command = '';
   }
   const mediated = (seg) =>
-    /\\btask\\s+(approve|reject)\\b/i.test(seg) && /--confirm\\s+\\S+/.test(seg) && /--by\\s+\\S+/.test(seg);
-  const hit = command
-    .split(/&&|\\|\\||;|\\|/)
-    .some((seg) => !mediated(seg) && PATTERNS.some((re) => re.test(seg)));
+    /(^|[\\s;&|])task\\s+(approve|reject)\\b/i.test(seg) &&
+    /--confirm\\s+\\S+/.test(seg) &&
+    /--by\\s+\\S+/.test(seg);
+  const hit = command.split(/&&|\\|\\||;|\\|/).some((seg) => {
+    const allowApproveReject = mediated(seg);
+    return PATTERN_SOURCES.some((p) => {
+      if (!new RegExp(p, 'i').test(seg)) return false;
+      if (allowApproveReject && p === EXEMPT) {
+        const verb = seg.match(/\\btask\\s+(approve|reject|waive|cancel|changes-requested)\\b/i)?.[1]?.toLowerCase();
+        if (verb === 'approve' || verb === 'reject') return false;
+      }
+      return true;
+    });
+  });
   if (hit) {
     process.stdout.write(
       JSON.stringify({

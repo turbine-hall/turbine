@@ -2211,7 +2211,7 @@ export class Engine {
   }
 
   next(idOrAlias: string): NextStep {
-    const work = this.ctx.store.getWork(idOrAlias);
+    let work = this.ctx.store.getWork(idOrAlias);
     const baseBranch =
       (this.ctx.config as { git?: { defaultBaseBranch?: string } }).git?.defaultBaseBranch ??
       'staging';
@@ -2228,9 +2228,14 @@ export class Engine {
     }
     let confirmToken: string | undefined;
     try {
-      confirmToken = this.pendingApproval(work.id).confirmToken;
+      const pending = this.pendingApproval(work.id);
+      confirmToken = pending.confirmToken;
+      // pendingApproval refreshes heads and may move review/acceptance back to AI_REVIEW.
+      work = pending.work;
     } catch {
       confirmToken = undefined;
+      // Re-read even when the lookup fails: refreshHeads may already have saved a new state.
+      work = this.ctx.store.getWork(work.id);
     }
     return computeNextStep({
       projectRoot: this.ctx.projectRoot,
