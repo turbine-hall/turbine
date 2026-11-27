@@ -2211,7 +2211,7 @@ export class Engine {
   }
 
   next(idOrAlias: string): NextStep {
-    const work = this.ctx.store.getWork(idOrAlias);
+    let work = this.ctx.store.getWork(idOrAlias);
     const baseBranch =
       (this.ctx.config as { git?: { defaultBaseBranch?: string } }).git?.defaultBaseBranch ??
       'staging';
@@ -2226,11 +2226,23 @@ export class Engine {
         this.writeTaskContext(work, { unavailable: `the selection could not be rebuilt: ${(e as Error).message.split('\n')[0]}` });
       }
     }
+    let confirmToken: string | undefined;
+    try {
+      const pending = this.pendingApproval(work.id);
+      confirmToken = pending.confirmToken;
+      // pendingApproval refreshes heads and may move review/acceptance back to AI_REVIEW.
+      work = pending.work;
+    } catch {
+      confirmToken = undefined;
+      // Re-read even when the lookup fails: refreshHeads may already have saved a new state.
+      work = this.ctx.store.getWork(work.id);
+    }
     return computeNextStep({
       projectRoot: this.ctx.projectRoot,
       work,
       defaultBaseBranch: baseBranch,
       briefUnavailable: !briefOk,
+      confirmToken,
     });
   }
 
@@ -4569,7 +4581,7 @@ export class Engine {
     try {
     let work = this.ctx.store.getWork(idOrAlias);
     const paths = packetPaths(this.ctx.projectRoot, work.id);
-    const approveHint = `Human approves in their own terminal: turbine task approve ${work.id}`;
+    const approveHint = `Human approves (terminal or mediated): turbine task approve ${work.id} [--confirm <token> --by <name>]`;
 
     // Any new commit in a worktree after implementation is a code change.
     const refreshed = this.refreshHeads(work.id);

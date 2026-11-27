@@ -14,6 +14,8 @@ const blocked = [
   'turbine task approve work_01ABC',
   'pnpm --dir /x/factory turbine task approve work_01ABC',
   'npx tsx apps/cli/src/index.ts task reject work_1 --reason no',
+  'turbine task approve work_1 --confirm abcdef12',
+  'turbine task approve work_1 --by Ada',
   'turbine task waive work_1 --obligation obl_manual_sqa --reason x --expires 2030-01-01',
   'turbine task cancel work_1 --reason x',
   'cd /repo && turbine task approve work_1',
@@ -21,11 +23,19 @@ const blocked = [
   'turbine task accept work_1',
   'sqlite3 .turbine/state/engine.db "update approvals set data=1"',
   'echo x > .turbine/state/engine.db',
+  // Mediated approve must not exempt a redirect into protected state.
+  'turbine task approve work_1 --confirm abcdef12 --by Ada > .turbine/state/engine.db',
+  'turbine task approve work_1 --confirm abcdef12 --by Ada && echo x > .turbine/state/x',
+  // Text that only mentions mediated flags inside an argument is not the decision operation.
+  'echo "task approve --confirm abcdef12 --by Ada" > .turbine/state/engine.db',
 ];
 const allowed = [
   'turbine task next work_1',
   'turbine task sync work_1',
   'turbine task gate work_1',
+  'turbine task approve work_1 --confirm abcdef12 --by Ada',
+  'turbine task reject work_1 --confirm abcdef12 --by Ada --reason no',
+  'pnpm --dir /x/factory turbine task approve work_1 --confirm abcdef12 --by Ada',
   'git commit -m "approve the plan"',
   'cat .turbine/tasks/work_1/03-PLAN.md',
   'npm run build',

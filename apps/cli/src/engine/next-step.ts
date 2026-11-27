@@ -26,6 +26,8 @@ export type NextStep = {
   important: string[];
   /** Short script for Cursor/agents */
   agentPlaybook: string[];
+  /** Pending gate token for mediated approve (`--confirm`) */
+  confirmToken?: string;
 };
 
 /** States in which an agent plans or implements, so it must read the project and task context first. */
@@ -59,10 +61,15 @@ export function computeNextStep(input: {
   defaultBaseBranch?: string;
   /** When true, omit brief section links — handoff sync could not prove they match HEAD. */
   briefUnavailable?: boolean;
+  confirmToken?: string;
 }): NextStep {
   const step = computeNextStepRaw(input);
   // Several legacy stage names now map to the same document; list each file once.
-  return { ...step, openFiles: [...new Set(step.openFiles)] };
+  return {
+    ...step,
+    openFiles: [...new Set(step.openFiles)],
+    ...(input.confirmToken ? { confirmToken: input.confirmToken } : {}),
+  };
 }
 
 function computeNextStepRaw(input: {
@@ -70,6 +77,7 @@ function computeNextStepRaw(input: {
   work: WorkPackage;
   defaultBaseBranch?: string;
   briefUnavailable?: boolean;
+  confirmToken?: string;
 }): NextStep {
   const { projectRoot, work } = input;
   const base = input.defaultBaseBranch ?? 'staging';
@@ -107,15 +115,17 @@ function computeNextStepRaw(input: {
       : 'Read .turbine/knowledge/index.md first (OKF bundle of verified facts and claims).';  const sync = `turbine task sync ${work.id}`;
   const next = `turbine task next ${work.id}`;
   const approve = `turbine task approve ${work.id}`;
+  const token = input.confirmToken ?? '<token>';
+  const mediated = `turbine task approve ${work.id} --confirm ${token} --by <human-name>`;
   const humanOnly = [
-    `AGENT: do NOT run "${approve}" or "turbine task reject" — only the human runs them, in their own terminal.`,
-    'AGENT: editing a Decision section in markdown has no effect; do not try.',
-    'Summarise what the human is approving, then stop and wait.',
+    'Summarise what the human is approving; wait for explicit approval in chat.',
+    `After they approve, run: ${mediated} (confirmToken from task next --json).`,
+    'Do not run bare approve/reject without --confirm and --by. Editing Decision markdown has no effect.',
   ];
   const commonImportant = [
     `Main project folder (${projectRoot}) is NOT automatically updated by Turbine.`,
     'Code changes belong in the worktree/branch until you merge a PR.',
-    `Human approvals happen only via: ${approve} (interactive, in your own terminal)`,
+    `Approve via terminal (${approve}) or mediated: ${mediated}`,
     `When unsure, run: ${next}`,
   ];
 

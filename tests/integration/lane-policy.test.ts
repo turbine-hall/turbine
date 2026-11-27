@@ -232,7 +232,7 @@ describe('approval and drift (FR-A3, FR-A4)', () => {
       expect(agent.stderr + agent.stdout).toMatch(/cannot run inside an AI agent session/);
       const piped = run(dir, args);
       expect(piped.status, args.join(' ')).not.toBe(0);
-      expect(piped.stderr + piped.stdout).toMatch(/needs an interactive terminal/);
+      expect(piped.stderr + piped.stdout).toMatch(/needs a TTY/);
     }
     // Nothing was approved by those attempts.
     const list = run(dir, ['policy', 'list', '--json']);
