@@ -1,5 +1,11 @@
 # @turbine-hall/turbine-contracts
 
+## 0.6.0
+
+### Minor Changes
+
+- Add task-decomposer role: split approved plans into small PR-sized subtasks and open one PR per subtask before execute.
+
 ## 0.5.2
 
 ### Patch Changes
