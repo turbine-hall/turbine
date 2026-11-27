@@ -46,22 +46,26 @@ function makeReadyTask(dir: string, title: string) {
 
 function plantPrediction(engine: Engine, workId: string, prediction: FilePrediction) {
   const body = `${JSON.stringify(prediction, null, 2)}\n`;
+  const prev = engine.ctx.store.getLatestArtifact(workId, 'file-prediction');
+  const revision = (prev?.revision ?? 0) + 1;
+  const location = join(engine.ctx.projectRoot, `.turbine/artifacts/${workId}-pred-r${revision}.json`);
+  mkdirSync(dirname(location), { recursive: true });
   engine.ctx.store.saveArtifact(
     {
       id: createId('art'),
       workId,
       type: 'file-prediction',
-      revision: 1,
+      revision,
       contentHash: contentHash(prediction),
       contentType: 'application/json',
-      location: join(engine.ctx.projectRoot, `.turbine/artifacts/${workId}-pred.json`),
+      location,
       createdBy: { kind: 'tool', identifier: 'test' },
       createdAt: new Date().toISOString(),
       parentArtifactIds: [],
     },
     body,
   );
-  writeFileSync(join(engine.ctx.projectRoot, `.turbine/artifacts/${workId}-pred.json`), body);
+  writeFileSync(location, body);
 }
 
 describe('fleet scheduler (Part E / #43)', () => {
@@ -774,6 +778,87 @@ describe('fleet scheduler (Part E / #43)', () => {
     expect(maxSeen).toBe(1);
     engine.ctx.store.close();
     engine2.ctx.store.close();
+  });
+
+  it('refreshes a stale file-prediction when the selection is already current', () => {
+    const dir = tempProject('fleet-pred-sync-', dirs);
+    const engine = new Engine(openContext(dir));
+    const work = engine.createTask({
+      title: 'Prediction sync',
+      file: (() => {
+        const p = join(dir, 'pred-sync.md');
+        writeFileSync(p, '# sync\n\nTouch README.md in this chore.\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    const first = engine.ensureTaskContext(work);
+    expect(first.status === 'rebuilt' || first.status === 'current').toBe(true);
+    plantPrediction(engine, work.id, {
+      kind: 'selection',
+      paths: ['stale-only.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: '2020-01-01T00:00:00.000Z',
+    });
+    const again = engine.ensureTaskContext(engine.ctx.store.getWork(work.id));
+    expect(again.status).toBe('current');
+    // ensureTaskContext(current) must refresh prediction itself — do not call refreshFilePrediction here.
+    const art = engine.ctx.store.getLatestArtifact(work.id, 'file-prediction')!;
+    const stored = parseFilePrediction(JSON.parse(engine.ctx.store.getArtifactContent(art.id)));
+    expect(stored.kind).toBe('selection');
+    if (stored.kind === 'selection') {
+      expect(stored.paths).not.toContain('stale-only.ts');
+    }
+    engine.ctx.store.close();
+  });
+
+  it('does not record prediction misses for awaiting-commits change reports', () => {
+    const dir = tempProject('fleet-awaiting-miss-', dirs);
+    const engine = new Engine(openContext(dir));
+    const work = engine.createTask({
+      title: 'Awaiting miss',
+      file: (() => {
+        const p = join(dir, 'awaiting.md');
+        writeFileSync(p, '# awaiting\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    plantPrediction(engine, work.id, {
+      kind: 'selection',
+      paths: ['a.ts', 'b.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+    const changeBody = {
+      status: 'awaiting-commits',
+      summary: 'waiting',
+      filesTouched: [] as string[],
+    };
+    const location = join(dir, `.turbine/artifacts/${work.id}-change.json`);
+    mkdirSync(dirname(location), { recursive: true });
+    writeFileSync(location, `${JSON.stringify(changeBody, null, 2)}\n`);
+    engine.ctx.store.saveArtifact(
+      {
+        id: createId('art'),
+        workId: work.id,
+        type: 'change-report',
+        revision: 1,
+        contentHash: contentHash(changeBody),
+        contentType: 'application/json',
+        location,
+        createdBy: { kind: 'tool', identifier: 'test' },
+        createdAt: new Date().toISOString(),
+        parentArtifactIds: [],
+      },
+      `${JSON.stringify(changeBody, null, 2)}\n`,
+    );
+    expect(engine.recordPredictionMisses(work.id)).toBeUndefined();
+    const misses = engine.ctx.store.listEvents(work.id).filter((e) => e.type === 'fleet.prediction-miss');
+    expect(misses).toHaveLength(0);
+    engine.ctx.store.close();
   });
 
   it('FR-F2/F4: prediction is labelled selection; misses feed metrics without blocking', () => {

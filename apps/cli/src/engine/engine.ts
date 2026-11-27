@@ -1131,9 +1131,9 @@ export class Engine {
   /** Records a selection as the next `repo-context` artifact, pinned to the Layer 1 snapshot it was read at. */
   private saveTaskContext(work: WorkPackage, selection: TaskContext): void {
     const source = this.ctx.store.getLatestArtifact(work.id, 'source');
-    // The record and its audit event are one unit: if the event cannot be written, the record is rolled back too,
-    // so a retry saves both instead of finding a "current" selection whose event is missing for good.
-    const written: { location?: string } = {};
+    // Selection + prediction + their audit events are one unit: a failed prediction refresh must not leave a
+    // current selection paired with an older file-prediction (fleet would miss conflicts).
+    const written: { location?: string; predictionLocation?: string } = {};
     try {
       this.ctx.store.transaction(() => {
         written.location = this.saveArtifact({
@@ -1156,12 +1156,29 @@ export class Engine {
             changesCycle: selection.changesCycle,
           },
         });
+        const prediction = buildFilePrediction(this.ctx.store, work.id);
+        written.predictionLocation = this.saveArtifact({
+          workId: work.id,
+          type: 'file-prediction',
+          content: prediction,
+          createdBy: { kind: 'tool', identifier: 'file-prediction' },
+        }).location;
+        this.ctx.store.appendEvent({
+          workId: work.id,
+          type: 'fleet.prediction-recorded',
+          payload: {
+            kind: prediction.kind,
+            pathCount: prediction.kind === 'selection' ? prediction.paths.length : 0,
+            reason: prediction.kind === 'unknown' ? prediction.reason : undefined,
+            at: prediction.at,
+          },
+        });
       });
     } catch (e) {
       if (written.location) rmSync(written.location, { force: true }); // the rolled-back revision's file
+      if (written.predictionLocation) rmSync(written.predictionLocation, { force: true });
       throw e;
     }
-    this.refreshFilePrediction(work.id);
   }
 
   /** Persist a selection-labelled predicted file set (or unknown) for fleet conflict checks. */
@@ -1187,6 +1204,25 @@ export class Engine {
     return prediction;
   }
 
+  /**
+   * Fail closed for fleet: never leave a current selection paired with a stale prediction after a refresh error.
+   * Writes an `unknown` prediction so admit refuses overlap checks until a successful refresh.
+   */
+  private recordUnknownPrediction(workId: string, reason: string): void {
+    const at = now();
+    this.saveArtifact({
+      workId,
+      type: 'file-prediction',
+      content: { kind: 'unknown', reason, labelled: 'selection', at },
+      createdBy: { kind: 'tool', identifier: 'file-prediction' },
+    });
+    this.ctx.store.appendEvent({
+      workId,
+      type: 'fleet.prediction-recorded',
+      payload: { kind: 'unknown', pathCount: 0, reason, at },
+    });
+  }
+
   /** Compare prediction to the latest change-report; record misses without blocking. */
   recordPredictionMisses(idOrAlias: string): PredictionMiss | undefined {
     const work = this.ctx.store.getWork(idOrAlias);
@@ -1200,6 +1236,14 @@ export class Engine {
         'E_UNSAFE_EXECUTION',
         `prediction miss: unreadable change-report for ${work.id}: ${(e as Error).message.split('\n')[0]}`,
       );
+    }
+    // awaiting-commits reports still carry filesTouched: [] — do not count every predicted path as a miss yet.
+    if (
+      changeContent &&
+      typeof changeContent === 'object' &&
+      (changeContent as { status?: unknown }).status === 'awaiting-commits'
+    ) {
+      return undefined;
     }
     const prediction = readFilePrediction(this.ctx.store, work.id);
     const predicted = prediction.kind === 'selection' ? prediction.paths : [];
@@ -1235,6 +1279,19 @@ export class Engine {
       previous: this.latestTaskContext(work.id),
       save: (selection) => this.saveTaskContext(work, selection),
     });
+    // Rebuilt selections refresh prediction inside saveTaskContext. A current selection still needs a refresh
+    // so a stale/out-of-band file-prediction cannot survive the next ensure.
+    if (result.status === 'current') {
+      try {
+        this.refreshFilePrediction(work.id);
+      } catch (e) {
+        this.recordUnknownPrediction(
+          work.id,
+          `prediction refresh failed: ${(e as Error).message.split('\n')[0]}`,
+        );
+        throw e;
+      }
+    }
     this.writeTaskContext(
       work,
       result.status === 'unavailable' ? { unavailable: result.reason } : { selection: result.selection, stale: [] },
