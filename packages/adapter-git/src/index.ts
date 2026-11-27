@@ -63,19 +63,20 @@ export function inspectRepo(cwd: string): RepoInfo {
 }
 
 /**
- * Resolve a branch tip for worktree/PR bases. Prefers `origin/<name>` when present so
- * local checkouts on a different branch do not poison the tip.
+ * Resolve a branch tip for worktree/PR bases. Prefers the remote-tracking ref so
+ * local checkouts on a different branch do not poison the tip. Fully-qualified refs
+ * avoid selecting a same-named tag.
  */
 export function resolveBaseCommit(repoRoot: string, baseBranch: string): string {
   const name = baseBranch.trim();
   if (!name) throw err('E_INVALID_CONFIG', 'baseBranch must be a non-empty git branch name');
-  for (const candidate of [`origin/${name}`, name]) {
+  for (const candidate of [`refs/remotes/origin/${name}`, `refs/heads/${name}`]) {
     const r = git(repoRoot, ['rev-parse', '--verify', `${candidate}^{commit}`]);
     if (r.status === 0 && r.stdout.trim()) return r.stdout.trim();
   }
   throw err(
     'E_ADAPTER',
-    `Cannot resolve base branch "${name}" (tried origin/${name} and ${name}). Fetch it or set git.defaultBaseBranch.`,
+    `Cannot resolve base branch "${name}" (tried refs/remotes/origin/${name} and refs/heads/${name}). Fetch it or set git.defaultBaseBranch.`,
   );
 }
 
@@ -97,17 +98,17 @@ export function createWorktree(input: {
     input.worktreePath ?? join(info.root, '.turbine', 'worktrees', input.workId);
   mkdirSync(join(worktreePath, '..'), { recursive: true });
 
-  const baseCommit = input.baseBranch
-    ? resolveBaseCommit(info.root, input.baseBranch)
-    : info.head;
-
   if (existsSync(worktreePath)) {
-    // Existing worktree: report its current tip (do not move an in-progress checkout).
+    // Existing worktree: report its current tip (do not resolve or move via configured base).
     const head = git(worktreePath, ['rev-parse', 'HEAD']).stdout.trim();
     return { worktreePath, branch, baseCommit: head };
   }
 
-  const branchExists = git(info.root, ['rev-parse', '--verify', branch]).status === 0;
+  const baseCommit = input.baseBranch
+    ? resolveBaseCommit(info.root, input.baseBranch)
+    : info.head;
+
+  const branchExists = git(info.root, ['rev-parse', '--verify', `refs/heads/${branch}`]).status === 0;
   if (!branchExists) {
     const created = git(info.root, ['branch', branch, baseCommit]);
     if (created.status !== 0) {
@@ -180,7 +181,10 @@ export function diffWorktree(worktreePath: string, baseCommit: string, headCommi
   return result.stdout;
 }
 
-export function createGitAdapter(repoRoot: string): ToolAdapter {
+export function createGitAdapter(
+  repoRoot: string,
+  opts?: { defaultBaseBranch?: string },
+): ToolAdapter {
   return {
     id: 'git',
     capabilities: ['repo.inspect', 'repo.read', 'git.diff', 'git.branch.create'] as Capability[],
@@ -208,11 +212,13 @@ export function createGitAdapter(repoRoot: string): ToolAdapter {
         };
       }
       if (capability === 'git.branch.create') {
+        const fromArgs = args.baseBranch != null ? String(args.baseBranch).trim() : '';
         return {
           data: createWorktree({
             repoRoot,
             workId: String(args.workId),
             branchName: args.branchName ? String(args.branchName) : undefined,
+            baseBranch: fromArgs || opts?.defaultBaseBranch,
           }),
         };
       }
