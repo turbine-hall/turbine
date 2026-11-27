@@ -207,6 +207,45 @@ export function ensureLocalSubtaskBranch(projectRoot: string, branch: string, he
   }
 }
 
+/** Tip of an existing local branch, if present. */
+export function existingBranchTip(projectRoot: string, branch: string): string | undefined {
+  const tip = spawnSync('git', ['rev-parse', '--verify', `refs/heads/${branch}^{commit}`], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+  });
+  if (tip.status !== 0) return undefined;
+  const sha = tip.stdout.trim();
+  return sha || undefined;
+}
+
+/** Child commit of `baseSha` with the same tree so the PR head differs without product diffs. */
+export function scaffoldSubtaskHead(projectRoot: string, branch: string, baseSha: string): string {
+  const tree = spawnSync('git', ['rev-parse', `${baseSha}^{tree}`], { cwd: projectRoot, encoding: 'utf8' });
+  if (tree.status !== 0 || !tree.stdout.trim()) {
+    throw err('E_ADAPTER', `task-decomposer could not read tree for ${baseSha.slice(0, 12)}: ${tree.stderr || tree.stdout}`);
+  }
+  const commit = spawnSync('git', ['commit-tree', tree.stdout.trim(), '-p', baseSha, '-m', `turbine: scaffold ${branch}`], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'Turbine',
+      GIT_AUTHOR_EMAIL: 'turbine@local',
+      GIT_COMMITTER_NAME: 'Turbine',
+      GIT_COMMITTER_EMAIL: 'turbine@local',
+    },
+  });
+  if (commit.status !== 0 || !commit.stdout.trim()) {
+    throw err(
+      'E_ADAPTER',
+      `task-decomposer could not scaffold ${branch}: ${commit.stderr || commit.stdout}`,
+    );
+  }
+  const headSha = commit.stdout.trim();
+  ensureLocalSubtaskBranch(projectRoot, branch, headSha);
+  return headSha;
+}
+
 /** Fail closed when a subtask tip would open a mega-PR vs the configured base. */
 export function assertSubtaskPrSize(
   projectRoot: string,
@@ -268,9 +307,8 @@ export async function openSubtaskPrs(input: {
   /** Persist after each PR so a mid-loop failure can resume without re-calling the model. */
   persistProgress: (decomposition: TaskDecomposition) => void;
 }): Promise<TaskDecomposition> {
-  // Subtask PR tips start at the configured base — not whatever the main checkout has checked out.
+  // Base tip comes from git.defaultBaseBranch — not the arbitrary checkout HEAD.
   const baseSha = resolveBaseCommit(input.projectRoot, input.target.baseBranch);
-  const headSha = baseSha;
   const subtasks: DecompositionSubtask[] = [];
   for (const st of input.decomposition.subtasks) {
     if (st.pr?.number && st.pr.url) {
@@ -282,8 +320,23 @@ export async function openSubtaskPrs(input: {
     const head = st.branchName.startsWith(`turbine/${input.work.id}-`)
       ? st.branchName
       : `turbine/${input.work.id}-${st.branchName}`;
-    ensureLocalSubtaskBranch(input.projectRoot, head, headSha);
-    assertSubtaskPrSize(input.projectRoot, baseSha, headSha, input.maxChangedLines, st.id);
+    const existingTip = existingBranchTip(input.projectRoot, head);
+    let headSha: string;
+    if (existingTip && existingTip !== baseSha) {
+      // Size-check the commits the PR will contain before any branch move/publish.
+      assertSubtaskPrSize(input.projectRoot, baseSha, existingTip, input.maxChangedLines, st.id);
+      headSha = existingTip;
+    } else {
+      // New (or at-base) branch: fork from configured base, then scaffold a distinct head for GitHub.
+      headSha = scaffoldSubtaskHead(input.projectRoot, head, baseSha);
+      assertSubtaskPrSize(input.projectRoot, baseSha, headSha, input.maxChangedLines, st.id);
+    }
+    if (headSha === baseSha) {
+      throw err(
+        'E_ADAPTER',
+        `Subtask ${st.id} PR head matches base ${input.target.baseBranch}; need at least one commit on ${head} before opening the PR`,
+      );
+    }
     await ensureRemoteSubtaskBranch({
       target: input.target,
       workId: input.work.id,

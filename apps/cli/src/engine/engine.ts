@@ -2588,8 +2588,42 @@ export class Engine {
     // Contract: rejects when pr.create is unavailable (does not skip).
     await this.runTaskDecomposer(work, plan, spec, taskContext, ownership);
 
-    // Revalidate before the IMPLEMENTING transition so async decomposition cannot overwrite a moved task.
+    // Revalidate before worktree prep / IMPLEMENTING so async decomposition cannot overwrite a moved task.
     work = this.assertExecuteStillOwns({ workId: work.id, ...ownership });
+
+    // Prepare worktrees before IMPLEMENTING so mid-prep failures stay retryable and partial trees are recorded.
+    let repos: RepoState[];
+    if (existing.length > 0) {
+      repos = observe(existing).repos;
+    } else {
+      try {
+        repos = prepareWorktrees({
+          projectRoot: this.ctx.projectRoot,
+          work,
+          primaryChecks: this.ctx.config.quality.checks,
+          primarySetup: this.ctx.config.quality.setup,
+          baseBranch: this.gitDefaults().defaultBaseBranch,
+        });
+      } catch (e) {
+        const partial = (e as { partialRepos?: RepoState[] }).partialRepos;
+        if (partial?.length) {
+          this.saveChangeSet(work.id, partial, {
+            status: 'awaiting-commits',
+            summary: 'Partial worktrees prepared; fix repository config and retry.',
+            createdBy: { kind: 'tool', identifier: 'executor' },
+            parentArtifactIds: [plan.id],
+          });
+        }
+        throw e;
+      }
+      this.saveChangeSet(work.id, repos, {
+        status: 'awaiting-commits',
+        summary: 'Worktrees prepared. No code committed yet.',
+        createdBy: { kind: 'tool', identifier: 'executor' },
+        parentArtifactIds: [plan.id],
+      });
+    }
+
     work = transition(work, 'IMPLEMENTING');
     this.ctx.store.saveWork(work);
 
@@ -2598,17 +2632,6 @@ export class Engine {
       eec = extendEecForImplementation(eec);
       this.ctx.store.saveEec(eec);
     }
-
-    const repos =
-      existing.length > 0
-        ? observe(existing).repos
-        : prepareWorktrees({
-            projectRoot: this.ctx.projectRoot,
-            work,
-            primaryChecks: this.ctx.config.quality.checks,
-            primarySetup: this.ctx.config.quality.setup,
-            baseBranch: this.gitDefaults().defaultBaseBranch,
-          });
 
     const executionMode = this.ctx.config.execution.mode;
 
@@ -3604,7 +3627,11 @@ export class Engine {
       policyApprovals,
       laneFallback: lane.fallback,
       track: trackFor(work),
-      next: computeNextStep({ projectRoot: this.ctx.projectRoot, work }),
+      next: computeNextStep({
+        projectRoot: this.ctx.projectRoot,
+        work,
+        defaultBaseBranch: this.gitDefaults().defaultBaseBranch,
+      }),
       notes: renderNotes,
       sourceText: source?.content.text ?? work.objective,
       facts: normalizeAssessment(assessment?.content).facts,

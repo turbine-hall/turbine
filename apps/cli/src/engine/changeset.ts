@@ -67,26 +67,31 @@ export function prepareWorktrees(input: {
 }): RepoState[] {
   const { projectRoot, work } = input;
   const out: RepoState[] = [];
-  const primary = createWorktree({
-    repoRoot: projectRoot,
-    workId: work.id,
-    baseBranch: input.baseBranch,
-  });
-  out.push({
-    name: primaryName(projectRoot),
-    root: inspectRepo(projectRoot).root,
-    worktreePath: primary.worktreePath,
-    branch: primary.branch,
-    baseCommit: primary.baseCommit,
-    headCommit: headOf(primary.worktreePath),
-    checks: input.primaryChecks,
-    setup: input.primarySetup,
-    primary: true,
-  });
-  for (const repo of work.repositories ?? []) {
-    out.push(prepareExtra(projectRoot, work.id, repo, input.baseBranch));
+  try {
+    const primary = createWorktree({
+      repoRoot: projectRoot,
+      workId: work.id,
+      baseBranch: input.baseBranch,
+    });
+    out.push({
+      name: primaryName(projectRoot),
+      root: inspectRepo(projectRoot).root,
+      worktreePath: primary.worktreePath,
+      branch: primary.branch,
+      baseCommit: primary.baseCommit,
+      headCommit: headOf(primary.worktreePath),
+      checks: input.primaryChecks,
+      setup: input.primarySetup,
+      primary: true,
+    });
+    for (const repo of work.repositories ?? []) {
+      out.push(prepareExtra(projectRoot, work.id, repo, input.baseBranch));
+    }
+    return out;
+  } catch (e) {
+    // Retain any worktrees already created (e.g. primary before a prepareExtra failure).
+    throw Object.assign(e instanceof Error ? e : new Error(String(e)), { partialRepos: out });
   }
-  return out;
 }
 
 function prepareExtra(
