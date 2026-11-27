@@ -137,9 +137,10 @@ describe('G9: AI review is grounded in the diff', () => {
       },
     };
     registerModel(liar);
-    engine.ctx.config.models.profiles.analysis = { provider: 'mock', model: 'liar-reviewer', maxOutputTokens: 4000 };
 
+    // Keep default mock for execute (task-decomposer uses analysis); swap only for aiReview.
     const { id, wt } = await toImplementing(engine);
+    engine.ctx.config.models.profiles.analysis = { provider: 'mock', model: 'liar-reviewer', maxOutputTokens: 4000 };
     commitIn(wt, 'src/upload.js', 'export const upload = (f) => parse(f);\n');
     writeFileSync(join(wt, 'package.json'), JSON.stringify({ name: 'x', dependencies: { xlsx: '0.18.5', multer: '2.0.0' } }));
     git(wt, 'add', 'package.json');
