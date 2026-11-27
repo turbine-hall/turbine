@@ -1,5 +1,17 @@
 # @turbine-hall/turbine-adapter-git
 
+## 0.6.0
+
+### Minor Changes
+
+- Add task-decomposer role: split approved plans into small PR-sized subtasks and open one PR per subtask before execute.
+
+### Patch Changes
+
+- Updated dependencies
+  - @turbine-hall/turbine-contracts@0.6.0
+  - @turbine-hall/turbine-tools@0.6.0
+
 ## 0.5.2
 
 ### Patch Changes

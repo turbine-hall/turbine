@@ -1,7 +1,7 @@
 {
   "name": "@turbine-hall/turbine",
   "private": true,
-  "version": "0.5.2",
+  "version": "0.6.0",
   "type": "module",
   "description": "Turbine Hall — governed human/AI software workflow CLI",
   "packageManager": "pnpm@10.28.2",
