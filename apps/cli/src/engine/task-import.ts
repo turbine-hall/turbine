@@ -1,0 +1,187 @@
+import { createId, err, type WorkPackage } from '@turbine-hall/turbine-contracts';
+import type { Engine } from './engine.js';
+
+export type ImportIssue = {
+  /** Stable tracker key used for alias / skip detection (e.g. `github:o/r#1` or `jira:KEY`). */
+  alias: string;
+  title: string;
+  body: string;
+  labels?: string[];
+  provider: 'github' | 'jira';
+  externalId: string;
+  url?: string;
+};
+
+export type ImportSkip = {
+  alias: string;
+  reason: string;
+  existingWorkId?: string;
+};
+
+export type ImportCreated = {
+  alias: string;
+  workId: string;
+};
+
+export type ImportReport = {
+  created: ImportCreated[];
+  skipped: ImportSkip[];
+};
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+/**
+ * Bulk-create tasks from tracker issues. Skips issues that already have a task and
+ * records a non-silent reason for every skip (AGENTS.md rule 9).
+ */
+export function importTasks(engine: Engine, issues: ImportIssue[]): ImportReport {
+  if (!Array.isArray(issues)) {
+    throw err('E_INVALID_CONFIG', 'importTasks requires an issues array');
+  }
+  const created: ImportCreated[] = [];
+  const skipped: ImportSkip[] = [];
+  const seen = new Set<string>();
+
+  for (const issue of issues) {
+    if (!issue || typeof issue.alias !== 'string' || !issue.alias.trim()) {
+      throw err('E_INVALID_CONFIG', 'import issue is missing alias');
+    }
+    if (!issue.title?.trim()) {
+      throw err('E_INVALID_CONFIG', `import issue ${issue.alias} is missing title`);
+    }
+    if (seen.has(issue.alias)) {
+      skipped.push({ alias: issue.alias, reason: 'duplicate alias in this import batch' });
+      engine.ctx.store.appendEvent({
+        type: 'task.import.skipped',
+        payload: { alias: issue.alias, reason: 'duplicate alias in this import batch', at: nowIso() },
+      });
+      continue;
+    }
+    seen.add(issue.alias);
+
+    const existing = engine.ctx.store.tryGetWork(issue.alias);
+    if (existing) {
+      skipped.push({
+        alias: issue.alias,
+        reason: `already has task ${existing.id}`,
+        existingWorkId: existing.id,
+      });
+      engine.ctx.store.appendEvent({
+        workId: existing.id,
+        type: 'task.import.skipped',
+        payload: { alias: issue.alias, reason: `already has task ${existing.id}`, at: nowIso() },
+      });
+      continue;
+    }
+
+    const text = `# ${issue.title}\n\n${issue.body ?? ''}\n`;
+    const work = engine.createTask({
+      title: issue.title,
+      type: 'feature',
+      text,
+      labels: issue.labels,
+    });
+
+    const aliases = [...new Set([...(work.aliases ?? []), issue.alias])];
+    if (issue.provider === 'jira' && !aliases.includes(issue.externalId)) {
+      aliases.push(issue.externalId);
+    }
+
+    const withAlias: WorkPackage = {
+      ...work,
+      aliases,
+      sourceRefs: [
+        {
+          provider: issue.provider,
+          externalId: issue.externalId,
+          url: issue.url,
+          snapshotHash: work.sourceRefs[0]!.snapshotHash,
+          ...(issue.labels?.length ? { labels: [...new Set(issue.labels)] } : {}),
+        },
+        ...work.sourceRefs.filter((r) => r.provider !== issue.provider),
+      ],
+      updatedAt: nowIso(),
+    };
+    engine.ctx.store.saveWork(withAlias);
+    engine.ctx.store.appendEvent({
+      workId: work.id,
+      type: 'task.import.created',
+      payload: {
+        alias: issue.alias,
+        provider: issue.provider,
+        externalId: issue.externalId,
+        at: nowIso(),
+        importId: createId('import'),
+      },
+    });
+    created.push({ alias: issue.alias, workId: work.id });
+  }
+
+  return { created, skipped };
+}
+
+/** Parse a GitHub fixture list: `{ owner, repo, issues: [{ number, title, body?, labels? }] }`. */
+export function issuesFromGitHubFixture(
+  owner: string,
+  repo: string,
+  fixture: { issues?: Array<{ number: number; title: string; body?: string; labels?: string[]; url?: string }> },
+  label?: string,
+): ImportIssue[] {
+  if (!owner || owner.includes('..') || owner.includes('/') || owner.includes('\\')) {
+    throw err('E_INVALID_CONFIG', `invalid GitHub owner: ${owner}`);
+  }
+  if (!repo || repo.includes('..') || repo.includes('/') || repo.includes('\\')) {
+    throw err('E_INVALID_CONFIG', `invalid GitHub repo: ${repo}`);
+  }
+  const issues = fixture?.issues;
+  if (!Array.isArray(issues)) {
+    throw err('E_INVALID_CONFIG', 'GitHub import fixture must include an issues array');
+  }
+  const out: ImportIssue[] = [];
+  for (const issue of issues) {
+    if (!issue || !Number.isInteger(issue.number) || issue.number < 1) {
+      throw err('E_INVALID_CONFIG', 'GitHub fixture issue needs a positive integer number');
+    }
+    const labels = issue.labels ?? [];
+    if (label && !labels.includes(label)) continue;
+    const externalId = `${owner}/${repo}#${issue.number}`;
+    out.push({
+      alias: `github:${externalId}`,
+      title: issue.title,
+      body: issue.body ?? '',
+      labels,
+      provider: 'github',
+      externalId,
+      url: issue.url ?? `https://github.com/${owner}/${repo}/issues/${issue.number}`,
+    });
+  }
+  return out;
+}
+
+/** Parse a Jira fixture list: `{ issues: [{ key, summary, description?, labels?, url? }] }`. */
+export function issuesFromJiraFixture(
+  fixture: {
+    issues?: Array<{ key: string; summary: string; description?: string; labels?: string[]; url?: string }>;
+  },
+): ImportIssue[] {
+  const issues = fixture?.issues;
+  if (!Array.isArray(issues)) {
+    throw err('E_INVALID_CONFIG', 'Jira import fixture must include an issues array');
+  }
+  return issues.map((issue) => {
+    if (!issue?.key?.trim() || !issue.summary?.trim()) {
+      throw err('E_INVALID_CONFIG', 'Jira fixture issue needs key and summary');
+    }
+    return {
+      alias: `jira:${issue.key}`,
+      title: `${issue.key}: ${issue.summary}`,
+      body: issue.description ?? '',
+      labels: issue.labels,
+      provider: 'jira' as const,
+      externalId: issue.key,
+      url: issue.url,
+    };
+  });
+}

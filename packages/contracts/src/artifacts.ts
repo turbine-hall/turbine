@@ -17,6 +17,8 @@ export const ArtifactTypeSchema = z.enum([
   'task-decomposition',
   /** Repository context layer 3: the files relevant to one task, bound to a Layer 1 snapshot. */
   'repo-context',
+  /** Predicted file set for fleet conflict avoidance (a selection, never a complete list). */
+  'file-prediction',
   'other',
 ]);
 export type ArtifactType = z.infer<typeof ArtifactTypeSchema>;

@@ -52,7 +52,7 @@ Shipped in [PR #37](https://github.com/turbine-hall/turbine/pull/37).
 
 ## Limits
 
-- Revert detection after a recorded merge and stacked PRs are not built. The fleet scheduler (`turbine fleet run` / `fleet status`) is shipped for concurrency + budget + suspend-aware handoff; predicted file-set overlap scheduling remains Part F.
+- Revert detection after a recorded merge and stacked PRs are not built. The fleet scheduler (`turbine fleet run` / `fleet status`) is shipped for concurrency + budget + suspend-aware handoff and predicted file-set overlap/`unknown` admit refusal (Part F). Bulk intake is `turbine task import` with fixtures in CI.
 - Hosted multi-tenant service / web UI are not built.
 - Model-proxy server is out of scope (you bring your own URL).
 - GitHub issue **label** intake for policy matching is incomplete (Jira labels and the createTask API already record labels).

@@ -22,10 +22,21 @@ export type LaneMetricsRow = {
   reviewerDisagreementRate: LaneMetric;
   fallbackShare: LaneMetric & { reasons: Record<string, number> };
 };
+export type PredictionMissMetric = {
+  /** Tasks that recorded at least one fleet.prediction-miss in the period. */
+  tasksWithMisses: number;
+  missEvents: number;
+  /** Predicted paths that did not appear in the change-report (sum of miss array lengths). */
+  missedPaths: number;
+  period: MetricPeriod;
+};
+
 export type LaneMetricsReport = {
   generatedAt: string;
   period: MetricPeriod;
   rows: LaneMetricsRow[];
+  /** Part F: prediction vs actual misses (never blocks acceptance). */
+  predictionMisses: PredictionMissMetric;
 };
 
 const round = (value: number) => Math.round(value * 1_000_000) / 1_000_000;
@@ -195,7 +206,31 @@ export function computeLaneMetrics(
       fallbackShare: { ...metric(fallbackWorkIds.size, taskIds.size, 0, period), reasons },
     };
   });
-  return { generatedAt, period, rows };
+
+  const missEvents = work.flatMap((item) =>
+    store
+      .listEvents(item.id)
+      .filter((event) => event.type === 'fleet.prediction-miss')
+      .filter((event) => event.createdAt >= since && event.createdAt <= generatedAt),
+  );
+  const tasksWithMisses = new Set(missEvents.map((event) => event.workId).filter((id): id is string => !!id));
+  let missedPaths = 0;
+  for (const event of missEvents) {
+    const misses = Array.isArray(event.payload.misses) ? event.payload.misses : [];
+    missedPaths += misses.length;
+  }
+
+  return {
+    generatedAt,
+    period,
+    rows,
+    predictionMisses: {
+      tasksWithMisses: tasksWithMisses.size,
+      missEvents: missEvents.length,
+      missedPaths,
+      period,
+    },
+  };
 }
 
 const DEFAULT_SUSPEND = {

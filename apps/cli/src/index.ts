@@ -55,6 +55,7 @@ import { nextLaneAudit, recordLaneAuditOutcome } from './engine/lane-audit.js';
 import { fleetStatus, runFleet } from './engine/fleet.js';
 import { DEFAULT_USD_PER_MILLION_TOKENS } from './engine/fleet-spend.js';
 import { DEFAULT_FLEET_LEASE_MS } from './engine/fleet-lock.js';
+import { importTasks, issuesFromGitHubFixture, issuesFromJiraFixture } from './engine/task-import.js';
 
 function parseTokenArg(raw: string): number | 'unknown' {
   if (raw === 'unknown' || raw === '?') return 'unknown';
@@ -673,6 +674,45 @@ task
       }
       const work = await engine.takeoverJiraAsync(key, fixtures);
       printResult({ id: work.id, aliases: work.aliases, state: work.currentState }, !!opts.json);
+      engine.ctx.store.close();
+    } catch (e) {
+      handleError(e);
+    }
+  });
+
+task
+  .command('import')
+  .option('--github <owner/repo>', 'Import open issues from GitHub (requires --fixture in CI)')
+  .option('--label <label>', 'Only GitHub issues carrying this label')
+  .option('--jira <jql>', 'Import Jira issues matching JQL (requires --fixture in CI; JQL recorded for operators)')
+  .option('--fixture <path>', 'JSON fixture of issues (required without live tokens)')
+  .option('--json')
+  .action((opts) => {
+    try {
+      const engine = withEngine();
+      const hasGh = Boolean(opts.github);
+      const hasJira = Boolean(opts.jira);
+      if (hasGh === hasJira) {
+        throw new Error('Specify exactly one of --github <owner/repo> or --jira <jql>');
+      }
+      if (!opts.fixture) {
+        throw new Error('task import currently requires --fixture <path> (live tracker list is not enabled in this build)');
+      }
+      const fixture = JSON.parse(readFileSync(opts.fixture, 'utf8'));
+      let issues;
+      if (hasGh) {
+        const parts = String(opts.github).split('/');
+        if (parts.length !== 2 || !parts[0] || !parts[1]) {
+          throw new Error('--github must be owner/repo');
+        }
+        issues = issuesFromGitHubFixture(parts[0], parts[1], fixture, opts.label);
+      } else {
+        // JQL is accepted for the CLI surface; fixtures supply the issue list for CI.
+        void opts.jira;
+        issues = issuesFromJiraFixture(fixture);
+      }
+      const report = importTasks(engine, issues);
+      printResult(report, !!opts.json);
       engine.ctx.store.close();
     } catch (e) {
       handleError(e);

@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from '
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createId } from '../../packages/contracts/dist/index.js';
+import { contentHash, createId } from '../../packages/contracts/dist/index.js';
 import { Engine } from '../../apps/cli/src/engine/engine.js';
 import { openContext } from '../../apps/cli/src/engine/project.js';
 import * as fleetLock from '../../apps/cli/src/engine/fleet-lock.js';
@@ -19,6 +19,14 @@ import {
 } from '../../apps/cli/src/engine/fleet-lock.js';
 import { measureFleetSpend } from '../../apps/cli/src/engine/fleet-spend.js';
 import { fleetStatus, runFleet } from '../../apps/cli/src/engine/fleet.js';
+import {
+  actualPathsFromChangeReport,
+  blocksAdmit,
+  comparePredictionToActual,
+  parseFilePrediction,
+  type FilePrediction,
+} from '../../apps/cli/src/engine/file-prediction.js';
+import { computeLaneMetrics } from '../../apps/cli/src/engine/lane-metrics.js';
 import { suspendPolicy } from '../../apps/cli/src/engine/lane-policy.js';
 import { cleanup, tempProject } from './fixture.js';
 import { laneProject, writePolicy } from './lane-fixture.js';
@@ -34,6 +42,26 @@ function makeReadyTask(dir: string, title: string) {
   const engine = new Engine(openContext(dir));
   const work = engine.createTask({ title, file: request, type: 'maintenance' });
   return { engine, work };
+}
+
+function plantPrediction(engine: Engine, workId: string, prediction: FilePrediction) {
+  const body = `${JSON.stringify(prediction, null, 2)}\n`;
+  engine.ctx.store.saveArtifact(
+    {
+      id: createId('art'),
+      workId,
+      type: 'file-prediction',
+      revision: 1,
+      contentHash: contentHash(prediction),
+      contentType: 'application/json',
+      location: join(engine.ctx.projectRoot, `.turbine/artifacts/${workId}-pred.json`),
+      createdBy: { kind: 'tool', identifier: 'test' },
+      createdAt: new Date().toISOString(),
+      parentArtifactIds: [],
+    },
+    body,
+  );
+  writeFileSync(join(engine.ctx.projectRoot, `.turbine/artifacts/${workId}-pred.json`), body);
 }
 
 describe('fleet scheduler (Part E / #43)', () => {
@@ -645,6 +673,153 @@ describe('fleet scheduler (Part E / #43)', () => {
     });
     expect(report.started).toBe(0);
     expect(report.stoppedReason).toBe('idle');
+    engine.ctx.store.close();
+  });
+
+  it('FR-F3: overlapping or unknown predictions are not admitted concurrently', async () => {
+    const dir = tempProject('fleet-overlap-', dirs);
+    const engine = new Engine(openContext(dir));
+    mkdirSync(join(dir, '.turbine', 'artifacts'), { recursive: true });
+    const mk = (title: string) => {
+      const p = join(dir, `${title.toLowerCase()}.md`);
+      writeFileSync(p, `# ${title}\n`);
+      return engine.createTask({ title, file: p, type: 'maintenance' });
+    };
+    const a = mk('Overlap A');
+    const b = mk('Overlap B');
+    const c = mk('Overlap C');
+    plantPrediction(engine, a.id, {
+      kind: 'selection',
+      paths: ['apps/cli/src/engine/fleet.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+    plantPrediction(engine, b.id, {
+      kind: 'selection',
+      paths: ['apps/cli/src/engine/fleet.ts', 'README.md'],
+      sources: { context: true, plan: true },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+    plantPrediction(engine, c.id, {
+      kind: 'selection',
+      paths: ['docs/AGENT_DRIVER.md'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+
+    const started: string[] = [];
+    const report = await runFleet(engine, {
+      maxConcurrent: 2,
+      budgetUsd: 100,
+      step: async (id) => {
+        started.push(id);
+        await new Promise((r) => setTimeout(r, 80));
+      },
+      maxIterations: 20,
+    });
+    expect(report.started).toBeGreaterThanOrEqual(2);
+    // A and B share a path — they must never both be active; C can pair with either.
+    const blocked = engine.ctx.store
+      .listWork()
+      .flatMap((w) => engine.ctx.store.listEvents(w.id))
+      .filter((e) => e.type === 'fleet.prediction-blocked');
+    expect(blocked.length).toBeGreaterThanOrEqual(1);
+
+    // Unknown never pairs with an active task.
+    const dir2 = tempProject('fleet-unknown-pred-', dirs);
+    const engine2 = new Engine(openContext(dir2));
+    mkdirSync(join(dir2, '.turbine', 'artifacts'), { recursive: true });
+    const u1 = engine2.createTask({
+      title: 'Unknown 1',
+      file: (() => {
+        const p = join(dir2, 'u1.md');
+        writeFileSync(p, '# u1\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    engine2.createTask({
+      title: 'Unknown 2',
+      file: (() => {
+        const p = join(dir2, 'u2.md');
+        writeFileSync(p, '# u2\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    plantPrediction(engine2, u1.id, {
+      kind: 'selection',
+      paths: ['a.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+    // u2 left without prediction → unknown
+    let concurrent = 0;
+    let maxSeen = 0;
+    await runFleet(engine2, {
+      maxConcurrent: 2,
+      budgetUsd: 100,
+      step: async () => {
+        concurrent += 1;
+        maxSeen = Math.max(maxSeen, concurrent);
+        await new Promise((r) => setTimeout(r, 50));
+        concurrent -= 1;
+      },
+      maxIterations: 15,
+    });
+    expect(maxSeen).toBe(1);
+    engine.ctx.store.close();
+    engine2.ctx.store.close();
+  });
+
+  it('FR-F2/F4: prediction is labelled selection; misses feed metrics without blocking', () => {
+    const selection = parseFilePrediction({
+      kind: 'selection',
+      paths: ['a.ts', 'b.ts'],
+      sources: { context: true, plan: true },
+      labelled: 'selection',
+      at: '2026-01-01T00:00:00.000Z',
+    });
+    expect(selection.kind).toBe('selection');
+    if (selection.kind === 'selection') expect(selection.labelled).toBe('selection');
+    expect(blocksAdmit(selection, [])).toBe(false);
+
+    const miss = comparePredictionToActual(['a.ts', 'b.ts'], ['a.ts', 'c.ts']);
+    expect(miss.misses).toEqual(['b.ts']);
+    expect(miss.extras).toEqual(['c.ts']);
+    expect(actualPathsFromChangeReport({ filesTouched: ['repo:a.ts', 'c.ts'] })).toEqual(['a.ts', 'c.ts']);
+
+    const dir = tempProject('fleet-miss-metrics-', dirs);
+    const engine = new Engine(openContext(dir));
+    const work = engine.createTask({
+      title: 'Miss metrics',
+      file: (() => {
+        const p = join(dir, 'miss.md');
+        writeFileSync(p, '# miss\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    engine.ctx.store.appendEvent({
+      workId: work.id,
+      type: 'fleet.prediction-miss',
+      payload: {
+        predicted: ['a.ts', 'b.ts'],
+        actual: ['a.ts'],
+        misses: ['b.ts'],
+        extras: [],
+        at: new Date().toISOString(),
+        predictionKind: 'selection',
+      },
+    });
+    const report = computeLaneMetrics(engine.ctx.store);
+    expect(report.predictionMisses.missEvents).toBe(1);
+    expect(report.predictionMisses.missedPaths).toBe(1);
+    expect(report.predictionMisses.tasksWithMisses).toBe(1);
     engine.ctx.store.close();
   });
 

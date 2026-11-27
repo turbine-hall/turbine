@@ -178,6 +178,14 @@ import {
   type PhaseResult,
   type SandboxHooks,
 } from '@turbine-hall/turbine-executor';
+import {
+  actualPathsFromChangeReport,
+  buildFilePrediction,
+  comparePredictionToActual,
+  readFilePrediction,
+  type FilePrediction,
+  type PredictionMiss,
+} from './file-prediction.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -1150,6 +1158,60 @@ export class Engine {
       if (written.location) rmSync(written.location, { force: true }); // the rolled-back revision's file
       throw e;
     }
+    this.refreshFilePrediction(work.id);
+  }
+
+  /** Persist a selection-labelled predicted file set (or unknown) for fleet conflict checks. */
+  refreshFilePrediction(idOrAlias: string): FilePrediction {
+    const work = this.ctx.store.getWork(idOrAlias);
+    const prediction = buildFilePrediction(this.ctx.store, work.id);
+    this.saveArtifact({
+      workId: work.id,
+      type: 'file-prediction',
+      content: prediction,
+      createdBy: { kind: 'tool', identifier: 'file-prediction' },
+    });
+    this.ctx.store.appendEvent({
+      workId: work.id,
+      type: 'fleet.prediction-recorded',
+      payload: {
+        kind: prediction.kind,
+        pathCount: prediction.kind === 'selection' ? prediction.paths.length : 0,
+        reason: prediction.kind === 'unknown' ? prediction.reason : undefined,
+        at: prediction.at,
+      },
+    });
+    return prediction;
+  }
+
+  /** Compare prediction to the latest change-report; record misses without blocking. */
+  recordPredictionMisses(idOrAlias: string): PredictionMiss | undefined {
+    const work = this.ctx.store.getWork(idOrAlias);
+    const change = this.ctx.store.getLatestArtifact(work.id, 'change-report');
+    if (!change) return undefined;
+    let changeContent: unknown;
+    try {
+      changeContent = JSON.parse(this.ctx.store.getArtifactContent(change.id));
+    } catch (e) {
+      throw err(
+        'E_UNSAFE_EXECUTION',
+        `prediction miss: unreadable change-report for ${work.id}: ${(e as Error).message.split('\n')[0]}`,
+      );
+    }
+    const prediction = readFilePrediction(this.ctx.store, work.id);
+    const predicted = prediction.kind === 'selection' ? prediction.paths : [];
+    const actual = actualPathsFromChangeReport(changeContent);
+    const miss = comparePredictionToActual(predicted, actual);
+    this.ctx.store.appendEvent({
+      workId: work.id,
+      type: 'fleet.prediction-miss',
+      payload: {
+        ...miss,
+        predictionKind: prediction.kind,
+        changeArtifactId: change.id,
+      },
+    });
+    return miss;
   }
 
   /**
@@ -1834,6 +1896,8 @@ export class Engine {
         });
         this.ctx.store.saveEdge(edge);
       }
+
+      this.refreshFilePrediction(work.id);
 
       const next = transition(current, 'PLAN_REVIEW');
       this.ctx.store.saveWork(next);
@@ -3894,6 +3958,16 @@ export class Engine {
           affectedObligationIds: ['obl_code_review', 'obl_automated_checks', 'obl_manual_sqa'],
         }),
       );
+    }
+    try {
+      this.recordPredictionMisses(workId);
+    } catch (e) {
+      // Miss recording must not block the change-report publish; surface via event.
+      this.ctx.store.appendEvent({
+        workId,
+        type: 'fleet.prediction-miss-failed',
+        payload: { reason: (e as Error).message.split('\n')[0], changeArtifactId: saved.id },
+      });
     }
     return saved;
   }

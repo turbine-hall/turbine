@@ -11,6 +11,7 @@ import {
   type FleetLockBody,
 } from './fleet-lock.js';
 import { DEFAULT_USD_PER_MILLION_TOKENS, measureFleetSpend, type FleetSpend } from './fleet-spend.js';
+import { blocksAdmit, readFilePrediction, type FilePrediction } from './file-prediction.js';
 import { policyStatuses } from './lane-policy.js';
 
 const HUMAN_WAIT: ReadonlySet<WorkState> = new Set([
@@ -360,6 +361,27 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
           try {
             const fresh = engine.ctx.store.getWork(work.id);
             if (!isFleetEligible(fresh) || deferred.has(fresh.id)) {
+              releaseFleetLock({ projectRoot: engine.ctx.projectRoot, workId: work.id, owner: acq.lock.owner });
+              continue;
+            }
+            // Part F: refuse admit when predicted file sets overlap or either is unknown.
+            const candidatePred = readFilePrediction(engine.ctx.store, fresh.id);
+            const activePreds: FilePrediction[] = [...active.keys()].map((id) =>
+              readFilePrediction(engine.ctx.store, id),
+            );
+            if (blocksAdmit(candidatePred, activePreds)) {
+              engine.ctx.store.appendEvent({
+                workId: fresh.id,
+                type: 'fleet.prediction-blocked',
+                payload: {
+                  runId,
+                  reason:
+                    candidatePred.kind === 'unknown'
+                      ? `candidate prediction unknown: ${candidatePred.reason}`
+                      : 'predicted file set overlaps an active task (or an active prediction is unknown)',
+                  activeWorkIds: [...active.keys()],
+                },
+              });
               releaseFleetLock({ projectRoot: engine.ctx.projectRoot, workId: work.id, owner: acq.lock.owner });
               continue;
             }
