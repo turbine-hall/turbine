@@ -59,7 +59,7 @@ export function laneProject(dirs: string[], opts: { policy?: string; approved?: 
   engine.ctx.config.models.profiles['review-secondary'] = { provider: 'mock', model: 'mock-review-secondary', maxOutputTokens: 3000 };
   registerModel(createMockModelAdapter('mock-review-primary'));
   registerModel(createMockModelAdapter('mock-review-secondary'));
-  engine.ctx.config.tools.allow.push('pr.create', 'pr.merge');
+  engine.ctx.config.tools.allow.push('pr.create', 'pr.merge', 'git.branch.create');
   engine.ctx.config.tools.denied = engine.ctx.config.tools.denied.filter((capability) => capability !== 'pr.merge');
   const github: GitHubFixtureState = {
     pullRequests: {},

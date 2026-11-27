@@ -283,7 +283,7 @@ Point your agent (Cursor, Claude Code, etc.) at [docs/AGENT_DRIVER.md](docs/AGEN
 
 ## Built-in roles and skills
 
-**16 roles:** requirements analyst, spec writer, project manager, architect, UX designer, frontend developer, backend developer, database engineer, code reviewer, code quality checker, security reviewer, unit tester, test-case SQA, API SQA, E2E SQA, release engineer. See [`roles/`](roles).
+**17 roles:** requirements analyst, spec writer, project manager, architect, UX designer, frontend developer, backend developer, database engineer, code reviewer, code quality checker, security reviewer, unit tester, test-case SQA, API SQA, E2E SQA, release engineer, task decomposer. See [`roles/`](roles).
 
 **Core skills:** assess requirements, write specification, plan change, execute code change, surgical changes, systematic debugging, review change, verify acceptance. See [`skills/core/`](skills/core).
 

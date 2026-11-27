@@ -17,6 +17,14 @@ afterEach(() => {
   cleanup(dirs);
 });
 
+/** Landing head is exactly `turbine/<workId>`; subtask heads are `turbine/<workId>-…`. */
+const isLandingHead = (head: string, workId?: string) =>
+  workId ? head === `turbine/${workId}` : /^turbine\/work_[A-Za-z0-9]+$/.test(head);
+const fixtureLandingPrs = (github: { pullRequests?: Record<string, Array<{ head: string }>> }, workId?: string) =>
+  (github.pullRequests?.['fixture/project'] ?? []).filter((pr) => isLandingHead(pr.head, workId));
+const fixtureLandingPr = <T extends { head: string }>(github: { pullRequests?: Record<string, T[]> }, workId: string) =>
+  (github.pullRequests?.['fixture/project'] ?? []).find((pr) => pr.head === `turbine/${workId}`);
+
 describe('Part C PR automation', () => {
   it('AC11 / FR-C1–C3: ACCEPTED creates and records a PR, publishes exact-SHA gate status, and queues auto-merge', async () => {
     const { dir, engine, github } = laneProject(dirs);
@@ -239,7 +247,7 @@ describe('Part C PR automation', () => {
     await engine.waitForLanePr();
     expect(engine.ctx.store.getLanePrRecord(first.work.id)).toMatchObject({ headSha: first.head });
     expect(engine.ctx.store.getLanePrRecord(second.work.id)).toMatchObject({ headSha: second.head });
-    expect(github.pullRequests?.['fixture/project']).toHaveLength(2);
+    expect(fixtureLandingPrs(github)).toHaveLength(2);
     engine.ctx.store.close();
   }, 120_000);
 
@@ -284,24 +292,66 @@ describe('Part C PR automation', () => {
   });
 
   it('FR-C5 config: human acceptance without pr.create in tools.allow skips PR automation without throwing', async () => {
-    const { engine, github } = laneProject(dirs, { approved: false });
+    const { engine } = laneProject(dirs, { approved: false });
+    // Execute still needs pr.create for task-decomposer (fail-closed). Strip it only before acceptance landing.
+    const title = 'Not opted in after execute';
+    const w = engine.createTask({ title, text: `${title}\n\nImplement with auth permissions checks.`, type: 'feature' });
+    await engine.assess(w.id);
+    engine.editRequirements(w.id, {
+      acceptanceCriteria: [{ id: 'ac_1', statement: 'Feature works', kind: 'behavioral', status: 'confirmed' }],
+      unknowns: [],
+    });
+    engine.approveRequirements(w.id, engine.ctx.store.getLatestArtifact(w.id, 'specification')!.contentHash, 'tester');
+    await engine.plan(w.id);
+    engine.approvePlan(w.id, engine.ctx.store.getLatestArtifact(w.id, 'plan')!.contentHash, 'tester');
+    const executed = await engine.execute(w.id);
+    const commit = commitIn(executed.result.worktreePath!, `${w.id}.txt`);
+    await engine.syncFromMarkdown(w.id);
+    await engine.aiReview(w.id);
+    engine.humanReview(w.id, 'tester', 'approve', undefined, { commit: commit.slice(0, 8) });
+    await engine.verify(w.id);
     engine.ctx.config.tools.allow = engine.ctx.config.tools.allow.filter((capability) => capability !== 'pr.create');
-    const { work } = await acceptByHuman(engine, 'Not opted in');
+    engine.accept(w.id, 'tester', { expected: 'works', actual: 'works', result: 'passed' }, { commit });
     await expect(engine.waitForLanePr()).resolves.toBeUndefined();
-    expect(engine.ctx.store.getWork(work.id).currentState).toBe('ACCEPTED');
-    expect(engine.ctx.store.getLanePrRecord(work.id)).toBeUndefined();
-    expect(github.pullRequests?.['fixture/project'] ?? []).toHaveLength(0);
-    expect(engine.ctx.store.listEvents(work.id).some((event) => event.type === 'lane.pr-automation-skipped')).toBe(true);
+    expect(engine.ctx.store.getWork(w.id).currentState).toBe('ACCEPTED');
+    expect(engine.ctx.store.getLanePrRecord(w.id)).toBeUndefined();
+    // Subtask PRs from decomposer may exist; landing automation must not record a landing PR.
+    expect(engine.ctx.store.listEvents(w.id).some((event) => event.type === 'lane.pr-automation-skipped')).toBe(true);
     engine.ctx.store.close();
   }, 60_000);
 
   it('FR-C5 config: an opted-in human acceptance still reports a failing PR automation', async () => {
     const { engine } = laneProject(dirs, { approved: false });
     const real = engine.lanePrTarget!.adapter;
-    engine.lanePrTarget!.adapter = { ...real, invoke: async () => { throw new Error('github down'); } };
-    const { work } = await acceptByHuman(engine, 'Opted in but failing');
+    let failLanding = false;
+    engine.lanePrTarget!.adapter = {
+      ...real,
+      invoke: async (request) => {
+        // Allow task-decomposer remote branch + subtask PRs during execute; fail only landing automation.
+        if (!failLanding) return real.invoke(request);
+        throw new Error('github down');
+      },
+    };
+    const title = 'Opted in but failing';
+    const created = engine.createTask({ title, text: `${title}\n\nImplement with auth permissions checks.`, type: 'feature' });
+    await engine.assess(created.id);
+    engine.editRequirements(created.id, {
+      acceptanceCriteria: [{ id: 'ac_1', statement: 'Feature works', kind: 'behavioral', status: 'confirmed' }],
+      unknowns: [],
+    });
+    engine.approveRequirements(created.id, engine.ctx.store.getLatestArtifact(created.id, 'specification')!.contentHash, 'tester');
+    await engine.plan(created.id);
+    engine.approvePlan(created.id, engine.ctx.store.getLatestArtifact(created.id, 'plan')!.contentHash, 'tester');
+    const executed = await engine.execute(created.id);
+    const commit = commitIn(executed.result.worktreePath!, `${created.id}.txt`);
+    await engine.syncFromMarkdown(created.id);
+    await engine.aiReview(created.id);
+    engine.humanReview(created.id, 'tester', 'approve', undefined, { commit: commit.slice(0, 8) });
+    await engine.verify(created.id);
+    failLanding = true;
+    const accepted = engine.accept(created.id, 'tester', { expected: 'works', actual: 'works', result: 'passed' }, { commit });
     await expect(engine.waitForLanePr()).rejects.toThrow('github down');
-    expect(engine.ctx.store.listEvents(work.id).some((event) => event.type === 'lane.pr-automation-failed')).toBe(true);
+    expect(engine.ctx.store.listEvents(accepted.work.id).some((event) => event.type === 'lane.pr-automation-failed')).toBe(true);
     engine.ctx.store.close();
   }, 60_000);
 
@@ -309,15 +359,30 @@ describe('Part C PR automation', () => {
     const { engine, github } = laneProject(dirs, { approved: false });
     const real = engine.lanePrTarget!.adapter;
     let down = true;
-    engine.lanePrTarget!.adapter = { ...real, invoke: async (request) => { if (down) throw new Error('github down'); return real.invoke(request); } };
+    const isSubtaskHead = (head: string) => /^turbine\/work_[A-Za-z0-9]+-/.test(head);
+    engine.lanePrTarget!.adapter = {
+      ...real,
+      invoke: async (request) => {
+        // Allow task-decomposer during execute; fail only landing automation while down.
+        if (
+          down &&
+          !(request.capability === 'git.branch.create') &&
+          !(request.capability === 'pr.create' && isSubtaskHead(String(request.arguments.head ?? '')))
+        ) {
+          throw new Error('github down');
+        }
+        return real.invoke(request);
+      },
+    };
     const { work } = await acceptByHuman(engine, 'Resume later');
     await expect(engine.waitForLanePr()).rejects.toThrow('github down');
     expect(engine.ctx.store.getLanePrRecord(work.id)).toBeUndefined();
     down = false;
     await engine.syncFromMarkdown(work.id);
-    expect(engine.ctx.store.getLanePrRecord(work.id)).toMatchObject({ number: 1 });
+    expect(engine.ctx.store.getLanePrRecord(work.id)).toMatchObject({ headBranch: `turbine/${work.id}` });
     await engine.syncFromMarkdown(work.id);
-    expect(github.pullRequests?.['fixture/project']).toHaveLength(1);
+    // Landing PR + any subtask PRs from decomposer.
+    expect(github.pullRequests?.['fixture/project']?.some((pr) => pr.head === `turbine/${work.id}`)).toBe(true);
     engine.ctx.store.close();
   }, 60_000);
 
@@ -419,15 +484,23 @@ describe('Part C PR automation', () => {
     engine.laneRetry(work.id, { actor: 'Rae', confirmToken: engine.pendingLaneRetry(work.id).confirmToken, presence: 'test' });
     return work.id;
   };
-  /** GitHub is unreachable for PR work (rules reads still work so the policy can accept). */
-  const flaky = (engine: Engine, failing: (capability: string) => boolean = (capability) => capability !== 'repo.rules.read') => {
+  /** GitHub is unreachable for landing PR work (rules + task-decomposer still work so execute/policy can proceed). */
+  const flaky = (
+    engine: Engine,
+    failing: (capability: string, args: Record<string, unknown>) => boolean = (capability, args) => {
+      if (capability === 'repo.rules.read') return false;
+      if (capability === 'git.branch.create') return false;
+      if (capability === 'pr.create' && /^turbine\/work_[A-Za-z0-9]+-/.test(String(args.head ?? ''))) return false;
+      return true;
+    },
+  ) => {
     const real = engine.lanePrTarget!.adapter;
     const state = { down: true, requests: [] as Array<{ capability: string; arguments: Record<string, unknown> }> };
     engine.lanePrTarget!.adapter = {
       ...real,
       invoke: async (request) => {
         state.requests.push({ capability: request.capability, arguments: request.arguments });
-        if (state.down && failing(request.capability)) throw new Error('github down');
+        if (state.down && failing(request.capability, request.arguments)) throw new Error('github down');
         return real.invoke(request);
       },
     };
@@ -452,7 +525,8 @@ describe('Part C PR automation', () => {
     net.down = false;
     await engine.syncFromMarkdown(id);
     expect(engine.ctx.store.getLanePrRecord(id)).toBeUndefined();
-    expect(github.pullRequests?.['fixture/project'] ?? []).toHaveLength(0);
+    // Subtask PRs from decomposer may exist; landing must not.
+    expect(github.pullRequests?.['fixture/project']?.some((pr) => pr.head === `turbine/${id}`) ?? false).toBe(false);
     expect(events(engine, id, 'lane.pr-automation-blocked').at(-1)?.payload.reason).toMatch(/re-approved/);
     expect(engine.ctx.store.listDecisions(id).filter((entry) => entry.gate === 'sqa-acceptance' && entry.actorType === 'human')).toHaveLength(0);
     engine.ctx.store.close();
@@ -467,7 +541,7 @@ describe('Part C PR automation', () => {
     net.down = false;
     await engine.syncFromMarkdown(id);
     expect(engine.ctx.store.getLanePrRecord(id)).toBeUndefined();
-    expect(github.pullRequests?.['fixture/project'] ?? []).toHaveLength(0);
+    expect(github.pullRequests?.['fixture/project']?.some((pr) => pr.head === `turbine/${id}`) ?? false).toBe(false);
     expect(events(engine, id, 'lane.pr-automation-blocked').at(-1)?.payload.reason).toMatch(/suspended/);
     engine.ctx.store.close();
   }, 120_000);
@@ -483,7 +557,7 @@ describe('Part C PR automation', () => {
     net.down = false;
     await engine.syncFromMarkdown(id);
     expect(engine.ctx.store.getLanePrRecord(id)).toMatchObject({ owner: 'fixture', repo: 'project', baseBranch: 'main', queueState: 'queued' });
-    expect(github.pullRequests?.['fixture/project']).toHaveLength(1);
+    expect(fixtureLandingPrs(github, id)).toHaveLength(1);
     expect(github.pullRequests?.['other/elsewhere']).toBeUndefined();
     engine.ctx.store.close();
   }, 120_000);
@@ -595,7 +669,7 @@ describe('Part C PR automation', () => {
     const published = github.statuses![`fixture/project@${head}`]!.length;
     await engine.syncFromMarkdown(work.id);
     expect(github.statuses![`fixture/project@${head}`]).toHaveLength(published);
-    expect(github.pullRequests?.['fixture/project']).toHaveLength(1);
+    expect(fixtureLandingPrs(github, work.id)).toHaveLength(1);
     engine.ctx.store.close();
   }, 120_000);
 
@@ -603,12 +677,14 @@ describe('Part C PR automation', () => {
     const { engine, github } = laneProject(dirs, { approved: false });
     const { work } = await acceptByHuman(engine, 'Closed later');
     await engine.waitForLanePr();
-    github.pullRequests!['fixture/project']![0]!.state = 'closed';
+    fixtureLandingPr(github, work.id)!.state = 'closed';
     await engine.refreshLanePullRequest(work.id);
     expect(engine.ctx.store.getLanePrRecord(work.id)).toMatchObject({ prState: 'closed', queueReason: 'PR was closed without merging' });
+    const closedNumber = engine.ctx.store.getLanePrRecord(work.id)!.number;
     await engine.syncFromMarkdown(work.id);
-    expect(github.pullRequests?.['fixture/project']).toHaveLength(2);
-    expect(engine.ctx.store.getLanePrRecord(work.id)).toMatchObject({ number: 2, prState: 'open' });
+    expect(fixtureLandingPrs(github, work.id).filter((pr) => pr.state === 'open' || pr.state === 'closed')).toHaveLength(2);
+    expect(engine.ctx.store.getLanePrRecord(work.id)).toMatchObject({ prState: 'open' });
+    expect(engine.ctx.store.getLanePrRecord(work.id)!.number).not.toBe(closedNumber);
     expect(events(engine, work.id, 'lane.pr-replaced')).toHaveLength(1);
     engine.ctx.store.close();
   }, 120_000);
@@ -621,7 +697,7 @@ describe('Part C PR automation', () => {
     const current = engine.ctx.store.getWork(bumped.work.id);
     engine.ctx.store.saveWork({ ...current, currentRevision: current.currentRevision + 1 });
     await engine.waitForLanePr();
-    expect(github.pullRequests?.['fixture/project'] ?? []).toHaveLength(0);
+    expect(fixtureLandingPrs(github)).toHaveLength(0);
     expect(engine.ctx.store.getLanePrRecord(moved.work.id)).toBeUndefined();
     expect(events(engine, moved.work.id, 'lane.pr-automation-discarded').at(-1)?.payload.reason).toMatch(/head/);
     expect(events(engine, bumped.work.id, 'lane.pr-automation-discarded').at(-1)?.payload.reason).toMatch(/revision/);
@@ -630,7 +706,8 @@ describe('Part C PR automation', () => {
 
   it('FR-C3 resume: a worktree that advanced past the accepted head is not landed; sync handles the new commit', async () => {
     const { engine, github } = laneProject(dirs, { approved: false });
-    const net = flaky(engine, () => true);
+    // Fail landing only; allow task-decomposer during execute.
+    const net = flaky(engine);
     const { work } = await acceptByHuman(engine, 'Advanced head');
     await expect(engine.waitForLanePr()).rejects.toThrow('github down');
     commitIn(engine.repoStates(work.id)[0]!.worktreePath, 'late.txt');
@@ -638,7 +715,7 @@ describe('Part C PR automation', () => {
     const result = await engine.syncFromMarkdown(work.id);
     expect(result.action).toBe('code.changed');
     expect(engine.ctx.store.getLanePrRecord(work.id)).toBeUndefined();
-    expect(github.pullRequests?.['fixture/project'] ?? []).toHaveLength(0);
+    expect(github.pullRequests?.['fixture/project']?.some((pr) => pr.head === `turbine/${work.id}`) ?? false).toBe(false);
     engine.ctx.store.close();
   }, 120_000);
 
@@ -668,7 +745,7 @@ describe('Part C PR automation', () => {
     const { engine, github } = laneProject(dirs, { approved: false });
     const { work } = await acceptByHuman(engine, 'Ejected later');
     await engine.waitForLanePr();
-    Object.assign(github.pullRequests!['fixture/project']![0]!, { mergeQueueState: 'ejected', queueReason: 'required check failed', queueRemovalId: 'rm_5' });
+    Object.assign(fixtureLandingPr(github, work.id)!, { mergeQueueState: 'ejected', queueReason: 'required check failed', queueRemovalId: 'rm_5' });
     await engine.syncFromMarkdown(work.id);
     expect(events(engine, work.id, 'lane.queue-ejected')[0]?.payload).toMatchObject({ reason: 'required check failed', fixRound: 1, removalId: 'rm_5' });
     expect(engine.ctx.store.getWork(work.id).currentState).not.toBe('ACCEPTED');
@@ -789,7 +866,7 @@ describe('Part C PR automation', () => {
     const id = await readyForPolicyAcceptance(engine);
     await expect(engine.syncFromMarkdown(id)).rejects.toThrow('github down');
     expect(engine.ctx.store.getLanePrRecord(id)).toMatchObject({ queueState: 'not-enabled', statusPublished: { state: 'success' } });
-    Object.assign(github.pullRequests!['fixture/project']![0]!, ejectedPr());
+    Object.assign(fixtureLandingPr(github, id)!, ejectedPr());
     net.down = false;
     const attempts = net.requests.filter((request) => request.capability === 'pr.merge').length;
     await engine.syncFromMarkdown(id);
@@ -839,7 +916,7 @@ describe('Part C PR automation', () => {
     net.down = false;
     await engine.syncFromMarkdown(id);
     expect(engine.ctx.store.getLanePrRecord(id)).toBeUndefined();
-    expect(github.pullRequests?.['fixture/project'] ?? []).toHaveLength(0);
+    expect(github.pullRequests?.['fixture/project']?.some((pr) => pr.head === `turbine/${id}`) ?? false).toBe(false);
     expect(events(engine, id, 'lane.pr-automation-blocked').at(-1)?.payload.reason).toMatch(/pending edit/);
     engine.ctx.store.close();
   }, 120_000);

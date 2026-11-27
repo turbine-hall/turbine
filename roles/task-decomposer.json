@@ -1,0 +1,15 @@
+{
+  "id": "task-decomposer",
+  "version": "0.1.0",
+  "responsibility": "Break approved work into small subtasks and open one PR per subtask before implementation starts",
+  "inputs": ["work-package", "approved-specification", "approved-plan", "repository-context"],
+  "skills": { "required": ["core/decompose-task"], "optional": [] },
+  "capabilities": {
+    "required": ["repo.read", "repo.inspect", "git.branch.create", "pr.create"],
+    "prohibited": ["requirements.approve", "plan.approve", "pr.merge", "git.merge", "production.deploy"]
+  },
+  "outputs": ["task-decomposition"],
+  "model_policy": "analysis-capable",
+  "max_attempts": 1,
+  "escalates_on": ["ambiguous-requirement", "scope-expansion"]
+}

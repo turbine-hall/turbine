@@ -232,6 +232,7 @@ export async function ensureAcceptedPr(input: {
     record && record.authorizationId === authorizationId && record.authorizingPolicy ? record.authorizingPolicy : snapshot;
   if (!record) {
     assertAuth();
+    const head = `turbine/${work.id}`;
     let created: InvokeResult<{
       number: number;
       nodeId?: string;
@@ -241,15 +242,19 @@ export async function ensureAcceptedPr(input: {
       base: string;
     }>;
     try {
+      // Ensure the landing head exists remotely (or in fixtures) before pr.create.
+      if (target.adapter.capabilities.includes('git.branch.create')) {
+        await invoke(target, 'git.branch.create', work.id, { branch: head, sha: headSha });
+      }
       created = await invoke(target, 'pr.create', work.id, {
-        head: `turbine/${work.id}`,
+        head,
         headSha,
         base: target.baseBranch,
         title: work.title,
         body: `Turbine task ${work.id}`,
       });
     } catch (e) {
-      // Turbine never pushes: create fails closed when the accepted branch is not on the remote yet.
+      // Create fails closed when the accepted branch cannot be published / opened remotely.
       throw err(
         'E_ADAPTER',
         `${(e as Error).message}. Push branch turbine/${work.id} with the accepted commit to the remote, then sync again`,

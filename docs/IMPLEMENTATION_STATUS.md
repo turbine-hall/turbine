@@ -8,7 +8,7 @@
 |---|---|---|
 | Phase 0 — Scaffold | tested | pnpm monorepo, CLI `turbine`, lint/typecheck/test/build, CI workflow |
 | Phase 1 — Contracts + persistence | tested | Zod contracts, `node:sqlite` store, init/doctor/task create-list-show-status-history, draft EEC |
-| Phase 2 — Workflow / EEC / ARSP | tested | State machine, gates, lineage invalidation/recovery, 16 roles, ARSP |
+| Phase 2 — Workflow / EEC / ARSP | tested | State machine, gates, lineage invalidation/recovery, 17 roles, ARSP |
 | Phase 3 — Skills + requirements | tested | assess/spec skills, mock model, budgets, hash-bound approvals |
 | Phase 4 — Planning + Jira (R0) | tested | plan skill (+ executive-summary companion), git inspect, Jira read + fixtures, recover --dry-run; packet docs PLAN.md + EXECUTIVE-SUMMARY.md with Mermaid and heuristic coding-agent token estimate (#17) |
 | Issue packet mirror (#21) | tested | Sticky Turbine-owned issue comment (STATUS/SPEC/PLAN/EXEC/REVIEW/CONTEXT) on each packet render via `issue.comment`; GitHub from URLs/aliases/sourceRefs, Jira from `jira:` aliases/sourceRefs/takeover; live gate = `tools.allow` + `inputs.adapters.{github,jira}.enabled` + GitHub `mirrorRepos` (not `execution.allowNetwork`); HTTPS-only API bases; fixtureMode is programmatic (injected adapters only); `issue-mirror.test.ts` |

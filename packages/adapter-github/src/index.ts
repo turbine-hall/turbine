@@ -40,6 +40,8 @@ export type GitHubPullRequest = {
 export type GitHubFixtureState = {
   comments?: Record<string, GitHubComment[]>;
   pullRequests?: Record<string, GitHubPullRequest[]>;
+  /** Remote branch refs created via git.branch.create, keyed by `owner/repo` then branch name → sha. */
+  refs?: Record<string, Record<string, string>>;
   statuses?: Record<string, Array<{ context: string; state: 'pending' | 'success' | 'failure'; description?: string }>>;
   protections?: Record<string, { mergeQueueRequired: boolean; requiredStatuses: string[] } | { error: string }>;
 };
@@ -81,7 +83,16 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
 
   return {
     id: 'github',
-    capabilities: ['issue.read', 'issue.comment', 'pr.create', 'pr.read', 'pr.merge', 'commit.status', 'repo.rules.read'] as Capability[],
+    capabilities: [
+      'issue.read',
+      'issue.comment',
+      'git.branch.create',
+      'pr.create',
+      'pr.read',
+      'pr.merge',
+      'commit.status',
+      'repo.rules.read',
+    ] as Capability[],
     async healthCheck() {
       if (config.fixtures) return { ok: true, details: 'fixture-mode' };
       if (!resolveToken(config)) return { ok: false, details: 'Missing GITHUB_TOKEN / token' };
@@ -150,6 +161,34 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
         return { data: { status: 'confirmed', mergeQueueRequired, turbineGateRequired } };
       }
 
+      if (capability === 'git.branch.create') {
+        const branch = String(args.branch ?? args.head ?? '');
+        const sha = String(args.sha ?? args.headSha ?? '');
+        if (!branch || !sha) throw err('E_ADAPTER', 'git.branch.create requires branch and sha');
+        if (config.fixtures) {
+          const refs = (config.fixtures.refs ??= {})[repoKey] ??= {};
+          refs[branch] = sha;
+          return { data: { branch, sha, remote: true }, externalOperationId: branch };
+        }
+        const token = resolveToken(config);
+        if (!token) throw err('E_ADAPTER', 'GitHub token missing (GITHUB_TOKEN)');
+        const ref = `refs/heads/${branch}`;
+        // Create, or force-update when the branch already exists (first execute points at base HEAD).
+        try {
+          await liveJson(config, `/repos/${owner}/${repo}/git/refs`, 'POST', { ref, sha });
+        } catch (createErr) {
+          try {
+            await liveJson(config, `/repos/${owner}/${repo}/git/refs/heads/${encodeURIComponent(branch)}`, 'PATCH', {
+              sha,
+              force: true,
+            });
+          } catch {
+            throw err('E_ADAPTER', `Failed to create or update remote branch ${branch}: ${(createErr as Error).message}`);
+          }
+        }
+        return { data: { branch, sha, remote: true }, externalOperationId: branch };
+      }
+
       if (capability === 'pr.create') {
         const head = String(args.head ?? '');
         const headSha = String(args.headSha ?? '');
@@ -158,6 +197,20 @@ export function createGitHubAdapter(config: GitHubConfig = {}): ToolAdapter {
         const body = String(args.body ?? '');
         if (!head || !headSha || !base || !title) throw err('E_ADAPTER', 'PR head, headSha, base, and title are required');
         if (config.fixtures) {
+          // When the fixture tracks refs (task-decomposer), require the head branch first.
+          // Landing-PR tests omit `refs` and keep the older create-without-push behavior.
+          if (config.fixtures.refs) {
+            const remoteSha = config.fixtures.refs[repoKey]?.[head];
+            if (!remoteSha) {
+              throw err(
+                'E_ADAPTER',
+                `Remote branch ${head} does not exist; create it with git.branch.create before pr.create`,
+              );
+            }
+            if (remoteSha !== headSha) {
+              throw err('E_STALE_REVISION', `Remote branch ${head} is ${remoteSha.slice(0, 8)}, not ${headSha.slice(0, 8)}`);
+            }
+          }
           const list = (config.fixtures.pullRequests ??= {})[repoKey] ??= [];
           const existing = list.find((pr) => pr.head === head && pr.base === base && pr.state === 'open');
           if (existing) return { data: existing, externalOperationId: String(existing.number) };
@@ -393,7 +446,7 @@ function liveHeaders(token: string): Record<string, string> {
   };
 }
 
-async function liveJson(config: GitHubConfig, path: string, method: 'GET' | 'POST', body?: unknown): Promise<unknown> {
+async function liveJson(config: GitHubConfig, path: string, method: 'GET' | 'POST' | 'PATCH', body?: unknown): Promise<unknown> {
   const token = resolveToken(config);
   if (!token) throw err('E_ADAPTER', 'GitHub token missing (GITHUB_TOKEN)');
   const response = await fetch(`${httpsApiBase(config)}${path}`, {
