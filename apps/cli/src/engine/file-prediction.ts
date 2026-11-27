@@ -94,6 +94,20 @@ export function buildFilePrediction(store: WorkStore, workId: string, at = new D
   if (planArt) {
     planPresent = true;
     const content = readArtifactJson(store, planArt);
+    // Fail closed: a missing/non-array steps field is not an empty selection (AGENTS.md rule 3).
+    if (
+      content === null ||
+      typeof content !== 'object' ||
+      !('steps' in (content as object)) ||
+      !Array.isArray((content as { steps?: unknown }).steps)
+    ) {
+      return {
+        kind: 'unknown',
+        reason: 'plan artifact missing steps array',
+        labelled: 'selection',
+        at,
+      };
+    }
     const plan = normalizePlan(content);
     planPaths = [...new Set(plan.steps.flatMap((s) => s.files.map(normalizePath)).filter(Boolean))].sort();
   }
@@ -127,9 +141,21 @@ export function parseFilePrediction(content: unknown): FilePrediction {
     if (!Array.isArray(c.paths) || c.labelled !== 'selection') {
       throw err('E_UNSAFE_EXECUTION', 'file-prediction selection has invalid paths/label');
     }
+    // Empty array is a valid empty selection; blank/non-string entries are corrupt (fail closed).
+    const paths: string[] = [];
+    for (const raw of c.paths) {
+      if (typeof raw !== 'string') {
+        throw err('E_UNSAFE_EXECUTION', 'file-prediction selection path is not a string');
+      }
+      const path = normalizePath(raw);
+      if (!path) {
+        throw err('E_UNSAFE_EXECUTION', 'file-prediction selection path is empty after normalize');
+      }
+      paths.push(path);
+    }
     return {
       kind: 'selection',
-      paths: c.paths.map(normalizePath).filter(Boolean).sort(),
+      paths: [...new Set(paths)].sort(),
       sources: {
         context: Boolean(c.sources?.context),
         plan: Boolean(c.sources?.plan),

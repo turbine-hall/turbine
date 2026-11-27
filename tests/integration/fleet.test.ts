@@ -22,6 +22,7 @@ import { fleetStatus, runFleet } from '../../apps/cli/src/engine/fleet.js';
 import {
   actualPathsFromChangeReport,
   blocksAdmit,
+  buildFilePrediction,
   comparePredictionToActual,
   parseFilePrediction,
   type FilePrediction,
@@ -875,6 +876,60 @@ describe('fleet scheduler (Part E / #43)', () => {
       expect(selection.paths).toContain('shared.ts');
       expect(selection.paths).not.toContain('src/../shared.ts');
     }
+    expect(
+      parseFilePrediction({
+        kind: 'selection',
+        paths: [],
+        sources: { context: true, plan: false },
+        labelled: 'selection',
+        at: 't',
+      }).kind,
+    ).toBe('selection');
+    expect(() =>
+      parseFilePrediction({
+        kind: 'selection',
+        paths: [' '],
+        sources: { context: true, plan: false },
+        labelled: 'selection',
+        at: 't',
+      }),
+    ).toThrow(/empty after normalize/i);
+
+    const dirPlan = tempProject('fleet-plan-steps-', dirs);
+    const enginePlan = new Engine(openContext(dirPlan));
+    const planWork = enginePlan.createTask({
+      title: 'Plan steps',
+      file: (() => {
+        const p = join(dirPlan, 'plan-steps.md');
+        writeFileSync(p, '# plan\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    const planLoc = join(dirPlan, `.turbine/artifacts/${planWork.id}-plan.json`);
+    mkdirSync(dirname(planLoc), { recursive: true });
+    const badPlan = { summary: 'no steps field' };
+    writeFileSync(planLoc, `${JSON.stringify(badPlan, null, 2)}\n`);
+    enginePlan.ctx.store.saveArtifact(
+      {
+        id: createId('art'),
+        workId: planWork.id,
+        type: 'plan',
+        revision: 1,
+        contentHash: contentHash(badPlan),
+        contentType: 'application/json',
+        location: planLoc,
+        createdBy: { kind: 'tool', identifier: 'test' },
+        createdAt: new Date().toISOString(),
+        parentArtifactIds: [],
+      },
+      `${JSON.stringify(badPlan, null, 2)}\n`,
+    );
+    const fromBadPlan = buildFilePrediction(enginePlan.ctx.store, planWork.id);
+    expect(fromBadPlan.kind).toBe('unknown');
+    if (fromBadPlan.kind === 'unknown') expect(fromBadPlan.reason).toMatch(/steps array/i);
+    enginePlan.ctx.store.close();
+
     expect(blocksAdmit(selection, [])).toBe(false);
     expect(
       blocksAdmit(
