@@ -62,12 +62,34 @@ export function inspectRepo(cwd: string): RepoInfo {
   return { root, branch, head, dirty, remotes };
 }
 
+/**
+ * Resolve a branch tip for worktree/PR bases. Prefers `origin/<name>` when present so
+ * local checkouts on a different branch do not poison the tip.
+ */
+export function resolveBaseCommit(repoRoot: string, baseBranch: string): string {
+  const name = baseBranch.trim();
+  if (!name) throw err('E_INVALID_CONFIG', 'baseBranch must be a non-empty git branch name');
+  for (const candidate of [`origin/${name}`, name]) {
+    const r = git(repoRoot, ['rev-parse', '--verify', `${candidate}^{commit}`]);
+    if (r.status === 0 && r.stdout.trim()) return r.stdout.trim();
+  }
+  throw err(
+    'E_ADAPTER',
+    `Cannot resolve base branch "${name}" (tried origin/${name} and ${name}). Fetch it or set git.defaultBaseBranch.`,
+  );
+}
+
 export function createWorktree(input: {
   repoRoot: string;
   workId: string;
   branchName?: string;
   /** Where to put the worktree; defaults to <repo>/.turbine/worktrees/<workId>. */
   worktreePath?: string;
+  /**
+   * Branch to fork from (e.g. main). When set, the new turbine/* branch is created at that
+   * tip — not at whatever HEAD the main checkout currently has.
+   */
+  baseBranch?: string;
 }): { worktreePath: string; branch: string; baseCommit: string } {
   const info = inspectRepo(input.repoRoot);
   const branch = input.branchName ?? `turbine/${input.workId}`;
@@ -75,16 +97,27 @@ export function createWorktree(input: {
     input.worktreePath ?? join(info.root, '.turbine', 'worktrees', input.workId);
   mkdirSync(join(worktreePath, '..'), { recursive: true });
 
+  const baseCommit = input.baseBranch
+    ? resolveBaseCommit(info.root, input.baseBranch)
+    : info.head;
+
   if (existsSync(worktreePath)) {
+    // Existing worktree: report its current tip (do not move an in-progress checkout).
     const head = git(worktreePath, ['rev-parse', 'HEAD']).stdout.trim();
     return { worktreePath, branch, baseCommit: head };
   }
 
   const branchExists = git(info.root, ['rev-parse', '--verify', branch]).status === 0;
   if (!branchExists) {
-    const created = git(info.root, ['branch', branch, info.head]);
+    const created = git(info.root, ['branch', branch, baseCommit]);
     if (created.status !== 0) {
       throw err('E_ADAPTER', `Failed to create branch ${branch}: ${created.stderr}`);
+    }
+  } else if (input.baseBranch) {
+    // Point the task branch at the configured base before the worktree is attached (no checkout).
+    const moved = git(info.root, ['branch', '-f', branch, baseCommit]);
+    if (moved.status !== 0) {
+      throw err('E_ADAPTER', `Failed to reset branch ${branch} to ${input.baseBranch}: ${moved.stderr}`);
     }
   }
 
@@ -92,7 +125,7 @@ export function createWorktree(input: {
   if (added.status !== 0) {
     throw err('E_ADAPTER', `Failed to create worktree: ${added.stderr}`);
   }
-  return { worktreePath, branch, baseCommit: info.head };
+  return { worktreePath, branch, baseCommit };
 }
 
 export function headOf(path: string): string {

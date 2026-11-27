@@ -47,6 +47,28 @@ export const ProjectConfigSchema = z.object({
     version: z.string().default('0.5.0'),
     policyProfile: z.enum(['lightweight', 'standard', 'comprehensive']).default('standard'),
   }),
+  /**
+   * Git defaults for task worktrees and subtask/landing PRs.
+   * Worktrees and PR heads are created from `defaultBaseBranch` (not whatever happens to be checked out).
+   */
+  git: z
+    .object({
+      /** Branch name PRs target and worktrees fork from (e.g. main). */
+      defaultBaseBranch: z
+        .string()
+        .min(1)
+        .max(256)
+        .regex(/^[A-Za-z0-9._/-]+$/, {
+          message: 'git.defaultBaseBranch must be a git branch name (letters, digits, . _ / -)',
+        })
+        .default('main'),
+      /**
+       * Max insertions+deletions vs the configured base when opening a subtask PR.
+       * Exceeding this fails closed so agents cannot open mega-diffs against the wrong tip.
+       */
+      maxSubtaskPrChangedLines: z.number().int().positive().max(10_000).default(400),
+    })
+    .default({ defaultBaseBranch: 'main', maxSubtaskPrChangedLines: 400 }),
   inputs: z.object({
     default: z.enum(['file', 'text', 'jira']).default('file'),
     adapters: z
