@@ -61,6 +61,16 @@ export const ProjectConfigSchema = z.object({
         .regex(/^[A-Za-z0-9._/-]+$/, {
           message: 'git.defaultBaseBranch must be a git branch name (letters, digits, . _ / -)',
         })
+        .refine(
+          (name) => {
+            if (name.includes('..') || name.endsWith('/') || name.startsWith('/')) return false;
+            return name.split('/').every((part) => part.length > 0 && !part.endsWith('.lock'));
+          },
+          {
+            message:
+              'git.defaultBaseBranch must be a valid git branch (no consecutive dots, leading/trailing slash, or .lock components)',
+          },
+        )
         .default('main'),
       /**
        * Max insertions+deletions vs the configured base when opening a subtask PR.

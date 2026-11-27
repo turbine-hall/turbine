@@ -132,5 +132,26 @@ describe('git.defaultBaseBranch', () => {
         git: { defaultBaseBranch: 'main;rm -rf /' },
       }),
     ).toThrow(/git.defaultBaseBranch/);
+    expect(() =>
+      ProjectConfigSchema.parse({
+        ...base,
+        git: { defaultBaseBranch: 'foo..bar' },
+      }),
+    ).toThrow(/git.defaultBaseBranch/);
+    expect(() =>
+      ProjectConfigSchema.parse({
+        ...base,
+        git: { defaultBaseBranch: 'release/' },
+      }),
+    ).toThrow(/git.defaultBaseBranch/);
+    expect(() =>
+      ProjectConfigSchema.parse({
+        ...base,
+        git: { defaultBaseBranch: 'heads/main.lock' },
+      }),
+    ).toThrow(/git.defaultBaseBranch/);
+    expect(ProjectConfigSchema.parse({ ...base, git: { defaultBaseBranch: 'release/next' } }).git.defaultBaseBranch).toBe(
+      'release/next',
+    );
   });
 });
