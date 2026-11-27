@@ -32,8 +32,10 @@ export function tempProject(prefix: string, dirs: string[], checks = ['node lint
   const { paths } = initProject({ projectPath: dir, nonInteractive: true });
   const cfg = loadConfig(paths.configPath);
   cfg.quality.checks = checks;
-  // task-decomposer runs before execute and fail-closes without pr.create.
-  if (!cfg.tools.allow.includes('pr.create')) cfg.tools.allow.push('pr.create');
+  // task-decomposer runs before execute and fail-closes without pr.create / git.branch.create.
+  for (const cap of ['pr.create', 'git.branch.create'] as const) {
+    if (!cfg.tools.allow.includes(cap)) cfg.tools.allow.push(cap);
+  }
   saveConfig(paths.configPath, cfg);
   return dir;
 }

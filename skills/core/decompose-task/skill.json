@@ -6,7 +6,7 @@
   "runnerCompatibility": ["turbine-models"],
   "inputs": ["work-package", "approved-specification", "approved-plan", "context"],
   "outputs": ["task-decomposition"],
-  "requiredCapabilities": ["repo.read", "pr.create"],
+  "requiredCapabilities": ["repo.read", "git.branch.create", "pr.create"],
   "resourceLimits": { "maxModelCalls": 2 },
   "notes": "Runs before execute. Produces small subtasks; the engine opens one PR per subtask."
 }

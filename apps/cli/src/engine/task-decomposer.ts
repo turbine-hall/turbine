@@ -23,12 +23,12 @@ export type TaskDecomposition = {
 
 type InvokeResult<T> = { data: T; externalOperationId?: string };
 
-async function invokePrCreate(
+async function invoke(
   target: LanePrTarget,
+  capability: Capability,
   workId: string,
   args: Record<string, unknown>,
-): Promise<InvokeResult<{ number: number; url: string; head: string; headSha: string; base: string }>> {
-  const capability: Capability = 'pr.create';
+): Promise<InvokeResult<unknown>> {
   if (!target.adapter.capabilities.includes(capability)) {
     throw err('E_MISSING_CAPABILITY', `GitHub adapter does not support ${capability}`);
   }
@@ -37,7 +37,7 @@ async function invokePrCreate(
     workId,
     arguments: { owner: target.owner, repo: target.repo, ...args },
     correlationId: createId('corr'),
-  }) as Promise<InvokeResult<{ number: number; url: string; head: string; headSha: string; base: string }>>;
+  });
 }
 
 function branchSuffix(raw: unknown, fallbackId: string): string {
@@ -49,6 +49,22 @@ function branchSuffix(raw: unknown, fallbackId: string): string {
     .slice(0, 48) || `st-${fallbackId.toLowerCase()}`;
 }
 
+/** Keep the proposed name when unique; otherwise append a deterministic `-2`, `-3`, … suffix. */
+function uniqueBranchNames(preferred: string[]): string[] {
+  const used = new Set<string>();
+  return preferred.map((name) => {
+    let candidate = name;
+    let n = 2;
+    while (used.has(candidate)) {
+      const base = name.slice(0, Math.max(1, 48 - `-${n}`.length));
+      candidate = `${base}-${n}`;
+      n += 1;
+    }
+    used.add(candidate);
+    return candidate;
+  });
+}
+
 export function normalizeDecomposition(content: unknown, planHash: string): TaskDecomposition {
   const body = (content && typeof content === 'object' ? content : {}) as {
     summary?: unknown;
@@ -58,7 +74,7 @@ export function normalizeDecomposition(content: unknown, planHash: string): Task
   if (raw.length === 0) {
     throw err('E_INVALID_CONFIG', 'task-decomposer produced no subtasks');
   }
-  const subtasks: DecompositionSubtask[] = raw.map((entry, index) => {
+  const drafted = raw.map((entry, index) => {
     const row = (entry && typeof entry === 'object' ? entry : {}) as Record<string, unknown>;
     const id = typeof row.id === 'string' && row.id.trim() ? row.id.trim() : `ST${index + 1}`;
     const title = typeof row.title === 'string' && row.title.trim() ? row.title.trim() : `Subtask ${id}`;
@@ -78,9 +94,18 @@ export function normalizeDecomposition(content: unknown, planHash: string): Task
       description,
       requirementIds,
       files,
-      branchName: branchSuffix(row.branchName, id),
+      preferredBranch: branchSuffix(row.branchName, id),
     };
   });
+  const branches = uniqueBranchNames(drafted.map((d) => d.preferredBranch));
+  const subtasks: DecompositionSubtask[] = drafted.map((d, i) => ({
+    id: d.id,
+    title: d.title,
+    description: d.description,
+    requirementIds: d.requirementIds,
+    files: d.files,
+    branchName: branches[i]!,
+  }));
   return {
     planHash,
     summary: typeof body.summary === 'string' && body.summary.trim() ? body.summary.trim() : 'Task decomposition',
@@ -114,11 +139,21 @@ export function renderDecompositionMarkdown(work: WorkPackage, decomposition: Ta
   return lines.join('\n');
 }
 
+/**
+ * Contract: Engine.execute fail-closes when PR/branch capabilities are unavailable.
+ * Do not skip decomposition silently.
+ */
 export function assertPrCreateAllowed(tools: { allow: string[]; denied: string[] }): void {
   if (!configAllows(tools, 'pr.create')) {
     throw err(
       'E_MISSING_CAPABILITY',
       'task-decomposer requires pr.create in project tools.allow before execute (fail closed)',
+    );
+  }
+  if (tools.denied.includes('git.branch.create') || (tools.allow.length > 0 && !tools.allow.includes('git.branch.create'))) {
+    throw err(
+      'E_MISSING_CAPABILITY',
+      'task-decomposer requires git.branch.create in project tools.allow before execute (fail closed)',
     );
   }
 }
@@ -157,9 +192,22 @@ export function currentHeadSha(projectRoot: string): string {
   return result.stdout.trim();
 }
 
-/** Best-effort local branch for the subtask; PR create still uses the given headSha. */
+/** Best-effort local branch for the subtask; remote prep is separate. */
 export function ensureLocalSubtaskBranch(projectRoot: string, branch: string, headSha: string): void {
   spawnSync('git', ['branch', '-f', branch, headSha], { cwd: projectRoot, encoding: 'utf8' });
+}
+
+/** Publish the branch tip to the remote (or fixture) so pr.create can reference it. */
+export async function ensureRemoteSubtaskBranch(input: {
+  target: LanePrTarget;
+  workId: string;
+  branch: string;
+  headSha: string;
+}): Promise<void> {
+  await invoke(input.target, 'git.branch.create', input.workId, {
+    branch: input.branch,
+    sha: input.headSha,
+  });
 }
 
 export function prBodyForSubtask(work: WorkPackage, subtask: DecompositionSubtask): string {
@@ -185,25 +233,39 @@ export async function openSubtaskPrs(input: {
   decomposition: TaskDecomposition;
   target: LanePrTarget;
   projectRoot: string;
+  /** Re-check ownership before each remote write; throw to refuse stale completion. */
+  assertStillOwns: () => void;
+  /** Persist after each PR so a mid-loop failure can resume without re-calling the model. */
+  persistProgress: (decomposition: TaskDecomposition) => void;
 }): Promise<TaskDecomposition> {
   const headSha = currentHeadSha(input.projectRoot);
   const subtasks: DecompositionSubtask[] = [];
   for (const st of input.decomposition.subtasks) {
-    if (st.pr) {
+    if (st.pr?.number && st.pr.url) {
       subtasks.push(st);
       continue;
     }
+    input.assertStillOwns();
     // Flat name: must not nest under `turbine/<workId>/…` or git refuses the worktree branch `turbine/<workId>`.
-    const head = `turbine/${input.work.id}-${st.branchName}`;
+    const head = st.branchName.startsWith(`turbine/${input.work.id}-`)
+      ? st.branchName
+      : `turbine/${input.work.id}-${st.branchName}`;
     ensureLocalSubtaskBranch(input.projectRoot, head, headSha);
-    const created = await invokePrCreate(input.target, input.work.id, {
+    await ensureRemoteSubtaskBranch({
+      target: input.target,
+      workId: input.work.id,
+      branch: head,
+      headSha,
+    });
+    input.assertStillOwns();
+    const created = (await invoke(input.target, 'pr.create', input.work.id, {
       head,
       headSha,
       base: input.target.baseBranch,
       title: st.title,
       body: prBodyForSubtask(input.work, st),
-    });
-    subtasks.push({
+    })) as InvokeResult<{ number: number; url: string; head: string; headSha: string; base: string }>;
+    const next: DecompositionSubtask = {
       ...st,
       branchName: head,
       pr: {
@@ -212,6 +274,12 @@ export async function openSubtaskPrs(input: {
         head: created.data.head,
         headSha: created.data.headSha,
       },
+    };
+    subtasks.push(next);
+    // Keep unfinished trailing subtasks from the original list when persisting mid-loop.
+    input.persistProgress({
+      ...input.decomposition,
+      subtasks: input.decomposition.subtasks.map((orig, i) => subtasks[i] ?? orig),
     });
   }
   return { ...input.decomposition, subtasks };
@@ -233,4 +301,12 @@ export function decompositionIsCurrent(
       existing.subtasks.length > 0 &&
       existing.subtasks.every((st) => st.pr?.number && st.pr.url),
   );
+}
+
+/** Same plan hash with at least one subtask — resume PR opens without another model call. */
+export function decompositionCanResume(
+  existing: TaskDecomposition | undefined,
+  planHash: string,
+): existing is TaskDecomposition {
+  return Boolean(existing && existing.planHash === planHash && existing.subtasks.length > 0);
 }

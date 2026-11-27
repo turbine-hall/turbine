@@ -8,7 +8,11 @@ import { Engine } from '../../apps/cli/src/engine/engine.js';
 import { factoryRoot } from '../../apps/cli/src/paths.js';
 import { createGitHubAdapter, type GitHubFixtureState } from '../../packages/adapter-github/dist/index.js';
 import { cleanup, tempProject } from './fixture.js';
-import { prBodyForSubtask, type TaskDecomposition } from '../../apps/cli/src/engine/task-decomposer.js';
+import {
+  normalizeDecomposition,
+  prBodyForSubtask,
+  type TaskDecomposition,
+} from '../../apps/cli/src/engine/task-decomposer.js';
 
 const dirs: string[] = [];
 afterEach(() => cleanup(dirs));
@@ -39,13 +43,17 @@ async function toPlanApproved(engine: Engine) {
 }
 
 function attachGithub(engine: Engine): GitHubFixtureState {
-  const github: GitHubFixtureState = { pullRequests: {}, statuses: {}, protections: {} };
+  // Track refs so pr.create requires git.branch.create first (matches live remote contract).
+  const github: GitHubFixtureState = { pullRequests: {}, statuses: {}, protections: {}, refs: {} };
   engine.lanePrTarget = {
     adapter: createGitHubAdapter({ fixtures: github }),
     owner: 'fixture',
     repo: 'project',
     baseBranch: 'main',
   };
+  if (!engine.ctx.config.tools.allow.includes('git.branch.create')) {
+    engine.ctx.config.tools.allow.push('git.branch.create');
+  }
   return github;
 }
 
@@ -54,6 +62,21 @@ describe('task-decomposer role', () => {
     const root = factoryRoot();
     expect(loadRoles(root).some((r) => r.id === 'task-decomposer')).toBe(true);
     expect(loadSkills(root).some((s) => s.id === 'core/decompose-task')).toBe(true);
+  });
+
+  it('assigns distinct branch names when proposed names collide', () => {
+    const d = normalizeDecomposition(
+      {
+        summary: 'collide',
+        subtasks: [
+          { id: 'ST1', title: 'A', description: 'a', requirementIds: ['FR-001'], files: [], branchName: 'feat' },
+          { id: 'ST2', title: 'B', description: 'b', requirementIds: ['FR-001'], files: [], branchName: 'feat' },
+        ],
+      },
+      'hash',
+    );
+    expect(d.subtasks[0]!.branchName).toBe('feat');
+    expect(d.subtasks[1]!.branchName).toBe('feat-2');
   });
 
   it('PR body includes parent work id and requirement ids', () => {

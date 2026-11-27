@@ -151,6 +151,7 @@ import {
 } from './lane-pr.js';
 import {
   assertPrCreateAllowed,
+  decompositionCanResume,
   decompositionIsCurrent,
   normalizeDecomposition,
   openSubtaskPrs,
@@ -2270,22 +2271,117 @@ export class Engine {
   }
 
   /**
+   * Refuse stale execute completion: revision, plan/spec identity, and plan approval must still match
+   * what this attempt started with. Does not mutate work state.
+   */
+  private assertExecuteStillOwns(input: {
+    workId: string;
+    startedRevision: number;
+    startedState: WorkState;
+    planId: string;
+    planHash: string;
+    specId: string;
+  }): WorkPackage {
+    const current = this.ctx.store.getWork(input.workId);
+    if (current.currentRevision !== input.startedRevision) {
+      throw err(
+        'E_CONCURRENT',
+        `${input.workId} revision moved from ${input.startedRevision} to ${current.currentRevision} while execute was running; refusing stale completion`,
+      );
+    }
+    if (current.currentState !== input.startedState) {
+      throw err(
+        'E_CONCURRENT',
+        `${input.workId} is ${current.currentState}, not ${input.startedState}; refusing stale execute completion`,
+      );
+    }
+    if (current.currentState !== 'PLAN_APPROVED' && current.currentState !== 'CHANGES_REQUESTED') {
+      throw err('E_INVALID_TRANSITION', `Cannot complete execute from ${current.currentState}`);
+    }
+    const plan = this.ctx.store.getLatestArtifact(current.id, 'plan');
+    const spec = this.ctx.store.getLatestArtifact(current.id, 'specification');
+    if (!plan || plan.id !== input.planId || plan.contentHash !== input.planHash) {
+      throw err('E_CONCURRENT', `Plan of ${input.workId} changed while execute was running; refusing stale completion`);
+    }
+    if (!spec || spec.id !== input.specId) {
+      throw err('E_CONCURRENT', `Specification of ${input.workId} changed while execute was running; refusing stale completion`);
+    }
+    const planOk = this.ctx.store
+      .listDecisions(current.id)
+      .some(
+        (d) =>
+          d.gate === 'plan' &&
+          d.action === 'approve' &&
+          !d.invalidatedAt &&
+          d.artifactHashes.includes(plan.contentHash),
+      );
+    if (!planOk) throw err('E_STALE_REVISION', 'Current plan is not approved');
+    return current;
+  }
+
+  /** Persist decomposition artifact (and completion event when all PRs exist) in one store transaction. */
+  private persistDecompositionRecord(
+    work: WorkPackage,
+    decomposition: TaskDecomposition,
+    plan: Artifact,
+    spec: Artifact,
+    opts: { completedEvent: boolean },
+  ): void {
+    this.ctx.store.transaction(() => {
+      this.saveArtifact({
+        workId: work.id,
+        type: 'task-decomposition',
+        content: decomposition,
+        createdBy: { kind: 'agent', identifier: 'task-decomposer' },
+        parentArtifactIds: [plan.id, spec.id],
+      });
+      if (opts.completedEvent && decompositionIsCurrent(decomposition, decomposition.planHash)) {
+        const already = this.ctx.store.listEvents(work.id).some((e) => e.type === 'task.decomposed');
+        if (!already) {
+          this.ctx.store.appendEvent({
+            workId: work.id,
+            type: 'task.decomposed',
+            payload: {
+              planHash: decomposition.planHash,
+              subtaskCount: decomposition.subtasks.length,
+              prs: decomposition.subtasks.map((st) => ({
+                id: st.id,
+                number: st.pr?.number,
+                url: st.pr?.url,
+                head: st.pr?.head,
+              })),
+            },
+          });
+        }
+      }
+    });
+  }
+
+  /**
    * Run task-decomposer before IMPLEMENTING: produce small subtasks and open one PR each.
-   * Idempotent on the current plan hash when PRs were already recorded.
+   * Fail-closed without pr.create. Idempotent / resumable on the current plan hash.
    */
   private async runTaskDecomposer(
     work: WorkPackage,
     plan: Artifact,
     spec: Artifact,
     taskContext: RefreshResult,
+    ownership: {
+      startedRevision: number;
+      startedState: WorkState;
+      planId: string;
+      planHash: string;
+      specId: string;
+    },
   ): Promise<TaskDecomposition> {
+    // Contract: reject (do not skip) when pr.create is unavailable.
     assertPrCreateAllowed(this.ctx.config.tools);
     const baseBranch =
       (this.ctx.config as { git?: { defaultBaseBranch?: string } }).git?.defaultBaseBranch ?? 'main';
     const target = resolveDecomposerPrTarget({
       lanePrTarget: this.lanePrTarget,
       resolveFromGit: () => this.resolveLanePrTarget(),
-      createFixtureAdapter: () => createGitHubAdapter({ fixtures: { pullRequests: {}, statuses: {}, protections: {} } }),
+      createFixtureAdapter: () => createGitHubAdapter({ fixtures: { pullRequests: {}, statuses: {}, protections: {}, refs: {} } }),
       baseBranch,
       setLanePrTarget: (t) => {
         this.lanePrTarget = t;
@@ -2302,58 +2398,64 @@ export class Engine {
       }
     }
     if (decompositionIsCurrent(existing, plan.contentHash)) {
+      // Reuse is model-free; regenerate packet on retry.
       writeDecompositionPacket(this.ctx.projectRoot, work.id, renderDecompositionMarkdown(work, existing));
       return existing;
     }
 
-    this.checkBudget(work.id);
-    const model = getModel(this.ctx.config.models.profiles.analysis?.model ?? 'mock-default');
-    const skill = getSkill(this.ctx.factoryRoot, 'core/decompose-task');
-    const result = await this.runAsRole({
-      skill,
-      model,
-      workId: work.id,
-      roleId: 'task-decomposer',
-      schemaId: 'task-decomposition',
-      maxOutputTokens: this.ctx.config.models.profiles.analysis?.maxOutputTokens ?? 4000,
-      context: [
-        `WORK: ${work.id} — ${work.title}`,
-        `SPEC:\n${this.ctx.store.getArtifactContent(spec.id)}`,
-        `PLAN:\n${this.ctx.store.getArtifactContent(plan.id)}`,
-        `TASK_CONTEXT:\n${this.promptContext(work, taskContext)}`,
-      ].join('\n\n'),
-    });
+    let decomposition: TaskDecomposition;
+    if (decompositionCanResume(existing, plan.contentHash)) {
+      decomposition = existing;
+    } else {
+      this.checkBudget(work.id);
+      const model = getModel(this.ctx.config.models.profiles.analysis?.model ?? 'mock-default');
+      const skill = getSkill(this.ctx.factoryRoot, 'core/decompose-task');
+      let modelContent: unknown;
+      try {
+        const result = await this.runAsRole({
+          skill,
+          model,
+          workId: work.id,
+          roleId: 'task-decomposer',
+          schemaId: 'task-decomposition',
+          maxOutputTokens: this.ctx.config.models.profiles.analysis?.maxOutputTokens ?? 4000,
+          context: [
+            `WORK: ${work.id} — ${work.title}`,
+            `SPEC:\n${this.ctx.store.getArtifactContent(spec.id)}`,
+            `PLAN:\n${this.ctx.store.getArtifactContent(plan.id)}`,
+            `TASK_CONTEXT:\n${this.promptContext(work, taskContext)}`,
+          ].join('\n\n'),
+        });
+        modelContent = result.content;
+      } finally {
+        // Charge every attempted call, including failures (reuse path never reaches here).
+        this.ctx.store.incrementBudget(work.id, 1);
+      }
+      decomposition = normalizeDecomposition(modelContent, plan.contentHash);
+      // Persist normalized subtasks before any remote PR writes so a failure can resume.
+      this.persistDecompositionRecord(work, decomposition, plan, spec, { completedEvent: false });
+      writeDecompositionPacket(this.ctx.projectRoot, work.id, renderDecompositionMarkdown(work, decomposition));
+    }
 
-    let decomposition = normalizeDecomposition(result.content, plan.contentHash);
+    this.assertExecuteStillOwns({ workId: work.id, ...ownership });
     decomposition = await openSubtaskPrs({
       work,
       decomposition,
       target,
       projectRoot: this.ctx.projectRoot,
-    });
-
-    this.saveArtifact({
-      workId: work.id,
-      type: 'task-decomposition',
-      content: decomposition,
-      createdBy: { kind: 'agent', identifier: 'task-decomposer' },
-      parentArtifactIds: [plan.id, spec.id],
-    });
-    writeDecompositionPacket(this.ctx.projectRoot, work.id, renderDecompositionMarkdown(work, decomposition));
-    this.ctx.store.appendEvent({
-      workId: work.id,
-      type: 'task.decomposed',
-      payload: {
-        planHash: plan.contentHash,
-        subtaskCount: decomposition.subtasks.length,
-        prs: decomposition.subtasks.map((st) => ({
-          id: st.id,
-          number: st.pr?.number,
-          url: st.pr?.url,
-          head: st.pr?.head,
-        })),
+      assertStillOwns: () => {
+        this.assertExecuteStillOwns({ workId: work.id, ...ownership });
+      },
+      persistProgress: (progress) => {
+        this.persistDecompositionRecord(work, progress, plan, spec, {
+          completedEvent: decompositionIsCurrent(progress, progress.planHash),
+        });
+        writeDecompositionPacket(this.ctx.projectRoot, work.id, renderDecompositionMarkdown(work, progress));
       },
     });
+
+    this.persistDecompositionRecord(work, decomposition, plan, spec, { completedEvent: true });
+    writeDecompositionPacket(this.ctx.projectRoot, work.id, renderDecompositionMarkdown(work, decomposition));
     return decomposition;
   }
 
@@ -2457,9 +2559,20 @@ export class Engine {
     this.syncBriefForHandoff();
     const taskContext = this.ensureTaskContext(work);
 
-    // task-decomposer: split into small PR-sized subtasks and open PRs before IMPLEMENTING.
-    await this.runTaskDecomposer(work, plan, spec, taskContext);
+    const ownership = {
+      startedRevision: work.currentRevision,
+      startedState: work.currentState,
+      planId: plan.id,
+      planHash: plan.contentHash,
+      specId: spec.id,
+    };
 
+    // task-decomposer: split into small PR-sized subtasks and open PRs before IMPLEMENTING.
+    // Contract: rejects when pr.create is unavailable (does not skip).
+    await this.runTaskDecomposer(work, plan, spec, taskContext, ownership);
+
+    // Revalidate before the IMPLEMENTING transition so async decomposition cannot overwrite a moved task.
+    work = this.assertExecuteStillOwns({ workId: work.id, ...ownership });
     work = transition(work, 'IMPLEMENTING');
     this.ctx.store.saveWork(work);
 
@@ -2509,6 +2622,8 @@ export class Engine {
     }
 
     if (existing.length === 0) {
+      // Decomposition may have consumed the early budget check; refuse if nothing remains for implement.
+      this.checkBudget(work.id);
       const model = getModel(this.ctx.config.models.profiles.implementation?.model ?? 'mock-default');
       const skill = getSkill(this.ctx.factoryRoot, 'core/execute-code-change');
       const implementer =
@@ -2527,6 +2642,7 @@ export class Engine {
           maxOutputTokens: 4000,
         })
       ).content;
+      this.ctx.store.incrementBudget(work.id, 1);
       const changeArt = this.saveChangeSet(work.id, repos, {
         status: 'awaiting-commits',
         summary: 'Worktrees prepared. No code committed yet.',

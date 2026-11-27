@@ -5,7 +5,7 @@
   "inputs": ["work-package", "approved-specification", "approved-plan", "repository-context"],
   "skills": { "required": ["core/decompose-task"], "optional": [] },
   "capabilities": {
-    "required": ["repo.read", "repo.inspect", "pr.create"],
+    "required": ["repo.read", "repo.inspect", "git.branch.create", "pr.create"],
     "prohibited": ["requirements.approve", "plan.approve", "pr.merge", "git.merge", "production.deploy"]
   },
   "outputs": ["task-decomposition"],
