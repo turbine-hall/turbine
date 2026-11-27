@@ -22,7 +22,7 @@ const ALL_ROLES = [
   'requirements-analyst', 'spec-writer', 'project-manager', 'architect', 'ux-designer',
   'frontend-developer', 'backend-developer', 'database-engineer', 'unit-tester',
   'code-quality-checker', 'code-reviewer', 'test-case-sqa', 'api-sqa', 'e2e-sqa',
-  'security-reviewer', 'release-engineer',
+  'security-reviewer', 'release-engineer', 'task-decomposer',
 ] as const;
 
 const RANK: Record<RiskProfile, number> = { lightweight: 0, standard: 1, comprehensive: 2 };
@@ -178,6 +178,8 @@ export function selectRoles(input: {
     if (/\b(test|unit)\b/.test(f)) add('unit-tester', `failed check: ${fail}`);
   }
   if (input.work.type !== 'investigation') add('code-quality-checker', 'deterministic checks');
+  // Always selected: runs automatically before execute to open small PRs per subtask.
+  add('task-decomposer', 'pre-execution decomposition');
 
   // Lightweight: drop optional specialists, but never anything a trigger asked for.
   if (profile === 'lightweight') {

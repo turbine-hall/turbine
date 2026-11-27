@@ -83,6 +83,9 @@ function systemForSchema(schemaId: string): string {
     schemaId === 'implement'
       ? 'Include fields: summary, filesTouched[], commandsToRun[], testCommands[], notes[]. For dependency updates, list exact package manager commands.'
       : '',
+    schemaId === 'task-decomposition'
+      ? 'Include fields: summary, subtasks[{id,title,description,requirementIds[],files[],branchName?}]. Every requirement ID must appear in at least one subtask. Prefer 2–6 small PR-sized subtasks.'
+      : '',
   ]
     .filter(Boolean)
     .join(' ');

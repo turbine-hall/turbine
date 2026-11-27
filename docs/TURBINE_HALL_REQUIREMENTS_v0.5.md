@@ -1084,7 +1084,7 @@ Each phase has a concrete deliverable and test gate. **Do not begin next phase u
 
 ### Phase 2 — Framework/gates and selection
 
-**Tasks:** framework loader, transition table, EEC obligation predicates, typed dependency graph, deterministic transitive invalidation and R0 recovery-plan computation, role manifest registry, 16 role definitions, ARSP deterministic rules and explainability, `framework/role/skill` read commands, task contract/impact/roles/explain.  
+**Tasks:** framework loader, transition table, EEC obligation predicates, typed dependency graph, deterministic transitive invalidation and R0 recovery-plan computation, role manifest registry, 17 role definitions, ARSP deterministic rules and explainability, `framework/role/skill` read commands, task contract/impact/roles/explain.  
 **Done:** property/table tests for all transitions and mandatory security triggers; role counts do not imply model run counts.
 
 ### Phase 3 — Skills, model and approved requirements

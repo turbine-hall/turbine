@@ -150,6 +150,16 @@ import {
   type LanePrTarget,
 } from './lane-pr.js';
 import {
+  assertPrCreateAllowed,
+  decompositionIsCurrent,
+  normalizeDecomposition,
+  openSubtaskPrs,
+  renderDecompositionMarkdown,
+  resolveDecomposerPrTarget,
+  type TaskDecomposition,
+  writeDecompositionPacket,
+} from './task-decomposer.js';
+import {
   agentCliCommand,
   assertSandboxNetworkPolicyReady,
   createContainerSandboxHooks,
@@ -979,8 +989,8 @@ export class Engine {
     if (![...role.skills.required, ...role.skills.optional].includes(skillId)) {
       throw err('E_MISSING_CAPABILITY', `Role ${roleId} is not allowed to run skill ${skillId}`);
     }
-    const intake = ['requirements-analyst', 'spec-writer', 'project-manager'];
-    if (!intake.includes(roleId) && !work.selectedRoles.some((r) => r.id === roleId)) {
+    const systemRoles = ['requirements-analyst', 'spec-writer', 'project-manager', 'task-decomposer'];
+    if (!systemRoles.includes(roleId) && !work.selectedRoles.some((r) => r.id === roleId)) {
       throw err('E_MISSING_CAPABILITY', `Role ${roleId} was not selected for this task (see turbine task roles)`);
     }
     const { allow, denied } = this.ctx.config.tools;
@@ -2259,6 +2269,94 @@ export class Engine {
     return result.ok;
   }
 
+  /**
+   * Run task-decomposer before IMPLEMENTING: produce small subtasks and open one PR each.
+   * Idempotent on the current plan hash when PRs were already recorded.
+   */
+  private async runTaskDecomposer(
+    work: WorkPackage,
+    plan: Artifact,
+    spec: Artifact,
+    taskContext: RefreshResult,
+  ): Promise<TaskDecomposition> {
+    assertPrCreateAllowed(this.ctx.config.tools);
+    const baseBranch =
+      (this.ctx.config as { git?: { defaultBaseBranch?: string } }).git?.defaultBaseBranch ?? 'main';
+    const target = resolveDecomposerPrTarget({
+      lanePrTarget: this.lanePrTarget,
+      resolveFromGit: () => this.resolveLanePrTarget(),
+      createFixtureAdapter: () => createGitHubAdapter({ fixtures: { pullRequests: {}, statuses: {}, protections: {} } }),
+      baseBranch,
+      setLanePrTarget: (t) => {
+        this.lanePrTarget = t;
+      },
+    });
+
+    const existingArt = this.ctx.store.getLatestArtifact(work.id, 'task-decomposition');
+    let existing: TaskDecomposition | undefined;
+    if (existingArt) {
+      try {
+        existing = JSON.parse(this.ctx.store.getArtifactContent(existingArt.id)) as TaskDecomposition;
+      } catch {
+        existing = undefined;
+      }
+    }
+    if (decompositionIsCurrent(existing, plan.contentHash)) {
+      writeDecompositionPacket(this.ctx.projectRoot, work.id, renderDecompositionMarkdown(work, existing));
+      return existing;
+    }
+
+    this.checkBudget(work.id);
+    const model = getModel(this.ctx.config.models.profiles.analysis?.model ?? 'mock-default');
+    const skill = getSkill(this.ctx.factoryRoot, 'core/decompose-task');
+    const result = await this.runAsRole({
+      skill,
+      model,
+      workId: work.id,
+      roleId: 'task-decomposer',
+      schemaId: 'task-decomposition',
+      maxOutputTokens: this.ctx.config.models.profiles.analysis?.maxOutputTokens ?? 4000,
+      context: [
+        `WORK: ${work.id} — ${work.title}`,
+        `SPEC:\n${this.ctx.store.getArtifactContent(spec.id)}`,
+        `PLAN:\n${this.ctx.store.getArtifactContent(plan.id)}`,
+        `TASK_CONTEXT:\n${this.promptContext(work, taskContext)}`,
+      ].join('\n\n'),
+    });
+
+    let decomposition = normalizeDecomposition(result.content, plan.contentHash);
+    decomposition = await openSubtaskPrs({
+      work,
+      decomposition,
+      target,
+      projectRoot: this.ctx.projectRoot,
+    });
+
+    this.saveArtifact({
+      workId: work.id,
+      type: 'task-decomposition',
+      content: decomposition,
+      createdBy: { kind: 'agent', identifier: 'task-decomposer' },
+      parentArtifactIds: [plan.id, spec.id],
+    });
+    writeDecompositionPacket(this.ctx.projectRoot, work.id, renderDecompositionMarkdown(work, decomposition));
+    this.ctx.store.appendEvent({
+      workId: work.id,
+      type: 'task.decomposed',
+      payload: {
+        planHash: plan.contentHash,
+        subtaskCount: decomposition.subtasks.length,
+        prs: decomposition.subtasks.map((st) => ({
+          id: st.id,
+          number: st.pr?.number,
+          url: st.pr?.url,
+          head: st.pr?.head,
+        })),
+      },
+    });
+    return decomposition;
+  }
+
   async execute(idOrAlias: string): Promise<{
     work: WorkPackage;
     result: { repos: RepoState[]; worktreePath?: string; branch?: string; baseCommit: string; modelNotes?: unknown };
@@ -2358,6 +2456,9 @@ export class Engine {
     // failure here (an unreadable repository, an unwritable packet folder) leaves the task retryable.
     this.syncBriefForHandoff();
     const taskContext = this.ensureTaskContext(work);
+
+    // task-decomposer: split into small PR-sized subtasks and open PRs before IMPLEMENTING.
+    await this.runTaskDecomposer(work, plan, spec, taskContext);
 
     work = transition(work, 'IMPLEMENTING');
     this.ctx.store.saveWork(work);

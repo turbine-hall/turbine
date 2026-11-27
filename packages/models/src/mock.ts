@@ -280,6 +280,40 @@ export function createMockModelAdapter(id = 'mock-default'): ModelAdapter {
         };
       }
 
+      if (
+        request.schemaId === 'task-decomposition' ||
+        request.skillIds.includes('core/decompose-task')
+      ) {
+        const ids = [...request.prompt.matchAll(/^- ([A-Za-z]+[-_]\w+) \(P[012]\):/gm)].map((m) => m[1]!);
+        const reqIds = ids.length ? ids : ['FR-001'];
+        const subtasks =
+          reqIds.length === 1
+            ? [
+                {
+                  id: 'ST1',
+                  title: `Implement ${reqIds[0]}`,
+                  description: `Small change covering ${reqIds[0]}.`,
+                  requirementIds: reqIds,
+                  files: ['src/'],
+                },
+              ]
+            : reqIds.map((id, i) => ({
+                id: `ST${i + 1}`,
+                title: `Implement ${id}`,
+                description: `Focused subtask for ${id}.`,
+                requirementIds: [id],
+                files: ['src/'],
+              }));
+        return {
+          content: {
+            summary: 'Mock decomposition into small PR-sized subtasks',
+            subtasks,
+          },
+          usage: { inputTokens: 130, outputTokens: 200 },
+          providerRequestId: `mock_${Date.now()}`,
+        };
+      }
+
       if (request.schemaId === 'project-brief' || request.skillIds.includes('core/draft-project-brief')) {
         // Propose one true claim (package.json exists) and one planted-false claim. Only the true one verifies.
         const section = /## SECTION\n([a-z][a-z0-9-]{0,39})/.exec(request.prompt)?.[1] ?? 'architecture';

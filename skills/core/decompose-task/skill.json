@@ -1,0 +1,12 @@
+{
+  "id": "core/decompose-task",
+  "version": "0.1.0",
+  "source": "turbine-original",
+  "license": "UNLICENSED-internal",
+  "runnerCompatibility": ["turbine-models"],
+  "inputs": ["work-package", "approved-specification", "approved-plan", "context"],
+  "outputs": ["task-decomposition"],
+  "requiredCapabilities": ["repo.read", "pr.create"],
+  "resourceLimits": { "maxModelCalls": 2 },
+  "notes": "Runs before execute. Produces small subtasks; the engine opens one PR per subtask."
+}
