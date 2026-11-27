@@ -781,6 +781,124 @@ describe('fleet scheduler (Part E / #43)', () => {
     engine2.ctx.store.close();
   });
 
+  it('retires expired dead-owner locks on non-candidates so they do not block admit', async () => {
+    const dir = tempProject('fleet-stale-accepted-', dirs);
+    const engine = new Engine(openContext(dir));
+    mkdirSync(join(dir, '.turbine', 'artifacts'), { recursive: true });
+    const done = engine.createTask({
+      title: 'Accepted leftover',
+      file: (() => {
+        const p = join(dir, 'accepted.md');
+        writeFileSync(p, '# accepted\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    engine.ctx.store.saveWork({
+      ...engine.ctx.store.getWork(done.id),
+      currentState: 'ACCEPTED',
+      updatedAt: new Date().toISOString(),
+    });
+    plantPrediction(engine, done.id, {
+      kind: 'selection',
+      paths: ['shared.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+
+    let nowMs = Date.parse('2026-01-01T00:00:00.000Z');
+    const held = acquireFleetLock({
+      projectRoot: dir,
+      workId: done.id,
+      runId: 'dead_run',
+      leaseMs: 1_000,
+      now: () => new Date(nowMs),
+    });
+    expect(held.ok).toBe(true);
+    if (!held.ok) return;
+    nowMs += 5_000;
+    const crashed = readFleetLock(dir, done.id)!;
+    writeFileSync(fleetLockPath(dir, done.id), `${JSON.stringify({ ...crashed, pid: 2 ** 22 }, null, 2)}\n`);
+
+    const ready = engine.createTask({
+      title: 'Ready overlap',
+      file: (() => {
+        const p = join(dir, 'ready.md');
+        writeFileSync(p, '# ready\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    plantPrediction(engine, ready.id, {
+      kind: 'selection',
+      paths: ['shared.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+
+    const report = await runFleet(engine, {
+      maxConcurrent: 1,
+      budgetUsd: 100,
+      now: () => new Date(nowMs),
+      step: async () => {},
+      maxIterations: 10,
+    });
+    expect(report.started).toBe(1);
+    expect(existsSync(fleetLockPath(dir, done.id))).toBe(false);
+    engine.ctx.store.close();
+  });
+
+  it('does not emit prediction-miss events for exact prediction matches', () => {
+    const dir = tempProject('fleet-exact-match-', dirs);
+    const engine = new Engine(openContext(dir));
+    const work = engine.createTask({
+      title: 'Exact match',
+      file: (() => {
+        const p = join(dir, 'exact.md');
+        writeFileSync(p, '# exact\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    plantPrediction(engine, work.id, {
+      kind: 'selection',
+      paths: ['a.ts'],
+      sources: { context: true, plan: false },
+      labelled: 'selection',
+      at: new Date().toISOString(),
+    });
+    const changeBody = {
+      status: 'complete',
+      summary: 'done',
+      filesTouched: ['repo:a.ts'],
+    };
+    const location = join(dir, `.turbine/artifacts/${work.id}-change.json`);
+    mkdirSync(dirname(location), { recursive: true });
+    writeFileSync(location, `${JSON.stringify(changeBody, null, 2)}\n`);
+    engine.ctx.store.saveArtifact(
+      {
+        id: createId('art'),
+        workId: work.id,
+        type: 'change-report',
+        revision: 1,
+        contentHash: contentHash(changeBody),
+        contentType: 'application/json',
+        location,
+        createdBy: { kind: 'tool', identifier: 'test' },
+        createdAt: new Date().toISOString(),
+        parentArtifactIds: [],
+      },
+      `${JSON.stringify(changeBody, null, 2)}\n`,
+    );
+    const miss = engine.recordPredictionMisses(work.id);
+    expect(miss?.misses).toEqual([]);
+    expect(miss?.extras).toEqual([]);
+    expect(engine.ctx.store.listEvents(work.id).filter((e) => e.type === 'fleet.prediction-miss')).toHaveLength(0);
+    engine.ctx.store.close();
+  });
+
   it('refreshes a stale file-prediction when the selection is already current', () => {
     const dir = tempProject('fleet-pred-sync-', dirs);
     const engine = new Engine(openContext(dir));
@@ -894,6 +1012,44 @@ describe('fleet scheduler (Part E / #43)', () => {
         at: 't',
       }),
     ).toThrow(/empty after normalize/i);
+
+    const dirBlank = tempProject('fleet-blank-ctx-', dirs);
+    const engineBlank = new Engine(openContext(dirBlank));
+    const blankWork = engineBlank.createTask({
+      title: 'Blank ctx',
+      file: (() => {
+        const p = join(dirBlank, 'blank-ctx.md');
+        writeFileSync(p, '# blank\n');
+        return p;
+      })(),
+      type: 'maintenance',
+    });
+    const ctxLoc = join(dirBlank, `.turbine/artifacts/${blankWork.id}-ctx.json`);
+    mkdirSync(dirname(ctxLoc), { recursive: true });
+    const blankCtx = {
+      files: [{ path: ' ' }],
+      snapshot: { commit: 'abc', hash: 'h' },
+      trigger: 'initial',
+      changesCycle: 0,
+    };
+    writeFileSync(ctxLoc, `${JSON.stringify(blankCtx, null, 2)}\n`);
+    engineBlank.ctx.store.saveArtifact(
+      {
+        id: createId('art'),
+        workId: blankWork.id,
+        type: 'repo-context',
+        revision: 1,
+        contentHash: contentHash(blankCtx),
+        contentType: 'application/json',
+        location: ctxLoc,
+        createdBy: { kind: 'tool', identifier: 'test' },
+        createdAt: new Date().toISOString(),
+        parentArtifactIds: [],
+      },
+      `${JSON.stringify(blankCtx, null, 2)}\n`,
+    );
+    expect(buildFilePrediction(engineBlank.ctx.store, blankWork.id).kind).toBe('unknown');
+    engineBlank.ctx.store.close();
 
     const dirPlan = tempProject('fleet-plan-steps-', dirs);
     const enginePlan = new Engine(openContext(dirPlan));

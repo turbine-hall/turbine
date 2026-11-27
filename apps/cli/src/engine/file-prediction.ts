@@ -85,9 +85,28 @@ export function buildFilePrediction(store: WorkStore, workId: string, at = new D
     if (!Array.isArray(files)) {
       return { kind: 'unknown', reason: 'repo-context missing files array', labelled: 'selection', at };
     }
-    contextPaths = [
-      ...new Set(files.map((f) => (typeof f?.path === 'string' ? normalizePath(f.path) : '')).filter(Boolean)),
-    ].sort();
+    const paths: string[] = [];
+    for (const entry of files) {
+      if (!entry || typeof entry !== 'object' || typeof (entry as { path?: unknown }).path !== 'string') {
+        return {
+          kind: 'unknown',
+          reason: 'repo-context file entry missing string path',
+          labelled: 'selection',
+          at,
+        };
+      }
+      const path = normalizePath((entry as { path: string }).path);
+      if (!path) {
+        return {
+          kind: 'unknown',
+          reason: 'repo-context path empty after normalize',
+          labelled: 'selection',
+          at,
+        };
+      }
+      paths.push(path);
+    }
+    contextPaths = [...new Set(paths)].sort();
   }
 
   const planArt = store.getLatestArtifact(workId, 'plan');
@@ -107,6 +126,37 @@ export function buildFilePrediction(store: WorkStore, workId: string, at = new D
         labelled: 'selection',
         at,
       };
+    }
+    for (const step of (content as { steps: unknown[] }).steps) {
+      if (!step || typeof step !== 'object') continue;
+      const stepFiles = (step as { files?: unknown }).files;
+      if (stepFiles === undefined) continue;
+      if (!Array.isArray(stepFiles)) {
+        return {
+          kind: 'unknown',
+          reason: 'plan step files is not an array',
+          labelled: 'selection',
+          at,
+        };
+      }
+      for (const file of stepFiles) {
+        if (typeof file !== 'string') {
+          return {
+            kind: 'unknown',
+            reason: 'plan step file path is not a string',
+            labelled: 'selection',
+            at,
+          };
+        }
+        if (!normalizePath(file)) {
+          return {
+            kind: 'unknown',
+            reason: 'plan step file path empty after normalize',
+            labelled: 'selection',
+            at,
+          };
+        }
+      }
     }
     const plan = normalizePlan(content);
     planPaths = [...new Set(plan.steps.flatMap((s) => s.files.map(normalizePath)).filter(Boolean))].sort();

@@ -115,6 +115,49 @@ function logReclaim(engine: Engine, workId: string, runId: string): void {
   });
 }
 
+/**
+ * Work ids whose locks still block admit. Expired locks with a dead owner are retired via the
+ * normal fenced reclaim path even when the task is no longer a fleet candidate (e.g. ACCEPTED),
+ * so a crashed holder cannot block overlapping work forever. Live owners stay blocking.
+ */
+function blockingLockedWorkIds(input: {
+  engine: Engine;
+  projectRoot: string;
+  runId: string;
+  leaseMs: number;
+  now: () => Date;
+  activeIds: Iterable<string>;
+  excludeId: string;
+}): string[] {
+  const active = new Set(input.activeIds);
+  const blocking: string[] = [...active].filter((id) => id !== input.excludeId);
+  for (const id of listFleetLockedWorkIds(input.projectRoot)) {
+    if (id === input.excludeId || active.has(id) || blocking.includes(id)) continue;
+    let acq: ReturnType<typeof acquireFleetLock>;
+    try {
+      acq = acquireFleetLock({
+        projectRoot: input.projectRoot,
+        workId: id,
+        runId: `${input.runId}:sweep`,
+        leaseMs: input.leaseMs,
+        now: input.now,
+      });
+    } catch {
+      // Unreadable/corrupt lock still blocks admit (fail closed); claim path can surface the error.
+      blocking.push(id);
+      continue;
+    }
+    if (acq.ok) {
+      // Reclaimed (or briefly free) — not an active holder; do not keep as a conflict peer.
+      if (acq.reclaimed) logReclaim(input.engine, id, input.runId);
+      releaseFleetLock({ projectRoot: input.projectRoot, workId: id, owner: acq.lock.owner });
+      continue;
+    }
+    blocking.push(id);
+  }
+  return blocking;
+}
+
 /** Tasks the fleet may still advance (not terminal, not already waiting on a human). */
 export function fleetCandidateWorks(engine: Engine): WorkPackage[] {
   return engine.ctx.store
@@ -365,13 +408,18 @@ export async function runFleet(engine: Engine, opts: FleetRunOptions): Promise<F
               continue;
             }
             // Part F: refuse admit when predicted file sets overlap or either is unknown.
-            // Include locks held by other fleet runs, not only this process's `active` map.
+            // Include locks held by other fleet runs; retire expired dead-owner locks first.
             const candidatePred = readFilePrediction(engine.ctx.store, fresh.id);
-            const lockedIds = new Set([
-              ...active.keys(),
-              ...listFleetLockedWorkIds(engine.ctx.projectRoot).filter((id) => id !== fresh.id),
-            ]);
-            const activePreds: FilePrediction[] = [...lockedIds].map((id) =>
+            const lockedIds = blockingLockedWorkIds({
+              engine,
+              projectRoot: engine.ctx.projectRoot,
+              runId,
+              leaseMs,
+              now,
+              activeIds: active.keys(),
+              excludeId: fresh.id,
+            });
+            const activePreds: FilePrediction[] = lockedIds.map((id) =>
               readFilePrediction(engine.ctx.store, id),
             );
             if (blocksAdmit(candidatePred, activePreds)) {

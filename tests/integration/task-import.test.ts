@@ -13,7 +13,7 @@ const dirs: string[] = [];
 afterEach(() => cleanup(dirs));
 
 describe('task import (Part F / #50)', () => {
-  it('does not let a body or title link claim another issue alias', () => {
+  it('does not let a body, title, or Source URL claim another issue alias', () => {
     const dir = tempProject('import-link-', dirs);
     const engine = new Engine(openContext(dir));
     const issues = issuesFromGitHubFixture('acme', 'widgets', {
@@ -23,6 +23,7 @@ describe('task import (Part F / #50)', () => {
           title: 'First see https://github.com/acme/widgets/issues/2',
           body: 'See https://github.com/acme/widgets/issues/2 for context',
           labels: ['bug'],
+          url: 'https://github.com/acme/widgets/issues/2',
         },
         { number: 2, title: 'Second', body: 'standalone', labels: ['bug'] },
       ],
@@ -40,6 +41,28 @@ describe('task import (Part F / #50)', () => {
     expect(scrubForeignGitHubIssueUrls('see https://github.com/acme/widgets/issues/9', 'acme/widgets#1')).toContain(
       'github-issue acme/widgets#9',
     );
+    engine.ctx.store.close();
+  });
+
+  it('fails closed when prior work for an alias is unreadable', () => {
+    const dir = tempProject('import-corrupt-', dirs);
+    const engine = new Engine(openContext(dir));
+    const realGet = engine.ctx.store.getWork.bind(engine.ctx.store);
+    engine.ctx.store.getWork = ((idOrAlias: string) => {
+      if (idOrAlias === 'github:acme/widgets#9') throw new SyntaxError('Unexpected token in JSON');
+      return realGet(idOrAlias);
+    }) as typeof engine.ctx.store.getWork;
+    expect(() =>
+      importTasks(engine, [
+        {
+          alias: 'github:acme/widgets#9',
+          title: 'Broken prior',
+          body: 'x',
+          provider: 'github',
+          externalId: 'acme/widgets#9',
+        },
+      ]),
+    ).toThrow(/unreadable prior work/i);
     engine.ctx.store.close();
   });
 

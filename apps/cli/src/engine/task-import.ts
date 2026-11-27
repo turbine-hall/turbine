@@ -1,4 +1,4 @@
-import { createId, err, type WorkPackage } from '@turbine-hall/turbine-contracts';
+import { createId, err, TurbineError, type WorkPackage } from '@turbine-hall/turbine-contracts';
 import type { Engine } from './engine.js';
 
 export type ImportIssue = {
@@ -76,7 +76,18 @@ export function importTasks(engine: Engine, issues: ImportIssue[]): ImportReport
     }
     seen.add(issue.alias);
 
-    const existing = engine.ctx.store.tryGetWork(issue.alias);
+    // Fail closed on corrupt prior state (AGENTS.md rule 12): only E_NOT_FOUND means "absent".
+    let existing: WorkPackage | null = null;
+    try {
+      existing = engine.ctx.store.getWork(issue.alias);
+    } catch (e) {
+      if (!(e instanceof TurbineError) || e.code !== 'E_NOT_FOUND') {
+        throw err(
+          'E_UNSAFE_EXECUTION',
+          `import: unreadable prior work for ${issue.alias}: ${(e as Error).message.split('\n')[0]}`,
+        );
+      }
+    }
     if (existing) {
       skipped.push({
         alias: issue.alias,
@@ -94,13 +105,16 @@ export function importTasks(engine: Engine, issues: ImportIssue[]): ImportReport
     const keepId = issue.provider === 'github' ? issue.externalId : undefined;
     const safeTitle = scrubForeignGitHubIssueUrls(issue.title, keepId);
     const body = scrubForeignGitHubIssueUrls(issue.body ?? '', keepId);
-    // Include this issue's own URL so createTask can record the matching github alias in one save.
-    const ownUrl =
+    // Include this issue's own URL (scrubbed) so createTask can record the matching github alias in one save.
+    const rawOwnUrl =
       issue.provider === 'github' && issue.url
-        ? `\n\nSource: ${issue.url}\n`
+        ? issue.url
         : issue.provider === 'github'
-          ? `\n\nSource: https://github.com/${issue.externalId.replace('#', '/issues/')}\n`
+          ? `https://github.com/${issue.externalId.replace('#', '/issues/')}`
           : '';
+    const ownUrl = rawOwnUrl
+      ? `\n\nSource: ${scrubForeignGitHubIssueUrls(rawOwnUrl, keepId)}\n`
+      : '';
     const text = `# ${safeTitle}\n\n${body}${ownUrl}`;
     const seedAliases = [issue.alias];
     if (issue.provider === 'jira') seedAliases.push(issue.externalId);

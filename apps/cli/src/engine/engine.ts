@@ -1249,6 +1249,8 @@ export class Engine {
     const predicted = prediction.kind === 'selection' ? prediction.paths : [];
     const actual = actualPathsFromChangeReport(changeContent);
     const miss = comparePredictionToActual(predicted, actual);
+    // Exact matches are comparisons, not miss events — only record when something disagreed.
+    if (miss.misses.length === 0 && miss.extras.length === 0) return miss;
     this.ctx.store.appendEvent({
       workId: work.id,
       type: 'fleet.prediction-miss',
