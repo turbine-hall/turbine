@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -44,7 +45,17 @@ async function toPlanApproved(engine: Engine) {
 
 function attachGithub(engine: Engine): GitHubFixtureState {
   // Track refs so pr.create requires git.branch.create first (matches live remote contract).
-  const github: GitHubFixtureState = { pullRequests: {}, statuses: {}, protections: {}, refs: {} };
+  // Seed `main` tip so the fixture can refuse identical head/base SHAs like GitHub.
+  const mainSha = spawnSync('git', ['rev-parse', 'HEAD'], {
+    cwd: engine.ctx.projectRoot,
+    encoding: 'utf8',
+  }).stdout.trim();
+  const github: GitHubFixtureState = {
+    pullRequests: {},
+    statuses: {},
+    protections: {},
+    refs: { 'fixture/project': { main: mainSha } },
+  };
   engine.lanePrTarget = {
     adapter: createGitHubAdapter({ fixtures: github }),
     owner: 'fixture',
@@ -115,19 +126,29 @@ describe('task-decomposer role', () => {
 
     const md = join(dir, '.turbine', 'tasks', work.id, 'DECOMPOSITION.md');
     expect(existsSync(md)).toBe(true);
-    expect(readFileSync(md, 'utf8')).toContain(work.id);
+    const mdText = readFileSync(md, 'utf8');
+    expect(mdText).toContain(work.id);
+    expect(mdText).toMatch(/\*\*Subtasks: \d+\*\*/);
+    expect(mdText).toContain(`**Subtasks: ${decomposition.subtasks.length}**`);
 
     const repoKey = 'fixture/project';
     const prs = github.pullRequests?.[repoKey] ?? [];
     expect(prs.length).toBe(decomposition.subtasks.length);
+    const mainSha = github.refs?.['fixture/project']?.main;
     for (const pr of prs) {
       // Fixture adapter stores created PRs without body; re-read via event payload + artifact.
       expect(pr.head.startsWith(`turbine/${work.id}-`)).toBe(true);
+      // Opened against configured base; head must differ from base tip (GitHub contract).
+      expect(pr.base).toBe('main');
+      expect(pr.headSha).not.toBe(mainSha);
     }
     for (const st of decomposition.subtasks) {
       expect(st.pr!.url).toContain('/pull/');
       expect(st.requirementIds.length).toBeGreaterThan(0);
     }
+    const ready = engine.ctx.store.listEvents(work.id).filter((e) => e.type === 'task.decomposition-ready');
+    expect(ready).toHaveLength(1);
+    expect((ready[0]!.payload as { subtaskCount: number }).subtaskCount).toBe(decomposition.subtasks.length);
     const events = engine.ctx.store.listEvents(work.id).filter((e) => e.type === 'task.decomposed');
     expect(events).toHaveLength(1);
   });
@@ -174,5 +195,28 @@ describe('task-decomposer role', () => {
     await expect(engine.execute(work.id)).rejects.toThrow(/pr\.create/);
     expect(engine.ctx.store.getWork(work.id).currentState).toBe('PLAN_APPROVED');
     expect(engine.ctx.store.getLatestArtifact(work.id, 'task-decomposition')).toBeFalsy();
+  });
+
+  it('GitHub fixture refuses PR when head SHA matches base tip', async () => {
+    const github: GitHubFixtureState = { pullRequests: {}, statuses: {}, protections: {}, refs: {} };
+    const adapter = createGitHubAdapter({ fixtures: github });
+    const sha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    github.refs!['fixture/project'] = { main: sha, 'feat/x': sha };
+    await expect(
+      adapter.invoke({
+        capability: 'pr.create',
+        workId: 'work_test',
+        correlationId: 'c1',
+        arguments: {
+          owner: 'fixture',
+          repo: 'project',
+          head: 'feat/x',
+          headSha: sha,
+          base: 'main',
+          title: 'identical',
+          body: '',
+        },
+      }),
+    ).rejects.toThrow(/No commits between base and head/);
   });
 });
